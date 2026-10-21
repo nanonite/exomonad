@@ -1164,39 +1164,48 @@ class RunStore:
         reason: str,
         *,
         error: BaseException | None = None,
-    ) -> None:
+        outcome: str = "controller_exit",
+        expected_revision: int | None = None,
+    ) -> bool:
         """Persist a diagnostic-only controller exit reason outside run state."""
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        payload = {"reason": reason, "recorded_at": time.time()}
-        try:
-            state = self.load()
-        except (OSError, ValueError):
-            state = None
-        if state is not None:
-            payload["checkpoint_version"] = state.version
-            payload["checkpoint_revision"] = state.revision
-            payload["checkpoint_state_version"] = state.state_version
-            phase = getattr(state, "recursive_fsm", None)
-            failure_reason = getattr(phase, "reason", None)
-            if isinstance(failure_reason, str) and failure_reason:
-                payload["checkpoint_failure_reason"] = failure_reason
-            phase_value = getattr(getattr(state, "fsm", None), "phase", None)
-            if phase_value is not None:
-                payload["checkpoint_phase"] = getattr(phase_value, "value", str(phase_value))
-        if error is not None:
-            payload["error_chain"] = list(_exception_chain(error))
-            context = _exception_context(error)
-            if context:
-                payload["context"] = context
-        try:
-            output = self.controller_output_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
-            output = ""
-        if output:
-            payload["recent_output"] = "\n".join(output.splitlines()[-20:])
-        temporary = self.exit_reason_path.with_suffix(".tmp")
-        temporary.write_text(dumps_json(payload, sort_keys=True), encoding="utf-8")
-        temporary.replace(self.exit_reason_path)
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("exit diagnostic reason must be non-empty text")
+        if not isinstance(outcome, str) or not outcome.strip():
+            raise ValueError("exit diagnostic outcome must be non-empty text")
+        if expected_revision is not None and (
+            type(expected_revision) is not int or expected_revision < 0
+        ):
+            raise ValueError("expected diagnostic checkpoint revision must be non-negative")
+        with RunLock(self.run_dir.parent / "run.lock"):
+            try:
+                state = self.load()
+            except (OSError, ValueError):
+                state = None
+            if expected_revision is not None and (
+                state is None or state.revision != expected_revision
+            ):
+                return False
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            payload: dict[str, object] = {
+                "reason": reason,
+                "outcome": outcome,
+                "recorded_at": time.time(),
+            }
+            if state is not None:
+                payload.update(_exit_diagnostic_checkpoint_binding(state))
+            if error is not None:
+                payload["error_chain"] = list(_exception_chain(error))
+                context = _exception_context(error)
+                if context:
+                    payload["context"] = context
+            try:
+                output = self.controller_output_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                output = ""
+            if output:
+                payload["recent_output"] = "\n".join(output.splitlines()[-20:])
+            publish(self.exit_reason_path, payload)
+        return True
 
     def exit_reason(self) -> str | None:
         """Read the diagnostic marker without treating it as a checkpoint."""
@@ -1574,6 +1583,46 @@ def checkpoint(
 
     apply(run_directory, mutate)
     return load(run_directory / "run.json")
+
+
+def _exit_diagnostic_checkpoint_binding(state: RunState) -> dict[str, object]:
+    """Bind an exit observation to its scope and any failed dispatch attempt."""
+    manifest = state.plan_manifest
+    payload: dict[str, object] = {
+        "checkpoint_version": state.version,
+        "checkpoint_revision": state.revision,
+        "checkpoint_state_version": state.state_version,
+        "scope_run_id": state.run_id,
+        "scope_parent_run_id": state.parent_run_id,
+        "scope_branch": state.owner_branch,
+        "controller_epoch": state.controller_epoch,
+        "plan_manifest_digest": manifest.digest if manifest is not None else None,
+    }
+    phase = state.recursive_fsm
+    failure_reason = getattr(phase, "reason", None)
+    if isinstance(failure_reason, str) and failure_reason:
+        payload["checkpoint_failure_reason"] = failure_reason
+    phase_value = getattr(getattr(state, "fsm", None), "phase", None)
+    if phase_value is not None:
+        payload["checkpoint_phase"] = getattr(phase_value, "value", str(phase_value))
+    dispatch_failures = [
+        {
+            "slice_id": slice_state.id,
+            "dispatch_intent_id": slice_state.dispatch_intent_id,
+            "dispatch_agent_id": slice_state.dispatch_agent_id,
+            "dispatch_invocation_id": slice_state.dispatch_invocation_id,
+            "dispatch_authoritative_event_seq": slice_state.dispatch_authoritative_event_seq,
+            "dispatch_generation": slice_state.dispatch_generation,
+            "attempt": slice_state.attempts,
+            "dispatch_error_code": slice_state.dispatch_error_code,
+            "dispatch_last_boundary": slice_state.dispatch_last_boundary,
+        }
+        for slice_state in sorted(state.slices.values(), key=lambda item: item.id)
+        if getattr(slice_state.status, "value", slice_state.status) == "dispatch_failed"
+    ]
+    if dispatch_failures:
+        payload["dispatch_failures"] = dispatch_failures
+    return payload
 
 
 def resume(run_id: str, *, root_dir: str | Path = DEFAULT_ROOT) -> ResumeState:

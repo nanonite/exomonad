@@ -49,6 +49,7 @@ from tl_loop.tests.checkpoint_fixtures import create
 JsonObject = dict[str, Any]
 
 BRANCH_EXISTS = "worktree.branch_exists"
+DIRTY_TL_PREFLIGHT = "agent.spawn_precondition.dirty_worktree"
 OWNERSHIP_CONFLICT = "worktree.branch_ownership_conflict"
 BASE_DELAY = 10.0
 MAX_DELAY = 40.0
@@ -106,6 +107,7 @@ class ScriptedTransport:
     project_root: Path
     run_id: str
     first_refusal_seq: int = 7
+    refusal_message: str = "spawn request rejected"
     calls: list[tuple[str, JsonObject]] = field(default_factory=list)
     events: list[JsonObject] = field(default_factory=list)
     spawn_calls: list[JsonObject] = field(default_factory=list)
@@ -136,7 +138,7 @@ class ScriptedTransport:
                     self.code,
                     run_seq=self.first_refusal_seq + attempt - 1,
                 )
-                return {"success": False, "error": "spawn request rejected"}
+                return {"success": False, "error": self.refusal_message}
             return {"success": True, "result": {"agent_id": "leaf-a-opencode"}}
         if tool_name == "list_agents":
             return {"success": True, "result": {"agents": self.listed_agents}}
@@ -288,6 +290,7 @@ def test_the_classification_table_reads_codes_and_never_prose() -> None:
         classify_dispatch_failure("worktree.lifecycle_lock_timeout")
         is DispatchFailureClass.RETRYABLE
     )
+    assert classify_dispatch_failure(DIRTY_TL_PREFLIGHT) is DispatchFailureClass.RETRYABLE
     assert classify_dispatch_failure(OWNERSHIP_CONFLICT) is DispatchFailureClass.TERMINAL
     assert (
         classify_dispatch_failure("worktree.pr_context_unavailable")
@@ -360,6 +363,56 @@ def test_a_retryable_branch_race_recovers_without_parking(tmp_path: Path) -> Non
     assert not second.final_state.gates
     assert "tl.gate_opened" not in transport.event_types()
     assert transport.event_types().count("tl.dispatch_retry_scheduled") == 1
+
+
+def test_dirty_preflight_refusal_rechecks_at_the_next_spawn_boundary(tmp_path: Path) -> None:
+    clock = ScriptedClock()
+    run_id = "dirty-preflight-retry"
+    transport = ScriptedTransport(
+        code=DIRTY_TL_PREFLIGHT,
+        rejections=1,
+        project_root=tmp_path,
+        run_id=run_id,
+    )
+
+    first = _invoke(tmp_path, run_id, clock, transport)
+    assert first.final_state.slices["leaf-a"].status is SliceStatus.DISPATCH_RETRY_SCHEDULED
+    assert first.final_state.slices["leaf-a"].dispatch_error_code == DIRTY_TL_PREFLIGHT
+    assert len(transport.spawn_calls) == 1
+
+    clock.advance(BASE_DELAY)
+    second = _invoke(tmp_path, run_id, clock, transport)
+
+    assert second.final_state.slices["leaf-a"].status is SliceStatus.DISPATCH_UNCONFIRMED
+    assert second.final_state.slices["leaf-a"].attempts == 2
+    assert len(transport.spawn_calls) == 2
+
+
+def test_unchanged_dirty_precondition_exhausts_into_its_precise_gate(tmp_path: Path) -> None:
+    clock = ScriptedClock()
+    run_id = "dirty-preflight-still-blocked"
+    transport = ScriptedTransport(
+        code=DIRTY_TL_PREFLIGHT,
+        rejections=2,
+        project_root=tmp_path,
+        run_id=run_id,
+        refusal_message=(
+            "TL preflight failed; spawning is blocked until the worktree is clean. "
+            "dirty TL worktree: CHANGELOG.md"
+        ),
+    )
+
+    first = _invoke(tmp_path, run_id, clock, transport, dispatch_retry_limit=1)
+    assert first.final_state.slices["leaf-a"].status is SliceStatus.DISPATCH_RETRY_SCHEDULED
+    clock.advance(BASE_DELAY)
+    second = _invoke(tmp_path, run_id, clock, transport, dispatch_retry_limit=1)
+
+    blocked = second.final_state.slices["leaf-a"]
+    assert blocked.status is SliceStatus.DISPATCH_FAILED
+    assert blocked.dispatch_error_code == DIRTY_TL_PREFLIGHT
+    assert "dirty" in (blocked.dispatch_error or "").lower()
+    assert len(transport.spawn_calls) == 2
+    assert second.final_state.gates[0].name == f"{DISPATCH_FAILURE_GATE_PREFIX}leaf-a"
 
 
 def test_a_scheduled_retry_never_claims_a_leaf_exists(tmp_path: Path) -> None:

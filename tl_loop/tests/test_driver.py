@@ -2153,7 +2153,9 @@ def test_live_waiting_child_is_terminated_on_explicit_cancellation() -> None:
 
     assert state is not None
     assert process.terminated
-    assert reasons == ["sub-TL controller cancelled explicitly"]
+    # The lightweight fixture cannot persist a failure checkpoint. A diagnostic
+    # must not be written unless it can bind to that durable failure revision.
+    assert reasons == []
 
 
 def test_exited_waiting_child_is_failed_as_process_loss() -> None:
@@ -2182,7 +2184,9 @@ def test_exited_waiting_child_is_failed_as_process_loss() -> None:
     )
 
     assert state is None
-    assert reasons == ["sub-TL controller exited before authoritative resolution with code 0"]
+    # Without a durable checkpoint there is no revision for an exit diagnostic
+    # to bind to, so the observer leaves recovery to the real RunStore path.
+    assert reasons == []
 
 
 @dataclass

@@ -748,7 +748,10 @@ git -C "$AGG_REPO" push -u origin main -q
 
 AGG_MOCK_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
 AGG_MOCK_URL="http://127.0.0.1:$AGG_MOCK_PORT"
+AGG_MERGED_PR_MARKER_DIR="$AGG_DIR/merged-pr-markers"
+mkdir -p "$AGG_MERGED_PR_MARKER_DIR"
 REMOTE_DIR="$AGG_REMOTE" MOCK_LOG="$AGG_DIR/mock.log" MOCK_ADVANCE_BASE_ON_MERGE=1 \
+    MOCK_MERGED_PR_MARKER_DIR="$AGG_MERGED_PR_MARKER_DIR" \
     python3 "$PROJECT_ROOT/tests/e2e/mock_github.py" --port "$AGG_MOCK_PORT" \
     > "$AGG_DIR/mock.stderr" 2>&1 &
 MOCK_PID=$!
@@ -804,10 +807,20 @@ architecture = root["slices"]["architecture"]
 kani = root["slices"]["kani"]
 candidate = root["integration"]["candidates"]["architecture"]
 kani_child_path = root_dir / "kani/run.json"
-assert kani_child_path.is_file(), "failed Kani startup checkpoint is missing"
+assert kani_child_path.is_file(), "failed Kani child checkpoint is missing"
 kani_child = json.loads(kani_child_path.read_text(encoding="utf-8"))
 exit_path = kani_child_path.parent / "controller-exit.json"
-exit_record = json.loads(exit_path.read_text(encoding="utf-8"))
+assert not exit_path.exists(), "legacy fixture must retain the missing normal-return diagnostic"
+failed_leaf = kani_child["slices"]["issue-814-substitution-model-kani"]
+child_journal = json.loads(
+    (kani_child_path.parent / "action-journal.json").read_text(encoding="utf-8")
+)
+rejected_spawns = [
+    entry for entry in child_journal
+    if entry.get("operation") == "spawn_leaf"
+    and entry.get("target") == "issue-814-substitution-model-kani"
+    and entry.get("status") == "rejected"
+]
 assert root["fsm"]["phase"] == "tl_failed"
 assert root["current_order"] == 2
 assert architecture["status"] == "merged"
@@ -819,8 +832,15 @@ assert kani["dispatch_intent_id"] and kani["dispatch_authoritative_event_seq"] =
 assert kani_child["run_id"] == "kani"
 assert kani_child["parent_run_id"] == "root"
 assert kani_child["fsm"]["phase"] == "tl_failed"
-assert exit_record["reason"] == kani_child["fsm"]["payload"]["reason"]
-assert exit_record["checkpoint_revision"] == kani_child["revision"]
+assert failed_leaf["status"] == "dispatch_failed"
+assert failed_leaf["dispatch_last_boundary"] == "spawn_request_failed"
+assert failed_leaf.get("dispatch_invocation_id") is None
+assert failed_leaf["park_cause"] == "dispatch_failed"
+assert len(rejected_spawns) == 1
+assert rejected_spawns[0]["arguments"]["intent_id"] == failed_leaf["dispatch_intent_id"]
+assert rejected_spawns[0]["result"]["error"] == failed_leaf["dispatch_error"]
+assert any(gate["name"] == "tl-dispatch-failed-issue-814-substitution-model-kani" for gate in kani_child["gates"])
+assert any(gate["name"] == "tl-ordered-child-recovery-kani" for gate in root["gates"])
 assert not Path(kani["worktree"]).exists(), "failed startup unexpectedly provisioned a child worktree"
 assert not (repo / ".exo/agents/kani/identity.json").exists(), (
     "failed startup already has a durable agent identity and must not be resumed as a PR owner"
@@ -846,7 +866,7 @@ AGGREGATE_MERGE_REQUESTS_BEFORE="$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/m
 PULL_PUBLICATIONS_BEFORE="$(count_pull_publications "$AGG_DIR/mock.log")"
 [[ "$PULL_PUBLICATIONS_BEFORE" == "2" ]] \
     || e2e_fail "fixture expected only its leaf and aggregate PR publications, found $PULL_PUBLICATIONS_BEFORE"
-e2e_log "Seeded merged aggregate PR #$AGGREGATE_PR, full architecture completion evidence, and a revision-bound Kani startup failure at order 2 (parent HEAD=$AGGREGATE_REMOTE_HEAD)"
+e2e_log "Seeded merged aggregate PR #$AGGREGATE_PR, full architecture completion evidence, and a legacy Kani #814 dirty-preflight rejection returned as TLFailed without controller-exit.json (parent HEAD=$AGGREGATE_REMOTE_HEAD)"
 
 # The post-checkout hook runs only when the new handoff-proof source worktree
 # is provisioned. It creates a dirty file in the outer root after the tidy
@@ -1034,8 +1054,8 @@ assert_init_status "$AGG_INIT_STATUS" "$AGG_DIR/init.log" "aggregate init --cont
 [[ "$(rg -F -c 'Recovered a proven orphan native Git lock' "$AGG_DIR/init.log" || printf '0')" == "0" ]] \
     || { cat "$AGG_DIR/init.log"; e2e_fail "legacy lock was misreported as a managed orphan"; }
 PULL_PUBLICATIONS_AFTER_START="$(count_pull_publications "$AGG_DIR/mock.log")"
-(( PULL_PUBLICATIONS_AFTER_START <= PULL_PUBLICATIONS_BEFORE + 1 )) \
-    || e2e_fail "first continuation published more than the single planned leaf PR"
+(( PULL_PUBLICATIONS_AFTER_START <= PULL_PUBLICATIONS_BEFORE + 2 )) \
+    || e2e_fail "first continuation published more than the recovered #814 and post-tidy leaf PRs"
 
 POST_TIDY_STATE=""
 for _ in $(seq 1 240); do
@@ -1105,8 +1125,65 @@ if [[ "$post_tidy_marker" != "ready" || ( "$final_phase" != "tl_running" && "$fi
     cat "$AGG_REPO/.exo/tl-loop/root/controller-output.log" 2>/dev/null || true
     e2e_fail "continuation did not reach the post-tidy leaf review handoff: '$POST_TIDY_STATE'"
 fi
-[[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$((PULL_PUBLICATIONS_BEFORE + 1))" ]] \
-    || e2e_fail "expected exactly one new PR publication for the post-tidy leaf"
+[[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$((PULL_PUBLICATIONS_BEFORE + 2))" ]] \
+    || e2e_fail "expected one recovered #814 publication and one post-tidy leaf publication"
+KANI_LEAF_PR="$(python3 - "$AGG_REPO" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+root_dir = repo / ".exo/tl-loop/root"
+root = json.loads((root_dir / "run.json").read_text())
+child = json.loads((root_dir / "kani/run.json").read_text())
+leaf = child["slices"]["issue-814-substitution-model-kani"]
+assert root["slices"]["kani"]["status"] == "merged"
+assert leaf["status"] == "merged", "recovered #814 leaf did not complete integration"
+assert leaf["attempts"] == 2, "recovery did not create exactly one new dispatch attempt"
+assert leaf["pr_number"] is not None
+assert not any(gate["name"] == "tl-dispatch-failed-issue-814-substitution-model-kani" for gate in child["gates"])
+assert not any(gate["name"] == "tl-ordered-child-recovery-kani" for gate in root["gates"])
+journal = json.loads((root_dir / "kani/action-journal.json").read_text())
+spawns = [
+    entry for entry in journal
+    if entry.get("operation") == "spawn_leaf"
+    and entry.get("target") == "issue-814-substitution-model-kani"
+]
+assert sum(entry.get("status") == "rejected" for entry in spawns) == 1
+assert sum(entry.get("status") == "confirmed" for entry in spawns) == 1
+rejected = next(entry for entry in spawns if entry.get("status") == "rejected")
+accepted = next(entry for entry in spawns if entry.get("status") == "confirmed")
+assert rejected["arguments"]["intent_id"] != accepted["arguments"]["intent_id"]
+assert accepted["arguments"]["intent_id"] == leaf["dispatch_intent_id"]
+assert leaf["dispatch_invocation_id"]
+events = [
+    json.loads(line)
+    for line in (repo / "agent-events.jsonl").read_text().splitlines()
+]
+worker_starts = [event for event in events if event.get("event") == "recovery_worker_started"]
+worker_prs = [event for event in events if event.get("event") == "recovery_worker_filed_pr"]
+assert len(worker_starts) == 1, "the proven rejected attempt did not launch exactly one worker"
+assert len(worker_prs) == 1, "the recovered worker did not publish exactly once"
+worker = worker_starts[0]
+assert worker["source_clean"] is True
+assert worker["source_branch"].startswith("main.kani."), worker["source_branch"]
+root_journal = json.loads((root_dir / "action-journal.json").read_text())
+kani_node = next(
+    node for node in root["plan_manifest"]["nodes"]
+    if node.get("kind") == "sub_tl" and node.get("name") == "kani"
+)
+kani_handoffs = [
+    entry for entry in root_journal
+    if entry.get("operation") == "prepare_scope_handoff"
+    and entry.get("arguments", {}).get("child_scope_id") == kani_node["node_id"]
+]
+assert len(kani_handoffs) == 1, "Kani retry bypassed the parent scope handoff"
+handoff = kani_handoffs[0]["result"]["result"]
+assert handoff["ready"] is True
+assert worker["source_head"] == handoff["head_after"]
+print(leaf["pr_number"])
+PY
+)"
 POST_TIDY_LEAF_PR="$leaf_pr"
 
 curl -fsS "$AGG_MOCK_URL/api/v1/repos/owner/repo/pulls/$POST_TIDY_LEAF_PR" \
@@ -1186,11 +1263,13 @@ leaf_pr_number = int(sys.argv[5])
 worker_starts = [entry for entry in events if entry["event"] == "worker_started"]
 worker_prs = [entry for entry in events if entry["event"] == "worker_filed_pr"]
 reviews = [entry for entry in events if entry["event"] == "reviewer_approved"]
-assert len(worker_starts) == 1, f"expected one real worker process, found {len(worker_starts)}"
-assert len(worker_prs) == 1, f"expected one worker file_pr call, found {len(worker_prs)}"
-assert len(reviews) == 1, f"expected one routed reviewer approval, found {len(reviews)}"
-worker = worker_starts[0]
-review = reviews[0]
+assert len(worker_starts) == 1, f"expected one post-tidy worker process, found {len(worker_starts)}"
+assert len(worker_prs) == 1, f"expected one post-tidy worker file_pr call, found {len(worker_prs)}"
+handoff_workers = [entry for entry in worker_starts if entry.get("source_worktree") == str(source_worktree)]
+worker = handoff_workers[0]
+handoff_reviews = [entry for entry in reviews if entry.get("pr_number") == leaf_pr_number]
+assert len(handoff_reviews) == 1, f"expected one routed post-tidy reviewer approval, found {len(handoff_reviews)}"
+review = handoff_reviews[0]
 assert worker["role"] == "dev" and worker["model"] == "gpt-5.6-luna"
 assert worker["source_worktree"] == str(source_worktree)
 assert worker["source_branch"] == "main.handoff-proof"
@@ -1437,8 +1516,10 @@ assert_legacy_recovery_receipt "$AGG_REPO" "$LEGACY_LOCK_CONTENTS" "$LEGACY_FING
 
 [[ "$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)" == "$AGGREGATE_MERGE_REQUESTS_BEFORE" ]] \
     || e2e_fail "continuation repeated the aggregate merge instead of resuming local synchronization"
-[[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$((PULL_PUBLICATIONS_BEFORE + 1))" ]] \
+[[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$((PULL_PUBLICATIONS_BEFORE + 2))" ]] \
     || e2e_fail "continuation published a replacement aggregate PR or duplicated the leaf publication"
+[[ "$(rg -c "pulls/$KANI_LEAF_PR/merge" "$AGG_DIR/mock.log" || true)" == "1" ]] \
+    || e2e_fail "recovered #814 leaf PR was not merged exactly once"
 [[ "$(rg -c "pulls/$LEAF_PR/merge" "$AGG_DIR/mock.log" || true)" == "1" ]] \
     || e2e_fail "completed leaf PR was merged again during aggregate recovery"
 [[ "$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' \
@@ -1504,8 +1585,10 @@ PY
     || e2e_fail "repeat init changed the post-tidy leaf's dispatch or PR identity"
 [[ "$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/mock.log" || true)" == "$AGGREGATE_MERGE_REQUESTS_BEFORE" ]] \
     || e2e_fail "repeated continuation duplicated the aggregate merge"
-[[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$((PULL_PUBLICATIONS_BEFORE + 1))" ]] \
+[[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$((PULL_PUBLICATIONS_BEFORE + 2))" ]] \
     || e2e_fail "repeat init published a replacement aggregate PR or duplicated the leaf publication"
+[[ "$(rg -c "pulls/$KANI_LEAF_PR/merge" "$AGG_DIR/mock.log" || true)" == "1" ]] \
+    || e2e_fail "repeat init duplicated the recovered #814 merge"
 [[ "$(rg -F -c 'Recovered a proven orphan native Git lock' "$AGG_DIR/init-repeat.log" || printf '0')" == "0" ]] \
     || e2e_fail "repeated init reported an already-completed lock recovery again"
 [[ "$(git -C "$AGG_REPO" rev-parse HEAD)" == "$HANDOFF_COMMIT_SHA" ]] \

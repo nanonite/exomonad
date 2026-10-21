@@ -513,7 +513,11 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
                 data = self._read_body()
                 event = data.get("event", "APPROVED")
                 body = data.get("body", "")
-                commit_id = data.get("commit_id")
+                # Forgejo binds a review created against the current PR diff
+                # to that diff's head when the caller omits commit_id.
+                # Preserve that authoritative head in the fixture response
+                # so the watcher can apply its exact-head review check.
+                commit_id = data.get("commit_id") or state.prs[pr_number]["head"]["sha"]
                 login = self._authenticated_login() or "copilot[bot]"
                 review = state.add_review(pr_number, event, body, commit_id, login)
                 return self._send_json(review, 200)
@@ -525,6 +529,17 @@ class GitHubMockHandler(BaseHTTPRequestHandler):
         if m:
             pr_number = int(m.group(3))
             if state.merge_pr(pr_number):
+                marker_dir = os.environ.get("MOCK_MERGED_PR_MARKER_DIR")
+                if marker_dir:
+                    marker_path = Path(marker_dir) / f"pr-{pr_number}.json"
+                    marker_path.parent.mkdir(parents=True, exist_ok=True)
+                    marker_path.write_text(
+                        json.dumps({
+                            "pr_number": pr_number,
+                            "merge_commit_sha": state.prs[pr_number]["merge_commit_sha"],
+                        }),
+                        encoding="utf-8",
+                    )
                 return self._send_json(
                     {
                         "merged": True,

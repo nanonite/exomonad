@@ -68,6 +68,12 @@ RETRYABLE_CODES: dict[str, str] = {
     # for longer than the bounded decision timeout, so this attempt made no
     # decision and created nothing. Satisfies "the decision never ran".
     "worktree.lifecycle_lock_timeout": "shared lifecycle lock busy: the decision never ran",
+    # The TL spawn preflight rejects a dirty source worktree before creating a
+    # leaf, worker, worktree, or invocation. The next attempt re-runs that same
+    # preflight, so retrying after the source handoff is safe.
+    "agent.spawn_precondition.dirty_worktree": (
+        "pre-execution TL spawn preflight refused a dirty worktree"
+    ),
 }
 
 #: Codes whose outcome cannot be proven either way.

@@ -332,6 +332,8 @@ impl<
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<()> {
         let mut failures = Vec::new();
+        let mut dirty_source = false;
+        let mut inspection_failed = false;
 
         match spawn_dirty_worktree_entries(&ctx.working_dir).await {
             Ok(report) => {
@@ -344,6 +346,7 @@ impl<
                     );
                 }
                 if !report.blocking.is_empty() {
+                    dirty_source = true;
                     failures.push(dirty_worktree_message(&report.blocking));
                     failures.push(format!(
                         "TL preflight runtime exclusions (built-in plus configured): {}",
@@ -351,7 +354,10 @@ impl<
                     ));
                 }
             }
-            Err(message) => failures.push(format!("worktree check failed: {message}")),
+            Err(message) => {
+                inspection_failed = true;
+                failures.push(format!("worktree check failed: {message}"));
+            }
         }
 
         if failures.is_empty() {
@@ -372,12 +378,19 @@ impl<
             return Ok(());
         }
 
-        Err(EffectError::invalid_input(format!(
+        let message = format!(
             "TL preflight failed; spawning is blocked until the worktree is clean or the user acknowledges with EXOMONAD_TL_PREFLIGHT_ACK=1.\n{}",
             failures.join("\n")
-        )))
+        );
+        if dirty_source && !inspection_failed {
+            Err(EffectError::custom(DIRTY_TL_SPAWN_PREFLIGHT_CODE, message))
+        } else {
+            Err(EffectError::invalid_input(message))
+        }
     }
 }
+
+const DIRTY_TL_SPAWN_PREFLIGHT_CODE: &str = "agent.spawn_precondition.dirty_worktree";
 
 #[async_trait]
 impl<
@@ -5079,6 +5092,36 @@ mod tests {
         assert_eq!(records[0].event.event_type, "agent.spawn_failed");
         assert_eq!(records[0].event.data["code"], "worktree.branch_exists");
         assert_eq!(records[0].event.data["intent_id"], "intent-1");
+    }
+
+    #[test]
+    fn dirty_tl_preflight_refusal_records_its_preexecution_code() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut services = crate::services::Services::test();
+        services.project_dir = temp.path().to_path_buf();
+        services.event_log = Some(Arc::new(
+            crate::services::EventLog::open(temp.path().join(".exo/logs")).expect("event log"),
+        ));
+        let services = Arc::new(services);
+
+        append_spawn_failed(
+            &services,
+            "root",
+            "leaf-a",
+            "intent-2",
+            &EffectError::custom(
+                DIRTY_TL_SPAWN_PREFLIGHT_CODE,
+                "TL preflight blocked a dirty worktree before spawn",
+            ),
+        );
+
+        let records = crate::services::immutable_ledger::LedgerWriter::open_project(temp.path())
+            .expect("ledger opens")
+            .read_resolved_events()
+            .expect("ledger reads");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event.data["code"], DIRTY_TL_SPAWN_PREFLIGHT_CODE);
+        assert_eq!(records[0].event.data["intent_id"], "intent-2");
     }
 
     #[test]

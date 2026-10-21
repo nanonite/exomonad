@@ -366,7 +366,7 @@ def seed_root(
     base_sha: str,
     merged_remote_head: str,
 ) -> dict[str, object]:
-    from tl_loop.client.effects import ToolResult
+    from tl_loop.client.effects import EffectClient, ToolResult
     from tl_loop.fsm.lane import LanePhase, LaneState
     from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
     from tl_loop.fsm.post_merge_events import (
@@ -377,6 +377,8 @@ def seed_root(
     from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
     from tl_loop.loop.driver import (
         AGGREGATE_PUBLICATION_GATE_PREFIX,
+        ORDERED_RECOVERY_GATE_PREFIX,
+        DispatchAttempt,
         EffectIntent,
         TLLoopConfig,
         WorkPlan,
@@ -387,6 +389,8 @@ def seed_root(
         _parent_aggregate_approval,
         _parent_sync_arguments,
         _parent_sync_identity_fields,
+        _record_terminal_dispatch_failure,
+        _reopen_ordered_scope,
         _sub_tl_worktree,
         _verified_child_completion_evidence,
         derive_child_branch,
@@ -435,7 +439,17 @@ def seed_root(
                 "name": "kani",
                 "order": 2,
                 "integration": {"aggregate_pr_required": False},
-                "plan": {"leaves": []},
+                "plan": {
+                    "leaves": [
+                        {
+                            "name": "issue-814-substitution-model-kani",
+                            "task": "Complete the Kani stage recovery fixture for issue 814",
+                            "chainlink_issue_id": None,
+                            "boundary": ["kani-recovery.txt"],
+                            "verify": ["test -s kani-recovery.txt"],
+                        }
+                    ]
+                },
             },
             {
                 "name": "handoff-proof",
@@ -607,14 +621,89 @@ def seed_root(
     kani_store = RunStore("kani", root_store.run_dir)
     kani_store.set_plan_manifest(kani_manifest, slices=kani_slices)
     kani_state = kani_store.load()
-    kani_failure = "server socket timed out during child startup"
-    kani_store.checkpoint(
-        RecursiveTLFailed(kani_failure),
-        kani_state.slices,
+    kani_task_plan = kani_task.plan
+    kani_state = _reopen_ordered_scope(kani_state, kani_task_plan, kani_store, None)
+    failed_leaf_name = "issue-814-substitution-model-kani"
+    failed_leaf_task = kani_task_plan.leaves[0]
+    failed_intent_id = "seed-issue-814-rejected-spawn-intent"
+    dirty_preflight_error = (
+        "TL preflight failed; spawning is blocked until the worktree is clean. "
+        "BLOCKED: cannot spawn agent into a dirty TL worktree. 2 file(s) have uncommitted changes"
+    )
+    failed_leaf = replace(
+        kani_state.slices[failed_leaf_name],
+        status=SliceStatus.DISPATCHING,
+        attempts=1,
+        dispatch_intent_id=failed_intent_id,
+        dispatch_started_at=1700000001.0,
+        dispatch_generation=1,
+        dispatch_ledger_floor=0,
+        dispatch_last_boundary="dispatch_intended",
+    )
+    kani_state = kani_store.checkpoint(
+        kani_state.recursive_fsm,
+        {**kani_state.slices, failed_leaf_name: failed_leaf},
         kani_state.budgets,
         kani_state.events.last_consumed_offset,
     )
-    kani_store.record_exit_reason(kani_failure)
+    failed_attempt = DispatchAttempt(
+        intent_id=failed_intent_id,
+        started_at=1700000001.0,
+        harness="codex",
+        agent_type="codex",
+        attempt=1,
+        controller_epoch=kani_state.controller_epoch,
+        dispatch_generation=1,
+        ledger_floor=0,
+    )
+    failed_spawn = EffectIntent(
+        "spawn_leaf",
+        failed_leaf_name,
+        {
+            "name": failed_leaf_name,
+            "task": failed_leaf_task.task,
+            "intent_id": failed_intent_id,
+        },
+        True,
+    )
+    kani_journal = EffectJournal("kani", kani_store.run_dir / "action-journal.json")
+    kani_journal.append(failed_spawn)
+    kani_journal.mark_result(
+        failed_spawn,
+        ToolResult.from_raw(
+            {
+                "success": False,
+                "error": dirty_preflight_error,
+                "error_kind": "agent_error",
+            }
+        ),
+    )
+
+    class _SeedTransport:
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: dict[str, object]
+        ) -> dict[str, object]:
+            del role, name, tool_name, arguments
+            raise AssertionError("offline historical fixture must not call tools")
+
+    failure_config = replace(
+        kani_config,
+        active=False,
+        session_mode="continue",
+    )
+    _record_terminal_dispatch_failure(
+        kani_store,
+        kani_state,
+        failed_leaf_name,
+        failed_attempt,
+        dirty_preflight_error,
+        "agent_error",
+        failure_config,
+        EffectClient(_SeedTransport()),
+        kani_journal,
+    )
+    kani_state = kani_store.load()
+    kani_failure = kani_state.recursive_fsm.reason
     failed_kani = replace(
         root_state.slices["kani"],
         status=SliceStatus.FAILED,
@@ -934,7 +1023,7 @@ def seed_root(
         active_aggregate_approval_id=approval_receipt.receipt_id,
     )
     root_store.checkpoint(
-        RecursiveTLFailed("Kani controller exited during startup"),
+        RecursiveTLFailed(f"Kani child failed: {kani_failure}"),
         {**root_state.slices, "architecture": parked_architecture},
         root_state.budgets,
         root_state.events.last_consumed_offset,
@@ -946,7 +1035,7 @@ def seed_root(
                 "architecture": IntegrationLifecycle.MERGED,
                 "kani": IntegrationLifecycle.FAILED,
             },
-            # The aggregate is already merged. The later Kani startup failure
+            # The aggregate is already merged. The later Kani dispatch refusal
             # is the root's current outcome and must not change this candidate.
             aggregate_pr_number=aggregate_pr,
             aggregate_head_sha=aggregate_head,
@@ -1024,7 +1113,7 @@ def seed_root(
         last_lane_epoch=2,
     )
     root_store.checkpoint(
-        RecursiveTLFailed("Kani controller exited during startup"),
+        RecursiveTLFailed(f"Kani child failed: {kani_failure}"),
         {
             **synced.slices,
             "architecture": synced_architecture,
@@ -1043,6 +1132,7 @@ def seed_root(
             },
         ),
     )
+    root_store.set_gate(f"{ORDERED_RECOVERY_GATE_PREFIX}kani", GateStatus.PENDING)
     git(repository, "merge", "--ff-only", merged_remote_head)
     return {
         "root": str(root_store.path),

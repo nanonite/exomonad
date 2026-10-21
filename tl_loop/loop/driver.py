@@ -1618,23 +1618,40 @@ def run_tl_loop(
                     if plan is not None
                     else _work_plan_from_manifest(existing_state.plan_manifest)
                 )
-                try:
-                    existing_state = _reopen_ordered_scope(
-                        existing_state,
-                        recovery_plan,
-                        store,
-                        None,
-                    )
-                except OrderedCompletionEvidenceError as error:
-                    return _terminal_ordered_completion_hold_result(
-                        existing_state,
-                        error,
-                        selected,
-                        effects,
-                        store,
-                        identity_effects,
-                    )
-                terminal_recovery_reopened = True
+                dispatch_failed = any(
+                    item.status is SliceStatus.DISPATCH_FAILED
+                    for item in existing_state.slices.values()
+                )
+                rejection = (
+                    _proven_preexecution_dispatch_rejection(existing_state, store)
+                    if dispatch_failed
+                    else None
+                )
+                if dispatch_failed and rejection is None:
+                    # The parent may restart a child controller only after its
+                    # proof. Recheck the leaf-owned evidence here as well so a
+                    # changed checkpoint cannot turn a prior authorization into
+                    # a fresh dispatch.
+                    terminal_recovery_reopened = False
+                else:
+                    try:
+                        existing_state = _reopen_ordered_scope(
+                            existing_state,
+                            recovery_plan,
+                            store,
+                            None,
+                            retry_dispatch_slice=(rejection.slice_id if rejection else None),
+                        )
+                    except OrderedCompletionEvidenceError as error:
+                        return _terminal_ordered_completion_hold_result(
+                            existing_state,
+                            error,
+                            selected,
+                            effects,
+                            store,
+                            identity_effects,
+                        )
+                    terminal_recovery_reopened = True
             # Fall through to the live loop when a recovery reopened this terminal
             # checkpoint so the recovered child is actually relaunched in this
             # invocation instead of requiring a second controller call.
@@ -2334,6 +2351,13 @@ def _ordered_terminal_recovery_decision(
         None,
     )
     if proof.recoverable:
+        if gate_status is GateStatus.REJECTED:
+            return replace(
+                proof,
+                recoverable=False,
+                reason=f"ordered recovery gate {proof.gate_name!r} was rejected",
+                gate_status=gate_status,
+            )
         return replace(proof, gate_status=gate_status)
     if gate_status is not GateStatus.APPROVED:
         return replace(proof, gate_status=gate_status)
@@ -2543,14 +2567,21 @@ def _ordered_child_recovery_reason(
     )
     if expected_child is None or child_state.plan_manifest.digest != expected_child.digest:
         return _hard_failure("child checkpoint plan manifest does not match the parent declaration")
-    diagnostic = RunStore(task.name, store.run_dir).exit_diagnostics()
+    diagnostic = child_store.exit_diagnostics()
+    rejection = _proven_preexecution_dispatch_rejection(child_state, child_store)
+    if isinstance(diagnostic, Mapping):
+        binding_error = _ordered_exit_diagnostic_binding_error(diagnostic, child_state)
+        if binding_error is not None:
+            return _hard_failure(binding_error)
+    elif rejection is None:
+        return _hard_failure(
+            "durable child exit diagnostic is missing and checkpoint/journal do not prove "
+            "a pre-execution dispatch refusal"
+        )
     exit_reason = diagnostic.get("reason") if isinstance(diagnostic, Mapping) else None
-    if not isinstance(exit_reason, str) or not exit_reason:
-        return _hard_failure("durable child exit diagnostic is missing")
-    binding_error = _ordered_exit_diagnostic_binding_error(diagnostic, child_state)
-    if binding_error is not None:
-        return _hard_failure(binding_error)
-    if not _retryable_ordered_exit_reason(exit_reason):
+    if rejection is None and (not isinstance(exit_reason, str) or not exit_reason):
+        return _hard_failure("durable child exit diagnostic has no failure reason")
+    if rejection is None and not _retryable_ordered_exit_reason(cast(str, exit_reason)):
         # Every ownership, publication, and effect proof above already holds, so
         # the only thing left unproven is how this message is classified. That
         # judgement is exactly what an operator is being asked to make.
@@ -2599,6 +2630,121 @@ def _ordered_child_recovery_reason(
     return _ChildRecoveryProof(None, False)
 
 
+class _PreExecutionDispatchRejection(NamedTuple):
+    """One scoped spawn refusal proven to have happened before worker creation."""
+
+    slice_id: str
+    intent_id: str
+    gate_name: str
+
+
+def _proven_preexecution_dispatch_rejection(
+    child_state: RunState,
+    child_store: RunStore,
+) -> _PreExecutionDispatchRejection | None:
+    """Recognize only a correlated dirty-worktree refusal with no launched leaf."""
+    failed = [
+        item
+        for item in child_state.slices.values()
+        if item.status is SliceStatus.DISPATCH_FAILED
+        and item.park_cause is ParkCause.DISPATCH_FAILED
+    ]
+    if len(failed) != 1:
+        return None
+    slice_state = failed[0]
+    if not _dispatch_rejection_has_no_active_sibling(child_state, slice_state.id):
+        return None
+    if not _dispatch_rejection_checkpoint_is_preexecution(slice_state):
+        return None
+    entry = _rejected_spawn_journal_entry(
+        child_store, slice_state.id, slice_state.dispatch_intent_id
+    )
+    if entry is None or not _journal_result_proves_dirty_preflight(entry, slice_state):
+        return None
+    gate_name = _dispatch_failure_gate_name(slice_state.id, slice_state.dispatch_error_code)
+    gate = next((item for item in child_state.gates if item.name == gate_name), None)
+    if gate is not None and gate.status is GateStatus.REJECTED:
+        return None
+    return _PreExecutionDispatchRejection(
+        slice_state.id, cast(str, slice_state.dispatch_intent_id), gate_name
+    )
+
+
+def _dispatch_rejection_has_no_active_sibling(state: RunState, failed_id: str) -> bool:
+    active = {
+        SliceStatus.SPAWNED,
+        SliceStatus.DISPATCHING,
+        SliceStatus.DISPATCH_UNCONFIRMED,
+        SliceStatus.DISPATCH_RETRY_SCHEDULED,
+        SliceStatus.IN_REVIEW,
+        SliceStatus.REPAIRING,
+    }
+    return all(
+        item.id == failed_id or (item.status not in active and item.action is None)
+        for item in state.slices.values()
+    )
+
+
+def _dispatch_rejection_checkpoint_is_preexecution(slice_state: SliceState) -> bool:
+    return (
+        slice_state.attempts > 0
+        and slice_state.action is None
+        and slice_state.dispatch_last_boundary == "spawn_request_failed"
+        and slice_state.dispatch_error_code
+        in {"agent_error", "agent.spawn_precondition.dirty_worktree"}
+        and bool(slice_state.dispatch_intent_id)
+        and slice_state.dispatch_started_at is not None
+        and slice_state.dispatch_agent_id is None
+        and slice_state.dispatch_invocation_id is None
+        and slice_state.dispatch_authoritative_event_seq is None
+        and slice_state.pr_number is None
+        and slice_state.publication is None
+    )
+
+
+def _rejected_spawn_journal_entry(
+    store: RunStore,
+    slice_id: str,
+    intent_id: str | None,
+) -> Mapping[str, object] | None:
+    if not intent_id:
+        return None
+    try:
+        entries = EffectJournal(store.run_id, store.run_dir / "action-journal.json").entries_for(
+            "spawn_leaf", slice_id
+        )
+    except ActionJournalError:
+        return None
+    matching = [
+        entry
+        for entry in entries
+        if entry.get("status") == "rejected"
+        and isinstance(entry.get("arguments"), Mapping)
+        and entry["arguments"].get("intent_id") == intent_id
+    ]
+    return matching[0] if len(matching) == 1 else None
+
+
+def _journal_result_proves_dirty_preflight(
+    entry: Mapping[str, object],
+    slice_state: SliceState,
+) -> bool:
+    result = entry.get("result")
+    if not isinstance(result, Mapping) or result.get("success") is not False:
+        return False
+    error = result.get("error")
+    if not isinstance(error, str) or error != slice_state.dispatch_error:
+        return False
+    legacy_agent_error = slice_state.dispatch_error_code == "agent_error"
+    stable_preflight_error = (
+        slice_state.dispatch_error_code == "agent.spawn_precondition.dirty_worktree"
+    )
+    exact_legacy = "TL preflight failed" in error and "dirty TL worktree" in error
+    return (legacy_agent_error and result.get("error_kind") == "agent_error" and exact_legacy) or (
+        stable_preflight_error and exact_legacy
+    )
+
+
 def _hard_failure(reason: str) -> _ChildRecoveryProof:
     """One fail-closed reason no operator answer may release."""
     return _ChildRecoveryProof(reason, False)
@@ -2625,7 +2771,53 @@ def _ordered_exit_diagnostic_binding_error(
     bound_reason = diagnostic.get("checkpoint_failure_reason")
     if not isinstance(bound_reason, str) or bound_reason != child_state.recursive_fsm.reason:
         return "durable child exit diagnostic does not match the child checkpoint failure reason"
+    scope_bindings = {
+        "scope_run_id": child_state.run_id,
+        "scope_parent_run_id": child_state.parent_run_id,
+        "scope_branch": child_state.owner_branch,
+        "controller_epoch": child_state.controller_epoch,
+        "plan_manifest_digest": (
+            child_state.plan_manifest.digest if child_state.plan_manifest is not None else None
+        ),
+    }
+    for field_name, expected in scope_bindings.items():
+        if field_name in diagnostic and diagnostic.get(field_name) != expected:
+            return f"durable child exit diagnostic conflicts with checkpoint {field_name}"
+    failure_bindings = diagnostic.get("dispatch_failures")
+    if failure_bindings is not None:
+        expected_failures = _dispatch_failure_diagnostic_bindings(child_state)
+        if failure_bindings != expected_failures:
+            return "durable child exit diagnostic conflicts with the current dispatch attempt"
+    outcome = diagnostic.get("outcome")
+    if outcome is not None and outcome not in {
+        "controller_exit",
+        "exception",
+        "process_exit",
+        "cancelled",
+        "normal_return",
+        "supervisor_observed_failure",
+    }:
+        return "durable child exit diagnostic has an unknown outcome classification"
     return None
+
+
+def _dispatch_failure_diagnostic_bindings(state: RunState) -> list[dict[str, object]]:
+    """Rebuild the minimal dispatch identity embedded in a diagnostic sidecar."""
+    return [
+        {
+            "slice_id": item.id,
+            "dispatch_intent_id": item.dispatch_intent_id,
+            "dispatch_agent_id": item.dispatch_agent_id,
+            "dispatch_invocation_id": item.dispatch_invocation_id,
+            "dispatch_authoritative_event_seq": item.dispatch_authoritative_event_seq,
+            "dispatch_generation": item.dispatch_generation,
+            "attempt": item.attempts,
+            "dispatch_error_code": item.dispatch_error_code,
+            "dispatch_last_boundary": item.dispatch_last_boundary,
+        }
+        for item in state.slices.values()
+        if item.status is SliceStatus.DISPATCH_FAILED
+    ]
 
 
 def _retryable_ordered_exit_reason(reason: str) -> bool:
@@ -2802,6 +2994,7 @@ def _reopen_ordered_scope(
     *,
     authorized: bool = False,
     expected_revision: int | None = None,
+    retry_dispatch_slice: str | None = None,
 ) -> RunState:
     """Reopen one proven ordered scope while retaining all durable identities.
 
@@ -2881,6 +3074,7 @@ def _reopen_ordered_scope(
             expected_revision=expected_revision,
         )
     slices = dict(state.slices)
+    clear_gates: set[str] = set()
     if target_name is not None:
         target = slices[target_name]
         reopened = replace(
@@ -2898,6 +3092,11 @@ def _reopen_ordered_scope(
                 _child_controller_name(task) if task is not None else target_name,
             )
         slices[target_name] = reopened
+        recovery_gate = _ordered_recovery_gate_name(target_name)
+        if any(
+            gate.name == recovery_gate and gate.status is GateStatus.PENDING for gate in state.gates
+        ):
+            clear_gates.add(recovery_gate)
         for order, records_at_order in pending_by_order.items():
             pending_by_order[order] = tuple(
                 replace(
@@ -2920,6 +3119,29 @@ def _reopen_ordered_scope(
             dispatch_intents.pop(target_name, None)
         else:
             dispatch_intents[target_name] = target_intent
+    if retry_dispatch_slice is not None:
+        rejected = slices.get(retry_dispatch_slice)
+        if rejected is None or rejected.status is not SliceStatus.DISPATCH_FAILED:
+            raise TLLoopError(
+                f"ordered retry slice {retry_dispatch_slice!r} is not a failed dispatch"
+            )
+        rejection = _proven_preexecution_dispatch_rejection(state, store)
+        if rejection is None or rejection.slice_id != retry_dispatch_slice:
+            raise TLLoopError(
+                f"ordered retry slice {retry_dispatch_slice!r} no longer has proven "
+                "pre-execution refusal evidence"
+            )
+        slices[retry_dispatch_slice] = replace(
+            slice_transition(rejected, SliceStatusChanged(SliceStatus.PENDING)),
+            park_cause=None,
+            dispatch_last_boundary="preexecution_retry_authorized",
+        )
+        if any(
+            gate.name == rejection.gate_name and gate.status is GateStatus.PENDING
+            for gate in state.gates
+        ):
+            clear_gates.add(rejection.gate_name)
+        dispatch_intents.pop(retry_dispatch_slice, None)
     running = RecursiveTLRunning(
         current_order=current_order,
         pending_by_order=pending_by_order,
@@ -2955,6 +3177,7 @@ def _reopen_ordered_scope(
         ordered_stages=state.ordered_stages,
         integration=integration,
         expected_revision=expected_revision,
+        clear_gates=tuple(sorted(clear_gates)),
     )
 
 
@@ -15296,7 +15519,9 @@ def _supervise_live_sub_tl(
             cancelled = True
             process.terminate()
             process.join()
-            _record_child_exit_reason(child_store, "sub-TL controller cancelled explicitly")
+            reason = "sub-TL controller cancelled explicitly"
+            _persist_child_startup_failure(child_store, reason)
+            _record_child_exit_reason(child_store, reason, outcome="cancelled")
             break
         try:
             child_state = child_store.load()
@@ -15337,12 +15562,21 @@ def _supervise_live_sub_tl(
                 f"sub-TL controller exited before authoritative resolution with code {exitcode}"
             )
             _persist_child_startup_failure(child_store, reason)
-            _record_child_exit_reason(child_store, reason)
+            _record_child_exit_reason(child_store, reason, outcome="process_exit")
             return None
     try:
-        return child_store.load()
+        child_state = child_store.load()
     except (OSError, ValueError):
         return None
+    if isinstance(getattr(child_state, "recursive_fsm", None), RecursiveTLFailed):
+        _record_child_exit_reason(
+            child_store,
+            child_state.recursive_fsm.reason,
+            outcome="supervisor_observed_failure",
+            expected_revision=child_state.revision,
+        )
+        return child_store.load()
+    return child_state
 
 
 def _run_live_sub_tl(
@@ -15396,9 +15630,16 @@ def _run_live_sub_tl(
             or _child_recovery_projection(final_state, store.run_id) is not None
         ):
             raise TLLoopError("sub-TL controller returned before authoritative resolution")
+        if final_state is not None and isinstance(final_state.recursive_fsm, RecursiveTLFailed):
+            _record_child_exit_reason(
+                child_store,
+                final_state.recursive_fsm.reason,
+                outcome="normal_return",
+                expected_revision=final_state.revision,
+            )
     except Exception as error:
         _persist_child_startup_failure(child_store, str(error))
-        _record_child_exit_reason(child_store, str(error), error=error)
+        _record_child_exit_reason(child_store, str(error), error=error, outcome="exception")
         raise
     finally:
         if owned_source is not None:
@@ -15750,21 +15991,42 @@ def _record_child_exit_reason(
     reason: str,
     *,
     error: BaseException | None = None,
+    outcome: str = "controller_exit",
+    expected_revision: int | None = None,
 ) -> None:
-    """Keep the diagnostic for the current failure, replacing a stale one.
+    """Record a checkpoint-bound diagnostic without overwriting newer evidence.
 
-    A marker is only retained while it is bound to the checkpoint revision it
-    was recorded against. Once a newer failure checkpoint exists, the marker is
-    rewritten so a later ``--continue`` cannot read the older transient reason.
+    A same-revision conflicting diagnostic is retained for recovery to reject.
+    A marker bound to an older checkpoint is replaced only after the current
+    failure checkpoint has been loaded and its revision rechecked under the
+    shared run-state lock.
     """
-    diagnostics = getattr(child_store, "exit_diagnostics", None)
-    existing = diagnostics() if diagnostics is not None else None
-    if _exit_marker_matches_checkpoint(existing, child_store):
+    try:
+        state = child_store.load()
+    except (OSError, ValueError):
         return
-    if error is None:
-        child_store.record_exit_reason(reason)
-    else:
-        child_store.record_exit_reason(reason, error=error)
+    if expected_revision is not None and state.revision != expected_revision:
+        return
+    recursive_phase = getattr(state, "recursive_fsm", None)
+    ordinary_phase = getattr(getattr(state, "fsm", None), "phase", None)
+    if not (isinstance(recursive_phase, RecursiveTLFailed) or ordinary_phase is TLPhase.TLFailed):
+        return
+    existing = child_store.exit_diagnostics()
+    existing_revision = (
+        existing.get("checkpoint_revision") if isinstance(existing, Mapping) else None
+    )
+    if existing_revision == state.revision:
+        if _ordered_exit_diagnostic_binding_error(existing, state) is None:
+            return
+        return
+    if type(existing_revision) is int and existing_revision > state.revision:
+        return
+    child_store.record_exit_reason(
+        reason,
+        error=error,
+        outcome=outcome,
+        expected_revision=state.revision,
+    )
 
 
 def _complete_sub_tl_batch(

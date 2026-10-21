@@ -75,6 +75,136 @@ if response.get("success") is not True:
 PY
 }
 
+if [[ "$role" == "dev" && "$agent" == *issue-814* ]]; then
+    [[ "$model" == "gpt-5.6-luna" ]] || {
+        printf 'unexpected recovered #814 worker model: %s\n' "$model" >&2
+        exit 1
+    }
+    source_branch="$(git -C "$PWD" branch --show-current)"
+    source_head="$(git -C "$PWD" rev-parse HEAD)"
+    source_status="$(git -C "$PWD" status --porcelain --untracked-files=all)"
+    [[ -z "$source_status" ]] || {
+        printf 'recovered #814 worker started from a dirty source worktree\n' >&2
+        exit 1
+    }
+    record_event recovery_worker_started "$(python3 - "$PWD" "$source_branch" "$source_head" <<'PY'
+import json
+import sys
+
+print(json.dumps({
+    "working_directory": sys.argv[1],
+    "source_branch": sys.argv[2],
+    "source_head": sys.argv[3],
+    "source_clean": True,
+}))
+PY
+)"
+    printf 'recovered Kani leaf from %s\n' "$agent" > kani-recovery.txt
+    git add -- kani-recovery.txt
+    git commit -m "test: complete recovered issue 814 spawn" -q
+    response="$(mcp_call dev "$agent" file_pr '{"title":"test: recover Kani issue 814","body":"Disposable continuation fixture for a previously rejected, pre-execution spawn."}')"
+    require_tool_success "$response"
+    record_event recovery_worker_filed_pr
+    pr_number="$(python3 - "$response" <<'PY'
+import json
+import sys
+
+
+def find_pr_number(value):
+    if isinstance(value, dict):
+        candidate = value.get("pr_number")
+        if isinstance(candidate, int) and candidate > 0:
+            return candidate
+        for nested in value.values():
+            found = find_pr_number(nested)
+            if found is not None:
+                return found
+        text = value.get("text")
+        if isinstance(text, str):
+            try:
+                found = find_pr_number(json.loads(text))
+            except json.JSONDecodeError:
+                found = None
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for nested in value:
+            found = find_pr_number(nested)
+            if found is not None:
+                return found
+    elif isinstance(value, str):
+        try:
+            return find_pr_number(json.loads(value))
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+number = find_pr_number(json.loads(sys.argv[1]))
+if number is None:
+    raise SystemExit("file_pr response did not include its authoritative PR number")
+print(number)
+PY
+)"
+    response="$(mcp_call dev "$agent" notify_parent '{"status":"success","message":"Recovered Kani change is published; the fixture keeps this invocation active until review and merge finish."}')"
+    require_tool_success "$response"
+    record_event recovery_worker_notified_parent "$(python3 - "$pr_number" "$E2E_AGENT_LOG" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+print(json.dumps({
+    "pr_number": int(sys.argv[1]),
+    "merge_marker_path": str(Path(sys.argv[2]).parent / "merged-pr-markers" / f"pr-{sys.argv[1]}.json"),
+}))
+PY
+)"
+    : "${E2E_AGENT_LOG:?E2E_AGENT_LOG is required to locate the mock merge marker}"
+    merge_marker="${E2E_AGENT_LOG%/*}/merged-pr-markers/pr-$pr_number.json"
+    [[ -d "${merge_marker%/*}" ]] || {
+        printf 'mock merge marker directory is missing: %s\n' "${merge_marker%/*}" >&2
+        exit 1
+    }
+    for _ in $(seq 1 180); do
+        if [[ -s "$merge_marker" ]]; then
+            break
+        fi
+        sleep 1
+    done
+python3 - "$merge_marker" "$pr_number" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+marker = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if marker.get("pr_number") != int(sys.argv[2]) or not marker.get("merge_commit_sha"):
+    raise SystemExit("merged PR marker does not match the recovered leaf")
+PY
+    record_event recovery_worker_pr_merged "$(cat "$merge_marker")"
+    exit 0
+fi
+
+if [[ "$role" == "tl" ]]; then
+    output_path=""
+    next_is_output=false
+    for argument in "$@"; do
+        if [[ "$next_is_output" == true ]]; then
+            output_path="$argument"
+            next_is_output=false
+        elif [[ "$argument" == "--output-last-message" ]]; then
+            next_is_output=true
+        fi
+    done
+    [[ -n "$output_path" ]] || {
+        printf 'TL fixture judgment did not receive --output-last-message\n' >&2
+        exit 1
+    }
+    cat > "$output_path" <<'JSON'
+{"action":"captured","reason":"The recovered fixture adds a test-only file and is not user-visible."}
+JSON
+    exit 0
+fi
+
 case "$role" in
     dev)
         [[ "$model" == "gpt-5.6-luna" ]] || {

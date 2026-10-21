@@ -7,11 +7,12 @@ import queue
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import NamedTuple
+from types import SimpleNamespace
+from typing import NamedTuple, cast
 
 import pytest
 
-from tl_loop.client.effects import EffectClient
+from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import TransportClient
 from tl_loop.events.envelope import EventEnvelope
@@ -21,6 +22,7 @@ from tl_loop.fsm.scope import TLFailed, TLRunning
 from tl_loop.loop import driver
 from tl_loop.loop.driver import (
     RECONCILED_SUB_TL_DISPATCH_BOUNDARIES,
+    EffectIntent,
     LeafTask,
     SubTLTask,
     TLLoopConfig,
@@ -70,6 +72,38 @@ class EmptyQueue:
         return LedgerSnapshot((), cursor, SequenceStatus.UNKNOWN, (), None)
 
 
+class _RecoveryTestTransport:
+    """Transport that must remain unused by the offline failure fixture."""
+
+    def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+        del role, name, tool_name, arguments
+        raise AssertionError("the offline failure fixture must not call external tools")
+
+
+class _RetryDispatchTransport:
+    """Accept the one authorized retry and expose no unrelated runtime owner."""
+
+    def __init__(self) -> None:
+        self.spawn_calls: list[dict[str, object]] = []
+
+    def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+        del role, name
+        if tool_name == "spawn_leaf":
+            self.spawn_calls.append(arguments)
+            return {
+                "success": True,
+                "result": {"agent_id": "leaf-agent", "invocation_id": "leaf-invocation"},
+            }
+        if tool_name == "list_agents":
+            return {"success": True, "result": {"agents": []}}
+        if tool_name == "repository_identity":
+            return {
+                "success": True,
+                "result": {"remote_url": "https://forge.example.com/org/repo.git"},
+            }
+        return {"success": True, "result": {}}
+
+
 class _ExitedProcess:
     """Stand-in for a child controller that exited before authoritative resolution."""
 
@@ -86,9 +120,10 @@ def _failed_ordered_run(
     child_status: SliceStatus = SliceStatus.PENDING,
     child_publication: bool = False,
     root_dir: Path | None = None,
+    child_plan: WorkPlan | None = None,
 ) -> tuple[RunStore, WorkPlan, TLLoopConfig]:
     state_root = root_dir or tmp_path / "state"
-    child_plan = WorkPlan(leaves=(LeafTask("leaf", "implement the child change"),))
+    child_plan = child_plan or WorkPlan(leaves=(LeafTask("leaf", "implement the child change"),))
     plan = WorkPlan(sub_tls=(SubTLTask("child", child_plan, order=1),))
     config = TLLoopConfig(
         root_dir=state_root,
@@ -1009,6 +1044,365 @@ def test_stale_exit_reason_cannot_reopen_newer_failure(tmp_path: Path) -> None:
     assert decision is not None
     assert decision.recoverable is False
     assert "durable child exit diagnostic" in decision.reason
+
+
+def _legacy_dirty_preflight_failure(
+    tmp_path: Path,
+    *,
+    active_sibling: bool = False,
+) -> tuple[RunStore, WorkPlan, TLLoopConfig, RunStore]:
+    """Build the retained dirty-preflight failure with its exact rejected intent."""
+    child_plan = WorkPlan(
+        leaves=(
+            LeafTask("leaf", "implement the child change"),
+            *((LeafTask("sibling", "implement sibling work"),) if active_sibling else ()),
+        )
+    )
+    parent_store, plan, config = _failed_ordered_run(tmp_path, child_plan=child_plan)
+    child_store = RunStore("child", parent_store.run_dir)
+    child_state = child_store.load()
+    driver._reopen_ordered_scope(child_state, child_plan, child_store, None)
+    child_state = child_store.load()
+    leaf = replace(
+        child_state.slices["leaf"],
+        status=SliceStatus.DISPATCHING,
+        attempts=1,
+        dispatch_intent_id="legacy-leaf-intent",
+        dispatch_started_at=100.0,
+        dispatch_generation=1,
+        dispatch_ledger_floor=0,
+        dispatch_last_boundary="dispatch_intended",
+    )
+    child_state = child_store.checkpoint(
+        child_state.recursive_fsm,
+        {**child_state.slices, "leaf": leaf},
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+    )
+    attempt = driver.DispatchAttempt(
+        intent_id="legacy-leaf-intent",
+        started_at=100.0,
+        harness="opencode",
+        agent_type="opencode",
+        attempt=1,
+        controller_epoch=child_state.controller_epoch,
+        dispatch_generation=1,
+        ledger_floor=0,
+    )
+    rejected = (
+        "TL preflight failed; spawning is blocked until the worktree is clean. "
+        "BLOCKED: cannot spawn agent into a dirty TL worktree. 2 file(s) have uncommitted changes"
+    )
+    journal = EffectJournal("child", child_store.run_dir / "action-journal.json")
+    leaf_intent = EffectIntent(
+        "spawn_leaf",
+        "leaf",
+        {"name": "leaf", "task": "implement the child change", "intent_id": attempt.intent_id},
+        True,
+    )
+    journal.append(leaf_intent)
+    journal.mark_result(
+        leaf_intent,
+        ToolResult(
+            {"success": False, "error": rejected, "error_kind": "agent_error"},
+            False,
+            None,
+            rejected,
+            "agent_error",
+        ),
+    )
+    effects = EffectClient(_RecoveryTestTransport())
+    driver._record_terminal_dispatch_failure(
+        child_store,
+        child_state,
+        "leaf",
+        attempt,
+        rejected,
+        "agent_error",
+        replace(config, active=False, run_id="child", root_dir=parent_store.run_dir),
+        effects,
+        journal,
+    )
+    if active_sibling:
+        current = child_store.load()
+        sibling = replace(
+            current.slices["sibling"],
+            status=SliceStatus.SPAWNED,
+            attempts=1,
+            dispatch_intent_id="sibling-intent",
+            dispatch_started_at=101.0,
+            dispatch_generation=1,
+            dispatch_agent_id="sibling-agent",
+            dispatch_invocation_id="sibling-invocation",
+            dispatch_authoritative_event_seq=30,
+            dispatch_last_boundary="spawn_request_accepted",
+        )
+        child_store.checkpoint(
+            current.recursive_fsm,
+            {**current.slices, "sibling": sibling},
+            current.budgets,
+            current.events.last_consumed_offset,
+        )
+    assert isinstance(child_store.load().recursive_fsm, TLFailed)
+    child_store.exit_reason_path.unlink(missing_ok=True)
+    return parent_store, plan, config, child_store
+
+
+def test_normal_failed_return_records_bound_diagnostic_and_recovers(tmp_path: Path) -> None:
+    """A normal TLFailed return records the same bound evidence as an exit."""
+    parent_store, plan, config, child_store = _legacy_dirty_preflight_failure(tmp_path)
+
+    # The child returns TLFailed normally. The supervisor records an accurate
+    # terminal observation, not a claim that the child crashed.
+    assert (
+        _supervise_live_sub_tl(
+            _ExitedProcess(),
+            child_store,
+            config,
+        )
+        is not None
+    )
+    diagnostic = child_store.exit_diagnostics()
+    assert diagnostic is not None
+    assert diagnostic["outcome"] == "supervisor_observed_failure"
+    assert diagnostic["scope_run_id"] == "child"
+    assert diagnostic["scope_parent_run_id"] == "parent"
+    assert diagnostic["dispatch_failures"][0]["dispatch_intent_id"] == "legacy-leaf-intent"
+
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
+
+    assert decision is not None
+    assert decision.recoverable is True
+
+
+def test_live_child_normal_return_writes_its_own_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_store, plan, config, child_store = _legacy_dirty_preflight_failure(tmp_path)
+    task = replace(plan.sub_tls[0], source=NoEventQueue())
+    failed_state = child_store.load()
+    monkeypatch.setattr(
+        driver,
+        "tl_run",
+        lambda *_args, **_kwargs: SimpleNamespace(final_state=failed_state),
+    )
+
+    driver._run_live_sub_tl(
+        task,
+        replace(config, project_root=None),
+        NoEventQueue(),
+        EffectClient(_RecoveryTestTransport()),
+        parent_store,
+        failed_state.budgets,
+    )
+
+    diagnostic = child_store.exit_diagnostics()
+    assert diagnostic is not None
+    assert diagnostic["outcome"] == "normal_return"
+    assert diagnostic["scope_run_id"] == "child"
+    assert diagnostic["checkpoint_revision"] == failed_state.revision
+    assert diagnostic["dispatch_failures"][0]["dispatch_intent_id"] == "legacy-leaf-intent"
+
+
+def test_exit_diagnostic_writer_skips_a_stale_return_revision(tmp_path: Path) -> None:
+    _parent_store, _plan, _config, child_store = _legacy_dirty_preflight_failure(tmp_path)
+    old = child_store.load()
+    child_store.checkpoint(
+        old.recursive_fsm,
+        old.slices,
+        old.budgets,
+        old.events.last_consumed_offset,
+    )
+
+    written = child_store.record_exit_reason(
+        cast(str, old.recursive_fsm.reason),
+        outcome="normal_return",
+        expected_revision=old.revision,
+    )
+
+    assert written is False
+    assert child_store.exit_diagnostics() is None
+
+
+def test_legacy_rejected_leaf_without_exit_marker_recovers_from_checkpoint_and_journal(
+    tmp_path: Path,
+) -> None:
+    """A legacy normal failure remains recoverable without inventing its marker."""
+    parent_store, plan, config, child_store = _legacy_dirty_preflight_failure(tmp_path)
+    # The pre-fix producer never emitted this sidecar for a normal return. Keep
+    # that historical on-disk shape while exercising the corrected consumer.
+    child_store.exit_reason_path.unlink(missing_ok=True)
+
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
+
+    assert child_store.exit_diagnostics() is None
+    assert decision is not None
+    assert decision.recoverable is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("scope_run_id", "wrong-child"),
+        ("scope_parent_run_id", "wrong-parent"),
+        ("controller_epoch", "stale-epoch"),
+        ("plan_manifest_digest", "stale-manifest"),
+        ("dispatch_intent_id", "wrong-attempt"),
+    ],
+)
+def test_conflicting_exit_diagnostic_cannot_authorize_retry(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    parent_store, plan, config, child_store = _legacy_dirty_preflight_failure(tmp_path)
+    child_state = child_store.load()
+    child_store.record_exit_reason(
+        cast(str, child_state.recursive_fsm.reason),
+        outcome="normal_return",
+        expected_revision=child_state.revision,
+    )
+    diagnostic = json.loads(child_store.exit_reason_path.read_text(encoding="utf-8"))
+    if field == "dispatch_intent_id":
+        diagnostic["dispatch_failures"][0][field] = value
+    else:
+        diagnostic[field] = value
+    child_store.exit_reason_path.write_text(json.dumps(diagnostic), encoding="utf-8")
+
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
+
+    assert decision is not None and not decision.recoverable
+    assert "diagnostic conflicts" in decision.reason
+
+
+def test_unresolved_spawn_effect_blocks_legacy_preexecution_retry(tmp_path: Path) -> None:
+    parent_store, plan, config, child_store = _legacy_dirty_preflight_failure(tmp_path)
+    unresolved = EffectIntent(
+        "spawn_leaf",
+        "leaf",
+        {"name": "leaf", "task": "implement the child change", "intent_id": "later-unknown"},
+        True,
+    )
+    journal = EffectJournal("child", child_store.run_dir / "action-journal.json")
+    journal.append(unresolved)
+    journal.mark_unknown(unresolved, RuntimeError("spawn response was interrupted"))
+
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
+
+    assert decision is not None and not decision.recoverable
+    assert "unreconciled effect" in decision.reason
+
+
+def test_active_sibling_worker_blocks_legacy_preexecution_retry(tmp_path: Path) -> None:
+    parent_store, plan, config, _child_store = _legacy_dirty_preflight_failure(
+        tmp_path,
+        active_sibling=True,
+    )
+
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
+
+    assert decision is not None and not decision.recoverable
+
+
+def test_proven_rejected_leaf_reopens_only_its_failed_dispatch_and_gate(
+    tmp_path: Path,
+) -> None:
+    parent_store, plan, config, child_store = _legacy_dirty_preflight_failure(tmp_path)
+    parent_store.set_gate(GATE)
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
+    assert decision is not None and decision.recoverable
+    history_before = EffectJournal("child", child_store.run_dir / "action-journal.json").snapshot()
+    child_plan = WorkPlan(leaves=(LeafTask("leaf", "implement the child change"),))
+
+    reopened = driver._reopen_ordered_scope(
+        child_store.load(),
+        child_plan,
+        child_store,
+        None,
+        retry_dispatch_slice="leaf",
+    )
+
+    assert reopened.recursive_fsm is not None
+    assert reopened.slices["leaf"].status is SliceStatus.PENDING
+    assert reopened.slices["leaf"].dispatch_last_boundary == "preexecution_retry_authorized"
+    assert not any(gate.name == "tl-dispatch-failed-leaf" for gate in reopened.gates)
+    assert (
+        history_before
+        == EffectJournal("child", child_store.run_dir / "action-journal.json").snapshot()
+    )
+
+    root_reopened = driver._reopen_ordered_scope(parent_store.load(), plan, parent_store, "child")
+    assert not any(gate.name == GATE for gate in root_reopened.gates)
+
+
+def test_recovered_dirty_refusal_dispatches_once_and_replay_does_not_duplicate(
+    tmp_path: Path,
+) -> None:
+    parent_store, plan, config, child_store = _legacy_dirty_preflight_failure(tmp_path)
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
+    assert decision is not None and decision.recoverable
+    transport = _RetryDispatchTransport()
+    effects = EffectClient(transport)
+    task = plan.sub_tls[0]
+    child_worktree = str(_sub_tl_worktree(config, parent_store.root_dir, "parent", task))
+    child_config = replace(
+        _child_config(
+            config,
+            task,
+            NoEventQueue(),
+            effects,
+            parent_store,
+            "main.child",
+            child_worktree,
+            ordered_recovery=True,
+        ),
+        project_root=None,
+        keep_alive_on_waiting=False,
+    )
+    child_plan = task.plan
+    assert isinstance(child_plan, WorkPlan)
+    reopened = driver._reopen_ordered_scope(
+        child_store.load(),
+        child_plan,
+        child_store,
+        None,
+        retry_dispatch_slice="leaf",
+    )
+    effects_log = EffectJournal("child", child_store.run_dir / "action-journal.json")
+
+    first = driver._dispatch_children(
+        child_plan,
+        reopened,
+        child_config,
+        effects,
+        effects_log,
+        child_store,
+    )
+
+    assert len(transport.spawn_calls) == 1
+    assert first.slices["leaf"].attempts == 2
+    assert first.slices["leaf"].status in {
+        SliceStatus.DISPATCH_UNCONFIRMED,
+        SliceStatus.SPAWNED,
+    }
+    assert (
+        sum(
+            entry.get("operation") == "spawn_leaf" and entry.get("status") == "rejected"
+            for entry in effects_log.snapshot()
+        )
+        == 1
+    )
+
+    second = driver._dispatch_children(
+        child_plan,
+        child_store.load(),
+        child_config,
+        effects,
+        effects_log,
+        child_store,
+    )
+
+    assert second.slices["leaf"].attempts == 2
+    assert len(transport.spawn_calls) == 1
 
 
 def test_child_config_declares_parent_manifest_for_recovery(tmp_path: Path) -> None:
