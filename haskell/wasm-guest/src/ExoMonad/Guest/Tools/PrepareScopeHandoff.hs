@@ -60,7 +60,7 @@ instance FromJSON PrepareScopeHandoffArgs where
 
 prepareScopeHandoffDescription :: Text
 prepareScopeHandoffDescription =
-  "Inspect or commit all normal Git changes in this TL's authenticated source worktree before handing control to one declared child. Standard git add -A ignore behavior, hooks, and configured identity apply. First call with apply=false; pass its branch, HEAD, and source fingerprint unchanged to apply=true. Changed paths are hexadecimal encoded. A false ready field blocks handoff."
+  "Inspect or commit all normal Git changes in this TL's authenticated source worktree before handing control to one declared child. Standard git add -A ignore behavior, hooks, and configured identity apply. First call with apply=false; pass its branch, HEAD, and source fingerprint unchanged to apply=true. committed_paths lists hex-encoded paths committed by this attempt; remaining_dirty_paths lists hex-encoded paths still dirty afterward; deprecated changed_paths aliases remaining_dirty_paths. A false ready field blocks handoff."
 
 prepareScopeHandoffSchema :: Aeson.Object
 prepareScopeHandoffSchema =
@@ -94,6 +94,8 @@ prepareScopeHandoffResponseValue response =
       "commit_sha" .= strictText (PA.prepareScopeHandoffResponseCommitSha response),
       "source_fingerprint" .= strictText (PA.prepareScopeHandoffResponseSourceFingerprint response),
       "changed_paths" .= map strictText (V.toList (PA.prepareScopeHandoffResponseChangedPaths response)),
+      "committed_paths" .= map strictText (V.toList (PA.prepareScopeHandoffResponseCommittedPaths response)),
+      "remaining_dirty_paths" .= map strictText (V.toList (PA.prepareScopeHandoffResponseRemainingDirtyPaths response)),
       "ready" .= PA.prepareScopeHandoffResponseReady response
     ]
 

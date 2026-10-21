@@ -1259,6 +1259,7 @@ class ScopeHandoffTransport(RecordingTransport):
     dirty: bool = True
     inspection_error: str | None = None
     change_before_apply: bool = False
+    contradictory_no_changes: bool = False
     commit_count: int = 0
     owners: list[str] = field(default_factory=list)
 
@@ -1307,8 +1308,22 @@ class ScopeHandoffTransport(RecordingTransport):
                 outcome="committed",
                 ready=True,
                 commit_sha=self.head,
+                committed_paths=["747261636b65642e747874"],
             )
         if not self.dirty and expected_head == self.head:
+            if self.contradictory_no_changes:
+                changed_head = self.committed_head
+                return _scope_handoff_tool_response(
+                    arguments,
+                    source_worktree=self.source_worktree,
+                    branch=cast(str, arguments["expected_branch"]),
+                    head_before=self.head,
+                    head_after=changed_head,
+                    fingerprint=self.fingerprint,
+                    outcome="no_changes",
+                    ready=True,
+                    commit_sha=changed_head,
+                )
             return _scope_handoff_tool_response(
                 arguments,
                 source_worktree=self.source_worktree,
@@ -1330,6 +1345,7 @@ class ScopeHandoffTransport(RecordingTransport):
                 outcome="recovered_commit",
                 ready=True,
                 commit_sha=self.head,
+                committed_paths=["747261636b65642e747874"],
             )
         return _scope_handoff_tool_response(
             arguments,
@@ -1357,8 +1373,11 @@ def _scope_handoff_tool_response(
     error: str = "",
     commit_sha: str = "",
     changed_paths: list[str] | None = None,
+    committed_paths: list[str] | None = None,
+    remaining_dirty_paths: list[str] | None = None,
 ) -> JsonObject:
     """Shape a typed host response behind the MCP success envelope."""
+    remaining = remaining_dirty_paths if remaining_dirty_paths is not None else changed_paths or []
     return {
         "success": True,
         "result": {
@@ -1381,10 +1400,112 @@ def _scope_handoff_tool_response(
             "head_after": head_after,
             "commit_sha": commit_sha,
             "source_fingerprint": fingerprint,
-            "changed_paths": changed_paths or [],
+            "changed_paths": remaining,
+            "committed_paths": committed_paths or [],
+            "remaining_dirty_paths": remaining,
             "ready": ready,
         },
     }
+
+
+def test_scope_handoff_receipt_distinguishes_committed_and_remaining_paths() -> None:
+    arguments: JsonObject = {
+        "handoff_id": "handoff",
+        "controller_id": "root-controller",
+        "parent_run_id": "root-run",
+        "parent_scope_id": "root",
+        "child_scope_id": "node:architecture",
+        "expected_branch": "main",
+    }
+    expected = {
+        "handoff_id": "handoff",
+        "controller_id": "root-controller",
+        "parent_run_id": "root-run",
+        "parent_scope_id": "root",
+        "child_scope_id": "node:architecture",
+        "expected_branch": "main",
+    }
+
+    def response(outcome: str, committed: list[str], remaining: list[str]) -> ToolResult:
+        return ToolResult.from_raw(
+            _scope_handoff_tool_response(
+                arguments,
+                source_worktree="/tmp/source",
+                branch="main",
+                head_before="1" * 40,
+                head_after="1" * 40 if outcome in {"ready", "no_changes"} else "2" * 40,
+                fingerprint="3" * 64,
+                outcome=outcome,
+                ready=True,
+                commit_sha="" if outcome in {"ready", "no_changes"} else "2" * 40,
+                committed_paths=committed,
+                remaining_dirty_paths=remaining,
+            )
+        )
+
+    assert (
+        driver_module._scope_handoff_response_error(response("ready", [], ["612e747874"]), expected)
+        is None
+    )
+    assert (
+        driver_module._scope_handoff_response_error(
+            response("no_changes", [], []),
+            expected,
+            expected_head="1" * 40,
+            expected_fingerprint="3" * 64,
+        )
+        is None
+    )
+    changed_noop_head = response("no_changes", [], [])
+    cast(dict[str, object], changed_noop_head.raw["result"])["head_after"] = "2" * 40
+    assert (
+        driver_module._scope_handoff_response_error(
+            changed_noop_head,
+            expected,
+            expected_head="1" * 40,
+            expected_fingerprint="3" * 64,
+        )
+        == "no-op scope handoff receipt changed source HEAD"
+    )
+    committed_noop = response("no_changes", [], [])
+    cast(dict[str, object], committed_noop.raw["result"])["commit_sha"] = "2" * 40
+    assert (
+        driver_module._scope_handoff_response_error(
+            committed_noop,
+            expected,
+            expected_head="1" * 40,
+            expected_fingerprint="3" * 64,
+        )
+        == "no-op scope handoff receipt reports a commit"
+    )
+    inspected_commit = response("no_changes", [], [])
+    cast(dict[str, object], inspected_commit.raw["result"])["commit_sha"] = "2" * 40
+    assert (
+        driver_module._scope_handoff_response_error(inspected_commit, expected)
+        == "no-op scope handoff receipt reports a commit"
+    )
+    assert (
+        driver_module._scope_handoff_response_error(
+            response("committed", ["612e747874"], []),
+            expected,
+            expected_head="1" * 40,
+            expected_fingerprint="3" * 64,
+        )
+        is None
+    )
+
+    mismatched_alias = response("committed", ["612e747874"], [])
+    assert isinstance(mismatched_alias.raw["result"], dict)
+    mismatched_alias.raw["result"]["changed_paths"] = ["622e747874"]
+    assert "alias conflicts" in cast(
+        str,
+        driver_module._scope_handoff_response_error(
+            mismatched_alias,
+            expected,
+            expected_head="1" * 40,
+            expected_fingerprint="3" * 64,
+        ),
+    )
 
 
 def test_required_aggregate_completion_needs_publication_and_post_merge(
@@ -10560,6 +10681,90 @@ def test_scope_handoff_commits_before_child_dispatch_and_replays_without_duplica
     assert repeated.final_state.slices["architecture"].status is SliceStatus.MERGED
     assert len(transport.calls) == call_count
     assert transport.commit_count == 1
+
+
+def test_confirmed_contradictory_no_changes_receipt_cannot_authorize_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = SubTLTask(
+        "architecture",
+        WorkPlan(),
+        order=1,
+        integration=IntegrationContract(aggregate_pr_required=False),
+    )
+    plan = WorkPlan(sub_tls=(task,))
+    transport = ScopeHandoffTransport(source_worktree=str(tmp_path), dirty=False)
+    effects = EffectClient(transport, name="root-controller")
+    config = replace(
+        _config(),
+        max_workers=0,
+        max_leaves=0,
+        max_parallel_slices=1,
+        ledger_run_id="scope-handoff-invalid-noop-ledger",
+        project_root=tmp_path,
+        worktree=tmp_path,
+        working_dir=str(tmp_path),
+        agent_id="root-controller",
+        keep_alive_on_waiting=False,
+    )
+    original_prepare = driver_module._prepare_sub_tl_stage
+
+    def crash_after_handoff(*args, **kwargs):
+        del args, kwargs
+        raise SystemExit("simulated crash after confirmed no-op handoff")
+
+    monkeypatch.setattr(driver_module, "_prepare_sub_tl_stage", crash_after_handoff)
+    with pytest.raises(SystemExit, match="confirmed no-op handoff"):
+        run_tl_loop(
+            "scope-handoff-invalid-noop-run",
+            plan,
+            SyntheticQueue([]),
+            effects,
+            config=config,
+            root_dir=tmp_path,
+        )
+
+    journal_path = tmp_path / "scope-handoff-invalid-noop-run" / "action-journal.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    confirmed_apply = next(
+        entry
+        for entry in journal
+        if entry.get("operation") == "prepare_scope_handoff"
+        and entry.get("status") == "confirmed"
+        and isinstance(entry.get("arguments"), dict)
+        and entry["arguments"].get("apply") is True
+    )
+    payload = confirmed_apply["result"]["result"]
+    assert payload["outcome"] == "no_changes"
+    assert payload["head_before"] == transport.head
+    assert payload["commit_sha"] == ""
+    payload["head_after"] = transport.committed_head
+    payload["commit_sha"] = transport.committed_head
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+
+    monkeypatch.setattr(driver_module, "_prepare_sub_tl_stage", original_prepare)
+    transport.contradictory_no_changes = True
+    resumed = run_tl_loop(
+        "scope-handoff-invalid-noop-run",
+        plan,
+        SyntheticQueue([]),
+        effects,
+        config=config,
+        root_dir=tmp_path,
+    )
+
+    assert resumed.final_state.fsm.phase is TLPhase.TLFailed
+    assert "no-op scope handoff" in str(resumed.final_state.recursive_fsm)
+    assert resumed.final_state.slices["architecture"].status is SliceStatus.PENDING
+    dispatches = [
+        arguments
+        for name, arguments in transport.calls
+        if name == "emit_controller_event"
+        and arguments.get("event_type") == "tl.dispatch_confirmed"
+    ]
+    assert dispatches == []
+    assert sum(name == "prepare_scope_handoff" for name, _ in transport.calls) == 4
 
 
 def test_scope_handoff_covers_root_and_descendant_boundaries(tmp_path: Path) -> None:

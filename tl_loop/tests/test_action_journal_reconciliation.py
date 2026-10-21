@@ -227,6 +227,8 @@ def test_scope_handoff_unknown_replays_exact_snapshot_without_operator_gate(tmp_
                     "commit_sha": "c" * 40,
                     "source_fingerprint": "b" * 64,
                     "changed_paths": [],
+                    "committed_paths": ["747261636b65642e747874"],
+                    "remaining_dirty_paths": [],
                     "error": "",
                 },
             }
@@ -242,6 +244,10 @@ def test_scope_handoff_unknown_replays_exact_snapshot_without_operator_gate(tmp_
     assert transport.calls == [("tl", "root", "prepare_scope_handoff", arguments)]
     assert journal.pending_entries() == []
     assert journal.existing(intent)["status"] == "confirmed"
+    retained = journal.existing(intent)["result"]["result"]
+    assert retained["committed_paths"] == ["747261636b65642e747874"]
+    assert retained["remaining_dirty_paths"] == []
+    assert retained["changed_paths"] == retained["remaining_dirty_paths"]
     assert reconciled.gates == state.gates
 
 

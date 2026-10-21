@@ -692,8 +692,16 @@ message PrepareScopeHandoffResponse {
   string head_after = 12;
   string commit_sha = 13;
   string source_fingerprint = 14;
-  repeated string changed_paths = 15;
+  // Deprecated compatibility alias for remaining_dirty_paths. Values are hex
+  // encoded relative Git paths; never infer committed paths from this field.
+  repeated string changed_paths = 15 [deprecated = true];
   bool ready = 16;
+  // Hex encoded relative Git paths included in this handoff commit. Empty for
+  // inspection, no-op, and outcomes whose commit cannot be confirmed.
+  repeated string committed_paths = 17;
+  // Hex encoded relative Git paths still dirty after this operation. This is
+  // also exposed through the deprecated changed_paths alias.
+  repeated string remaining_dirty_paths = 18;
 }
 
 // ============================================================================
