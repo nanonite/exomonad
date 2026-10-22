@@ -1,0 +1,571 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "d60bc52869ea60a0383f43c742d86abec3f679e3",
+  "hlint_version": "3.10",
+  "findings": [
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad.hs",
+      "hint": "Redundant as",
+      "from": "import ExoMonad.Guest.SpawnSpec.Types as ExoMonad.Guest.SpawnSpec.Types",
+      "to": "import ExoMonad.Guest.SpawnSpec.Types"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Effect/Class.hs",
+      "hint": "Unused LANGUAGE pragma",
+      "from": "{-# LANGUAGE FunctionalDependencies #-}",
+      "to": ""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Effect/Class.hs",
+      "hint": "Unused LANGUAGE pragma",
+      "from": "{-# LANGUAGE OverloadedStrings #-}",
+      "to": ""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Effect/Class.hs",
+      "hint": "Unused LANGUAGE pragma",
+      "from": "{-# LANGUAGE TypeApplications #-}",
+      "to": ""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Effects/Log.hs",
+      "hint": "Unused LANGUAGE pragma",
+      "from": "{-# LANGUAGE TypeApplications #-}",
+      "to": ""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Effects/Memory.hs",
+      "hint": "Use camelCase",
+      "from": "data MemoryKind\n  = MemoryKindMEMORY_KIND_UNSPECIFIED |\n    MemoryKindORIGINAL_PLAN |\n    MemoryKindWAVE_PLAN |\n    MemoryKindSPAWNED_CHILD |\n    MemoryKindCHILD_HANDOFF |\n    MemoryKindBLOCKER |\n    MemoryKindDECISION |\n    MemoryKindREVIEW_FEEDBACK |\n    MemoryKindFIX_DIRECTION |\n    MemoryKindMERGE_RESULT |\n    MemoryKindCI_RESULT |\n    MemoryKindNEXT_ACTION |\n    MemoryKindHUMAN_CLARIFICATION |\n    MemoryKindSESSION_SUMMARY\n  deriving (Eq, Generic, Show)",
+      "to": "data MemoryKind\n  = MemoryKindMEMORYKINDUNSPECIFIED |\n    MemoryKindORIGINALPLAN |\n    MemoryKindWAVEPLAN |\n    MemoryKindSPAWNEDCHILD |\n    MemoryKindCHILDHANDOFF |\n    MemoryKindBLOCKER |\n    MemoryKindDECISION |\n    MemoryKindREVIEWFEEDBACK |\n    MemoryKindFIXDIRECTION |\n    MemoryKindMERGERESULT |\n    MemoryKindCIRESULT |\n    MemoryKindNEXTACTION |\n    MemoryKindHUMANCLARIFICATION |\n    MemoryKindSESSIONSUMMARY\n  deriving (Eq, Generic, Show)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Effects/Memory.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data MemoryAppendResponse\n  = MemoryAppendResponse {memoryAppendResponseId :: Int64}\n  deriving (Eq, Generic, Show)",
+      "to": "newtype MemoryAppendResponse\n  = MemoryAppendResponse {memoryAppendResponseId :: Int64}\n  deriving (Eq, Generic, Show)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Effects/Memory.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data MemoryBriefResponse\n  = MemoryBriefResponse {memoryBriefResponseMarkdown :: TL.Text}\n  deriving (Eq, Generic, Show)",
+      "to": "newtype MemoryBriefResponse\n  = MemoryBriefResponse {memoryBriefResponseMarkdown :: TL.Text}\n  deriving (Eq, Generic, Show)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Effects/Memory.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data MemoryListResponse\n  = MemoryListResponse {memoryListResponseRecords :: PBT.NestedVec MemoryRecord}\n  deriving (Eq, Generic, Show)",
+      "to": "newtype MemoryListResponse\n  = MemoryListResponse {memoryListResponseRecords :: PBT.NestedVec MemoryRecord}\n  deriving (Eq, Generic, Show)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Effects/MergePR.hs",
+      "hint": "Unused LANGUAGE pragma",
+      "from": "{-# LANGUAGE TypeApplications #-}",
+      "to": ""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Effect.hs",
+      "hint": "Unused LANGUAGE pragma",
+      "from": "{-# LANGUAGE ForeignFunctionInterface #-}",
+      "to": ""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Effect.hs",
+      "hint": "Unused LANGUAGE pragma",
+      "from": "{-# LANGUAGE OverloadedStrings #-}",
+      "to": ""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Effects/FileSystem.hs",
+      "hint": "Unused LANGUAGE pragma",
+      "from": "{-# LANGUAGE OverloadedStrings #-}",
+      "to": ""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Events/Templates.hs",
+      "hint": "Eta reduce",
+      "from": "reviewCommentedForParent n branch authorBranch comments\n  = reviewParentMessage n branch \"comment-only\" authorBranch comments",
+      "to": "reviewCommentedForParent n branch\n  = reviewParentMessage n branch \"comment-only\""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Events/Templates.hs",
+      "hint": "Eta reduce",
+      "from": "reviewReceivedForParent n branch authorBranch comments\n  = reviewParentMessage\n      n branch \"changes requested\" authorBranch comments",
+      "to": "reviewReceivedForParent n branch\n  = reviewParentMessage n branch \"changes requested\""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Events/Templates.hs",
+      "hint": "Use fromMaybe",
+      "from": "maybe \"unknown\" id",
+      "to": "Data.Maybe.fromMaybe \"unknown\""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/SpawnSpec/Compile.hs",
+      "hint": "Use list comprehension",
+      "from": "if noCommit then\n    [\"Do NOT commit. Send a note when done or if you hit a blocker.\"]\nelse\n    []",
+      "to": "[\"Do NOT commit. Send a note when done or if you hit a blocker.\" |\n   noCommit]"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/StateMachine.hs",
+      "hint": "Use fromMaybe",
+      "from": "maybe defaultPhase id",
+      "to": "Data.Maybe.fromMaybe defaultPhase"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/StateMachine.hs",
+      "hint": "Use fromMaybe",
+      "from": "maybe defaultPhase id",
+      "to": "Data.Maybe.fromMaybe defaultPhase"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tool/Mode.hs",
+      "hint": "Avoid lambda",
+      "from": "\\ args -> runToolEff (toolHandlerEff @t args)",
+      "to": "runToolEff . toolHandlerEff @t"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tool/Record.hs",
+      "hint": "Eta reduce",
+      "from": "dispatchRecord handlers name args\n  = gDispatch (from handlers) name args",
+      "to": "dispatchRecord handlers = gDispatch (from handlers)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tool/Record.hs",
+      "hint": "Eta reduce",
+      "from": "gDispatch (M1 (K1 subRecord)) name args\n  = dispatchRecord subRecord name args",
+      "to": "gDispatch (M1 (K1 subRecord)) = dispatchRecord subRecord"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tool/Runtime.hs",
+      "hint": "Redundant flip",
+      "from": "flip\n  (maybe (Left \"Invalid input format\")) (parseMaybe parser val) Right",
+      "to": "maybe (Left \"Invalid input format\") Right (parseMaybe parser val)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tool/Schema.hs",
+      "hint": "Eta reduce",
+      "from": "gToSchema _ descs = gToSchema (Proxy @f) descs",
+      "to": "gToSchema _ = gToSchema (Proxy @f)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tool/Schema.hs",
+      "hint": "Eta reduce",
+      "from": "gToSchema _ descs = gToSchema (Proxy @f) descs",
+      "to": "gToSchema _ = gToSchema (Proxy @f)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tool/SuspendEffect.hs",
+      "hint": "Unused LANGUAGE pragma",
+      "from": "{-# LANGUAGE TypeOperators #-}",
+      "to": ""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Chainlink.hs",
+      "hint": "Redundant map",
+      "from": "any isChangelog\n  $ map TL.toStrict\n      $ V.toList (Git.getStatusResponseDirtyFiles status)\n          <>\n            V.toList (Git.getStatusResponseStagedFiles status)\n              <> V.toList (Git.getStatusResponseUntrackedFiles status)",
+      "to": "any\n  (isChangelog . TL.toStrict)\n  (V.toList (Git.getStatusResponseDirtyFiles status)\n     <>\n       V.toList (Git.getStatusResponseStagedFiles status)\n         <> V.toList (Git.getStatusResponseUntrackedFiles status))"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Chainlink.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data ChainlinkIssueCreateOutput\n  = ChainlinkIssueCreateOutput {cicoIssueId :: Int}\n  deriving (Generic, Show)",
+      "to": "newtype ChainlinkIssueCreateOutput\n  = ChainlinkIssueCreateOutput {cicoIssueId :: Int}\n  deriving (Generic, Show)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Chainlink.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data ChainlinkIssueShowArgs\n  = ChainlinkIssueShowArgs {cisaIssueId :: Int}\n  deriving (Generic, Show)",
+      "to": "newtype ChainlinkIssueShowArgs\n  = ChainlinkIssueShowArgs {cisaIssueId :: Int}\n  deriving (Generic, Show)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Chainlink/Pure.hs",
+      "hint": "Use isDigit",
+      "from": "c >= '0' && c <= '9'",
+      "to": "isDigit c"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Chainlink/Pure.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data ChainlinkCascadeArgs\n  = ChainlinkCascadeArgs {ccIssueId :: Int}\n  deriving (Generic, Show)",
+      "to": "newtype ChainlinkCascadeArgs\n  = ChainlinkCascadeArgs {ccIssueId :: Int}\n  deriving (Generic, Show)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Chainlink/Pure.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data ChainlinkIssueCommentOutput\n  = ChainlinkIssueCommentOutput {cicoSuccess :: Bool}\n  deriving (Generic, Show)",
+      "to": "newtype ChainlinkIssueCommentOutput\n  = ChainlinkIssueCommentOutput {cicoSuccess :: Bool}\n  deriving (Generic, Show)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Chainlink/Pure.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data ChainlinkMilestoneCreateOutput\n  = ChainlinkMilestoneCreateOutput {cmcoMilestoneId :: Int}\n  deriving (Generic, Show, Eq)",
+      "to": "newtype ChainlinkMilestoneCreateOutput\n  = ChainlinkMilestoneCreateOutput {cmcoMilestoneId :: Int}\n  deriving (Generic, Show, Eq)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Chainlink/Pure.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data ChainlinkSessionEndArgs\n  = ChainlinkSessionEndArgs {cseNotes :: Maybe Text}\n  deriving (Generic, Show)",
+      "to": "newtype ChainlinkSessionEndArgs\n  = ChainlinkSessionEndArgs {cseNotes :: Maybe Text}\n  deriving (Generic, Show)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Chainlink/Pure.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data ChainlinkSessionWorkArgs\n  = ChainlinkSessionWorkArgs {cswIssueId :: Int}\n  deriving (Generic, Show)",
+      "to": "newtype ChainlinkSessionWorkArgs\n  = ChainlinkSessionWorkArgs {cswIssueId :: Int}\n  deriving (Generic, Show)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Chainlink/Pure.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data ChainlinkTimerStartArgs\n  = ChainlinkTimerStartArgs {ctsIssueId :: Int}\n  deriving (Generic, Show)",
+      "to": "newtype ChainlinkTimerStartArgs\n  = ChainlinkTimerStartArgs {ctsIssueId :: Int}\n  deriving (Generic, Show)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Chainlink/Pure.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data ChainlinkTimerStatusArgs\n  = ChainlinkTimerStatusArgs {ctstatusIssueId :: Maybe Int}\n  deriving (Generic, Show)",
+      "to": "newtype ChainlinkTimerStatusArgs\n  = ChainlinkTimerStatusArgs {ctstatusIssueId :: Maybe Int}\n  deriving (Generic, Show)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Chainlink/Pure.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data ChainlinkTimerStopArgs\n  = ChainlinkTimerStopArgs {ctstopIssueId :: Int}\n  deriving (Generic, Show)",
+      "to": "newtype ChainlinkTimerStopArgs\n  = ChainlinkTimerStopArgs {ctstopIssueId :: Int}\n  deriving (Generic, Show)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Chainlink/Pure.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data StructuredIssueId\n  = StructuredIssueId {structuredIssueId :: Int}",
+      "to": "newtype StructuredIssueId\n  = StructuredIssueId {structuredIssueId :: Int}"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Cleanup.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data Cleanup = Cleanup ()",
+      "to": "newtype Cleanup = Cleanup ()"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/CleanupLeaf.hs",
+      "hint": "Use fromMaybe",
+      "from": "maybe \"\" id",
+      "to": "Data.Maybe.fromMaybe \"\""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/CleanupLeaf.hs",
+      "hint": "Use fromMaybe",
+      "from": "maybe \"\" id",
+      "to": "Data.Maybe.fromMaybe \"\""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/CleanupLeaf.hs",
+      "hint": "Use fromMaybe",
+      "from": "maybe False id",
+      "to": "Data.Maybe.fromMaybe False"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/CleanupLeaf.hs",
+      "hint": "Use fromMaybe",
+      "from": "maybe False id",
+      "to": "Data.Maybe.fromMaybe False"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/CleanupLeaf.hs",
+      "hint": "Use fromMaybe",
+      "from": "maybe False id",
+      "to": "Data.Maybe.fromMaybe False"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/CleanupLeaf.hs",
+      "hint": "Use fromMaybe",
+      "from": "maybe False id",
+      "to": "Data.Maybe.fromMaybe False"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/CleanupLeaf.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data CleanupLeaf = CleanupLeaf ()",
+      "to": "newtype CleanupLeaf = CleanupLeaf ()"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/CleanupOrphan.hs",
+      "hint": "Use fromMaybe",
+      "from": "maybe \"\" id",
+      "to": "Data.Maybe.fromMaybe \"\""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/CleanupOrphan.hs",
+      "hint": "Use fromMaybe",
+      "from": "maybe False id",
+      "to": "Data.Maybe.fromMaybe False"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/CleanupOrphan.hs",
+      "hint": "Use fromMaybe",
+      "from": "maybe False id",
+      "to": "Data.Maybe.fromMaybe False"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/CleanupOrphan.hs",
+      "hint": "Use fromMaybe",
+      "from": "maybe False id",
+      "to": "Data.Maybe.fromMaybe False"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/DiscardWorkerOutput.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data DiscardWorkerOutputArgs\n  = DiscardWorkerOutputArgs {dwoReason :: Text}\n  deriving (Generic, Show)",
+      "to": "newtype DiscardWorkerOutputArgs\n  = DiscardWorkerOutputArgs {dwoReason :: Text}\n  deriving (Generic, Show)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Events.hs",
+      "hint": "Use fromMaybe",
+      "from": "maybe \"\" id",
+      "to": "Data.Maybe.fromMaybe \"\""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Events.hs",
+      "hint": "Use fromMaybe",
+      "from": "maybe \"\" id",
+      "to": "Data.Maybe.fromMaybe \"\""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Events.hs",
+      "hint": "Use isNothing",
+      "from": "beBaseSha (brEvidence report) == Nothing",
+      "to": "isNothing (beBaseSha (brEvidence report))"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Events.hs",
+      "hint": "Use isNothing",
+      "from": "beHeadSha (brEvidence report) == Nothing",
+      "to": "isNothing (beHeadSha (brEvidence report))"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Memory.hs",
+      "hint": "Use <$>",
+      "from": "do result <- action\n   pure $ either errorResult successResult result",
+      "to": "do either errorResult successResult <$> action"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Memory.hs",
+      "hint": "Use lambda-case",
+      "from": "\\ value\n  -> case value of\n       \"unspecified\" -> pure KindUnspecified\n       \"original_plan\" -> pure KindOriginalPlan\n       \"wave_plan\" -> pure KindWavePlan\n       \"spawned_child\" -> pure KindSpawnedChild\n       \"child_handoff\" -> pure KindChildHandoff\n       \"blocker\" -> pure KindBlocker\n       \"decision\" -> pure KindDecision\n       \"review_feedback\" -> pure KindReviewFeedback\n       \"fix_direction\" -> pure KindFixDirection\n       \"merge_result\" -> pure KindMergeResult\n       \"ci_result\" -> pure KindCiResult\n       \"next_action\" -> pure KindNextAction\n       \"human_clarification\" -> pure KindHumanClarification\n       \"session_summary\" -> pure KindSessionSummary\n       other -> fail $ \"Unknown memory kind: \" <> T.unpack other",
+      "to": "\\case\n  \"unspecified\" -> pure KindUnspecified\n  \"original_plan\" -> pure KindOriginalPlan\n  \"wave_plan\" -> pure KindWavePlan\n  \"spawned_child\" -> pure KindSpawnedChild\n  \"child_handoff\" -> pure KindChildHandoff\n  \"blocker\" -> pure KindBlocker\n  \"decision\" -> pure KindDecision\n  \"review_feedback\" -> pure KindReviewFeedback\n  \"fix_direction\" -> pure KindFixDirection\n  \"merge_result\" -> pure KindMergeResult\n  \"ci_result\" -> pure KindCiResult\n  \"next_action\" -> pure KindNextAction\n  \"human_clarification\" -> pure KindHumanClarification\n  \"session_summary\" -> pure KindSessionSummary\n  other -> fail $ \"Unknown memory kind: \" <> T.unpack other"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/MergePR.hs",
+      "hint": "Use when",
+      "from": "if mergeSuccess then\n    do let eventPayload\n             = BSL.toStrict\n                 $ Aeson.encode\n                     $ object\n                         [\"pr_number\" .= mprPrNumber args, \"success\" .= True,\n                          \"head_sha\" .= headShaValue, \"head_sha_finding\" .= headShaFinding]\n       void\n         $ suspendEffect_\n             @LogEmitEvent\n             (Log.EmitEventRequest\n                {Log.emitEventRequestEventType = \"pr.merged\",\n                 Log.emitEventRequestPayload = eventPayload,\n                 Log.emitEventRequestTimestamp = 0})\n       cleanupMergedAgent branchName\nelse\n    pure ()",
+      "to": "when mergeSuccess\n  $ do let eventPayload\n             = BSL.toStrict\n                 $ Aeson.encode\n                     $ object\n                         [\"pr_number\" .= mprPrNumber args, \"success\" .= True,\n                          \"head_sha\" .= headShaValue, \"head_sha_finding\" .= headShaFinding]\n       void\n         $ suspendEffect_\n             @LogEmitEvent\n             (Log.EmitEventRequest\n                {Log.emitEventRequestEventType = \"pr.merged\",\n                 Log.emitEventRequestPayload = eventPayload,\n                 Log.emitEventRequestTimestamp = 0})\n       cleanupMergedAgent branchName"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/PollWorkers.hs",
+      "hint": "Use fromMaybe",
+      "from": "maybe \"\" id",
+      "to": "Data.Maybe.fromMaybe \"\""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/PollWorkers.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data ActiveIssueSnapshot = ActiveIssueSnapshot {aisIssueId :: Int}",
+      "to": "newtype ActiveIssueSnapshot\n  = ActiveIssueSnapshot {aisIssueId :: Int}"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/PollWorkers.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data ChainlinkSessionSnapshot\n  = ChainlinkSessionSnapshot {cssActiveIssue :: Maybe ActiveIssueSnapshot}",
+      "to": "newtype ChainlinkSessionSnapshot\n  = ChainlinkSessionSnapshot {cssActiveIssue :: Maybe ActiveIssueSnapshot}"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/PostMergeRecovery.hs",
+      "hint": "Hoist not",
+      "from": "any (not . validToken)",
+      "to": "(not . all validToken)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/PostMergeRecovery.hs",
+      "hint": "Hoist not",
+      "from": "any (not . validToken) names",
+      "to": "not (all validToken names)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/PostMergeRecovery.hs",
+      "hint": "Use isNothing",
+      "from": "pmpSyncOperationId args == Nothing",
+      "to": "isNothing (pmpSyncOperationId args)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/PostMergeRecovery.hs",
+      "hint": "Use record patterns",
+      "from": "SquashMergeIntegrationProof _ _ _ _ _ _ _ _ _ _",
+      "to": "SquashMergeIntegrationProof {}"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/PostMergeRecovery.hs",
+      "hint": "Use void",
+      "from": "fmap (const ())",
+      "to": "void"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/PostMergeRecovery.hs",
+      "hint": "Use when",
+      "from": "if forgejoHead /= pmpMergedHeadSha args then\n    Left \"squash merge proof PR head does not match the requested head\"\nelse\n    pure ()",
+      "to": "Control.Monad.when (forgejoHead /= pmpMergedHeadSha args)\n  $ Left\n      \"squash merge proof PR head does not match the requested head\""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/PostMergeRecovery.hs",
+      "hint": "Use when",
+      "from": "if forgejoPr /= pmpPrNumber args then\n    Left \"squash merge proof PR number does not match the requested PR\"\nelse\n    pure ()",
+      "to": "Control.Monad.when (forgejoPr /= pmpPrNumber args)\n  $ Left\n      \"squash merge proof PR number does not match the requested PR\""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/ReplaceClosedPr.hs",
+      "hint": "Use fromMaybe",
+      "from": "maybe \"\" id",
+      "to": "Data.Maybe.fromMaybe \"\""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/ResolveLivePrForSlice.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data ResolveLivePrForSliceArgs\n  = ResolveLivePrForSliceArgs {rlpfssSliceId :: Text}\n  deriving (Show, Eq, Generic)",
+      "to": "newtype ResolveLivePrForSliceArgs\n  = ResolveLivePrForSliceArgs {rlpfssSliceId :: Text}\n  deriving (Show, Eq, Generic)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Spawn.hs",
+      "hint": "Use list comprehension",
+      "from": "if T.null t then [] else [\"## CONTEXT\\n\" <> t]",
+      "to": "([\"## CONTEXT\\n\" <> t | not (T.null t)])"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Spawn.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data CloseWorkerPaneArgs\n  = CloseWorkerPaneArgs {cwpPaneId :: Text}\n  deriving (Show, Eq, Generic)",
+      "to": "newtype CloseWorkerPaneArgs\n  = CloseWorkerPaneArgs {cwpPaneId :: Text}\n  deriving (Show, Eq, Generic)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Spawn.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data SpawnWorkersArgs\n  = SpawnWorkersArgs {swsSpecs :: [WorkerSpec]}\n  deriving (Show, Eq, Generic)",
+      "to": "newtype SpawnWorkersArgs\n  = SpawnWorkersArgs {swsSpecs :: [WorkerSpec]}\n  deriving (Show, Eq, Generic)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Tasks.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data TaskGetArgs\n  = TaskGetArgs {tgTaskId :: Text}\n  deriving (Show, Eq, Generic)",
+      "to": "newtype TaskGetArgs\n  = TaskGetArgs {tgTaskId :: Text}\n  deriving (Show, Eq, Generic)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/Tasks.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data TaskListArgs\n  = TaskListArgs {tlStatusFilter :: Maybe Text}\n  deriving (Show, Eq, Generic)",
+      "to": "newtype TaskListArgs\n  = TaskListArgs {tlStatusFilter :: Maybe Text}\n  deriving (Show, Eq, Generic)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/TestRunner.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data InstructArgs\n  = InstructArgs {iaContent :: Text}\n  deriving (Generic, Show)",
+      "to": "newtype InstructArgs\n  = InstructArgs {iaContent :: Text}\n  deriving (Generic, Show)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/UnlinkedChangelog.hs",
+      "hint": "Eta reduce",
+      "from": "withRecovery detail recovered\n  = either\n      (\\ err -> detail <> \"; local restore failed: \" <> err)\n      (const detail) recovered",
+      "to": "withRecovery detail\n  = either\n      (\\ err -> detail <> \"; local restore failed: \" <> err)\n      (const detail)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/UnlinkedChangelog.hs",
+      "hint": "Use elemIndex",
+      "from": "findIndex (== name)",
+      "to": "elemIndex name"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/UnlinkedChangelog.hs",
+      "hint": "Use isJust",
+      "from": "maybe False (const True)",
+      "to": "Data.Maybe.isJust"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Tools/WatcherPrState.hs",
+      "hint": "Use newtype instead of data",
+      "from": "data WatcherPrStateArgs\n  = WatcherPrStateArgs {wpsPrNumber :: Int}\n  deriving (Show, Eq, Generic)",
+      "to": "newtype WatcherPrStateArgs\n  = WatcherPrStateArgs {wpsPrNumber :: Int}\n  deriving (Show, Eq, Generic)"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Types.hs",
+      "hint": "Unused LANGUAGE pragma",
+      "from": "{-# LANGUAGE TypeOperators #-}",
+      "to": ""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Types/Permissions.hs",
+      "hint": "Use maybe",
+      "from": "map CustomPat (fromMaybe [] allow)",
+      "to": "maybe [] (map CustomPat) allow"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Guest/Types/Permissions.hs",
+      "hint": "Use maybe",
+      "from": "map CustomPat (fromMaybe [] deny)",
+      "to": "maybe [] (map CustomPat) deny"
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Permissions.hs",
+      "hint": "Unused LANGUAGE pragma",
+      "from": "{-# LANGUAGE OverloadedStrings #-}",
+      "to": ""
+    },
+    {
+      "file": "haskell/wasm-guest/src/ExoMonad/Types.hs",
+      "hint": "Unused LANGUAGE pragma",
+      "from": "{-# LANGUAGE TypeOperators #-}",
+      "to": ""
+    },
+    {
+      "file": "haskell/wasm-guest/test/ExoMonad/Guest/Tools/EventsTest.hs",
+      "hint": "Use infix",
+      "from": "isInfixOf \"\\\"attempt\\\"\" (L8.unpack schema)",
+      "to": "\"\\\"attempt\\\"\" `isInfixOf` L8.unpack schema"
+    },
+    {
+      "file": "haskell/wasm-guest/test/ExoMonad/Guest/Tools/EventsTest.hs",
+      "hint": "Use infix",
+      "from": "isInfixOf \"\\\"blocked\\\"\" (L8.unpack schema)",
+      "to": "\"\\\"blocked\\\"\" `isInfixOf` L8.unpack schema"
+    },
+    {
+      "file": "haskell/wasm-guest/test/ExoMonad/Guest/Tools/EventsTest.hs",
+      "hint": "Use infix",
+      "from": "isInfixOf \"\\\"declared_difficulty\\\"\" (L8.unpack schema)",
+      "to": "\"\\\"declared_difficulty\\\"\" `isInfixOf` L8.unpack schema"
+    },
+    {
+      "file": "haskell/wasm-guest/test/ExoMonad/Guest/Tools/EventsTest.hs",
+      "hint": "Use infix",
+      "from": "isInfixOf \"\\\"evidence\\\"\" (L8.unpack schema)",
+      "to": "\"\\\"evidence\\\"\" `isInfixOf` L8.unpack schema"
+    },
+    {
+      "file": "haskell/wasm-guest/test/ExoMonad/Guest/Tools/PostMergeRecoveryTest.hs",
+      "hint": "Use infix",
+      "from": "List.isInfixOf field changelogSchema",
+      "to": "field `isInfixOf` changelogSchema"
+    },
+    {
+      "file": "haskell/wasm-guest/test/ExoMonad/Guest/Tools/PostMergeRecoveryTest.hs",
+      "hint": "Use infix",
+      "from": "List.isInfixOf field parentSchema",
+      "to": "field `isInfixOf` parentSchema"
+    },
+    {
+      "file": "haskell/wasm-guest/test/ExoMonad/Guest/Tools/PostMergeRecoveryTest.hs",
+      "hint": "Use infix",
+      "from": "List.isInfixOf field pushSchema",
+      "to": "field `isInfixOf` pushSchema"
+    },
+    {
+      "file": "haskell/wasm-guest/test/ExoMonad/Guest/Tools/PostMergeRecoveryTest.hs",
+      "hint": "Use infix",
+      "from": "List.isInfixOf field remoteSchema",
+      "to": "field `isInfixOf` remoteSchema"
+    }
+  ]
+}

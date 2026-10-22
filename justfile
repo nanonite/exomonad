@@ -39,7 +39,7 @@ check-fmt:
 
 # Lint Haskell code
 lint:
-    nix develop --command hlint haskell
+    nix develop --command python3 scripts/check_haskell_lint.py
 
 # Check that fixture activity has not damaged the ExoMonad repository.
 test-repo-integrity:

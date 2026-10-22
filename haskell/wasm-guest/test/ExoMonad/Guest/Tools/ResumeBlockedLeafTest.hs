@@ -63,10 +63,11 @@ resumeBlockedLeafTests =
                     (resumeBlockedLeafFailure effectError)
                 )
             oldOutput = Aeson.toJSON (errorResult (spawnErrorMessage effectError))
-        (Just Aeson.Null) @=? field "error_kind" oldOutput
-        (Just (Aeson.toJSON ("agent.spawn_precondition.dirty_worktree" :: TL.Text)))
+        Just Aeson.Null @=? field "error_kind" oldOutput
+        Just
+          (Aeson.toJSON ("agent.spawn_precondition.dirty_worktree" :: TL.Text))
           @=? field "error_kind" output
-        (Just (Aeson.toJSON ("resume preflight wording may vary" :: TL.Text)))
+        Just (Aeson.toJSON ("resume preflight wording may vary" :: TL.Text))
           @=? field "error" output
     ]
 
