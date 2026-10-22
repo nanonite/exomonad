@@ -1062,6 +1062,8 @@ pub struct AgentControlService<C> {
     pub(crate) tmux_ipc: Option<super::tmux_ipc::TmuxIpc>,
     #[cfg(test)]
     pub(crate) ordered_sub_tl_routing_override: Option<RoutingInfo>,
+    #[cfg(test)]
+    pub(crate) before_invocation_registration_pause: Option<Arc<InvocationRegistrationPause>>,
     /// This agent's birth-branch (git identity). Root TL = "main".
     pub(crate) birth_branch: BirthBranch,
     /// Legacy compatibility flag; no longer changes harness behavior.
@@ -1091,6 +1093,12 @@ pub struct AgentControlService<C> {
     pub(crate) forgejo_spawn_env: Option<ForgejoSpawnEnv>,
 }
 
+#[cfg(test)]
+pub(crate) struct InvocationRegistrationPause {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Semaphore,
+}
+
 impl<
         C: super::HasGitHubClient
             + super::HasTeamRegistry
@@ -1111,6 +1119,8 @@ impl<
             tmux_ipc: None,
             #[cfg(test)]
             ordered_sub_tl_routing_override: None,
+            #[cfg(test)]
+            before_invocation_registration_pause: None,
             birth_branch: BirthBranch::try_from_str("unset")
                 .expect("literal validated string is non-empty"),
             yolo: false,
@@ -1442,6 +1452,16 @@ impl<
                 }));
             }
         }
+        #[cfg(test)]
+        if let Some(pause) = self.before_invocation_registration_pause.as_ref() {
+            pause.reached.notify_one();
+            let permit = pause
+                .release
+                .acquire()
+                .await
+                .map_err(|_| anyhow!("test invocation registration pause was closed"))?;
+            permit.forget();
+        }
         let adoption_identity = identity.as_ref().map(|record| {
             (
                 record.birth_branch.to_string(),
@@ -1519,7 +1539,6 @@ impl<
         } else {
             Vec::new()
         };
-        routing.write_to_dir(&agent_config_dir).await?;
         let invocation =
             invocation::start_invocation_with_provenance_and_context_and_mode_with_id_guarded(
                 &agent_config_dir,

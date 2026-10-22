@@ -2618,6 +2618,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordered_sub_tl_separate_services_preserve_winner_routing() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        let run_git = |args: &[&str], directory: &std::path::Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"], &project_dir);
+        run_git(
+            &["config", "user.email", "test@example.invalid"],
+            &project_dir,
+        );
+        run_git(&["config", "user.name", "Test"], &project_dir);
+        std::fs::write(project_dir.join("seed"), "seed\n").unwrap();
+        run_git(&["add", "seed"], &project_dir);
+        run_git(&["commit", "-q", "-m", "seed"], &project_dir);
+
+        let record = AgentIdentityRecord {
+            agent_name: AgentName::try_from_str("ordered-child").unwrap(),
+            slug: Slug::try_from_str("ordered-child").unwrap(),
+            agent_type: AgentType::Codex,
+            birth_branch: BirthBranch::try_from_str("main.ordered-child").unwrap(),
+            parent_branch: BirthBranch::try_from_str("main").unwrap(),
+            working_dir: project_dir.join(".exo/worktrees/ordered-child"),
+            display_name: "🤖 ordered-child".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
+            ledger_owned: true,
+            slice_id: Some("ordered-child".to_string()),
+        };
+        let first_service = ordered_service(&project_dir, "@81").await;
+        let agent_dir = project_dir.join(".exo/agents/ordered-child");
+        let first_id = first_service
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .unwrap();
+        finish_invocation(&agent_dir, &first_id, InvocationStatus::Killed, Some(137))
+            .await
+            .unwrap();
+
+        let pause = Arc::new(super::super::InvocationRegistrationPause {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let mut stale_service = ordered_service(&project_dir, "@83").await;
+        stale_service.before_invocation_registration_pause = Some(pause.clone());
+        let stale_record = record.clone();
+        let stale_task =
+            tokio::spawn(async move { stale_service.provision_ordered_sub_tl(stale_record).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached.notified())
+            .await
+            .expect("stale service reached invocation registration with its old snapshot");
+
+        let winning_service = ordered_service(&project_dir, "@82").await;
+        let winning_id = winning_service
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .expect("the first restart registers one replacement invocation");
+        let winning = read_invocation(&agent_dir)
+            .await
+            .unwrap()
+            .expect("winning invocation is durable");
+        assert_eq!(winning.invocation_id, winning_id);
+        assert_eq!(winning.generation, 2);
+        assert!(winning.is_live());
+
+        pause.release.add_permits(1);
+        let stale_result = stale_task
+            .await
+            .expect("stale service task completes")
+            .expect_err("stale lineage cannot replace the winner");
+        let stale_reason = format!("{stale_result:#}");
+        assert!(
+            stale_reason.contains("recovery invocation generation mismatch"),
+            "{stale_reason}"
+        );
+
+        let persisted = read_invocation(&agent_dir)
+            .await
+            .unwrap()
+            .expect("winner remains the current invocation");
+        let routing = RoutingInfo::read_from_dir(&agent_dir).await.unwrap();
+        assert_eq!(persisted.invocation_id, winning_id);
+        assert_eq!(
+            persisted.routing.window_id.as_ref().unwrap().as_str(),
+            "@82"
+        );
+        assert_eq!(routing.window_id.as_ref().unwrap().as_str(), "@82");
+        assert_eq!(routing.owner_agent_id.as_deref(), Some("ordered-child"));
+        assert_eq!(
+            routing.owner_invocation_id.as_deref(),
+            Some(winning_id.as_str())
+        );
+        assert_eq!(routing.owner_generation, Some(winning.generation));
+        let history =
+            std::fs::read_to_string(project_dir.join(".exo/events/ordered-child.jsonl")).unwrap();
+        assert_eq!(
+            history
+                .lines()
+                .filter(|line| line.contains("\"trigger\":\"controller_restart\""))
+                .count(),
+            1
+        );
+    }
+
+    async fn ordered_service(
+        project_dir: &Path,
+        window_id: &str,
+    ) -> AgentControlService<crate::services::Services> {
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.to_path_buf();
+        services.git_wt = Arc::new(crate::services::git_worktree::GitWorktreeService::new(
+            project_dir.to_path_buf(),
+        ));
+        services.agent_resolver = Arc::new(AgentResolver::load(project_dir.to_path_buf()).await);
+        AgentControlService::new(Arc::new(services)).with_ordered_sub_tl_routing_for_test(
+            RoutingInfo::window(super::super::tmux_ipc::WindowId::parse(window_id).unwrap()),
+        )
+    }
+
+    #[tokio::test]
     async fn ordered_sub_tl_published_resume_requires_exact_registry_evidence() {
         use crate::services::pr_registry::{
             publish_verified_head, read_published_heads, PublicationProvenance, PublishedHead,

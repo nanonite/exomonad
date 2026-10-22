@@ -561,6 +561,10 @@ pub async fn start_invocation_with_provenance_and_context_and_mode_with_id_guard
             ));
         }
     }
+    // Revalidate lineage before changing the route. A concurrent service may
+    // have registered a replacement after this caller read its prior record.
+    // Keep route and invocation ownership updates inside the same mutation lock.
+    routing.write_to_dir(agent_dir).await?;
     let identity = identity.unwrap_or_default();
     let record = InvocationRecord {
         invocation_id,
