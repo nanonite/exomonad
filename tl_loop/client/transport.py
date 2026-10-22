@@ -131,6 +131,8 @@ class TransportClient:
         parent_branch: str,
         working_dir: str | Path,
         slice_id: str,
+        pr_number: int | None = None,
+        head_sha: str | None = None,
     ) -> str:
         """Provision a live ordered controller and return its durable invocation ID."""
         path = f"/agents/{quote('tl', safe='')}/{quote(parent_name, safe='')}/provision-sub-tl"
@@ -142,6 +144,8 @@ class TransportClient:
                 "parent_branch": parent_branch,
                 "working_dir": str(working_dir),
                 "slice_id": slice_id,
+                "pr_number": pr_number,
+                "head_sha": head_sha,
             },
         )
         invocation_id = response.get("invocation_id") if isinstance(response, dict) else None

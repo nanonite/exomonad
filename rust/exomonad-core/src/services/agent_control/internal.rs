@@ -1,5 +1,302 @@
 use super::*;
 
+use crate::services::pr_registry::{
+    invocation_succession_reaches_current, read_published_heads, PublishedHead,
+};
+
+struct OrderedInvocationPlan {
+    trigger: invocation::InvocationTrigger,
+    recovery_lineage: Option<invocation::RecoveryInvocationLineage>,
+    expected_live_invocation_id: Option<String>,
+    pr_number: Option<u64>,
+    head_sha: Option<String>,
+}
+
+fn ordered_provision_failure(
+    kind: super::OrderedSubTLProvisionFailureKind,
+    message: &'static str,
+) -> anyhow::Error {
+    anyhow::Error::new(super::OrderedSubTLProvisionFailure { kind, message })
+}
+
+fn validate_prior_ordered_invocation(
+    prior: &invocation::InvocationRecord,
+    identity: &AgentIdentityRecord,
+) -> anyhow::Result<()> {
+    let matches_identity = prior.runtime == AgentType::Codex
+        && prior.mode == invocation::InvocationMode::Interactive
+        && matches!(
+            prior.trigger,
+            invocation::InvocationTrigger::Spawn
+                | invocation::InvocationTrigger::ControllerRestart
+                | invocation::InvocationTrigger::ResumePr
+        )
+        && prior.runtime_agent_id.as_deref() == Some(identity.agent_name.as_str())
+        && prior.slice_id == identity.slice_id
+        && prior.branch.as_deref() == Some(identity.birth_branch.as_str())
+        && prior.worktree.as_deref() == Some(identity.working_dir.to_string_lossy().as_ref());
+    if prior.invocation_id.trim().is_empty() || !matches_identity {
+        return Err(ordered_provision_failure(
+            super::OrderedSubTLProvisionFailureKind::OwnershipConflict,
+            "the prior controller invocation does not match the accepted child identity",
+        ));
+    }
+    if prior.is_live() {
+        return Ok(());
+    }
+    let terminal = matches!(
+        prior.status,
+        invocation::InvocationStatus::Exited
+            | invocation::InvocationStatus::Failed
+            | invocation::InvocationStatus::Killed
+            | invocation::InvocationStatus::TimedOut
+    ) && prior.ended_at.is_some();
+    if !terminal {
+        return Err(ordered_provision_failure(
+            super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+            "the prior controller outcome is unresolved; reconcile its invocation before retrying",
+        ));
+    }
+    Ok(())
+}
+
+fn ordered_invocation_history_exists(project_dir: &Path, agent_name: &str) -> anyhow::Result<bool> {
+    let segments = project_dir.join(".exo/ledger/segments");
+    if segments.is_dir() {
+        let event_log = crate::services::EventLog::open(project_dir.join(".exo/events"))
+            .map_err(|_| {
+                ordered_provision_failure(
+                    super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                    "controller invocation history is unavailable; inspect the durable lifecycle ledger",
+                )
+            })?;
+        let records = event_log.ledger().read_events().map_err(|_| {
+            ordered_provision_failure(
+                super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                "controller invocation history is unreadable; inspect the durable lifecycle ledger",
+            )
+        })?;
+        if records.iter().any(|record| {
+            record.event.agent_id.as_deref() == Some(agent_name)
+                && record.event.event_type == "agent.invocation.started"
+        }) {
+            return Ok(true);
+        }
+    }
+
+    let event_path = project_dir
+        .join(".exo/events")
+        .join(format!("{agent_name}.jsonl"));
+    let contents = match std::fs::read_to_string(&event_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => {
+            return Err(ordered_provision_failure(
+                super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                "controller invocation history is unreadable; inspect the durable lifecycle ledger",
+            ));
+        }
+    };
+    for line in contents.lines() {
+        let event: serde_json::Value = serde_json::from_str(line).map_err(|_| {
+            ordered_provision_failure(
+                super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                "controller invocation history is malformed; inspect the durable lifecycle ledger",
+            )
+        })?;
+        if event.get("type").and_then(serde_json::Value::as_str) == Some("agent.invocation.started")
+            && event.get("agent_id").and_then(serde_json::Value::as_str) == Some(agent_name)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn published_ordered_owner_heads<'a>(
+    publications: &'a [PublishedHead],
+    identity: &AgentIdentityRecord,
+) -> Vec<&'a PublishedHead> {
+    publications
+        .iter()
+        .filter(|head| {
+            head.author_agent.as_deref() == Some(identity.agent_name.as_str())
+                || head.head_branch == identity.birth_branch.as_str()
+        })
+        .collect()
+}
+
+fn matching_ordered_publication_count(
+    publications: &[&PublishedHead],
+    identity: &AgentIdentityRecord,
+    prior_invocation_id: &str,
+    pr_number: u64,
+    head_sha: &str,
+) -> usize {
+    publications
+        .iter()
+        .filter(|head| {
+            head.author_agent.as_deref() == Some(identity.agent_name.as_str())
+                && head.matches_current(
+                    pr_number,
+                    identity.birth_branch.as_str(),
+                    identity.parent_branch.as_str(),
+                    head_sha,
+                )
+                && head.slice_id.as_deref() == identity.slice_id.as_deref()
+                && invocation_succession_reaches_current(head, prior_invocation_id)
+        })
+        .count()
+}
+
+fn ordered_invocation_plan(
+    prior: Option<&invocation::InvocationRecord>,
+    identity: &AgentIdentityRecord,
+    publications: &[PublishedHead],
+    requested_pr: Option<u64>,
+    requested_head: Option<&str>,
+) -> anyhow::Result<OrderedInvocationPlan> {
+    if requested_pr.is_some() != requested_head.is_some()
+        || requested_head.is_some_and(|head| head.trim().is_empty())
+    {
+        return Err(ordered_provision_failure(
+            super::OrderedSubTLProvisionFailureKind::PublicationResumeRequired,
+            "published controller continuation requires both a PR number and exact head SHA",
+        ));
+    }
+    let owned_publications = published_ordered_owner_heads(publications, identity);
+    let Some(prior) = prior else {
+        if requested_pr.is_some() || !owned_publications.is_empty() {
+            return Err(ordered_provision_failure(
+                super::OrderedSubTLProvisionFailureKind::PublicationResumeRequired,
+                "published work cannot be resumed without its durable prior invocation and verified PR coordinates",
+            ));
+        }
+        return Ok(OrderedInvocationPlan {
+            trigger: invocation::InvocationTrigger::Spawn,
+            recovery_lineage: None,
+            expected_live_invocation_id: None,
+            pr_number: None,
+            head_sha: None,
+        });
+    };
+
+    if prior.is_live() {
+        if requested_pr.is_some()
+            && ((prior.pr_number.is_some() && prior.pr_number != requested_pr)
+                || (prior.head_sha.is_some() && prior.head_sha.as_deref() != requested_head)
+                || matching_ordered_publication_count(
+                    &owned_publications,
+                    identity,
+                    &prior.invocation_id,
+                    requested_pr.unwrap_or_default(),
+                    requested_head.unwrap_or_default(),
+                ) != 1)
+        {
+            return Err(ordered_provision_failure(
+                super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                "requested publication coordinates conflict with the live controller invocation",
+            ));
+        }
+        return Ok(OrderedInvocationPlan {
+            trigger: prior.trigger,
+            recovery_lineage: None,
+            expected_live_invocation_id: Some(prior.invocation_id.clone()),
+            pr_number: prior.pr_number,
+            head_sha: prior.head_sha.clone(),
+        });
+    }
+
+    let has_prior_publication = prior.pr_number.is_some() || prior.head_sha.is_some();
+    if !has_prior_publication && requested_pr.is_none() && owned_publications.is_empty() {
+        let invocation_generation = prior.generation.checked_add(1).ok_or_else(|| {
+            ordered_provision_failure(
+                super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                "controller invocation generation is exhausted; manual recovery is required",
+            )
+        })?;
+        let recovery_round = prior.recovery_round.checked_add(1).ok_or_else(|| {
+            ordered_provision_failure(
+                super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                "controller recovery lineage is exhausted; manual recovery is required",
+            )
+        })?;
+        return Ok(OrderedInvocationPlan {
+            trigger: invocation::InvocationTrigger::ControllerRestart,
+            recovery_lineage: Some(invocation::RecoveryInvocationLineage {
+                prior_invocation_id: prior.invocation_id.clone(),
+                invocation_generation,
+                recovery_round,
+                authorization_source: invocation::RecoveryAuthorization::Controller,
+            }),
+            expected_live_invocation_id: None,
+            pr_number: None,
+            head_sha: None,
+        });
+    }
+
+    if requested_pr.is_none() {
+        return Err(ordered_provision_failure(
+            super::OrderedSubTLProvisionFailureKind::PublicationResumeRequired,
+            "published controller continuation requires current PR and head coordinates",
+        ));
+    }
+
+    if prior.pr_number.is_some() != prior.head_sha.is_some()
+        || prior
+            .pr_number
+            .is_some_and(|number| Some(number) != requested_pr)
+        || prior
+            .head_sha
+            .as_deref()
+            .is_some_and(|sha| Some(sha) != requested_head)
+    {
+        return Err(ordered_provision_failure(
+            super::OrderedSubTLProvisionFailureKind::PublicationResumeRequired,
+            "published controller continuation requires PR and head coordinates matching the prior invocation",
+        ));
+    }
+    let pr_number = requested_pr.expect("publication coordinates were checked above");
+    let head_sha = requested_head.expect("publication coordinates were checked above");
+    let matching_publication_count = matching_ordered_publication_count(
+        &owned_publications,
+        identity,
+        &prior.invocation_id,
+        pr_number,
+        head_sha,
+    );
+    if matching_publication_count != 1 {
+        return Err(ordered_provision_failure(
+            super::OrderedSubTLProvisionFailureKind::PublicationResumeRequired,
+            "published controller continuation lacks one exact owner, branch, slice, PR, head, and invocation binding",
+        ));
+    }
+    let invocation_generation = prior.generation.checked_add(1).ok_or_else(|| {
+        ordered_provision_failure(
+            super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+            "controller invocation generation is exhausted; manual recovery is required",
+        )
+    })?;
+    let recovery_round = prior.recovery_round.checked_add(1).ok_or_else(|| {
+        ordered_provision_failure(
+            super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+            "controller recovery lineage is exhausted; manual recovery is required",
+        )
+    })?;
+    Ok(OrderedInvocationPlan {
+        trigger: invocation::InvocationTrigger::ResumePr,
+        recovery_lineage: Some(invocation::RecoveryInvocationLineage {
+            prior_invocation_id: prior.invocation_id.clone(),
+            invocation_generation,
+            recovery_round,
+            authorization_source: invocation::RecoveryAuthorization::Controller,
+        }),
+        expected_live_invocation_id: None,
+        pr_number: Some(pr_number),
+        head_sha: Some(head_sha.to_string()),
+    })
+}
+
 // `opencode run` is non-interactive. Keep it on a private server so workers in
 // separate projects cannot collide through OpenCode's shared background service.
 // Current OpenCode CLIs take reasoning variants as `provider/model#variant`.
@@ -92,6 +389,18 @@ impl<
     /// serialized lifecycle operation. Existing ownership is reusable only
     /// when every field matches exactly; no existing workspace is removed.
     pub async fn provision_ordered_sub_tl(&self, record: AgentIdentityRecord) -> Result<String> {
+        self.provision_ordered_sub_tl_with_publication(record, None, None)
+            .await
+    }
+
+    /// Provision or continue an ordered controller using exact PR coordinates
+    /// supplied by the accepted child checkpoint when that scope has published.
+    pub async fn provision_ordered_sub_tl_with_publication(
+        &self,
+        record: AgentIdentityRecord,
+        pr_number: Option<u64>,
+        head_sha: Option<String>,
+    ) -> Result<String> {
         let _guard = self.ordered_sub_tl_provision_lock.lock().await;
         let agent_name = record.agent_name.clone();
         if agent_name.as_str() == "root"
@@ -145,7 +454,63 @@ impl<
             ));
         }
 
+        let agent_dir = project_dir.join(".exo/agents").join(agent_name.as_str());
+        let prior_invocation = read_invocation(&agent_dir).await.map_err(|_| {
+            ordered_provision_failure(
+                super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                "the prior controller invocation is malformed or unreadable; reconcile it before provisioning",
+            )
+        })?;
+        if let Some(prior) = prior_invocation.as_ref() {
+            validate_prior_ordered_invocation(prior, &record)?;
+        } else if ordered_invocation_history_exists(&project_dir, agent_name.as_str())? {
+            return Err(ordered_provision_failure(
+                super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                "controller invocation history exists without its current checkpoint; reconcile the durable lifecycle history before provisioning",
+            ));
+        }
+
+        let routing_path = agent_dir.join("routing.json");
+        if prior_invocation.is_none() && routing_path.exists() {
+            let persisted_routing = RoutingInfo::read_from_dir(&agent_dir).await.map_err(|_| {
+                ordered_provision_failure(
+                    super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                    "routing evidence exists without a readable invocation; reconcile controller ownership before provisioning",
+                )
+            })?;
+            if persisted_routing.has_ownership_proof()
+                || persisted_routing.owner_agent_id.is_some()
+                || persisted_routing.owner_invocation_id.is_some()
+                || persisted_routing.owner_generation.is_some()
+            {
+                return Err(ordered_provision_failure(
+                    super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                    "routing ownership exists without its invocation checkpoint; reconcile controller ownership before provisioning",
+                ));
+            }
+        }
+
+        let publications = read_published_heads(&project_dir).await.map_err(|_| {
+            ordered_provision_failure(
+                super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                "publication history is unavailable; ordered controller continuation is blocked",
+            )
+        })?;
+        let invocation_plan = ordered_invocation_plan(
+            prior_invocation.as_ref(),
+            &record,
+            &publications,
+            pr_number,
+            head_sha.as_deref(),
+        )?;
+
         let existing_identity = self.agent_resolver().get(&agent_name).await;
+        if prior_invocation.is_some() && existing_identity.as_ref() != Some(&record) {
+            return Err(ordered_provision_failure(
+                super::OrderedSubTLProvisionFailureKind::OwnershipConflict,
+                "the durable controller identity does not match its prior invocation",
+            ));
+        }
         let branch = BranchName::try_from_str(record.birth_branch.as_str())?;
         let branch_exists = {
             let git_wt = self.git_wt().clone();
@@ -155,8 +520,9 @@ impl<
                 .context("ordered sub-TL branch inspection failed")??
         };
         if existing_identity.is_none() && branch_exists {
-            return Err(anyhow!(
-                "ordered sub-TL branch already exists without matching durable identity"
+            return Err(ordered_provision_failure(
+                super::OrderedSubTLProvisionFailureKind::OwnershipConflict,
+                "ordered sub-TL branch exists without matching durable identity",
             ));
         }
 
@@ -169,7 +535,68 @@ impl<
                     .await
                     .context("ordered sub-TL worktree inspection failed")??;
             if current_branch.as_deref() != Some(record.birth_branch.as_str()) {
-                return Err(anyhow!("ordered sub-TL worktree has a conflicting branch"));
+                return Err(ordered_provision_failure(
+                    super::OrderedSubTLProvisionFailureKind::OwnershipConflict,
+                    "ordered sub-TL worktree has a conflicting branch",
+                ));
+            }
+        }
+        if prior_invocation.is_some() && !worktree_preexisting {
+            return Err(ordered_provision_failure(
+                super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                "the prior controller worktree is missing; recovery will not recreate or reset it",
+            ));
+        }
+
+        let routing = self.ordered_sub_tl_routing().await.map_err(|_| {
+            ordered_provision_failure(
+                super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                "no unique current TL delivery target is available for ordered controller provisioning",
+            )
+        })?;
+        if let Some(prior) = prior_invocation.as_ref().filter(|record| record.is_live()) {
+            if !prior.routing.same_delivery_target(&routing) {
+                return Err(ordered_provision_failure(
+                    super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                    "the live controller is bound to a different delivery target and will not be replaced",
+                ));
+            }
+        }
+        if let Some(prior) = prior_invocation.as_ref() {
+            if routing_path.exists() {
+                let persisted_routing = RoutingInfo::read_from_dir(&agent_dir).await.map_err(|_| {
+                    ordered_provision_failure(
+                        super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                        "the prior controller routing record is unreadable; reconcile it before provisioning",
+                    )
+                })?;
+                let has_partial_ownership = persisted_routing.owner_agent_id.is_some()
+                    || persisted_routing.owner_invocation_id.is_some()
+                    || persisted_routing.owner_generation.is_some();
+                let owned_by_prior = persisted_routing.has_ownership_proof()
+                    && persisted_routing.owner_agent_id.as_deref() == Some(agent_name.as_str())
+                    && persisted_routing.owner_invocation_id.as_deref()
+                        == Some(prior.invocation_id.as_str())
+                    && persisted_routing.owner_generation == Some(prior.generation);
+                if has_partial_ownership && !owned_by_prior {
+                    return Err(ordered_provision_failure(
+                        super::OrderedSubTLProvisionFailureKind::OwnershipConflict,
+                        "routing ownership conflicts with the prior controller invocation",
+                    ));
+                }
+                if prior.is_live()
+                    && (!persisted_routing.same_delivery_target(&routing) || !owned_by_prior)
+                {
+                    return Err(ordered_provision_failure(
+                        super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                        "the live controller routing is incomplete or differs from the current TL target",
+                    ));
+                }
+            } else if prior.is_live() {
+                return Err(ordered_provision_failure(
+                    super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                    "the live controller routing record is missing; reconcile it before provisioning",
+                ));
             }
         }
 
@@ -205,11 +632,7 @@ impl<
             }
         }
 
-        let identity_path = self
-            .project_dir()
-            .join(".exo/agents")
-            .join(agent_name.as_str())
-            .join("identity.json");
+        let identity_path = agent_dir.join("identity.json");
         let durable_identity: AgentIdentityRecord =
             serde_json::from_slice(&fs::read(&identity_path).await.with_context(|| {
                 format!(
@@ -224,23 +647,12 @@ impl<
                 )
             })?;
         if durable_identity != record {
-            return Err(anyhow!(
-                "ordered sub-TL identity changed during provisioning"
+            return Err(ordered_provision_failure(
+                super::OrderedSubTLProvisionFailureKind::OwnershipConflict,
+                "ordered sub-TL identity changed during provisioning",
             ));
         }
 
-        let routing = match self.ordered_sub_tl_routing().await {
-            Ok(routing) => routing,
-            Err(error) => {
-                warn!(agent = %agent_name, error = %error, "Ordered sub-TL has no verifiable tmux delivery target");
-                return Err(error);
-            }
-        };
-        let trigger = if existing_identity.is_some() || worktree_preexisting {
-            invocation::InvocationTrigger::ResumePr
-        } else {
-            invocation::InvocationTrigger::Spawn
-        };
         let identity_context = InvocationIdentityContext {
             runtime_agent_id: Some(agent_name.to_string()),
             slice_id: durable_identity.slice_id.clone(),
@@ -253,22 +665,19 @@ impl<
             Some(durable_identity.clone()),
             InvocationMetadata {
                 runtime: durable_identity.agent_type,
-                trigger,
-                pr_number: None,
-                head_sha: None,
+                trigger: invocation_plan.trigger,
+                pr_number: invocation_plan.pr_number,
+                head_sha: invocation_plan.head_sha,
                 model: durable_identity.model.clone(),
                 effort: durable_identity.effort.clone(),
                 identity: Some(identity_context),
-                recovery_lineage: None,
+                recovery_lineage: invocation_plan.recovery_lineage,
+                expected_live_invocation_id: invocation_plan.expected_live_invocation_id,
                 mode: InvocationMode::Interactive,
             },
             true,
         )
         .await?;
-        let agent_dir = self
-            .project_dir()
-            .join(".exo/agents")
-            .join(agent_name.as_str());
         let invocation = read_invocation(&agent_dir)
             .await?
             .ok_or_else(|| anyhow!("ordered sub-TL provisioning wrote no invocation record"))?;
@@ -1958,7 +2367,13 @@ mod tests {
             .provision_ordered_sub_tl(record.clone())
             .await
             .expect_err("provisioning without an existing delivery route must fail closed");
-        assert!(error.to_string().contains("tmux session is unavailable"));
+        assert_eq!(
+            error
+                .downcast_ref::<super::OrderedSubTLProvisionFailure>()
+                .unwrap()
+                .code(),
+            "ordered_sub_tl_lifecycle_blocked"
+        );
         let after_missing_route = read_invocation_conservatively(&agent_dir)
             .await
             .expect("missing route must not erase existing provenance");
@@ -1975,7 +2390,13 @@ mod tests {
             .provision_ordered_sub_tl(record.clone())
             .await
             .expect_err("conflicting live invocation provenance must not be replaced");
-        assert!(error.to_string().contains("conflicting live invocation"));
+        assert_eq!(
+            error
+                .downcast_ref::<super::OrderedSubTLProvisionFailure>()
+                .unwrap()
+                .code(),
+            "ordered_sub_tl_ownership_conflict"
+        );
         assert_eq!(std::fs::read(&invocation_path).unwrap(), conflicting_bytes);
         std::fs::write(&invocation_path, original_invocation).unwrap();
 
@@ -1986,11 +2407,47 @@ mod tests {
         ));
         restarted.agent_resolver = Arc::new(AgentResolver::load(project_dir.clone()).await);
         let restarted_invocation_id = AgentControlService::new(Arc::new(restarted))
-            .with_ordered_sub_tl_routing_for_test(expected_routing)
+            .with_ordered_sub_tl_routing_for_test(expected_routing.clone())
             .provision_ordered_sub_tl(record.clone())
             .await
             .unwrap();
         assert_eq!(restarted_invocation_id, invocation_id);
+
+        let mut rerouted_services = crate::services::Services::test();
+        rerouted_services.project_dir = project_dir.clone();
+        rerouted_services.git_wt = Arc::new(
+            crate::services::git_worktree::GitWorktreeService::new(project_dir.clone()),
+        );
+        rerouted_services.agent_resolver = Arc::new(AgentResolver::load(project_dir.clone()).await);
+        let conflicting_route =
+            RoutingInfo::window(super::super::tmux_ipc::WindowId::parse("@99").unwrap());
+        let error = AgentControlService::new(Arc::new(rerouted_services))
+            .with_ordered_sub_tl_routing_for_test(conflicting_route)
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .expect_err("a live invocation must not be rebound to a new route");
+        assert_eq!(
+            error
+                .downcast_ref::<super::OrderedSubTLProvisionFailure>()
+                .unwrap()
+                .code(),
+            "ordered_sub_tl_lifecycle_blocked"
+        );
+        assert_eq!(
+            read_invocation(&agent_dir)
+                .await
+                .unwrap()
+                .unwrap()
+                .invocation_id,
+            invocation_id
+        );
+        assert!(
+            RoutingInfo::read_from_dir(&agent_dir)
+                .await
+                .unwrap()
+                .same_delivery_target(&expected_routing),
+            "a rejected route conflict must retain the live route"
+        );
 
         let conflict = AgentIdentityRecord {
             birth_branch: BirthBranch::try_from_str("other.ordered-child").unwrap(),
@@ -2003,10 +2460,388 @@ mod tests {
             .provision_ordered_sub_tl(conflict)
             .await
             .expect_err("a different owner must not be adopted");
-        assert!(error.to_string().contains("conflicting branch"));
+        assert_eq!(
+            error
+                .downcast_ref::<super::OrderedSubTLProvisionFailure>()
+                .unwrap()
+                .code(),
+            "ordered_sub_tl_ownership_conflict"
+        );
         assert_eq!(
             std::fs::read_to_string(identity_path).unwrap(),
             identity_before
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_sub_tl_restarts_dormant_controller_without_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        let run_git = |args: &[&str], directory: &std::path::Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"], &project_dir);
+        run_git(
+            &["config", "user.email", "test@example.invalid"],
+            &project_dir,
+        );
+        run_git(&["config", "user.name", "Test"], &project_dir);
+        std::fs::write(project_dir.join("seed"), "seed\n").unwrap();
+        run_git(&["add", "seed"], &project_dir);
+        run_git(&["commit", "-q", "-m", "seed"], &project_dir);
+
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.clone();
+        services.git_wt = Arc::new(crate::services::git_worktree::GitWorktreeService::new(
+            project_dir.clone(),
+        ));
+        services.agent_resolver = Arc::new(AgentResolver::load(project_dir.clone()).await);
+        let routing = RoutingInfo::window(super::super::tmux_ipc::WindowId::parse("@71").unwrap());
+        let service = AgentControlService::new(Arc::new(services))
+            .with_ordered_sub_tl_routing_for_test(routing.clone());
+        let agent_name = AgentName::try_from_str("ordered-child").unwrap();
+        let record = AgentIdentityRecord {
+            agent_name: agent_name.clone(),
+            slug: Slug::try_from_str("ordered-child").unwrap(),
+            agent_type: AgentType::Codex,
+            birth_branch: BirthBranch::try_from_str("main.ordered-child").unwrap(),
+            parent_branch: BirthBranch::try_from_str("main").unwrap(),
+            working_dir: project_dir.join(".exo/worktrees/ordered-child"),
+            display_name: "🤖 ordered-child".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
+            ledger_owned: true,
+            slice_id: Some("ordered-child".to_string()),
+        };
+
+        let first_id = service
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .unwrap();
+        let agent_dir = project_dir.join(".exo/agents/ordered-child");
+        let first = read_invocation(&agent_dir)
+            .await
+            .unwrap()
+            .expect("first controller invocation is durable");
+        assert_eq!(first.invocation_id, first_id);
+        assert_eq!(first.pr_number, None);
+        assert_eq!(first.head_sha, None);
+        assert!(record.working_dir.join(".git").exists());
+
+        finish_invocation(&agent_dir, &first_id, InvocationStatus::Killed, Some(137))
+            .await
+            .unwrap();
+        let dormant = read_invocation(&agent_dir)
+            .await
+            .unwrap()
+            .expect("terminal controller invocation remains durable");
+        assert_eq!(dormant.status, InvocationStatus::Killed);
+        assert!(dormant.ended_at.is_some());
+        assert_eq!(dormant.pr_number, None);
+        assert_eq!(dormant.head_sha, None);
+
+        let mut restarted_services = crate::services::Services::test();
+        restarted_services.project_dir = project_dir.clone();
+        restarted_services.git_wt = Arc::new(
+            crate::services::git_worktree::GitWorktreeService::new(project_dir.clone()),
+        );
+        restarted_services.agent_resolver =
+            Arc::new(AgentResolver::load(project_dir.clone()).await);
+        let current_routing =
+            RoutingInfo::window(super::super::tmux_ipc::WindowId::parse("@72").unwrap());
+        let restarted_service = AgentControlService::new(Arc::new(restarted_services))
+            .with_ordered_sub_tl_routing_for_test(current_routing.clone());
+        let resumed_id = restarted_service
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .expect("dormant no-PR controller must use controller restart semantics");
+        let resumed = read_invocation(&agent_dir)
+            .await
+            .unwrap()
+            .expect("replacement controller invocation is durable");
+        assert_ne!(resumed_id, first_id);
+        assert_eq!(resumed.invocation_id, resumed_id);
+        assert_eq!(
+            serde_json::to_value(resumed.trigger).unwrap(),
+            serde_json::json!("controller_restart")
+        );
+        assert_eq!(resumed.generation, dormant.generation + 1);
+        assert_eq!(resumed.recovery_round, dormant.recovery_round + 1);
+        assert_eq!(
+            resumed.authorization_source,
+            Some(invocation::RecoveryAuthorization::Controller)
+        );
+        assert_eq!(resumed.pr_number, None);
+        assert_eq!(resumed.head_sha, None);
+        assert_eq!(
+            resumed.prior_invocation_id.as_deref(),
+            Some(first_id.as_str())
+        );
+        assert_eq!(resumed.routing, current_routing);
+        assert_ne!(resumed.routing, dormant.routing);
+        let persisted_identity: AgentIdentityRecord = serde_json::from_slice(
+            &std::fs::read(project_dir.join(".exo/agents/ordered-child/identity.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted_identity, record);
+        assert!(record.working_dir.join(".git").exists());
+
+        let (retry_a, retry_b) = tokio::join!(
+            restarted_service.provision_ordered_sub_tl(record.clone()),
+            restarted_service.provision_ordered_sub_tl(record.clone())
+        );
+        assert_eq!(retry_a.unwrap(), resumed_id);
+        assert_eq!(retry_b.unwrap(), resumed_id);
+        let repeated = read_invocation(&agent_dir)
+            .await
+            .unwrap()
+            .expect("concurrent retry retains one live invocation");
+        assert_eq!(repeated.invocation_id, resumed_id);
+        assert_eq!(repeated.generation, resumed.generation);
+        let lifecycle =
+            std::fs::read_to_string(project_dir.join(".exo/events/ordered-child.jsonl")).unwrap();
+        assert!(lifecycle.contains(&format!("\"invocation_id\":\"{first_id}\"")));
+        assert!(lifecycle.contains(&format!("\"invocation_id\":\"{resumed_id}\"")));
+        assert_eq!(
+            lifecycle
+                .lines()
+                .filter(|line| line.contains("\"trigger\":\"controller_restart\""))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_sub_tl_published_resume_requires_exact_registry_evidence() {
+        use crate::services::pr_registry::{
+            publish_verified_head, read_published_heads, PublicationProvenance, PublishedHead,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        let run_git = |args: &[&str], directory: &std::path::Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"], &project_dir);
+        run_git(
+            &["config", "user.email", "test@example.invalid"],
+            &project_dir,
+        );
+        run_git(&["config", "user.name", "Test"], &project_dir);
+        std::fs::write(project_dir.join("seed"), "seed\n").unwrap();
+        run_git(&["add", "seed"], &project_dir);
+        run_git(&["commit", "-q", "-m", "seed"], &project_dir);
+
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.clone();
+        services.git_wt = Arc::new(crate::services::git_worktree::GitWorktreeService::new(
+            project_dir.clone(),
+        ));
+        services.agent_resolver = Arc::new(AgentResolver::load(project_dir.clone()).await);
+        let route = RoutingInfo::window(super::super::tmux_ipc::WindowId::parse("@73").unwrap());
+        let service = AgentControlService::new(Arc::new(services))
+            .with_ordered_sub_tl_routing_for_test(route);
+        let record = AgentIdentityRecord {
+            agent_name: AgentName::try_from_str("ordered-published").unwrap(),
+            slug: Slug::try_from_str("ordered-published").unwrap(),
+            agent_type: AgentType::Codex,
+            birth_branch: BirthBranch::try_from_str("main.ordered-published").unwrap(),
+            parent_branch: BirthBranch::try_from_str("main").unwrap(),
+            working_dir: project_dir.join(".exo/worktrees/ordered-published"),
+            display_name: "🤖 ordered-published".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
+            ledger_owned: true,
+            slice_id: Some("ordered-published".to_string()),
+        };
+        let first_id = service
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .unwrap();
+        let agent_dir = project_dir.join(".exo/agents/ordered-published");
+        finish_invocation(&agent_dir, &first_id, InvocationStatus::Killed, Some(137))
+            .await
+            .unwrap();
+        let publication = PublishedHead {
+            pr_number: 46,
+            head_branch: "main.ordered-published".to_string(),
+            base_branch: "main".to_string(),
+            head_sha: "exact-head".to_string(),
+            author_agent: Some("ordered-published".to_string()),
+            author_role: Some("tl".to_string()),
+            provenance: PublicationProvenance::LedgerOwned,
+            slice_id: Some("ordered-published".to_string()),
+            invocation_id: Some(first_id.clone()),
+            invocation_trigger: Some("spawn".to_string()),
+            invocation_runtime: Some("codex".to_string()),
+            invocation_succession: Vec::new(),
+        };
+        publish_verified_head(&project_dir, publication)
+            .await
+            .unwrap();
+
+        let error = service
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .expect_err("a published controller cannot restart without PR coordinates");
+        assert_eq!(
+            error
+                .downcast_ref::<super::OrderedSubTLProvisionFailure>()
+                .unwrap()
+                .code(),
+            "ordered_sub_tl_publication_resume_required"
+        );
+        assert_eq!(
+            read_invocation(&agent_dir)
+                .await
+                .unwrap()
+                .unwrap()
+                .invocation_id,
+            first_id
+        );
+
+        let error = service
+            .provision_ordered_sub_tl_with_publication(
+                record.clone(),
+                Some(46),
+                Some("wrong-head".to_string()),
+            )
+            .await
+            .expect_err("a changed published head must not be adopted");
+        assert_eq!(
+            error
+                .downcast_ref::<super::OrderedSubTLProvisionFailure>()
+                .unwrap()
+                .code(),
+            "ordered_sub_tl_publication_resume_required"
+        );
+        assert_eq!(
+            read_invocation(&agent_dir)
+                .await
+                .unwrap()
+                .unwrap()
+                .invocation_id,
+            first_id
+        );
+
+        let resumed_id = service
+            .provision_ordered_sub_tl_with_publication(
+                record,
+                Some(46),
+                Some("exact-head".to_string()),
+            )
+            .await
+            .expect("exact publication coordinates continue through ResumePr");
+        let resumed = read_invocation(&agent_dir).await.unwrap().unwrap();
+        assert_eq!(resumed.trigger, invocation::InvocationTrigger::ResumePr);
+        assert_eq!(resumed.pr_number, Some(46));
+        assert_eq!(resumed.head_sha.as_deref(), Some("exact-head"));
+        assert_eq!(
+            resumed.prior_invocation_id.as_deref(),
+            Some(first_id.as_str())
+        );
+        assert_eq!(resumed.invocation_id, resumed_id);
+        let publications = read_published_heads(&project_dir).await.unwrap();
+        assert_eq!(publications.len(), 1);
+        assert!(invocation_succession_reaches_current(
+            &publications[0],
+            &resumed_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn ordered_sub_tl_rejects_unresolved_invocation_without_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        let run_git = |args: &[&str], directory: &std::path::Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"], &project_dir);
+        run_git(
+            &["config", "user.email", "test@example.invalid"],
+            &project_dir,
+        );
+        run_git(&["config", "user.name", "Test"], &project_dir);
+        std::fs::write(project_dir.join("seed"), "seed\n").unwrap();
+        run_git(&["add", "seed"], &project_dir);
+        run_git(&["commit", "-q", "-m", "seed"], &project_dir);
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.clone();
+        services.git_wt = Arc::new(crate::services::git_worktree::GitWorktreeService::new(
+            project_dir.clone(),
+        ));
+        services.agent_resolver = Arc::new(AgentResolver::load(project_dir.clone()).await);
+        let service = AgentControlService::new(Arc::new(services))
+            .with_ordered_sub_tl_routing_for_test(RoutingInfo::window(
+                super::super::tmux_ipc::WindowId::parse("@74").unwrap(),
+            ));
+        let record = AgentIdentityRecord {
+            agent_name: AgentName::try_from_str("ordered-uncertain").unwrap(),
+            slug: Slug::try_from_str("ordered-uncertain").unwrap(),
+            agent_type: AgentType::Codex,
+            birth_branch: BirthBranch::try_from_str("main.ordered-uncertain").unwrap(),
+            parent_branch: BirthBranch::try_from_str("main").unwrap(),
+            working_dir: project_dir.join(".exo/worktrees/ordered-uncertain"),
+            display_name: "🤖 ordered-uncertain".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
+            ledger_owned: true,
+            slice_id: Some("ordered-uncertain".to_string()),
+        };
+        let first_id = service
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .unwrap();
+        let agent_dir = project_dir.join(".exo/agents/ordered-uncertain");
+        let mut current = read_invocation(&agent_dir).await.unwrap().unwrap();
+        current.ended_at = Some(current.started_at + 1);
+        std::fs::write(
+            agent_dir.join("invocation.json"),
+            serde_json::to_vec_pretty(&current).unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::read(agent_dir.join("invocation.json")).unwrap();
+
+        let error = service
+            .provision_ordered_sub_tl(record)
+            .await
+            .expect_err("running status with an end time is an unresolved lifecycle state");
+        assert_eq!(
+            error
+                .downcast_ref::<super::OrderedSubTLProvisionFailure>()
+                .unwrap()
+                .code(),
+            "ordered_sub_tl_lifecycle_blocked"
+        );
+        assert_eq!(
+            std::fs::read(agent_dir.join("invocation.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            read_invocation(&agent_dir)
+                .await
+                .unwrap()
+                .unwrap()
+                .invocation_id,
+            first_id
         );
     }
 

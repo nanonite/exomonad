@@ -172,6 +172,10 @@ struct OrderedSubTLProvisionRequest {
     working_dir: PathBuf,
     #[serde(default)]
     slice_id: Option<String>,
+    #[serde(default)]
+    pr_number: Option<u64>,
+    #[serde(default)]
+    head_sha: Option<String>,
 }
 
 /// Query parameters for the `/hook` endpoint.
@@ -770,7 +774,11 @@ async fn provision_ordered_sub_tl(
         ledger_owned: true,
         slice_id: body.slice_id,
     };
-    match state.agent_control.provision_ordered_sub_tl(record).await {
+    match state
+        .agent_control
+        .provision_ordered_sub_tl_with_publication(record, body.pr_number, body.head_sha)
+        .await
+    {
         Ok(invocation_id) => Json(serde_json::json!({
             "provisioned": true,
             "agent_name": child_name.as_str(),
@@ -779,17 +787,39 @@ async fn provision_ordered_sub_tl(
         .into_response(),
         Err(error) => {
             error!(agent = %child_name, error = %error, "Ordered sub-TL provisioning failed");
-            (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "kind": "ordered_sub_tl_provisioning_failed",
-                    "agent": child_name.as_str(),
-                    "message": "ordered sub-TL identity or workspace conflicts with existing ownership"
-                })),
-            )
-                .into_response()
+            ordered_sub_tl_provision_error_response(child_name.as_str(), &error)
         }
     }
+}
+
+fn ordered_sub_tl_provision_error_response(agent: &str, error: &anyhow::Error) -> Response {
+    if let Some(failure) =
+        error.downcast_ref::<exomonad_core::services::agent_control::OrderedSubTLProvisionFailure>()
+    {
+        let status = match failure.kind {
+            exomonad_core::services::agent_control::OrderedSubTLProvisionFailureKind::OwnershipConflict
+            | exomonad_core::services::agent_control::OrderedSubTLProvisionFailureKind::PublicationResumeRequired => StatusCode::CONFLICT,
+            exomonad_core::services::agent_control::OrderedSubTLProvisionFailureKind::LifecycleBlocked => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        return (
+            status,
+            Json(serde_json::json!({
+                "kind": failure.code(),
+                "agent": agent,
+                "message": failure.message
+            })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "kind": "ordered_sub_tl_provisioning_error",
+            "agent": agent,
+            "message": "ordered sub-TL provisioning failed; inspect the server lifecycle log"
+        })),
+    )
+        .into_response()
 }
 
 // ============================================================================
@@ -2397,6 +2427,69 @@ mod tests {
         assert_eq!(document["kind"], "agent_identity_unresolved");
         assert_eq!(document["agent"], "missing-child");
         assert!(!String::from_utf8_lossy(&body).contains("/home/"));
+    }
+
+    #[tokio::test]
+    async fn ordered_sub_tl_endpoint_reports_lifecycle_and_ownership_failures_separately() {
+        use exomonad_core::services::agent_control::{
+            OrderedSubTLProvisionFailure, OrderedSubTLProvisionFailureKind,
+        };
+
+        let lifecycle = ordered_sub_tl_provision_error_response(
+            "child",
+            &anyhow::Error::new(OrderedSubTLProvisionFailure {
+                kind: OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                message: "the prior controller outcome is unresolved",
+            }),
+        );
+        assert_eq!(lifecycle.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(lifecycle.into_body(), 1024)
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(document["kind"], "ordered_sub_tl_lifecycle_blocked");
+        assert_eq!(
+            document["message"],
+            "the prior controller outcome is unresolved"
+        );
+
+        let ownership = ordered_sub_tl_provision_error_response(
+            "child",
+            &anyhow::Error::new(OrderedSubTLProvisionFailure {
+                kind: OrderedSubTLProvisionFailureKind::OwnershipConflict,
+                message: "the durable controller identity conflicts with its prior invocation",
+            }),
+        );
+        assert_eq!(ownership.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(ownership.into_body(), 1024)
+            .await
+            .unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(document["kind"], "ordered_sub_tl_ownership_conflict");
+        assert_eq!(document["agent"], "child");
+    }
+
+    #[test]
+    fn ordered_sub_tl_request_keeps_publication_coordinates_optional_but_paired() {
+        let base = serde_json::json!({
+            "agent_name": "child",
+            "birth_branch": "main.child",
+            "parent_branch": "main",
+            "working_dir": "/tmp/worktrees/child",
+            "slice_id": "child"
+        });
+        let first_provision: OrderedSubTLProvisionRequest =
+            serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(first_provision.pr_number, None);
+        assert_eq!(first_provision.head_sha, None);
+
+        let mut published = base;
+        published["pr_number"] = serde_json::json!(46);
+        published["head_sha"] = serde_json::json!("verified-head");
+        let published_resume: OrderedSubTLProvisionRequest =
+            serde_json::from_value(published).unwrap();
+        assert_eq!(published_resume.pr_number, Some(46));
+        assert_eq!(published_resume.head_sha.as_deref(), Some("verified-head"));
     }
 
     #[tokio::test]

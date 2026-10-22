@@ -3759,6 +3759,7 @@ fn ordered_invocation_matches_spec(record: &InvocationRecord, spec: &OrderedBran
         && matches!(
             record.trigger,
             exomonad_core::services::agent_control::InvocationTrigger::Spawn
+                | exomonad_core::services::agent_control::InvocationTrigger::ControllerRestart
                 | exomonad_core::services::agent_control::InvocationTrigger::ResumePr
         )
         && record.runtime_agent_id.as_deref() == Some(spec.agent_name.as_str())
@@ -3971,8 +3972,12 @@ async fn verify_repaired_ordered_sub_tl(
         && invocation.invocation_id == expected_invocation_id
         && !invocation.invocation_id.trim().is_empty()
         && invocation.runtime == AgentType::Codex
-        && invocation.trigger
-            == exomonad_core::services::agent_control::InvocationTrigger::ResumePr
+        && matches!(
+            invocation.trigger,
+            exomonad_core::services::agent_control::InvocationTrigger::Spawn
+                | exomonad_core::services::agent_control::InvocationTrigger::ControllerRestart
+                | exomonad_core::services::agent_control::InvocationTrigger::ResumePr
+        )
         && invocation.mode == exomonad_core::services::agent_control::InvocationMode::Interactive
         && invocation.generation > 0
         && invocation.runtime_agent_id.as_deref() == Some(spec.agent_name.as_str())
@@ -8839,7 +8844,7 @@ mod tests {
             let invocation = start_invocation_with_provenance_and_context_and_mode(
                 &project_for_server.join(".exo/agents/stage"),
                 AgentType::Codex,
-                InvocationTrigger::ResumePr,
+                InvocationTrigger::Spawn,
                 routing,
                 None,
                 None,
@@ -8891,7 +8896,7 @@ mod tests {
         let invocation = read_invocation_conservatively(&agent_dir)
             .await
             .expect("repair must leave a valid invocation record");
-        assert_eq!(invocation.trigger, InvocationTrigger::ResumePr);
+        assert_eq!(invocation.trigger, InvocationTrigger::Spawn);
         assert_eq!(invocation.mode, InvocationMode::Interactive);
         assert_eq!(invocation.generation, 1);
         let (preserved, recreated) = reconcile_agent_continuations(project_dir).await.unwrap();

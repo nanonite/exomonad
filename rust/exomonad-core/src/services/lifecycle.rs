@@ -458,15 +458,12 @@ fn role_for_trigger(trigger: InvocationTrigger) -> &'static str {
     match trigger {
         InvocationTrigger::Review => "reviewer",
         InvocationTrigger::Spawn | InvocationTrigger::ResumePr => "dev",
+        InvocationTrigger::ControllerRestart => "tl",
     }
 }
 
 fn trigger_label(trigger: InvocationTrigger) -> &'static str {
-    match trigger {
-        InvocationTrigger::Spawn => "spawn",
-        InvocationTrigger::ResumePr => "resume_pr",
-        InvocationTrigger::Review => "review",
-    }
+    trigger.as_str()
 }
 
 fn status_label(status: InvocationStatus) -> &'static str {

@@ -130,6 +130,32 @@ class TransportTest(unittest.TestCase):
             )
         self.assertEqual(invocation_id, "durable-id")
         self.assertEqual(post_json.call_args.args[0], "/agents/tl/root/provision-sub-tl")
+        self.assertIsNone(post_json.call_args.args[1]["pr_number"])
+        self.assertIsNone(post_json.call_args.args[1]["head_sha"])
+
+    def test_ordered_sub_tl_provision_sends_published_coordinates_together(self) -> None:
+        client = TransportClient(socket_path=Path("unused.sock"))
+        with patch.object(
+            client,
+            "post_json",
+            return_value={
+                "provisioned": True,
+                "agent_name": "child",
+                "invocation_id": "resumed-id",
+            },
+        ) as post_json:
+            client.provision_ordered_sub_tl(
+                "root",
+                agent_name="child",
+                birth_branch="main.child",
+                parent_branch="main",
+                working_dir="/project/.exo/worktrees/child",
+                slice_id="child",
+                pr_number=46,
+                head_sha="exact-head",
+            )
+        self.assertEqual(post_json.call_args.args[1]["pr_number"], 46)
+        self.assertEqual(post_json.call_args.args[1]["head_sha"], "exact-head")
 
     def test_ordered_sub_tl_provision_requires_an_invocation_id(self) -> None:
         client = TransportClient(socket_path=Path("unused.sock"))
@@ -165,24 +191,27 @@ class TransportTest(unittest.TestCase):
             )
 
     def test_four_hundred_response_raises_server_error(self) -> None:
-        with stub_server(lambda _request, _body: ResponseSpec(400, b'{"error":"bad"}')) as path, self.assertRaises(
-            ServerError
-        ) as caught:
+        with (
+            stub_server(lambda _request, _body: ResponseSpec(400, b'{"error":"bad"}')) as path,
+            self.assertRaises(ServerError) as caught,
+        ):
             TransportClient(socket_path=path).get_json("/bad")
         self.assertEqual(caught.exception.status, 400)
         self.assertEqual(caught.exception.body, '{"error":"bad"}')
 
     def test_five_hundred_response_raises_server_error(self) -> None:
-        with stub_server(lambda _request, _body: ResponseSpec(503, b'{"error":"down"}')) as path, self.assertRaises(
-            ServerError
-        ) as caught:
+        with (
+            stub_server(lambda _request, _body: ResponseSpec(503, b'{"error":"down"}')) as path,
+            self.assertRaises(ServerError) as caught,
+        ):
             TransportClient(socket_path=path).get_json("/bad")
         self.assertEqual(caught.exception.status, 503)
         self.assertEqual(caught.exception.body, '{"error":"down"}')
 
     def test_timeout_raises_server_timeout(self) -> None:
-        with stub_server(lambda _request, _body: ResponseSpec(200, b"{}", delay=0.2)) as path, self.assertRaises(
-            ServerTimeout
+        with (
+            stub_server(lambda _request, _body: ResponseSpec(200, b"{}", delay=0.2)) as path,
+            self.assertRaises(ServerTimeout),
         ):
             TransportClient(socket_path=path, timeout=0.02).get_json("/slow")
 
@@ -231,5 +260,6 @@ class TransportTest(unittest.TestCase):
                 )
             with patch.dict(os.environ, {}, clear=True):
                 self.assertEqual(
-                    resolve_socket_path(project_root=root), (root / ".exo" / "server.sock").resolve()
+                    resolve_socket_path(project_root=root),
+                    (root / ".exo" / "server.sock").resolve(),
                 )

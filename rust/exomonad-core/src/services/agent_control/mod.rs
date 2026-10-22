@@ -28,6 +28,36 @@ pub use invocation::{
     InvocationRecord, InvocationStatus, InvocationTrigger, RecoveryAuthorization,
     RecoveryInvocationLineage, INVOCATION_FILENAME,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderedSubTLProvisionFailureKind {
+    OwnershipConflict,
+    LifecycleBlocked,
+    PublicationResumeRequired,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct OrderedSubTLProvisionFailure {
+    pub kind: OrderedSubTLProvisionFailureKind,
+    pub message: &'static str,
+}
+
+impl OrderedSubTLProvisionFailure {
+    pub const fn code(&self) -> &'static str {
+        match self.kind {
+            OrderedSubTLProvisionFailureKind::OwnershipConflict => {
+                "ordered_sub_tl_ownership_conflict"
+            }
+            OrderedSubTLProvisionFailureKind::LifecycleBlocked => {
+                "ordered_sub_tl_lifecycle_blocked"
+            }
+            OrderedSubTLProvisionFailureKind::PublicationResumeRequired => {
+                "ordered_sub_tl_publication_resume_required"
+            }
+        }
+    }
+}
 pub use spawn::{
     CODEX_DEV_INSTRUCTIONS, CODEX_REVIEWER_INSTRUCTIONS, CODEX_TL_RUNTIME_NOTES,
     CODEX_WORKER_INSTRUCTIONS, OPENCODE_DEV_INSTRUCTIONS, OPENCODE_WORKER_INSTRUCTIONS,
@@ -1372,6 +1402,7 @@ impl<
                 effort,
                 identity: Some(identity_context),
                 recovery_lineage: None,
+                expected_live_invocation_id: None,
                 mode,
             },
             false,
@@ -1399,6 +1430,18 @@ impl<
             ));
         }
         let prior_invocation = read_invocation_conservatively(&agent_config_dir).await;
+        if let Some(expected_id) = metadata.expected_live_invocation_id.as_deref() {
+            if prior_invocation
+                .as_ref()
+                .is_none_or(|record| record.invocation_id != expected_id || !record.is_live())
+            {
+                return Err(anyhow::Error::new(OrderedSubTLProvisionFailure {
+                    kind: OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                    message:
+                        "the matching live controller invocation changed before it could be reused",
+                }));
+            }
+        }
         let adoption_identity = identity.as_ref().map(|record| {
             (
                 record.birth_branch.to_string(),
@@ -1477,21 +1520,23 @@ impl<
             Vec::new()
         };
         routing.write_to_dir(&agent_config_dir).await?;
-        let invocation = invocation::start_invocation_with_provenance_and_context_and_mode_with_id(
-            &agent_config_dir,
-            metadata.runtime,
-            metadata.trigger,
-            routing,
-            metadata.pr_number,
-            metadata.head_sha.clone(),
-            metadata.model,
-            metadata.effort,
-            identity_context,
-            metadata.recovery_lineage,
-            metadata.mode,
-            invocation_id,
-        )
-        .await?;
+        let invocation =
+            invocation::start_invocation_with_provenance_and_context_and_mode_with_id_guarded(
+                &agent_config_dir,
+                metadata.runtime,
+                metadata.trigger,
+                routing,
+                metadata.pr_number,
+                metadata.head_sha.clone(),
+                metadata.model,
+                metadata.effort,
+                identity_context,
+                metadata.recovery_lineage,
+                metadata.mode,
+                invocation_id,
+                metadata.expected_live_invocation_id.as_deref(),
+            )
+            .await?;
         for adoption in adoptions {
             crate::services::lifecycle::record_invocation_succession(
                 self.project_dir(),

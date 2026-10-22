@@ -7,9 +7,13 @@ import hashlib
 import json
 import subprocess
 import urllib.request
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+
+
+DORMANT_KANI_INVOCATION_ID = "seed-kani-dormant-controller-invocation"
 
 
 def git(repository: Path, *arguments: str) -> str:
@@ -444,6 +448,7 @@ def seed_root(
                         {
                             "name": "issue-814-substitution-model-kani",
                             "task": "Complete the Kani stage recovery fixture for issue 814",
+                            "agent_type": "opencode/opencode-go/deepseek-v4.1-flash",
                             "chainlink_issue_id": None,
                             "boundary": ["kani-recovery.txt"],
                             "verify": ["test -s kani-recovery.txt"],
@@ -718,7 +723,7 @@ def seed_root(
         worktree=kani_worktree,
         dispatch_intent_id="seed-kani-dispatch-intent",
         dispatch_agent_id=_child_controller_name(kani_task),
-        dispatch_invocation_id="seed-kani-failed-startup-invocation",
+        dispatch_invocation_id=DORMANT_KANI_INVOCATION_ID,
         dispatch_generation=1,
         dispatch_authoritative_event_seq=1,
         dispatch_last_boundary="sub_tl_started",
@@ -1154,7 +1159,65 @@ def seed_root(
         "failed_child": "kani",
         "failed_child_run": str(kani_store.path),
         "failed_child_worktree": kani_worktree,
+        "failed_child_branch": kani_branch,
     }
+
+
+def seed_dormant_kani_controller(repository: Path, result: dict[str, object]) -> None:
+    """Retain the owned Kani scope and a killed no-PR controller invocation."""
+    agent_name = "kani"
+    branch = str(result["failed_child_branch"])
+    worktree = Path(str(result["failed_child_worktree"]))
+    git(repository, "worktree", "add", "--quiet", "-b", branch, str(worktree), "main")
+    agent_dir = repository / ".exo" / "agents" / agent_name
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    identity = {
+        "agent_name": agent_name,
+        "slug": agent_name,
+        "agent_type": "codex",
+        "birth_branch": branch,
+        "parent_branch": "main",
+        "working_dir": str(worktree),
+        "display_name": "🤖 kani",
+        "topology": "worktree_per_agent",
+        "model": None,
+        "effort": None,
+        "ledger_owned": True,
+        "slice_id": "kani",
+    }
+    (agent_dir / "identity.json").write_text(
+        json.dumps(identity, indent=2) + "\n", encoding="utf-8"
+    )
+    started_at = int(time.time()) - 10
+    invocation = {
+        "invocation_id": DORMANT_KANI_INVOCATION_ID,
+        "runtime": "codex",
+        "trigger": "spawn",
+        "mode": "interactive",
+        "routing": {"window_id": "@999999"},
+        "started_at": started_at,
+        "ended_at": started_at + 1,
+        "status": "killed",
+        "exit_code": 137,
+        "pr_number": None,
+        "head_sha": None,
+        "model": None,
+        "effort": None,
+        "prior_invocation_id": None,
+        "recovery_round": 0,
+        "authorization_source": None,
+        "generation": 1,
+        "runtime_agent_id": agent_name,
+        "slice_id": "kani",
+        "branch": branch,
+        "worktree": str(worktree),
+        "exit_reason": "tmux_target_exited_without_exit_marker",
+        "exit_classification": "missing_exit_marker",
+        "stderr_tail": None,
+    }
+    (agent_dir / "invocation.json").write_text(
+        json.dumps(invocation, indent=2) + "\n", encoding="utf-8"
+    )
 
 
 def seed_local_edits(repository: Path) -> dict[str, str]:
@@ -1231,6 +1294,8 @@ def main() -> None:
         base_sha=base_sha,
         merged_remote_head=merged_remote_head,
     )
+    seed_dormant_kani_controller(args.repo, result)
+    result["dormant_controller_invocation_id"] = DORMANT_KANI_INVOCATION_ID
     result["preserved_local_edits"] = seed_local_edits(args.repo)
     args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(result, sort_keys=True))

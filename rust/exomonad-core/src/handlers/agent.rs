@@ -15,9 +15,9 @@ use super::non_empty;
 use crate::services::agent_control::{
     finish_invocation_and_tombstone, read_invocation, slugify, AgentControlService, AgentIdentity,
     AgentIdentityRecord, AgentInfo, AgentType as ServiceAgentType, ClaudeSpawnFlags,
-    InvocationFinishResult, InvocationRecord, InvocationStatus, InvocationTrigger,
-    RecoveryAuthorization, RecoveryInvocationLineage, SpawnLeafOptions, SpawnOptions,
-    SpawnSubtreeOptions, SpawnWorkerOptions, Topology, DIRTY_TL_SPAWN_PREFLIGHT_CODE,
+    InvocationFinishResult, InvocationRecord, InvocationStatus, RecoveryAuthorization,
+    RecoveryInvocationLineage, SpawnLeafOptions, SpawnOptions, SpawnSubtreeOptions,
+    SpawnWorkerOptions, Topology, DIRTY_TL_SPAWN_PREFLIGHT_CODE,
 };
 use crate::services::configured_tl_preflight_runtime_paths;
 use crate::services::continuation::composer::{prefix_task, resume_pr_prefix};
@@ -4589,12 +4589,7 @@ fn invocation_handoff_to_proto(
     };
     InvocationHandoff {
         invocation_id: invocation.invocation_id.clone(),
-        trigger: match invocation.trigger {
-            InvocationTrigger::Spawn => "spawn",
-            InvocationTrigger::ResumePr => "resume_pr",
-            InvocationTrigger::Review => "review",
-        }
-        .to_string(),
+        trigger: invocation.trigger.as_str().to_string(),
         runtime: invocation.runtime.suffix().to_string(),
         branch_name: branch_name.to_string(),
         target_type: target_type.to_string(),
@@ -4833,6 +4828,7 @@ fn agent_is_alive(info: &AgentInfo) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::agent_control::InvocationTrigger;
     use exomonad_test_support::init_fixture_git_repository;
     use prost::Message;
     use serial_test::serial;

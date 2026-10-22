@@ -21,7 +21,19 @@ pub const INVOCATION_FILENAME: &str = "invocation.json";
 pub enum InvocationTrigger {
     Spawn,
     ResumePr,
+    ControllerRestart,
     Review,
+}
+
+impl InvocationTrigger {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Spawn => "spawn",
+            Self::ResumePr => "resume_pr",
+            Self::ControllerRestart => "controller_restart",
+            Self::Review => "review",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,6 +99,7 @@ pub struct InvocationMetadata {
     pub effort: Option<String>,
     pub identity: Option<InvocationIdentityContext>,
     pub recovery_lineage: Option<RecoveryInvocationLineage>,
+    pub expected_live_invocation_id: Option<String>,
     pub mode: InvocationMode,
 }
 
@@ -458,17 +471,93 @@ pub async fn start_invocation_with_provenance_and_context_and_mode_with_id(
     mode: InvocationMode,
     invocation_id: String,
 ) -> Result<InvocationRecord> {
+    start_invocation_with_provenance_and_context_and_mode_with_id_guarded(
+        agent_dir,
+        runtime,
+        trigger,
+        routing,
+        pr_number,
+        head_sha,
+        model,
+        effort,
+        identity,
+        recovery_lineage,
+        mode,
+        invocation_id,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn start_invocation_with_provenance_and_context_and_mode_with_id_guarded(
+    agent_dir: &Path,
+    runtime: AgentType,
+    trigger: InvocationTrigger,
+    routing: RoutingInfo,
+    pr_number: Option<u64>,
+    head_sha: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    identity: Option<InvocationIdentityContext>,
+    recovery_lineage: Option<RecoveryInvocationLineage>,
+    mode: InvocationMode,
+    invocation_id: String,
+    expected_live_invocation_id: Option<&str>,
+) -> Result<InvocationRecord> {
     if invocation_id.trim().is_empty() {
         return Err(anyhow::anyhow!("invocation ID must not be empty"));
     }
+    if trigger == InvocationTrigger::ControllerRestart
+        && (recovery_lineage.is_none() || pr_number.is_some() || head_sha.is_some())
+    {
+        return Err(anyhow::anyhow!(
+            "controller restart requires terminal invocation lineage and cannot carry PR coordinates"
+        ));
+    }
     let _guard = mutation_lock().lock().await;
-    let generation = next_generation(agent_dir).await?;
+    let current = read_locked(agent_dir).await?;
+    if let Some(expected_id) = expected_live_invocation_id {
+        if current
+            .as_ref()
+            .is_none_or(|record| record.invocation_id != expected_id || !record.is_live())
+        {
+            return Err(anyhow::anyhow!(
+                "the expected live controller invocation changed before provisioning completed"
+            ));
+        }
+        return Err(anyhow::anyhow!(
+            "a matching live controller invocation must be reused, not replaced"
+        ));
+    }
+    let generation = current
+        .as_ref()
+        .map(|record| record.generation.checked_add(1))
+        .unwrap_or(Some(1))
+        .ok_or_else(|| anyhow::anyhow!("invocation generation is exhausted"))?;
     if let Some(lineage) = recovery_lineage.as_ref() {
         if lineage.invocation_generation != generation {
             return Err(anyhow::anyhow!(
                 "recovery invocation generation mismatch: expected {}, allocated {}",
                 lineage.invocation_generation,
                 generation
+            ));
+        }
+        let Some(previous) = current.as_ref() else {
+            return Err(anyhow::anyhow!(
+                "recovery lineage references a prior invocation, but the current invocation checkpoint is missing"
+            ));
+        };
+        let previous_is_terminal = matches!(
+            previous.status,
+            InvocationStatus::Exited
+                | InvocationStatus::Failed
+                | InvocationStatus::Killed
+                | InvocationStatus::TimedOut
+        ) && previous.ended_at.is_some();
+        if previous.invocation_id != lineage.prior_invocation_id || !previous_is_terminal {
+            return Err(anyhow::anyhow!(
+                "recovery lineage no longer matches the current terminal invocation"
             ));
         }
     }
@@ -771,16 +860,34 @@ mod tests {
     #[tokio::test]
     async fn recovery_lineage_persists_and_requires_next_generation() {
         let dir = tempdir().expect("tempdir");
+        let prior = start_invocation(
+            dir.path(),
+            AgentType::Codex,
+            InvocationTrigger::Spawn,
+            routing(),
+            None,
+            None,
+        )
+        .await
+        .expect("prior invocation");
+        finish_invocation(
+            dir.path(),
+            &prior.invocation_id,
+            InvocationStatus::Killed,
+            Some(137),
+        )
+        .await
+        .expect("finish prior invocation");
         let lineage = RecoveryInvocationLineage {
-            prior_invocation_id: "prior-invocation".to_string(),
-            invocation_generation: 1,
+            prior_invocation_id: prior.invocation_id.clone(),
+            invocation_generation: 2,
             recovery_round: 2,
             authorization_source: RecoveryAuthorization::HumanApproved,
         };
         let record = start_invocation_with_provenance_and_context(
             dir.path(),
             AgentType::Codex,
-            InvocationTrigger::Spawn,
+            InvocationTrigger::ControllerRestart,
             routing(),
             None,
             None,
@@ -792,10 +899,10 @@ mod tests {
         .await
         .expect("lineage invocation");
 
-        assert_eq!(record.generation, 1);
+        assert_eq!(record.generation, 2);
         assert_eq!(
             record.prior_invocation_id.as_deref(),
-            Some("prior-invocation")
+            Some(prior.invocation_id.as_str())
         );
         assert_eq!(record.recovery_round, 2);
         assert_eq!(

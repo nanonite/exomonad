@@ -462,21 +462,26 @@ copied into these provenance fields.
 
 ### Ordered sub-TL invocation provisioning
 
-`provision_ordered_sub_tl` first ensures the plan-owned identity and worktree,
-then resolves exactly one existing `TL` window from the configured tmux
-session. It fails closed with a warning when that delivery target is missing
-or ambiguous; it never guesses a pane or creates a second routing writer. The
-resolved target and the durable `identity.json` fields go through
-`finalize_spawn_with_invocation`, with `spawn` for a new owner and `resume_pr`
-for reattachment, always in `interactive` mode. A matching live invocation is
-reused without replacing its ID or adding another monitor. Conflicting live
-provenance is an error, and tmux routing ownership already held by another
-agent is retained.
+`provision_ordered_sub_tl` validates the plan-owned identity, branch, worktree,
+invocation history, and publication evidence before resolving exactly one
+current `TL` delivery target. A missing or ambiguous target fails closed; the
+service never guesses a pane or creates a second routing writer. In
+`interactive` mode, first provisioning uses `spawn`; an exact matching live
+controller is reused without changing its invocation; a dormant terminal
+controller with no publication uses the explicit `controller_restart` trigger
+and records the prior invocation as recovery lineage; and published work uses
+`resume_pr` only when exact PR, head, owner, branch, slice, and invocation
+succession are corroborated. Existing publication evidence cannot fall back
+to a controller restart. Conflicting ownership, a live invocation bound to
+another route, or an unresolved prior outcome is held without replacement.
+The confirmed invocation ID is returned for the parent checkpoint to bind.
 
-During `init --continue`, only an ordered sub-TL whose identity exactly matches
-the persisted plan and whose invocation file is absent is eligible for repair.
-After an existing or gated `TL` window and the server are ready, init calls the
-same `/agents/tl/{parent}/provision-sub-tl` endpoint and verifies the resulting
+During `init --continue`, ordered sub-TL recovery uses the same provisioning
+decision as live execution. The accepted plan declaration must match the
+durable child identity; an existing invocation is classified as live reuse,
+dormant controller restart, or publication-backed PR resume from durable
+evidence. After the current `TL` delivery target and server are ready, init
+calls `/agents/tl/{parent}/provision-sub-tl` and verifies the confirmed
 invocation and routing records before the controller starts. Other agents
 retain the publication-backed continuation classification.
 

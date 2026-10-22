@@ -2871,9 +2871,11 @@ def _raw_legacy_dirty_preflight(error: str) -> bool:
     except ValueError:
         return False
     paths = lines[1:recovery_index]
-    return len(paths) == expected_paths and all(
-        path.startswith("  ") and path[2:].strip() for path in paths
-    ) and lines[recovery_index + 1 :] == []
+    return (
+        len(paths) == expected_paths
+        and all(path.startswith("  ") and path[2:].strip() for path in paths)
+        and lines[recovery_index + 1 :] == []
+    )
 
 
 def _wrapped_legacy_dirty_preflight(error: str) -> bool:
@@ -15304,6 +15306,11 @@ def _run_sub_tls(
         for batch_start in range(0, len(spawned), width):
             batch = spawned[batch_start : batch_start + width]
             outcomes = _run_sub_tl_batch(batch, config, source, effects, store, state.budgets)
+            # A live child process may have durably bound the server-confirmed
+            # controller invocation into this parent while it was running.
+            # Rebase the batch completion on that checkpoint so its status
+            # update cannot overwrite the invocation lineage with stale state.
+            state = store.load()
             state = _complete_sub_tl_batch(
                 batch, outcomes, state, config, effects, store, effects_log
             )
@@ -15817,6 +15824,12 @@ def _run_live_sub_tl(
                 child_store,
             )
         if config.project_root is not None:
+            published_pr_number: int | None = None
+            published_head_sha: str | None = None
+            if child_store.path.exists():
+                persisted_child = child_store.load()
+                published_pr_number = persisted_child.integration.aggregate_pr_number
+                published_head_sha = persisted_child.integration.aggregate_head_sha
             invocation_id = effects.transport.provision_ordered_sub_tl(
                 effects.name,
                 agent_name=_child_controller_name(task),
@@ -15824,6 +15837,8 @@ def _run_live_sub_tl(
                 parent_branch=config.branch,
                 working_dir=worktree,
                 slice_id=task.name,
+                pr_number=published_pr_number,
+                head_sha=published_head_sha,
             )
             _checkpoint_ordered_sub_tl_invocation(store, task.name, invocation_id)
         child_config = _child_config(

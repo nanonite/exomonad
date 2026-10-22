@@ -1904,12 +1904,27 @@ def test_live_restart_revalidates_child_identity_before_controller_start(
     parent_store = RunStore("parent", state_root)
     create("child", {}, root_dir=parent_store.run_dir)
     child_store = RunStore("child", parent_store.run_dir)
+    initial_child = child_store.load()
+    child_store.checkpoint(
+        initial_child.fsm,
+        initial_child.slices,
+        initial_child.budgets,
+        initial_child.events.last_consumed_offset,
+        integration=replace(
+            initial_child.integration,
+            aggregate_pr_number=46,
+            aggregate_head_sha="published-head-sha",
+        ),
+        expected_revision=initial_child.revision,
+    )
     checkpoint_before = child_store.load()
     calls: list[str] = []
+    provision_arguments: list[dict[str, object]] = []
 
     def provision(self: TransportClient, parent_name: str, **kwargs: object) -> str:
-        del self, parent_name, kwargs
+        del self, parent_name
         calls.append("provision")
+        provision_arguments.append(kwargs)
         return "server-invocation"
 
     def run_child(root_spec: object, config: TLLoopConfig, budgets: object) -> None:
@@ -1929,6 +1944,8 @@ def test_live_restart_revalidates_child_identity_before_controller_start(
     )
 
     assert calls == ["provision", "run"]
+    assert provision_arguments[0]["pr_number"] == 46
+    assert provision_arguments[0]["head_sha"] == "published-head-sha"
     assert child_store.load() == checkpoint_before
 
 
@@ -11102,6 +11119,43 @@ def test_ordered_sub_tl_restart_adopts_terminal_child_checkpoint(
     )
 
     assert result.final_state.slices["adopt-child"].status is SliceStatus.MERGED
+
+
+def test_ordered_sub_tl_completion_preserves_server_confirmed_restart_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = "ordered-restart-parent-binding"
+    replacement_invocation = "server-confirmed-controller-restart"
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                "dormant-child",
+                WorkPlan(),
+                source=SyntheticQueue([]),
+                order=1,
+                integration=IntegrationContract(aggregate_pr_required=False),
+            ),
+        )
+    )
+
+    def provision_then_fail(tasks, config, source, effects, store, budgets):
+        del config, source, effects, budgets
+        _checkpoint_ordered_sub_tl_invocation(store, tasks[0].name, replacement_invocation)
+        return ((tasks[0], TLPhase.TLFailed, None),)
+
+    monkeypatch.setattr(driver_module, "_run_sub_tl_batch", provision_then_fail)
+    result = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(RecordingTransport()),
+        config=replace(_config(), keep_alive_on_waiting=False),
+        root_dir=tmp_path,
+    )
+
+    assert result.final_state.slices["dormant-child"].dispatch_invocation_id == (
+        replacement_invocation
+    )
 
 
 def test_sub_tl_aggregate_pr_is_persisted_and_reused_on_restart(

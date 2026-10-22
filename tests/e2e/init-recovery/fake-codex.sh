@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ "${1:-}" == "debug" && "${2:-}" == "models" ]]; then
     cat <<'JSON'
-{"models":[{"slug":"gpt-5.6-luna","supported_reasoning_levels":[{"effort":"minimal"},{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]}]}
+{"models":[{"slug":"gpt-5.6-luna","supported_reasoning_levels":[{"effort":"minimal"},{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]},{"slug":"gpt-6-luna","supported_reasoning_levels":[{"effort":"minimal"},{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]}]}
 JSON
     exit 0
 fi
@@ -11,6 +11,7 @@ fi
 agent="${EXOMONAD_AGENT_ID:-unknown}"
 role="${EXOMONAD_ROLE:-unknown}"
 model=""
+effort=""
 next_is_model=false
 for argument in "$@"; do
     if [[ "$next_is_model" == true ]]; then
@@ -20,6 +21,8 @@ for argument in "$@"; do
         next_is_model=true
     elif [[ "$argument" == --model=* ]]; then
         model="${argument#--model=}"
+    elif [[ "$argument" == model_reasoning_effort=* ]]; then
+        effort="${argument#model_reasoning_effort=}"
     fi
 done
 
@@ -76,7 +79,7 @@ PY
 }
 
 if [[ "$role" == "dev" && "$agent" == *issue-814* ]]; then
-    [[ "$model" == "gpt-5.6-luna" ]] || {
+    [[ "$(basename "$0")" == "opencode" && "${model%%#*}" == "opencode-go/deepseek-v4.1-flash" ]] || {
         printf 'unexpected recovered #814 worker model: %s\n' "$model" >&2
         exit 1
     }
@@ -256,7 +259,7 @@ PY
         done
         ;;
     reviewer)
-        [[ "$model" == "gpt-5.6-luna" ]] || {
+        [[ "$model" == "gpt-6-luna" && "$effort" == "xhigh" ]] || {
             printf 'unexpected reviewer model: %s\n' "$model" >&2
             exit 1
         }
@@ -293,11 +296,15 @@ PY
 )"
         response="$(mcp_call reviewer "$agent" approve_pr "$arguments")"
         require_tool_success "$response"
-        record_event reviewer_approved "$(python3 - "$pr_number" "$head_sha" <<'PY'
+        record_event reviewer_approved "$(python3 - "$pr_number" "$head_sha" "$effort" <<'PY'
 import json
 import sys
 
-print(json.dumps({"pr_number": int(sys.argv[1]), "head_sha": sys.argv[2]}))
+print(json.dumps({
+    "pr_number": int(sys.argv[1]),
+    "head_sha": sys.argv[2],
+    "effort": sys.argv[3],
+}))
 PY
 )"
         ;;
