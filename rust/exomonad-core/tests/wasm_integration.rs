@@ -25,8 +25,11 @@ use exomonad_core::services::pr_registry::{
     publish_verified_head, read_published_heads, InvocationSuccession, PublicationProvenance,
     PublishedHead, SuccessionReason,
 };
-use exomonad_core::services::Services;
-use exomonad_core::{EffectError, EffectHandler, EffectResult, RuntimeBuilder};
+use exomonad_core::services::{AgentResolver, Services};
+use exomonad_core::{
+    AgentName, BirthBranch, EffectContext, EffectError, EffectHandler, EffectRegistry,
+    EffectResult, PluginManager, Runtime, RuntimeBuilder,
+};
 use prost::Message;
 use serde_json::{json, Value};
 use serial_test::serial;
@@ -42,6 +45,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 mod aggregate_approval_merge;
 #[path = "wasm_integration/post_merge_sync.rs"]
 mod post_merge_sync;
+#[path = "wasm_integration/resume_preflight.rs"]
+mod resume_preflight;
 
 static MOCK_AGENT_CLOSE_SELF_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MOCK_EVENTS_NOTIFY_PARENT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -115,26 +120,57 @@ async fn build_test_runtime() -> exomonad_core::Runtime {
 async fn build_production_agent_runtime(
     project_dir: &Path,
     forgejo_client: Arc<ForgejoClient>,
-) -> exomonad_core::Runtime {
+) -> Runtime {
+    let agent_handler = build_production_agent_handler(project_dir, forgejo_client).await;
+    build_wasm_runtime_with_agent_handler(project_dir, agent_handler).await
+}
+
+async fn build_production_agent_handler(
+    project_dir: &Path,
+    forgejo_client: Arc<ForgejoClient>,
+) -> AgentHandler<Services> {
     let mut services = Services::benchmark(project_dir.to_path_buf())
         .expect("construct isolated production handler services");
     services.forgejo_client = Some(forgejo_client);
+    services.agent_resolver = Arc::new(AgentResolver::load(project_dir.to_path_buf()).await);
     services.event_log = Some(Arc::new(
         EventLog::open(project_dir.join(".exo/logs")).expect("open isolated event log"),
     ));
     let services = Arc::new(services);
     let agent_control = Arc::new(AgentControlService::new(services.clone()));
+    AgentHandler::new(agent_control, services)
+}
 
-    test_runtime_builder_with_handlers(
-        AgentHandler::new(agent_control, services),
-        MockGitHubHandler,
-        MockMergePRHandler,
-        MockProcessHandler,
-    )
-    .with_wasm_bytes(wasm_binary_bytes())
-    .build()
-    .await
-    .expect("build WASM runtime with production AgentHandler")
+async fn build_wasm_runtime_with_agent_handler(
+    project_dir: &Path,
+    agent_handler: impl EffectHandler + 'static,
+) -> Runtime {
+    let mut registry = EffectRegistry::new();
+    registry.register_owned(MockGitHandler);
+    registry.register_owned(MockLogHandler);
+    registry.register_owned(MockFsHandler);
+    registry.register_owned(MockFilePRHandler);
+    registry.register_owned(MockMergePRHandler);
+    registry.register_owned(MockEventsHandler);
+    registry.register_owned(MockSessionHandler);
+    registry.register_owned(MockKvHandler);
+    registry.register_owned(MockGitHubHandler);
+    registry.register_owned(MockCopilotHandler);
+    registry.register_owned(MockProcessHandler);
+    registry.register_owned(agent_handler);
+    let registry = Arc::new(registry);
+    let context = EffectContext {
+        agent_name: AgentName::try_from_str("root").expect("root identity is valid"),
+        birth_branch: BirthBranch::root().expect("root branch is valid"),
+        working_dir: project_dir.to_path_buf(),
+    };
+    let plugin_manager = PluginManager::new(&wasm_binary_bytes(), registry.clone(), context)
+        .await
+        .expect("build WASM runtime with production AgentHandler");
+    Runtime {
+        plugin_manager,
+        registry,
+    }
 }
 
 fn run_git(project_dir: &Path, arguments: &[&str]) {
