@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Fix recovery of historical spawn refusals with missing error kinds (#1280)
 - Fix continuation preserving completed subTL receipts during ordered recovery (#1266)
 - Fix recovered aggregate bookkeeping completion when its integration lane is idle (#1264)
 - Fix plan-scoped aggregate merge replay after interrupted parent synchronization (#1259)
