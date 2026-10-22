@@ -284,6 +284,77 @@ async fn persist_routing_ownership(
         .await
 }
 
+pub(crate) async fn repair_live_routing_ownership(
+    agent_dir: &Path,
+    expected: &InvocationRecord,
+    requested_routing: &RoutingInfo,
+) -> Result<()> {
+    let _guard = mutation_lock().lock().await;
+    let current = require_expected_live_invocation(agent_dir, expected, requested_routing).await?;
+    let persisted = RoutingInfo::read_from_dir(agent_dir).await?;
+    if !persisted.same_delivery_target(&current.routing) {
+        return Err(anyhow::anyhow!(
+            "persisted routing target conflicts with the live invocation"
+        ));
+    }
+    if routing_has_owner_fields(&persisted) {
+        return verify_current_routing_owner(agent_dir, &persisted, &current);
+    }
+    persist_routing_ownership(
+        agent_dir,
+        &current.routing,
+        &current.invocation_id,
+        current.generation,
+    )
+    .await
+}
+
+async fn require_expected_live_invocation(
+    agent_dir: &Path,
+    expected: &InvocationRecord,
+    requested_routing: &RoutingInfo,
+) -> Result<InvocationRecord> {
+    let current = read_locked(agent_dir)
+        .await?
+        .context("live invocation checkpoint is unavailable during route recovery")?;
+    if &current == expected
+        && current.is_live()
+        && current.routing.same_delivery_target(requested_routing)
+    {
+        return Ok(current);
+    }
+    Err(anyhow::anyhow!(
+        "live invocation changed before its routing ownership could be recovered"
+    ))
+}
+
+fn routing_has_owner_fields(routing: &RoutingInfo) -> bool {
+    routing.owner_agent_id.is_some()
+        || routing.owner_invocation_id.is_some()
+        || routing.owner_generation.is_some()
+}
+
+fn verify_current_routing_owner(
+    agent_dir: &Path,
+    routing: &RoutingInfo,
+    invocation: &InvocationRecord,
+) -> Result<()> {
+    let agent_id = agent_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("agent directory has no usable identity for routing recovery")?;
+    let is_current_owner = routing.has_ownership_proof()
+        && routing.owner_agent_id.as_deref() == Some(agent_id)
+        && routing.owner_invocation_id.as_deref() == Some(invocation.invocation_id.as_str())
+        && routing.owner_generation == Some(invocation.generation);
+    if is_current_owner {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "persisted routing ownership conflicts with the live invocation"
+    ))
+}
+
 pub async fn read_invocation(agent_dir: &Path) -> Result<Option<InvocationRecord>> {
     read_locked(agent_dir).await
 }

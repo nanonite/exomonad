@@ -570,7 +570,7 @@ impl<
                         "the prior controller routing record is unreadable; reconcile it before provisioning",
                     )
                 })?;
-                let has_partial_ownership = persisted_routing.owner_agent_id.is_some()
+                let has_owner_fields = persisted_routing.owner_agent_id.is_some()
                     || persisted_routing.owner_invocation_id.is_some()
                     || persisted_routing.owner_generation.is_some();
                 let owned_by_prior = persisted_routing.has_ownership_proof()
@@ -578,19 +578,33 @@ impl<
                     && persisted_routing.owner_invocation_id.as_deref()
                         == Some(prior.invocation_id.as_str())
                     && persisted_routing.owner_generation == Some(prior.generation);
-                if has_partial_ownership && !owned_by_prior {
+                if has_owner_fields && !owned_by_prior {
                     return Err(ordered_provision_failure(
                         super::OrderedSubTLProvisionFailureKind::OwnershipConflict,
                         "routing ownership conflicts with the prior controller invocation",
                     ));
                 }
-                if prior.is_live()
-                    && (!persisted_routing.same_delivery_target(&routing) || !owned_by_prior)
-                {
-                    return Err(ordered_provision_failure(
-                        super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
-                        "the live controller routing is incomplete or differs from the current TL target",
-                    ));
+                if prior.is_live() {
+                    if !persisted_routing.same_delivery_target(&routing) {
+                        return Err(ordered_provision_failure(
+                            super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                            "the live controller routing differs from the current TL target",
+                        ));
+                    }
+                    if !owned_by_prior {
+                        invocation::repair_live_routing_ownership(
+                            &agent_dir,
+                            prior,
+                            &routing,
+                        )
+                        .await
+                        .map_err(|_| {
+                            ordered_provision_failure(
+                                super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                                "the live controller routing ownership could not be safely reconciled",
+                            )
+                        })?;
+                    }
                 }
             } else if prior.is_live() {
                 return Err(ordered_provision_failure(
@@ -2741,6 +2755,168 @@ mod tests {
         AgentControlService::new(Arc::new(services)).with_ordered_sub_tl_routing_for_test(
             RoutingInfo::window(super::super::tmux_ipc::WindowId::parse(window_id).unwrap()),
         )
+    }
+
+    #[tokio::test]
+    async fn ordered_sub_tl_reconciles_route_after_invocation_save_interruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        let run_git = |args: &[&str], directory: &std::path::Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"], &project_dir);
+        run_git(
+            &["config", "user.email", "test@example.invalid"],
+            &project_dir,
+        );
+        run_git(&["config", "user.name", "Test"], &project_dir);
+        std::fs::write(project_dir.join("seed"), "seed\n").unwrap();
+        run_git(&["add", "seed"], &project_dir);
+        run_git(&["commit", "-q", "-m", "seed"], &project_dir);
+
+        let record = AgentIdentityRecord {
+            agent_name: AgentName::try_from_str("ordered-child").unwrap(),
+            slug: Slug::try_from_str("ordered-child").unwrap(),
+            agent_type: AgentType::Codex,
+            birth_branch: BirthBranch::try_from_str("main.ordered-child").unwrap(),
+            parent_branch: BirthBranch::try_from_str("main").unwrap(),
+            working_dir: project_dir.join(".exo/worktrees/ordered-child"),
+            display_name: "🤖 ordered-child".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
+            ledger_owned: true,
+            slice_id: Some("ordered-child".to_string()),
+        };
+        let first_service = ordered_service(&project_dir, "@91").await;
+        let agent_dir = project_dir.join(".exo/agents/ordered-child");
+        let first_id = first_service
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .unwrap();
+        finish_invocation(&agent_dir, &first_id, InvocationStatus::Killed, Some(137))
+            .await
+            .unwrap();
+
+        let restart_service = ordered_service(&project_dir, "@92").await;
+        let resumed_id = restart_service
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .expect("dormant controller receives one replacement invocation");
+        let saved_invocation = read_invocation(&agent_dir)
+            .await
+            .unwrap()
+            .expect("replacement invocation is durable");
+        assert_eq!(saved_invocation.invocation_id, resumed_id);
+        assert_eq!(saved_invocation.generation, 2);
+
+        // This is the persisted crash boundary after invocation.json was
+        // committed but before routing ownership was written.
+        saved_invocation
+            .routing
+            .write_to_dir(&agent_dir)
+            .await
+            .unwrap();
+        let unowned_route = RoutingInfo::read_from_dir(&agent_dir).await.unwrap();
+        assert_eq!(unowned_route.window_id.as_ref().unwrap().as_str(), "@92");
+        assert!(unowned_route.owner_agent_id.is_none());
+        assert!(unowned_route.owner_invocation_id.is_none());
+        assert!(unowned_route.owner_generation.is_none());
+        let invocation_bytes = std::fs::read(agent_dir.join("invocation.json")).unwrap();
+
+        let retry_service = ordered_service(&project_dir, "@92").await;
+        let retry_id = retry_service
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .expect("repeat provisioning repairs the partial save and reuses the live invocation");
+        assert_eq!(retry_id, resumed_id);
+        assert_eq!(
+            std::fs::read(agent_dir.join("invocation.json")).unwrap(),
+            invocation_bytes,
+            "route repair must not rewrite the invocation checkpoint"
+        );
+        let repaired_route = RoutingInfo::read_from_dir(&agent_dir).await.unwrap();
+        assert_eq!(repaired_route.window_id.as_ref().unwrap().as_str(), "@92");
+        assert_eq!(
+            repaired_route.owner_agent_id.as_deref(),
+            Some("ordered-child")
+        );
+        assert_eq!(
+            repaired_route.owner_invocation_id.as_deref(),
+            Some(resumed_id.as_str())
+        );
+        assert_eq!(
+            repaired_route.owner_generation,
+            Some(saved_invocation.generation)
+        );
+
+        let changed_route =
+            RoutingInfo::window(super::super::tmux_ipc::WindowId::parse("@93").unwrap());
+        changed_route.write_to_dir(&agent_dir).await.unwrap();
+        let error = ordered_service(&project_dir, "@92")
+            .await
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .expect_err("a changed unowned delivery target cannot be adopted");
+        assert_eq!(
+            error
+                .downcast_ref::<super::OrderedSubTLProvisionFailure>()
+                .unwrap()
+                .code(),
+            "ordered_sub_tl_lifecycle_blocked"
+        );
+        assert_eq!(
+            RoutingInfo::read_from_dir(&agent_dir)
+                .await
+                .unwrap()
+                .window_id
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "@93",
+            "mismatched route evidence remains untouched"
+        );
+
+        let mut partial_route =
+            RoutingInfo::window(super::super::tmux_ipc::WindowId::parse("@92").unwrap());
+        partial_route.owner_invocation_id = Some("foreign-invocation".to_string());
+        partial_route.write_to_dir(&agent_dir).await.unwrap();
+        let error = ordered_service(&project_dir, "@92")
+            .await
+            .provision_ordered_sub_tl(record)
+            .await
+            .expect_err("partial ownership evidence remains unresolved");
+        assert_eq!(
+            error
+                .downcast_ref::<super::OrderedSubTLProvisionFailure>()
+                .unwrap()
+                .code(),
+            "ordered_sub_tl_ownership_conflict"
+        );
+        assert_eq!(
+            RoutingInfo::read_from_dir(&agent_dir)
+                .await
+                .unwrap()
+                .owner_invocation_id
+                .as_deref(),
+            Some("foreign-invocation"),
+            "partial ownership evidence remains untouched"
+        );
+        let history =
+            std::fs::read_to_string(project_dir.join(".exo/events/ordered-child.jsonl")).unwrap();
+        assert_eq!(
+            history
+                .lines()
+                .filter(|line| line.contains("\"trigger\":\"controller_restart\""))
+                .count(),
+            1,
+            "recovery must not create a duplicate invocation"
+        );
     }
 
     #[tokio::test]
