@@ -42,6 +42,7 @@
           haskell.compiler.${ghcVersion}
           cabal-install
           haskell-language-server
+          hlint
           ormolu
           zlib
           zlib.dev
