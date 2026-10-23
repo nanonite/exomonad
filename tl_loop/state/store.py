@@ -2098,6 +2098,8 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             record["dispatch_error"] = value.dispatch_error
         if value.dispatch_error_code is not None:
             record["dispatch_error_code"] = value.dispatch_error_code
+        if value.dispatch_uses_current_role_configuration:
+            record["dispatch_uses_current_role_configuration"] = True
         if value.dispatch_retry_attempt:
             record["dispatch_retry_attempt"] = value.dispatch_retry_attempt
         if value.dispatch_next_attempt_at is not None:
@@ -3379,6 +3381,9 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         dispatch_last_boundary=cast(str | None, value.get("dispatch_last_boundary")),
         dispatch_error=cast(str | None, value.get("dispatch_error")),
         dispatch_error_code=cast(str | None, value.get("dispatch_error_code")),
+        dispatch_uses_current_role_configuration=(
+            value.get("dispatch_uses_current_role_configuration") is True
+        ),
         dispatch_retry_attempt=cast(int, value.get("dispatch_retry_attempt", 0)),
         dispatch_next_attempt_at=cast(float | None, value.get("dispatch_next_attempt_at")),
         dispatch_retry_for_attempt=cast(int, value.get("dispatch_retry_for_attempt", 0)),

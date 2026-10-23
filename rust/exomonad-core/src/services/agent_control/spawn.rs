@@ -58,6 +58,10 @@ fn action_name(action: LeafWorktreeAction) -> &'static str {
     }
 }
 
+fn resumed_agent_type(configured: AgentType, _historical_identity: &AgentIdentity) -> AgentType {
+    configured
+}
+
 /// Decide whether a failed branch creation may be recovered by one attach.
 ///
 /// Only the stable branch-exists code proves that another creator won the race.
@@ -2675,7 +2679,7 @@ impl<
                     ));
                 }
                 identity = expected_identity;
-                agent_type = identity.agent_type();
+                agent_type = resumed_agent_type(options.agent_type, &identity);
                 agent_name = expected_agent_name.clone();
                 display_name = identity.display_name();
                 worktree_path = self.worktree_base.join(agent_name.as_str());
@@ -2939,16 +2943,24 @@ impl<
             let role = options.role.as_ref().unwrap_or(&default_dev);
             let model = self.effective_model_for(agent_type, role.as_str(), options.model.as_deref());
             let effort = self.effective_effort_for(role.as_str(), None);
-            let identity_model = existing_identity_record
-                .as_ref()
-                .and_then(|record| record.model.clone())
-                .or_else(|| prior_identity.as_ref().and_then(|record| record.model.clone()))
-                .or_else(|| model.clone());
-            let identity_effort = existing_identity_record
-                .as_ref()
-                .and_then(|record| record.effort.clone())
-                .or_else(|| prior_identity.as_ref().and_then(|record| record.effort.clone()))
-                .or_else(|| effort.clone());
+            let identity_model = if options.expected_agent_name.is_some() {
+                model.clone()
+            } else {
+                existing_identity_record
+                    .as_ref()
+                    .and_then(|record| record.model.clone())
+                    .or_else(|| prior_identity.as_ref().and_then(|record| record.model.clone()))
+                    .or_else(|| model.clone())
+            };
+            let identity_effort = if options.expected_agent_name.is_some() {
+                effort.clone()
+            } else {
+                existing_identity_record
+                    .as_ref()
+                    .and_then(|record| record.effort.clone())
+                    .or_else(|| prior_identity.as_ref().and_then(|record| record.effort.clone()))
+                    .or_else(|| effort.clone())
+            };
             let mut env_vars = self.common_spawn_env(&agent_name, &branch_name, role);
             self.write_agent_mcp_config(effective_project_dir, &worktree_path, agent_type, role)
                 .await?;
@@ -3070,14 +3082,20 @@ impl<
                 topology: Topology::WorktreePerAgent,
                 model: identity_model.clone(),
                 effort: identity_effort.clone(),
-                ledger_owned: false,
+                ledger_owned: prior_identity
+                    .as_ref()
+                    .is_some_and(|record| record.ledger_owned),
                 slice_id: prior_identity
                     .as_ref()
                     .and_then(|record| record.slice_id.clone())
                     .or_else(|| Some(options.branch_name.clone())),
             };
             let trigger = if options.expected_agent_name.is_some() {
-                InvocationTrigger::ResumePr
+                if options.invocation_pr_number.is_some() {
+                    InvocationTrigger::ResumePr
+                } else {
+                    InvocationTrigger::ResumeBlocked
+                }
             } else {
                 InvocationTrigger::Spawn
             };
@@ -3225,7 +3243,8 @@ impl<
 
         // Compute the reviewer's own identity and path — same derivation spawn_subtree uses
         // internally so the MCP config agent_name matches the directory name.
-        let agent_type = self.reviewer_agent_type;
+        let reviewer_route = self.configured_runtime_route("reviewer");
+        let agent_type = reviewer_route.agent_type;
         let identity = AgentIdentity::new(slugify(branch_name), agent_type);
         let reviewer_path = self.worktree_base.join(identity.internal_name().as_str());
 
@@ -3297,8 +3316,8 @@ impl<
             }),
             standalone_repo: false,
             allowed_dirs: vec![],
-            model: self.reviewer_model.clone(),
-            effort: self.reviewer_effort().map(str::to_string),
+            model: reviewer_route.model,
+            effort: reviewer_route.effort,
             invocation_pr_number: Some(pr_entry.number),
             invocation_head_sha: pr_entry.last_head_sha.clone(),
         };
@@ -3350,8 +3369,9 @@ impl<
         reviewer_branch_name: &str,
         acceptance_criteria: &[String],
     ) -> Result<SpawnResult> {
+        let reviewer_route = self.configured_runtime_route("reviewer");
         let reviewer_identity =
-            AgentIdentity::new(slugify(reviewer_branch_name), self.reviewer_agent_type);
+            AgentIdentity::new(slugify(reviewer_branch_name), reviewer_route.agent_type);
         let reviewer_internal_name = reviewer_identity.internal_name().to_string();
         let reviewer_birth_branch = caller_bb.child(&reviewer_internal_name).to_string();
         let result = self
@@ -3427,6 +3447,17 @@ mod tests {
     /// resume can name the one it continues.
     const FIRST_GENERATION: &str = "11111111-1111-1111-1111-111111111111";
     const SECOND_GENERATION: &str = "22222222-2222-2222-2222-222222222222";
+
+    #[test]
+    fn configured_runtime_overrides_historical_runtime_suffix_on_resume() {
+        let historical = AgentIdentity::from_internal_name("kani-opencode");
+
+        assert_eq!(
+            resumed_agent_type(AgentType::Codex, &historical),
+            AgentType::Codex,
+            "a configured runtime transition must not be undone by the old logical name"
+        );
+    }
 
     #[test]
     fn expected_leaf_birth_prefers_durable_identity() {

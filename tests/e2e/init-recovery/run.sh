@@ -718,6 +718,7 @@ git -C "$AGG_REPO" remote add origin "file://$AGG_REMOTE"
 git -C "$AGG_REPO" config user.name "Exomonad aggregate recovery E2E"
 git -C "$AGG_REPO" config user.email "aggregate-recovery-e2e@example.invalid"
 mkdir -p "$AGG_REPO/.exo"
+mkdir -p "$AGG_REPO/.chainlink"
 mkdir -p "$AGG_REPO/.forgejo/workflows"
 cp "$PROJECT_ROOT/CHANGELOG.md" "$AGG_REPO/CHANGELOG.md"
 cp "$PROJECT_ROOT/.forgejo/workflows/ci.yml" "$AGG_REPO/.forgejo/workflows/ci.yml"
@@ -738,6 +739,43 @@ opencode.json
 .chainlink/issues.db
 .exo/e2e-runtime-ignored-untracked/
 EOF
+chainlink init --no-hooks --db "$AGG_REPO/.chainlink/issues.db" \
+    > "$AGG_DIR/chainlink-init.log" 2>&1 \
+    || { cat "$AGG_DIR/chainlink-init.log"; e2e_fail "failed to initialize disposable Chainlink database"; }
+python3 - "$AGG_DIR/chainlink-issues.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+rows = []
+for issue_id in range(1, 815):
+    is_target = issue_id == 814
+    rows.append({
+        "id": issue_id,
+        "title": "Disposable Kani recovery issue 814" if is_target else f"Disposable closed issue {issue_id}",
+        "description": "Isolated actual-init regression fixture.",
+        "status": "open" if is_target else "closed",
+        "priority": "high" if is_target else "low",
+        "parent_id": None,
+        "labels": [],
+        "comments": [],
+        "created_at": "2026-10-23T00:00:00Z",
+        "updated_at": "2026-10-23T00:00:00Z",
+        "closed_at": None if is_target else "2026-10-23T00:00:00Z",
+    })
+Path(sys.argv[1]).write_text(
+    json.dumps({"version": 1, "exported_at": "2026-10-23T00:00:00Z", "issues": rows}),
+    encoding="utf-8",
+)
+PY
+chainlink import "$AGG_DIR/chainlink-issues.json" --db "$AGG_REPO/.chainlink/issues.db" \
+    > "$AGG_DIR/chainlink-import.log" 2>&1 \
+    || { cat "$AGG_DIR/chainlink-import.log"; e2e_fail "failed to seed disposable issue #814"; }
+chainlink show 814 --db "$AGG_REPO/.chainlink/issues.db" \
+    > "$AGG_DIR/chainlink-issue-814.log" \
+    || e2e_fail "disposable issue #814 is not readable"
+rg -Fq 'Status: open' "$AGG_DIR/chainlink-issue-814.log" \
+    || e2e_fail "disposable issue #814 must remain open for routed recovery"
 git -C "$AGG_REPO" commit --allow-empty -q -m "aggregate recovery base"
 printf 'tracked staged baseline\n' > "$AGG_REPO/preserved-staged.txt"
 printf 'tracked unstaged baseline\n' > "$AGG_REPO/preserved-unstaged.txt"
@@ -778,19 +816,19 @@ policy = policy_path.read_text(encoding="utf-8")
 replacements = (
     (
         'allow = ["codex/gpt-5.6-luna", "claude/sonnet"]',
-        'allow = ["codex/gpt-5.6-luna", "claude/sonnet", "opencode/opencode-go/deepseek-v4.1-flash"]',
+        'allow = ["codex/gpt-6-luna", "claude/sonnet"]',
     ),
     (
         'cost_rank = { "codex/gpt-5.6-luna" = 1, "claude/sonnet" = 2 }',
-        'cost_rank = { "codex/gpt-5.6-luna" = 1, "claude/sonnet" = 2, "opencode/opencode-go/deepseek-v4.1-flash" = 3 }',
+        'cost_rank = { "codex/gpt-6-luna" = 1, "claude/sonnet" = 2 }',
     ),
     (
         'per_harness_budget = { "codex/gpt-5.6-luna" = 80000, "claude/sonnet" = 40000 }',
-        'per_harness_budget = { "codex/gpt-5.6-luna" = 80000, "claude/sonnet" = 40000, "opencode/opencode-go/deepseek-v4.1-flash" = 40000 }',
+        'per_harness_budget = { "codex/gpt-6-luna" = 80000, "claude/sonnet" = 40000 }',
     ),
     (
         '[roles.reviewer]\nallow = ["codex/gpt-5.6-luna"]\ncost_rank = { "codex/gpt-5.6-luna" = 1 }',
-        '[roles.reviewer]\nallow = ["codex/gpt-6-luna"]\ncost_rank = { "codex/gpt-6-luna" = 1 }',
+        '[roles.reviewer]\nallow = ["codex/gpt-6.1-sol"]\ncost_rank = { "codex/gpt-6.1-sol" = 1 }',
     ),
 )
 for before, after in replacements:
@@ -806,8 +844,8 @@ from pathlib import Path
 capability_path = Path(sys.argv[1])
 capabilities = capability_path.read_text(encoding="utf-8")
 required_entries = (
-    '"opencode/opencode-go/deepseek-v4.1-flash" = "hard"',
-    '"codex/gpt-6-luna" = "standard"',
+    '"codex/gpt-6-luna" = "hard"',
+    '"codex/gpt-6.1-sol" = "standard"',
 )
 for entry in required_entries:
     if entry not in capabilities:
@@ -879,6 +917,7 @@ assert kani_child["run_id"] == "kani"
 assert kani_child["parent_run_id"] == "root"
 assert kani_child["fsm"]["phase"] == "tl_failed"
 assert failed_leaf["status"] == "dispatch_failed"
+assert failed_leaf["requested_harness"] == "opencode/opencode-go/deepseek-v4.1-flash"
 assert failed_leaf["dispatch_last_boundary"] == "spawn_request_failed"
 assert failed_leaf.get("dispatch_invocation_id") is None
 assert failed_leaf["park_cause"] == "dispatch_failed"
@@ -997,12 +1036,20 @@ spawn_agent_type = "codex"
 forgejo_url = "$AGG_MOCK_URL"
 forgejo_token = "test-token-e2e"
 forgejo_reviewer_token = "reviewer-token-e2e"
+worker_effort_level = "xhigh"
 
 [reviewer]
 agent_type = "codex"
-model = "gpt-6-luna"
-effort_level = "xhigh"
+model = "gpt-6.1-sol"
+effort_level = "medium"
 EOF
+
+mkdir -p "$AGG_HOME/.codex"
+cat > "$AGG_HOME/.codex/config.toml" <<'EOF'
+model = "gpt-6-luna"
+EOF
+export CODEX_HOME="$AGG_HOME/.codex"
+export EXOMONAD_CODEX_MODEL="gpt-6-luna"
 
 LOCAL_EDIT_STATE_BEFORE="$(capture_local_edit_state)"
 printf '%s\n' "$LOCAL_EDIT_STATE_BEFORE" > "$AGG_DIR/local-edits-before.json"
@@ -1028,9 +1075,9 @@ tmux set-environment -t "$AGGREGATE_SESSION" E2E_HANDOFF_HEAD_FILE "$HANDOFF_HEA
 tmux set-environment -t "$AGGREGATE_SESSION" E2E_MOCK_URL "$AGG_MOCK_URL"
 tmux set-environment -t "$AGGREGATE_SESSION" E2E_MCP_SOCKET "$AGG_REPO/.exo/server.sock"
 tmux set-environment -t "$AGGREGATE_SESSION" E2E_AGG_REPO "$AGG_REPO"
-# The accepted Kani declaration explicitly selects OpenCode for the recovered
-# worker, while later default work remains on the configured Codex route.
-tmux set-environment -t "$AGGREGATE_SESSION" EXOMONAD_ALLOW_HARNESS_SWITCH 1
+# The accepted Kani declaration keeps its historical OpenCode route. The
+# replacement invocation must use the operator's current Codex configuration.
+tmux set-environment -t "$AGGREGATE_SESSION" CODEX_HOME "$CODEX_HOME"
 tmux set-window-option -t "$AGGREGATE_SESSION:TL" remain-on-exit on
 [[ "$(tmux show-environment -t "$AGGREGATE_SESSION" GIT_SSH_COMMAND)" == \
     "GIT_SSH_COMMAND=$AGG_DIR/git-ssh" ]] \
@@ -1178,7 +1225,7 @@ ready = (
     and leaf.get("status") in {"in_review", "merged"}
     and bool(leaf.get("pr_number"))
     and leaf.get("agent_type") == "codex"
-    and leaf.get("model") == "gpt-5.6-luna"
+    and leaf.get("model") == "gpt-6-luna"
     and bool(leaf.get("reviewed_head"))
 )
 print(
@@ -1211,7 +1258,7 @@ if [[ "$post_tidy_marker" != "ready" || ( "$final_phase" != "tl_running" && "$fi
     || ( "$handoff_status" != "spawned" && "$handoff_status" != "in_review" && "$handoff_status" != "merged" ) \
     || "$handoff_intent" == "none" || ( "$leaf_status" != "in_review" && "$leaf_status" != "merged" ) \
     || "$leaf_pr" == "none" || "$leaf_agent_type" != "codex" \
-    || "$leaf_model" != "gpt-5.6-luna" || "$leaf_head" == "none" ]]; then
+    || "$leaf_model" != "gpt-6-luna" || "$leaf_head" == "none" ]]; then
     cat "$AGG_DIR/init.log"
     cat "$AGG_REPO/.exo/tl-loop/root/controller-output.log" 2>/dev/null || true
     e2e_fail "continuation did not reach the post-tidy leaf review handoff: '$POST_TIDY_STATE'"
@@ -1234,9 +1281,30 @@ assert root["slices"]["kani"]["status"] == "merged"
 assert leaf["status"] == "merged", "recovered #814 leaf did not complete integration"
 assert leaf["attempts"] == 2, "recovery did not create exactly one new dispatch attempt"
 assert leaf["pr_number"] is not None
-assert leaf["agent_type"] == "opencode"
-assert leaf["model"] == "opencode-go/deepseek-v4.1-flash"
-assert leaf["resolved_harness"] == "opencode/opencode-go/deepseek-v4.1-flash"
+assert leaf["agent_type"] == "codex"
+assert leaf["model"] == "gpt-6-luna"
+assert leaf["resolved_harness"] == "codex/gpt-6-luna"
+assert leaf["requested_harness"] == "opencode/opencode-go/deepseek-v4.1-flash"
+owner_id = leaf["dispatch_agent_id"]
+owner_events = [
+    json.loads(line)
+    for line in (repo / ".exo/events" / f"{owner_id}.jsonl").read_text().splitlines()
+]
+owner_invocations = [
+    event["data"]
+    for event in owner_events
+    if event.get("type") == "agent.invocation.started"
+    and event.get("data", {}).get("invocation_id") == leaf["dispatch_invocation_id"]
+]
+assert len(owner_invocations) == 1, "configured worker invocation is not retained in lifecycle history"
+owner_invocation = owner_invocations[0]
+assert owner_invocation["runtime_agent_id"] == owner_id
+assert owner_invocation["slice_id"] == leaf["id"]
+assert owner_invocation["branch"] == leaf["branch"]
+assert owner_invocation["runtime"] == "codex" and owner_invocation["provider"] == "codex"
+owner_worktree = Path(owner_invocation["worktree"])
+assert owner_worktree.is_absolute()
+assert (repo / ".exo/worktrees") in owner_worktree.parents
 assert not any(gate["name"] == "tl-dispatch-failed-issue-814-substitution-model-kani" for gate in child["gates"])
 assert not any(gate["name"] == "tl-ordered-child-recovery-kani" for gate in root["gates"])
 journal = json.loads((root_dir / "kani/action-journal.json").read_text())
@@ -1265,7 +1333,8 @@ assert len(worker_starts) == 1, "the proven rejected attempt did not launch exac
 assert len(worker_prs) == 1, "the recovered worker did not publish exactly once"
 worker = worker_starts[0]
 assert worker["source_clean"] is True
-assert worker["model"].split("#", 1)[0] == "opencode-go/deepseek-v4.1-flash"
+assert worker["model"].split("#", 1)[0] == "gpt-6-luna"
+assert worker["effort"] == "xhigh"
 assert worker["source_branch"].startswith("main.kani."), worker["source_branch"]
 reviewers = [
     event for event in events
@@ -1273,7 +1342,7 @@ reviewers = [
     and event.get("pr_number") == leaf["pr_number"]
 ]
 assert len(reviewers) == 1
-assert reviewers[0]["model"] == "gpt-6-luna" and reviewers[0]["effort"] == "xhigh"
+assert reviewers[0]["model"] == "gpt-6.1-sol" and reviewers[0]["effort"] == "medium"
 # Kani was already provisioned before this continuation, so this leaf retry
 # does not create a new parent-to-subTL handoff. Its source must instead match
 # the authoritative aggregate synchronization receipt retained by the parent.
@@ -1418,13 +1487,14 @@ worker = handoff_workers[0]
 handoff_reviews = [entry for entry in reviews if entry.get("pr_number") == leaf_pr_number]
 assert len(handoff_reviews) == 1, f"expected one routed post-tidy reviewer approval, found {len(handoff_reviews)}"
 review = handoff_reviews[0]
-assert worker["role"] == "dev" and worker["model"] == "gpt-5.6-luna"
+assert worker["role"] == "dev" and worker["model"] == "gpt-6-luna"
+assert worker["effort"] == "xhigh"
 assert worker["source_worktree"] == str(source_worktree)
 assert worker["source_branch"] == "main.handoff-proof"
 assert worker["source_head"] == handoff_head
 assert worker["source_clean"] is True and worker["outer_root_dirty"] is True
-assert review["role"] == "reviewer" and review["model"] == "gpt-6-luna"
-assert review["effort"] == "xhigh"
+assert review["role"] == "reviewer" and review["model"] == "gpt-6.1-sol"
+assert review["effort"] == "medium"
 assert review["pr_number"] == leaf_pr_number
 pr = json.loads((Path(sys.argv[4]).parent / "post-tidy-leaf-pr.json").read_text())
 assert review["head_sha"] == pr["head"]["sha"], "review was not bound to the actual PR head"
@@ -1432,7 +1502,7 @@ assert review["head_sha"] == pr["head"]["sha"], "review was not bound to the act
 child = json.loads((repo / ".exo/tl-loop/root/handoff-proof/run.json").read_text())
 leaf = child["slices"]["post-tidy-leaf"]
 assert leaf["status"] in {"in_review", "merged"}
-assert leaf["agent_type"] == "codex" and leaf["model"] == "gpt-5.6-luna"
+assert leaf["agent_type"] == "codex" and leaf["model"] == "gpt-6-luna"
 leaf_agent = leaf["dispatch_agent_id"]
 leaf_identity = json.loads((repo / ".exo/agents" / leaf_agent / "identity.json").read_text())
 assert leaf_identity["agent_type"] == "codex"

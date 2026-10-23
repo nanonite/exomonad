@@ -21,6 +21,7 @@ pub const INVOCATION_FILENAME: &str = "invocation.json";
 pub enum InvocationTrigger {
     Spawn,
     ResumePr,
+    ResumeBlocked,
     ControllerRestart,
     Review,
 }
@@ -30,6 +31,7 @@ impl InvocationTrigger {
         match self {
             Self::Spawn => "spawn",
             Self::ResumePr => "resume_pr",
+            Self::ResumeBlocked => "resume_blocked",
             Self::ControllerRestart => "controller_restart",
             Self::Review => "review",
         }

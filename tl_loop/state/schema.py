@@ -632,6 +632,7 @@ SLICE_KEYS = frozenset(
         "dispatch_last_boundary",
         "dispatch_error",
         "dispatch_error_code",
+        "dispatch_uses_current_role_configuration",
         "dispatch_retry_attempt",
         "dispatch_next_attempt_at",
         "dispatch_retry_for_attempt",
@@ -896,6 +897,7 @@ class SliceState:
     dispatch_last_boundary: str | None = None
     dispatch_error: str | None = None
     dispatch_error_code: str | None = None
+    dispatch_uses_current_role_configuration: bool = False
     dispatch_retry_attempt: int = 0
     dispatch_next_attempt_at: float | None = None
     dispatch_retry_for_attempt: int = 0
@@ -1619,6 +1621,8 @@ def _validate_slice(
     _nullable_string(value, "dispatch_last_boundary", path, errors)
     _nullable_string(value, "dispatch_error", path, errors)
     _nullable_string(value, "dispatch_error_code", path, errors)
+    if "dispatch_uses_current_role_configuration" in value:
+        _boolean(value, "dispatch_uses_current_role_configuration", path, errors)
     if "dispatch_retry_attempt" in value:
         _non_negative_int(value, "dispatch_retry_attempt", path, errors)
     _nullable_number(value, "dispatch_next_attempt_at", path, errors)

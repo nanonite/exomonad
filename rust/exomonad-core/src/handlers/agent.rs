@@ -15,9 +15,9 @@ use super::non_empty;
 use crate::services::agent_control::{
     finish_invocation_and_tombstone, read_invocation, slugify, AgentControlService, AgentIdentity,
     AgentIdentityRecord, AgentInfo, AgentType as ServiceAgentType, ClaudeSpawnFlags,
-    InvocationFinishResult, InvocationRecord, InvocationStatus, RecoveryAuthorization,
-    RecoveryInvocationLineage, SpawnLeafOptions, SpawnOptions, SpawnSubtreeOptions,
-    SpawnWorkerOptions, Topology, DIRTY_TL_SPAWN_PREFLIGHT_CODE,
+    ConfiguredRuntimeRoute, InvocationFinishResult, InvocationRecord, InvocationStatus,
+    RecoveryAuthorization, RecoveryInvocationLineage, SpawnLeafOptions, SpawnOptions,
+    SpawnSubtreeOptions, SpawnWorkerOptions, Topology, DIRTY_TL_SPAWN_PREFLIGHT_CODE,
 };
 use crate::services::configured_tl_preflight_runtime_paths;
 use crate::services::continuation::composer::{prefix_task, resume_pr_prefix};
@@ -63,6 +63,16 @@ use crate::services::{
 pub struct AgentHandler<C> {
     service: Arc<AgentControlService<C>>,
     ctx: Arc<C>,
+}
+
+struct BlockedResumeAdoption<'a> {
+    owner: &'a AgentIdentityRecord,
+    owner_dir: &'a Path,
+    request: &'a SpawnLeafSubtreeRequest,
+    invocation: &'a InvocationRecord,
+    route: &'a ConfiguredRuntimeRoute,
+    intent_id: &'a str,
+    context: &'a crate::effects::EffectContext,
 }
 
 impl<
@@ -3083,6 +3093,11 @@ impl<
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnLeafSubtreeResponse> {
         validate_resume_request(req)?;
+        let _resume_guard = resume_reconciliation_lock().lock().await;
+        let desired_route = self.service.configured_runtime_route("dev");
+        let desired_agent_type = desired_route.agent_type;
+        let desired_model = desired_route.model;
+        let desired_effort = desired_route.effort;
         let forgejo = self.ctx.forgejo_client().ok_or_else(|| {
             EffectError::invalid_input("Forgejo is not configured; cannot resume a PR")
         })?;
@@ -3181,6 +3196,8 @@ impl<
                 req.resume_pr_number, head_branch, pr.base_ref
             )));
         }
+        self.ensure_tl_spawn_preflight_for_child(ctx, owner.agent_name.as_str(), &req.intent_id)
+            .await?;
 
         let continuation_prefix = resume_pr_prefix(
             self.ctx.as_ref(),
@@ -3191,11 +3208,108 @@ impl<
             owner,
         )
         .await;
+        let owner_dir = self
+            .ctx
+            .project_dir()
+            .join(".exo/agents")
+            .join(owner.agent_name.as_str());
+        let previous_invocation = read_invocation(&owner_dir).await.effect_err("agent")?;
+        let Some(previous) = previous_invocation.as_ref() else {
+            return Err(EffectError::invalid_input(format!(
+                "PR #{} owner has no durable invocation history; refusing to change its configured route",
+                req.resume_pr_number
+            )));
+        };
+        if previous.is_live() {
+            return Err(EffectError::invalid_input(format!(
+                "PR #{} owner invocation is still active; configured runtime changes wait for its exact invocation to finish",
+                req.resume_pr_number
+            )));
+        }
+        if !invocation_has_terminal_outcome(previous) {
+            return Err(EffectError::invalid_input(format!(
+                "PR #{} owner invocation outcome is unresolved; reconcile it before changing runtime configuration",
+                req.resume_pr_number
+            )));
+        }
+        let next_generation = previous.generation.checked_add(1).ok_or_else(|| {
+            EffectError::invalid_input("PR owner invocation generation is exhausted")
+        })?;
+        let next_recovery_round = previous
+            .recovery_round
+            .checked_add(1)
+            .ok_or_else(|| EffectError::invalid_input("PR owner recovery round is exhausted"))?;
+        let worktree = resolve_owner_worktree(self.ctx.project_dir(), owner)?;
+        let current_branch = git_current_branch(&worktree).await?;
+        if current_branch != head_branch {
+            return Err(EffectError::invalid_input(format!(
+                "PR #{} owner worktree branch changed: expected {}, found {}",
+                req.resume_pr_number, head_branch, current_branch
+            )));
+        }
+        let fingerprint = worktree_fingerprint(&worktree).await?;
+        let intent_id = if req.intent_id.trim().is_empty() {
+            blocked_resume_intent_id(
+                owner,
+                req.resume_pr_number,
+                &previous.invocation_id,
+                head_branch,
+                &fingerprint,
+            )
+        } else {
+            req.intent_id.clone()
+        };
+        if configured_route_changed(
+            previous,
+            owner,
+            desired_agent_type,
+            desired_model.as_deref(),
+            desired_effort.as_deref(),
+        ) {
+            let transition_id = configured_route_transition_id(
+                &intent_id,
+                desired_agent_type,
+                desired_model.as_deref(),
+                desired_effort.as_deref(),
+            );
+            let data = serde_json::json!({
+                "operation": "resume_pr",
+                "transition_id": transition_id,
+                "scope": owner.slice_id,
+                "pr_number": req.resume_pr_number,
+                "head_sha": head_sha,
+                "agent_id": owner.agent_name,
+                "prior_invocation_id": previous.invocation_id,
+                "prior_generation": previous.generation,
+                "from_harness": owner.agent_type.suffix(),
+                "from_model": previous.model,
+                "from_effort": previous.effort,
+                "to_harness": desired_agent_type.suffix(),
+                "to_model": desired_model,
+                "to_effort": desired_effort,
+                "branch": head_branch,
+                "base_branch": pr.base_ref,
+                "worktree": worktree.display().to_string(),
+                "worktree_fingerprint": fingerprint,
+                "authorization_source": "accepted_operator_role_configuration",
+            });
+            let log = self.ctx.event_log().ok_or_else(|| {
+                EffectError::invalid_input(
+                    "configured runtime change is blocked because durable event history is unavailable",
+                )
+            })?;
+            record_configured_route_transition(
+                log,
+                ctx.agent_name.as_ref(),
+                &transition_id,
+                &data,
+            )?;
+        }
         let options = SpawnLeafOptions {
             task: req.task.clone(),
             branch_name: owner.slug.to_string(),
             role: Some(crate::domain::Role::dev()),
-            agent_type: owner.agent_type,
+            agent_type: desired_agent_type,
             claude_flags: ClaudeSpawnFlags::default(),
             standalone_repo: false,
             allowed_dirs: Vec::new(),
@@ -3204,20 +3318,24 @@ impl<
             expected_agent_name: Some(owner.agent_name.clone()),
             invocation_pr_number: Some(req.resume_pr_number),
             recovery_lineage: None,
-            model: non_empty(req.model.clone()),
+            model: desired_model.clone(),
         };
+        let mut options = options;
+        options.recovery_lineage = Some(RecoveryInvocationLineage {
+            prior_invocation_id: previous.invocation_id.clone(),
+            invocation_generation: next_generation,
+            recovery_round: next_recovery_round,
+            authorization_source: RecoveryAuthorization::Reconciler,
+        });
         let options = with_resume_task(options, continuation_prefix.as_deref());
-        let owner_dir = self
-            .ctx
-            .project_dir()
-            .join(".exo/agents")
-            .join(owner.agent_name.as_str());
-        let previous_invocation = read_invocation(&owner_dir).await.effect_err("agent")?;
-        self.ensure_tl_spawn_preflight_for_child(ctx, owner.agent_name.as_str(), &req.intent_id)
-            .await?;
         let result = self
             .service
-            .spawn_leaf_subtree(&options, &ctx.birth_branch)
+            .spawn_leaf_subtree_with_intent_from_worktree(
+                &options,
+                &ctx.birth_branch,
+                Some(&intent_id),
+                &ctx.working_dir,
+            )
             .await
             .effect_err_preserve("agent")?;
         let invocation = read_invocation(&owner_dir)
@@ -3234,6 +3352,19 @@ impl<
             return Err(EffectError::invalid_input(format!(
                 "PR #{} owner is already running invocation {}; resume_pr did not create a fresh invocation",
                 req.resume_pr_number, invocation.invocation_id
+            )));
+        }
+        if invocation.prior_invocation_id.as_deref() != Some(previous.invocation_id.as_str())
+            || invocation.generation != next_generation
+            || invocation.runtime != desired_agent_type
+            || invocation.model.as_deref() != desired_model.as_deref()
+            || invocation.effort.as_deref() != desired_effort.as_deref()
+            || invocation.pr_number != Some(req.resume_pr_number)
+            || invocation.head_sha.as_deref() != Some(head_sha)
+        {
+            return Err(EffectError::invalid_input(format!(
+                "PR #{} resume did not preserve exact publication coordinates on the configured runtime",
+                req.resume_pr_number
             )));
         }
         let target_alive = self.service.routing_liveness(&owner_dir).await == Some(true);
@@ -3269,8 +3400,8 @@ impl<
                 .await;
         }
 
-        let model = invocation.model.clone().or_else(|| owner.model.clone());
-        let effort = invocation.effort.clone().or_else(|| owner.effort.clone());
+        let model = invocation.model.clone();
+        let effort = invocation.effort.clone();
         let topology = format!("{:?}", owner.topology).to_lowercase();
         info!(
             pr_number = req.resume_pr_number,
@@ -3288,7 +3419,7 @@ impl<
                 ctx.agent_name.as_ref(),
                 &serde_json::json!({
                     "child_agent": owner.agent_name,
-                    "agent_type": owner.agent_type.suffix(),
+                    "agent_type": desired_agent_type.suffix(),
                     "branch": head_branch,
                     "spawn_type": "resume_pr",
                     "pr_number": req.resume_pr_number,
@@ -3327,9 +3458,14 @@ impl<
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnLeafSubtreeResponse> {
         validate_blocked_resume_request(req)?;
+        let _resume_guard = resume_reconciliation_lock().lock().await;
         ensure_chainlink_issue_open(self.ctx.project_dir(), req.blocked_issue_id)
             .await
             .map_err(EffectError::invalid_input)?;
+        let desired_route = self.service.configured_runtime_route("dev");
+        let desired_agent_type = desired_route.agent_type;
+        let desired_model = desired_route.model.clone();
+        let desired_effort = desired_route.effort.clone();
 
         let records = self.ctx.agent_resolver().all().await;
         let mut owners = Vec::new();
@@ -3422,14 +3558,33 @@ impl<
                 )
             })?;
         if invocation.invocation_id != req.expected_invocation_id {
-            return Err(EffectError::invalid_input(format!(
-                "blocked owner invocation changed: expected {}, found {}",
-                req.expected_invocation_id, invocation.invocation_id
-            )));
+            let intent_id = blocked_resume_intent_id(
+                owner,
+                req.blocked_issue_id,
+                &req.expected_invocation_id,
+                &req.expected_branch,
+                &req.expected_worktree_fingerprint,
+            );
+            return self
+                .adopt_blocked_resume_successor(BlockedResumeAdoption {
+                    owner,
+                    owner_dir,
+                    request: req,
+                    invocation: &invocation,
+                    route: &desired_route,
+                    intent_id: &intent_id,
+                    context: ctx,
+                })
+                .await;
         }
         if invocation.is_live() {
             return Err(EffectError::invalid_input(
                 "blocked owner invocation is still live; refusing duplicate resume",
+            ));
+        }
+        if !invocation_has_terminal_outcome(&invocation) {
+            return Err(EffectError::invalid_input(
+                "blocked owner invocation outcome is unresolved; reconcile its lifecycle before changing runtime configuration",
             ));
         }
         if invocation.pr_number.is_some() {
@@ -3468,6 +3623,64 @@ impl<
             ));
         }
 
+        let intent_id = blocked_resume_intent_id(
+            owner,
+            req.blocked_issue_id,
+            &invocation.invocation_id,
+            &req.expected_branch,
+            &fingerprint,
+        );
+        let next_generation = invocation.generation.checked_add(1).ok_or_else(|| {
+            EffectError::invalid_input("blocked owner invocation generation is exhausted")
+        })?;
+        let next_recovery_round = invocation.recovery_round.checked_add(1).ok_or_else(|| {
+            EffectError::invalid_input("blocked owner recovery round is exhausted")
+        })?;
+        if configured_route_changed(
+            &invocation,
+            owner,
+            desired_agent_type,
+            desired_model.as_deref(),
+            desired_effort.as_deref(),
+        ) {
+            let transition_id = configured_route_transition_id(
+                &intent_id,
+                desired_agent_type,
+                desired_model.as_deref(),
+                desired_effort.as_deref(),
+            );
+            let data = serde_json::json!({
+                "operation": "resume_blocked_leaf",
+                "transition_id": transition_id,
+                "scope": owner.slice_id,
+                "chainlink_issue_id": req.blocked_issue_id,
+                "agent_id": owner.agent_name,
+                "prior_invocation_id": invocation.invocation_id,
+                "prior_generation": invocation.generation,
+                "from_harness": owner.agent_type.suffix(),
+                "from_model": invocation.model,
+                "from_effort": invocation.effort,
+                "to_harness": desired_agent_type.suffix(),
+                "to_model": desired_model,
+                "to_effort": desired_effort,
+                "branch": req.expected_branch,
+                "worktree": worktree.display().to_string(),
+                "worktree_fingerprint": fingerprint,
+                "authorization_source": "accepted_operator_role_configuration",
+            });
+            let log = self.ctx.event_log().ok_or_else(|| {
+                EffectError::invalid_input(
+                    "configured runtime change is blocked because durable event history is unavailable",
+                )
+            })?;
+            record_configured_route_transition(
+                log,
+                ctx.agent_name.as_ref(),
+                &transition_id,
+                &data,
+            )?;
+        }
+
         let options = SpawnLeafOptions {
             task: format!(
                 "{}\n\nResume the existing parked assignment for Chainlink issue #{}. Preserve the current branch and worktree; do not create a new owner or PR until the task is complete.",
@@ -3476,7 +3689,7 @@ impl<
             ),
             branch_name: owner.slug.to_string(),
             role: Some(crate::domain::Role::dev()),
-            agent_type: owner.agent_type,
+            agent_type: desired_agent_type,
             claude_flags: ClaudeSpawnFlags::default(),
             standalone_repo: false,
             allowed_dirs: Vec::new(),
@@ -3486,17 +3699,22 @@ impl<
             invocation_pr_number: None,
             recovery_lineage: Some(RecoveryInvocationLineage {
                 prior_invocation_id: invocation.invocation_id.clone(),
-                invocation_generation: invocation.generation.saturating_add(1),
-                recovery_round: invocation.recovery_round.saturating_add(1),
+                invocation_generation: next_generation,
+                recovery_round: next_recovery_round,
                 authorization_source: RecoveryAuthorization::HumanApproved,
             }),
-            model: owner.model.clone(),
+            model: desired_model.clone(),
         };
         self.ensure_tl_spawn_preflight_for_child(ctx, owner.agent_name.as_str(), &req.intent_id)
             .await?;
         let result = self
             .service
-            .spawn_leaf_subtree(&options, &ctx.birth_branch)
+            .spawn_leaf_subtree_with_intent_from_worktree(
+                &options,
+                &ctx.birth_branch,
+                Some(&intent_id),
+                &ctx.working_dir,
+            )
             .await
             .effect_err_preserve("agent")?;
         let fresh_invocation = read_invocation(owner_dir)
@@ -3509,6 +3727,43 @@ impl<
         {
             return Err(EffectError::invalid_input(
                 "blocked resume did not start a fresh live invocation",
+            ));
+        }
+        if fresh_invocation.prior_invocation_id.as_deref()
+            != Some(invocation.invocation_id.as_str())
+            || fresh_invocation.generation != next_generation
+            || fresh_invocation.trigger
+                != crate::services::agent_control::InvocationTrigger::ResumeBlocked
+            || fresh_invocation.runtime != desired_agent_type
+            || fresh_invocation.model.as_deref() != desired_model.as_deref()
+            || fresh_invocation.effort.as_deref() != desired_effort.as_deref()
+            || fresh_invocation.branch.as_deref() != Some(req.expected_branch.as_str())
+            || fresh_invocation.worktree.as_deref()
+                != Some(owner.working_dir.to_string_lossy().as_ref())
+        {
+            return Err(EffectError::invalid_input(
+                "blocked resume invocation does not match the configured route or preserved owner coordinates",
+            ));
+        }
+        let updated_owner = self
+            .ctx
+            .agent_resolver()
+            .get(&owner.agent_name)
+            .await
+            .ok_or_else(|| {
+                EffectError::invalid_input("blocked resume did not persist current owner metadata")
+            })?;
+        if updated_owner.agent_type != desired_agent_type
+            || updated_owner.model.as_deref() != desired_model.as_deref()
+            || updated_owner.effort.as_deref() != desired_effort.as_deref()
+            || updated_owner.birth_branch != owner.birth_branch
+            || updated_owner.parent_branch != owner.parent_branch
+            || updated_owner.working_dir != owner.working_dir
+            || updated_owner.slice_id != owner.slice_id
+            || updated_owner.ledger_owned != owner.ledger_owned
+        {
+            return Err(EffectError::invalid_input(
+                "blocked resume changed the configured runtime without preserving the logical owner binding",
             ));
         }
         let target_alive = self.service.routing_liveness(owner_dir).await == Some(true);
@@ -3533,7 +3788,9 @@ impl<
                 ctx.agent_name.as_ref(),
                 &serde_json::json!({
                     "child_agent": owner.agent_name,
-                    "agent_type": owner.agent_type.suffix(),
+                    "agent_type": desired_agent_type.suffix(),
+                    "model": fresh_invocation.model,
+                    "effort": fresh_invocation.effort,
                     "branch": owner.birth_branch,
                     "spawn_type": "resume_blocked",
                     "chainlink_issue_id": req.blocked_issue_id,
@@ -3550,6 +3807,154 @@ impl<
             invocation: Some(invocation_handoff),
         })
     }
+
+    async fn adopt_blocked_resume_successor(
+        &self,
+        adoption: BlockedResumeAdoption<'_>,
+    ) -> EffectResult<SpawnLeafSubtreeResponse> {
+        let BlockedResumeAdoption {
+            owner,
+            owner_dir,
+            request: req,
+            invocation,
+            route,
+            intent_id,
+            context: ctx,
+        } = adoption;
+        let desired_agent_type = route.agent_type;
+        let desired_model = route.model.as_deref();
+        let desired_effort = route.effort.as_deref();
+        let linked =
+            invocation.prior_invocation_id.as_deref() == Some(req.expected_invocation_id.as_str());
+        let route_matches = invocation.runtime == desired_agent_type
+            && invocation.model.as_deref() == desired_model
+            && invocation.effort.as_deref() == desired_effort;
+        let execution_matches = invocation.is_live()
+            && invocation.trigger
+                == crate::services::agent_control::InvocationTrigger::ResumeBlocked
+            && invocation.pr_number.is_none()
+            && invocation.head_sha.is_none()
+            && invocation.branch.as_deref() == Some(req.expected_branch.as_str())
+            && invocation.worktree.as_deref() == Some(owner.working_dir.to_string_lossy().as_ref());
+        if !linked || !route_matches || !execution_matches {
+            return Err(EffectError::invalid_input(format!(
+                "blocked resume response cannot be reconciled: current invocation {} is not the configured successor of {}",
+                invocation.invocation_id, req.expected_invocation_id
+            )));
+        }
+        if owner.birth_branch.as_str() != req.expected_branch {
+            return Err(EffectError::invalid_input(
+                "blocked resume successor has a conflicting owner branch",
+            ));
+        }
+        let persisted_intent = fs::read_to_string(owner_dir.join("dispatch_intent"))
+            .await
+            .map_err(|error| {
+                EffectError::invalid_input(format!(
+                    "blocked resume successor intent is unavailable: {error}"
+                ))
+            })?;
+        if persisted_intent.trim() != intent_id {
+            return Err(EffectError::invalid_input(
+                "blocked resume successor is not bound to this durable dispatch intent",
+            ));
+        }
+        let worktree = resolve_owner_worktree(self.ctx.project_dir(), owner)?;
+        let actual_branch = git_current_branch(&worktree).await?;
+        if actual_branch != req.expected_branch {
+            return Err(EffectError::invalid_input(format!(
+                "blocked resume successor worktree branch changed: expected {}, found {}",
+                req.expected_branch, actual_branch
+            )));
+        }
+        let routing = crate::domain::RoutingInfo::read_from_dir(owner_dir)
+            .await
+            .map_err(|error| {
+                EffectError::invalid_input(format!(
+                    "blocked resume successor routing is unavailable: {error}"
+                ))
+            })?;
+        if !routing.has_ownership_proof()
+            || routing.owner_agent_id.as_deref() != Some(owner.agent_name.as_str())
+            || routing.owner_invocation_id.as_deref() != Some(invocation.invocation_id.as_str())
+            || routing.owner_generation != Some(invocation.generation)
+        {
+            return Err(EffectError::invalid_input(
+                "blocked resume successor routing ownership is incomplete or conflicting",
+            ));
+        }
+        if self.service.routing_liveness(owner_dir).await != Some(true) {
+            return Err(EffectError::invalid_input(
+                "blocked resume successor target is not authoritatively live",
+            ));
+        }
+        self.reconcile_owner_runtime_metadata(
+            owner,
+            desired_agent_type,
+            desired_model,
+            desired_effort,
+        )
+        .await?;
+
+        let result = crate::services::agent_control::SpawnResult {
+            agent_dir: owner_dir.to_path_buf(),
+            worktree_path: worktree,
+            branch_name: req.expected_branch.clone(),
+            agent_name: owner.agent_name.clone(),
+            issue_title: owner.slug.to_string(),
+            agent_type: desired_agent_type,
+            pane_id: invocation
+                .routing
+                .window_id
+                .as_ref()
+                .map(ToString::to_string),
+        };
+        let mut agent_info = leaf_subtree_result_to_proto(owner.slug.as_str(), &result)?;
+        agent_info.alive = true;
+        agent_info.is_alive = true;
+        self.register_child_supervisor(agent_info.id.as_str(), ctx)
+            .await;
+        let invocation_handoff = invocation_handoff_to_proto(
+            invocation,
+            &result.branch_name,
+            false,
+            true,
+            "adopted_after_response_loss",
+        );
+        Ok(SpawnLeafSubtreeResponse {
+            agent: Some(agent_info),
+            invocation: Some(invocation_handoff),
+        })
+    }
+
+    async fn reconcile_owner_runtime_metadata(
+        &self,
+        owner: &AgentIdentityRecord,
+        agent_type: ServiceAgentType,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> EffectResult<()> {
+        if owner.agent_type == agent_type
+            && owner.model.as_deref() == model
+            && owner.effort.as_deref() == effort
+        {
+            return Ok(());
+        }
+        let mut updated = owner.clone();
+        updated.agent_type = agent_type;
+        updated.model = model.map(str::to_owned);
+        updated.effort = effort.map(str::to_owned);
+        self.ctx
+            .agent_resolver()
+            .register(updated)
+            .await
+            .map_err(|error| {
+                EffectError::invalid_input(format!(
+                    "configured runtime ownership could not be reconciled: {error}"
+                ))
+            })
+    }
+
     async fn reject_orphan_pr_spawn(&self, req: &SpawnLeafSubtreeRequest) -> EffectResult<()> {
         let Some(pr_number) = referenced_pr_number(&req.task) else {
             return Ok(());
@@ -3750,6 +4155,99 @@ async fn worktree_fingerprint(worktree: &Path) -> EffectResult<String> {
         ));
     }
     Ok(format!("sha256:{:x}", Sha256::digest(&output.stdout)))
+}
+
+fn resume_reconciliation_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn blocked_resume_intent_id(
+    owner: &AgentIdentityRecord,
+    issue_id: u64,
+    prior_invocation_id: &str,
+    branch: &str,
+    fingerprint: &str,
+) -> String {
+    let input = format!(
+        "blocked-resume-v1\0{}\0{issue_id}\0{prior_invocation_id}\0{branch}\0{}\0{fingerprint}",
+        owner.agent_name,
+        owner.working_dir.display()
+    );
+    format!("blocked-resume:{:x}", Sha256::digest(input.as_bytes()))
+}
+
+fn configured_route_transition_id(
+    intent_id: &str,
+    agent_type: ServiceAgentType,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> String {
+    let input = format!(
+        "configured-route-v1\0{intent_id}\0{}\0{}\0{}",
+        agent_type.suffix(),
+        model.unwrap_or_default(),
+        effort.unwrap_or_default()
+    );
+    format!("runtime-route:{:x}", Sha256::digest(input.as_bytes()))
+}
+
+fn configured_route_changed(
+    invocation: &InvocationRecord,
+    owner: &AgentIdentityRecord,
+    agent_type: ServiceAgentType,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> bool {
+    invocation.runtime != agent_type
+        || invocation.model.as_deref() != model
+        || invocation.effort.as_deref() != effort
+        || owner.agent_type != agent_type
+        || owner.model.as_deref() != model
+        || owner.effort.as_deref() != effort
+}
+
+fn invocation_has_terminal_outcome(invocation: &InvocationRecord) -> bool {
+    invocation.ended_at.is_some()
+        && matches!(
+            invocation.status,
+            InvocationStatus::Exited
+                | InvocationStatus::Failed
+                | InvocationStatus::Killed
+                | InvocationStatus::TimedOut
+        )
+}
+
+fn record_configured_route_transition(
+    log: &crate::services::EventLog,
+    actor: &str,
+    transition_id: &str,
+    data: &serde_json::Value,
+) -> EffectResult<()> {
+    let records = log.ledger().read_events().map_err(|error| {
+        EffectError::invalid_input(format!("cannot verify runtime-route history: {error}"))
+    })?;
+    if let Some(existing) = records.iter().find(|record| {
+        record.event.event_type == "agent.harness_switch"
+            && record
+                .event
+                .data
+                .get("transition_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(transition_id)
+    }) {
+        if existing.event.data != *data {
+            return Err(EffectError::invalid_input(
+                "runtime-route transition identity conflicts with its durable audit record",
+            ));
+        }
+        return Ok(());
+    }
+    log.append("agent.harness_switch", actor, data)
+        .map_err(|error| {
+            EffectError::invalid_input(format!("cannot persist runtime-route transition: {error}"))
+        })?;
+    Ok(())
 }
 
 fn with_resume_task(options: SpawnLeafOptions, prefix: Option<&str>) -> SpawnLeafOptions {
@@ -6226,6 +6724,128 @@ mod tests {
         assert!(!invocation_is_fresh(Some(&same_generation), &current));
         assert!(invocation_is_fresh(Some(&previous), &current));
         assert!(invocation_is_fresh(None, &current));
+    }
+
+    #[test]
+    fn configured_route_change_tracks_harness_model_effort_and_noop() {
+        let owner = AgentIdentityRecord {
+            agent_name: AgentName::try_from_str("issue-814-opencode").unwrap(),
+            slug: Slug::try_from_str("issue-814").unwrap(),
+            agent_type: ServiceAgentType::OpenCode,
+            birth_branch: BirthBranch::try_from_str("main.kani.issue-814-opencode").unwrap(),
+            parent_branch: BirthBranch::try_from_str("main.kani").unwrap(),
+            working_dir: PathBuf::from(".exo/worktrees/issue-814-opencode"),
+            display_name: "issue-814".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: Some("opencode-go/deepseek-v4.1-flash".to_string()),
+            effort: Some("high".to_string()),
+            ledger_owned: true,
+            slice_id: Some("issue-814".to_string()),
+        };
+        let invocation = InvocationRecord {
+            invocation_id: "old-invocation".to_string(),
+            runtime: ServiceAgentType::OpenCode,
+            trigger: InvocationTrigger::Spawn,
+            mode: crate::services::agent_control::InvocationMode::OneShot,
+            routing: RoutingInfo::window(
+                crate::services::tmux_ipc::WindowId::parse("@42").unwrap(),
+            ),
+            started_at: 1,
+            ended_at: Some(2),
+            status: InvocationStatus::Failed,
+            exit_code: Some(1),
+            pr_number: None,
+            head_sha: None,
+            model: owner.model.clone(),
+            effort: owner.effort.clone(),
+            prior_invocation_id: None,
+            recovery_round: 0,
+            authorization_source: None,
+            generation: 1,
+            runtime_agent_id: Some(owner.agent_name.to_string()),
+            slice_id: owner.slice_id.clone(),
+            branch: Some(owner.birth_branch.to_string()),
+            worktree: Some(owner.working_dir.display().to_string()),
+            exit_reason: None,
+            exit_classification: None,
+            stderr_tail: None,
+        };
+
+        assert!(configured_route_changed(
+            &invocation,
+            &owner,
+            ServiceAgentType::Codex,
+            Some("gpt-6-luna"),
+            Some("xhigh"),
+        ));
+        assert!(configured_route_changed(
+            &invocation,
+            &owner,
+            ServiceAgentType::OpenCode,
+            Some("opencode-go/deepseek-v4.1-flash"),
+            Some("medium"),
+        ));
+        let mut current = owner.clone();
+        current.agent_type = ServiceAgentType::Codex;
+        current.model = Some("gpt-6-luna".to_string());
+        current.effort = Some("xhigh".to_string());
+        let mut current_invocation = invocation;
+        current_invocation.runtime = ServiceAgentType::Codex;
+        current_invocation.model = current.model.clone();
+        current_invocation.effort = current.effort.clone();
+        assert!(!configured_route_changed(
+            &current_invocation,
+            &current,
+            ServiceAgentType::Codex,
+            Some("gpt-6-luna"),
+            Some("xhigh"),
+        ));
+    }
+
+    #[test]
+    fn configured_route_transition_audit_is_idempotent_and_conflict_checked() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = crate::services::EventLog::open(temp.path().join(".exo/logs")).unwrap();
+        let data = serde_json::json!({
+            "operation": "resume_blocked_leaf",
+            "transition_id": "runtime-route:stable",
+            "prior_invocation_id": "old-invocation",
+            "from_harness": "opencode",
+            "to_harness": "codex",
+            "to_model": "gpt-6-luna",
+            "to_effort": "xhigh",
+            "authorization_source": "accepted_operator_role_configuration"
+        });
+
+        record_configured_route_transition(&log, "root", "runtime-route:stable", &data).unwrap();
+        record_configured_route_transition(&log, "root", "runtime-route:stable", &data).unwrap();
+        assert_eq!(
+            log.ledger()
+                .read_events()
+                .unwrap()
+                .iter()
+                .filter(|record| record.event.event_type == "agent.harness_switch")
+                .count(),
+            1
+        );
+
+        let conflicting = serde_json::json!({
+            "operation": "resume_blocked_leaf",
+            "transition_id": "runtime-route:stable",
+            "prior_invocation_id": "foreign-invocation",
+            "from_harness": "opencode",
+            "to_harness": "codex",
+            "to_model": "gpt-6-luna",
+            "to_effort": "xhigh",
+            "authorization_source": "accepted_operator_role_configuration"
+        });
+        assert!(record_configured_route_transition(
+            &log,
+            "root",
+            "runtime-route:stable",
+            &conflicting
+        )
+        .is_err());
     }
 
     #[test]

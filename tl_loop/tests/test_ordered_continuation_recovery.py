@@ -43,6 +43,9 @@ from tl_loop.loop.driver import (
 )
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.ordered import IntegrationLifecycle
+from tl_loop.select.capability import CapabilityMap
+from tl_loop.select.classify import Difficulty
+from tl_loop.select.policy import validate_policy
 from tl_loop.state.schema import (
     BudgetLedger,
     GateStatus,
@@ -1054,11 +1057,16 @@ def _legacy_dirty_preflight_failure(
     structured_response: bool = False,
     journal_child_name: str = "leaf",
     wrapped_trailer: str = "",
+    requested_harness: str | None = None,
 ) -> tuple[RunStore, WorkPlan, TLLoopConfig, RunStore]:
     """Build the retained dirty-preflight failure with its exact rejected intent."""
     child_plan = WorkPlan(
         leaves=(
-            LeafTask("leaf", "implement the child change"),
+            LeafTask(
+                "leaf",
+                "implement the child change",
+                agent_type=requested_harness,
+            ),
             *((LeafTask("sibling", "implement sibling work"),) if active_sibling else ()),
         )
     )
@@ -1151,11 +1159,7 @@ def _legacy_dirty_preflight_failure(
             False,
             None,
             rejected,
-            (
-                "agent.spawn_precondition.dirty_worktree"
-                if structured_response
-                else "agent_error"
-            ),
+            ("agent.spawn_precondition.dirty_worktree" if structured_response else "agent_error"),
         )
     )
     journal.mark_result(leaf_intent, journal_result)
@@ -1166,11 +1170,7 @@ def _legacy_dirty_preflight_failure(
         "leaf",
         attempt,
         rejected,
-        (
-            "agent.spawn_precondition.dirty_worktree"
-            if structured_response
-            else "agent_error"
-        ),
+        ("agent.spawn_precondition.dirty_worktree" if structured_response else "agent_error"),
         replace(config, active=False, run_id="child", root_dir=parent_store.run_dir),
         effects,
         journal,
@@ -1328,9 +1328,7 @@ def test_exact_historical_raw_spawn_refusal_with_null_error_kind_recovers(
     assert decision.recoverable is True
     child_plan = plan.sub_tls[0].plan
     assert isinstance(child_plan, WorkPlan)
-    journal_before = EffectJournal(
-        "child", child_store.run_dir / "action-journal.json"
-    ).snapshot()
+    journal_before = EffectJournal("child", child_store.run_dir / "action-journal.json").snapshot()
     reopened = driver._reopen_ordered_scope(
         child_store.load(),
         child_plan,
@@ -1431,9 +1429,7 @@ def test_rejected_spawn_journal_must_name_the_failed_child(tmp_path: Path) -> No
     failed_leaf = child_store.load().slices["leaf"]
 
     assert (
-        driver._rejected_spawn_journal_entry(
-            child_store, "leaf", failed_leaf.dispatch_intent_id
-        )
+        driver._rejected_spawn_journal_entry(child_store, "leaf", failed_leaf.dispatch_intent_id)
         is None
     )
     decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
@@ -1458,9 +1454,7 @@ def test_raw_legacy_refusal_requires_its_explicit_null_kind_envelope(
     raw_result.pop("error_kind")
 
     assert (
-        driver._journal_result_dirty_preflight_format(
-            {**entry, "result": raw_result}, slice_state
-        )
+        driver._journal_result_dirty_preflight_format({**entry, "result": raw_result}, slice_state)
         is None
     )
 
@@ -1634,6 +1628,92 @@ def test_recovered_dirty_refusal_dispatches_once_and_replay_does_not_duplicate(
 
     assert second.slices["leaf"].attempts == 2
     assert len(transport.spawn_calls) == 1
+
+
+def test_proven_preexecution_retry_uses_current_role_route_and_keeps_plan_request(
+    tmp_path: Path,
+) -> None:
+    historical_request = "opencode/opencode-go/deepseek-v4.1-flash"
+    parent_store, plan, config, child_store = _legacy_dirty_preflight_failure(
+        tmp_path,
+        raw_legacy_response=True,
+        requested_harness=historical_request,
+    )
+    decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
+    assert decision is not None and decision.recoverable
+    task = plan.sub_tls[0]
+    child_plan = task.plan
+    assert isinstance(child_plan, WorkPlan)
+    reopened = _reopen_ordered_scope(
+        child_store.load(),
+        child_plan,
+        child_store,
+        None,
+        retry_dispatch_slice="leaf",
+    )
+    assert reopened.slices["leaf"].dispatch_uses_current_role_configuration
+    assert reopened.slices["leaf"].requested_harness == historical_request
+
+    route = "codex/gpt-6-luna"
+    role = {
+        "allow": [route],
+        "cost_rank": {route: 1},
+        "token_budget": 10000,
+        "per_harness_budget": {route: 10000},
+        "escalate_after_attempts": 1,
+    }
+    policy = validate_policy({"roles": {"tl": role, "worker": role, "reviewer": role}})
+    capabilities = CapabilityMap({route: Difficulty.HARD})
+    child_worktree = str(_sub_tl_worktree(config, parent_store.root_dir, "parent", task))
+    child_config = replace(
+        _child_config(
+            config,
+            task,
+            EmptyQueue(),
+            None,
+            parent_store,
+            "main.child",
+            child_worktree,
+            ordered_recovery=True,
+        ),
+        active=False,
+        project_root=tmp_path,
+        keep_alive_on_waiting=False,
+        policy=policy,
+        capabilities=capabilities,
+    )
+    assert (
+        driver.select_agent_type(
+            reopened.slices["leaf"],
+            child_config.role,
+            reopened.budgets,
+            policy,
+            capabilities,
+            requested_harness=historical_request,
+        )
+        is None
+    )
+
+    effects = EffectClient(_RetryDispatchTransport())
+    intent = driver._prepare_spawn(
+        "leaf",
+        reopened,
+        child_config,
+        effects,
+        child_store,
+        [],
+    )
+    persisted = child_store.load().slices["leaf"]
+
+    assert intent.agent_type == "codex"
+    assert intent.harness == route
+    assert intent.model == "gpt-6-luna"
+    assert intent.requested_harness == historical_request
+    assert intent.route_reconciliation_source == "proven_preexecution_retry"
+    assert persisted.requested_harness == historical_request
+    assert persisted.resolved_harness == route
+    assert persisted.model == "gpt-6-luna"
+    assert persisted.dispatch_uses_current_role_configuration
 
 
 def test_child_config_declares_parent_manifest_for_recovery(tmp_path: Path) -> None:

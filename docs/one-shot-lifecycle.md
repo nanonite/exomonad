@@ -22,6 +22,24 @@ Routing uses the current `routing.json` target and rejects stale or unverifiable
 targets. It never redirects a stale message to the root pane. When there is no
 live invocation, the durable inbox row remains unread for the next `resume_pr`.
 
+## Configured route changes on continuation
+
+Worker and reviewer harness, model, and effort settings describe the route for
+the next invocation. A dormant failed assignment can use the current worker
+route through the supported blocked-work or exact-PR resume path while keeping
+its logical owner name, issue, branch, worktree, and historical invocation
+records. The transition is recorded in the event ledger before launch; the new
+invocation records the selected route and links to its predecessor. Historical
+invocation metadata is not rewritten.
+
+An active or unresolved invocation is not replaced. Continuation reports a
+specific blocker until its exact lifecycle outcome is known. A published PR
+resume still validates its owner, repository, branch, base, PR number, and exact
+current head before launching. A reviewer spawned after a route change uses the
+configured reviewer route and remains bound to the PR head being reviewed.
+When the route is already current, route reconciliation does not emit another
+transition or restart an otherwise active invocation.
+
 ## Lifecycle telemetry
 
 The host emits `agent.invocation.started`, `agent.invocation.finished`, and

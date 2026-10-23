@@ -59,6 +59,27 @@ pub(crate) fn resolve_scaffold_harness(env: EnvLookup<'_>) -> Result<String> {
     Ok(format!("{HARNESS_AGENT_TYPE}/{model}"))
 }
 
+/// Resolve the model a spawned Codex worker should request at runtime.
+///
+/// Runtime permits a missing model so Codex can use its own default, but when
+/// an override or host config supplies one it is returned for invocation
+/// metadata and an explicit `--model` argument.
+pub(crate) fn configured_model() -> Result<Option<String>> {
+    let environment = |name: &str| std::env::var(name).ok();
+    configured_model_from(&environment)
+}
+
+fn configured_model_from(env: EnvLookup<'_>) -> Result<Option<String>> {
+    let model = match non_blank(env(CODEX_MODEL_ENV)) {
+        Some(model) => Some(model),
+        None => host_config_model_optional(&host_config_path(env))?,
+    };
+    if let Some(model) = model.as_deref() {
+        reject_unrunnable_model(model)?;
+    }
+    Ok(model)
+}
+
 /// Refuse a model the account is known to reject.
 ///
 /// This is a guard against re-introducing the rejected scaffold default, not a
@@ -115,6 +136,26 @@ fn host_config_model(path: &std::path::Path) -> Result<String> {
                 path.display()
             )
         })
+}
+
+fn host_config_model_optional(path: &std::path::Path) -> Result<Option<String>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot read Codex config at {}", path.display()))
+        }
+    };
+    let document = toml::from_str::<toml::Value>(&text)
+        .with_context(|| format!("cannot parse the host Codex config at {}", path.display()))?;
+    let model = document
+        .get("model")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string);
+    Ok(model)
 }
 
 /// An owned, trimmed string, or `None` when the value is absent or blank.
@@ -175,6 +216,19 @@ mod tests {
         assert_eq!(
             resolve_scaffold_harness(&host.env()).unwrap(),
             format!("codex/{SUPPORTED}")
+        );
+    }
+
+    #[test]
+    fn runtime_model_uses_codex_override_or_host_config() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "model = \"gpt-6-luna\"\n").unwrap();
+        let home_path = home.path().display().to_string();
+        let environment = HashMap::from([(CODEX_HOME_ENV.to_string(), home_path)]);
+        let lookup = |name: &str| environment.get(name).cloned();
+        assert_eq!(
+            configured_model_from(&lookup).unwrap().as_deref(),
+            Some("gpt-6-luna")
         );
     }
 

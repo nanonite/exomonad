@@ -956,6 +956,13 @@ pub struct SpawnLeafOptions {
     pub recovery_lineage: Option<RecoveryInvocationLineage>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfiguredRuntimeRoute {
+    pub agent_type: AgentType,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
 /// Result of spawning an agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SpawnResult {
@@ -1363,6 +1370,19 @@ impl<
             .filter(|effort| !effort.trim().is_empty())
             .map(str::to_string)
             .or_else(|| self.effort_for_role(role).map(str::to_string))
+    }
+
+    pub(crate) fn configured_runtime_route(&self, role: &str) -> ConfiguredRuntimeRoute {
+        let agent_type = if role == "reviewer" {
+            self.reviewer_agent_type
+        } else {
+            self.spawn_agent_type
+        };
+        ConfiguredRuntimeRoute {
+            agent_type,
+            model: self.effective_model_for(agent_type, role, None),
+            effort: self.effective_effort_for(role, None),
+        }
     }
 
     /// Set the agent type for the reviewer.
@@ -2495,6 +2515,35 @@ mod tests {
                 .effective_model_for(AgentType::OpenCode, "dev", Some("   "))
                 .as_deref(),
             Some("config-default-model")
+        );
+    }
+
+    #[test]
+    fn configured_runtime_routes_resolve_harness_model_and_effort_by_role() {
+        let services = crate::services::Services::test();
+        let service = AgentControlService::new(Arc::new(services))
+            .with_spawn_agent_type(AgentType::Codex)
+            .with_spawn_agent_model(Some("gpt-6-luna".to_string()))
+            .with_spawn_agent_effort(Some("xhigh".to_string()))
+            .with_reviewer_agent_type(AgentType::Codex)
+            .with_reviewer_model(Some("gpt-6.1-sol".to_string()))
+            .with_reviewer_effort(Some("medium".to_string()));
+
+        assert_eq!(
+            service.configured_runtime_route("dev"),
+            ConfiguredRuntimeRoute {
+                agent_type: AgentType::Codex,
+                model: Some("gpt-6-luna".to_string()),
+                effort: Some("xhigh".to_string()),
+            }
+        );
+        assert_eq!(
+            service.configured_runtime_route("reviewer"),
+            ConfiguredRuntimeRoute {
+                agent_type: AgentType::Codex,
+                model: Some("gpt-6.1-sol".to_string()),
+                effort: Some("medium".to_string()),
+            }
         );
     }
 

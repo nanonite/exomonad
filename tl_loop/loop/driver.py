@@ -843,6 +843,8 @@ class DispatchAttempt:
     #: The harness identifier the plan requested, carried so a dispatch record
     #: can name both the request and the route it resolved to.
     requested_harness: str | None = None
+    #: Authorized reason a retry may use the current role policy instead.
+    route_reconciliation_source: str | None = None
     attempt: int = 0
     controller_epoch: str | None = None
     #: The per-slice dispatch attempt counter under the current controller epoch.
@@ -868,6 +870,7 @@ class DispatchAttempt:
         agent_type: str,
         model: str | None,
         requested_harness: str | None = None,
+        route_reconciliation_source: str | None = None,
     ) -> DispatchAttempt:
         """Return this attempt with the selected harness route attached.
 
@@ -887,6 +890,9 @@ class DispatchAttempt:
             agent_type=agent_type,
             model=model,
             requested_harness=self.requested_harness or requested_harness,
+            route_reconciliation_source=(
+                self.route_reconciliation_source or route_reconciliation_source
+            ),
         )
 
     @classmethod
@@ -926,6 +932,11 @@ class DispatchAttempt:
             agent_type=slice_state.agent_type or "",
             model=slice_state.model,
             requested_harness=slice_state.requested_harness,
+            route_reconciliation_source=(
+                "proven_preexecution_retry"
+                if slice_state.dispatch_uses_current_role_configuration
+                else None
+            ),
             attempt=max(1, slice_state.attempts),
             controller_epoch=controller_epoch,
             dispatch_generation=slice_state.dispatch_generation,
@@ -3328,6 +3339,7 @@ def _reopen_ordered_scope(
             slice_transition(rejected, SliceStatusChanged(SliceStatus.PENDING)),
             park_cause=None,
             dispatch_last_boundary="preexecution_retry_authorized",
+            dispatch_uses_current_role_configuration=True,
         )
         if any(
             gate.name == rejection.gate_name and gate.status is GateStatus.PENDING
@@ -13624,6 +13636,8 @@ def _dispatch_payload(
         payload["agent_type"] = attempt.agent_type
     if attempt.requested_harness:
         payload["requested_harness"] = attempt.requested_harness
+    if attempt.route_reconciliation_source is not None:
+        payload["route_reconciliation_source"] = attempt.route_reconciliation_source
     if attempt.model:
         payload["model"] = attempt.model
     return payload
@@ -13931,7 +13945,11 @@ def _recovered_spawn_choice(
             config.policy,
             capabilities,
             config.learned_policy,
-            requested_harness=current.requested_harness,
+            requested_harness=(
+                None
+                if current.dispatch_uses_current_role_configuration
+                else current.requested_harness
+            ),
         )
     except (OSError, ValueError):
         return None, "spawn_confirmation_policy_or_capability_unavailable"
@@ -22075,6 +22093,13 @@ def _prepare_spawn(
         current = state.slices.get(name)
         if current is None:
             raise TLLoopError(f"dispatch slice {name!r} is missing from run state")
+        if (
+            current.dispatch_uses_current_role_configuration
+            and current.requested_harness is not None
+        ):
+            raise TLLoopError(
+                "pre-execution retry requires the current validated role policy; refusing to reuse the historical harness request"
+            )
         direct = _resolve_direct_request(current.requested_harness)
         if direct is not None:
             intent = intent.routed(
@@ -22115,7 +22140,11 @@ def _prepare_spawn(
     if slice_state is None:
         raise TLLoopError(f"selector slice {name!r} is missing from run state")
     capabilities = config.capabilities or load_capability()
-    requested = slice_state.requested_harness
+    requested = (
+        None
+        if slice_state.dispatch_uses_current_role_configuration
+        else slice_state.requested_harness
+    )
     choice = select_agent_type(
         slice_state,
         config.role,
@@ -22172,7 +22201,12 @@ def _prepare_spawn(
         harness=choice.harness,
         agent_type=route.agent_type,
         model=model_id,
-        requested_harness=requested,
+        requested_harness=slice_state.requested_harness,
+        route_reconciliation_source=(
+            "proven_preexecution_retry"
+            if slice_state.dispatch_uses_current_role_configuration
+            else None
+        ),
     )
 
     def record_spawn(document: dict[str, object]) -> dict[str, object]:

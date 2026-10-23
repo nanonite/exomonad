@@ -1957,7 +1957,13 @@ Run `exomonad recompile` first to build it.",
     agent_control = agent_control.with_tmux_session(config.tmux_session.clone());
     agent_control = agent_control.with_yolo(config.yolo);
     agent_control = agent_control.with_spawn_agent_type(config.spawn_agent_type);
-    agent_control = agent_control.with_spawn_agent_model(config.opencode.worker_model.clone());
+    let worker_model = match config.spawn_agent_type {
+        exomonad_core::services::agent_control::AgentType::Codex => {
+            crate::codex_model::configured_model()?
+        }
+        _ => config.opencode.worker_model.clone(),
+    };
+    agent_control = agent_control.with_spawn_agent_model(worker_model);
     agent_control =
         agent_control.with_spawn_agent_effort(Some(config.worker_effort_level.level.to_string()));
     agent_control =

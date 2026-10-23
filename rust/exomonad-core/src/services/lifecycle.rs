@@ -520,7 +520,9 @@ fn agent_dir_candidates(agent_key: &str) -> Vec<String> {
 fn role_for_trigger(trigger: InvocationTrigger) -> &'static str {
     match trigger {
         InvocationTrigger::Review => "reviewer",
-        InvocationTrigger::Spawn | InvocationTrigger::ResumePr => "dev",
+        InvocationTrigger::Spawn
+        | InvocationTrigger::ResumePr
+        | InvocationTrigger::ResumeBlocked => "dev",
         InvocationTrigger::ControllerRestart => "tl",
     }
 }

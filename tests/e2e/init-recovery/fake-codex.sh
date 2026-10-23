@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ "${1:-}" == "debug" && "${2:-}" == "models" ]]; then
     cat <<'JSON'
-{"models":[{"slug":"gpt-5.6-luna","supported_reasoning_levels":[{"effort":"minimal"},{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]},{"slug":"gpt-6-luna","supported_reasoning_levels":[{"effort":"minimal"},{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]}]}
+{"models":[{"slug":"gpt-5.6-luna","supported_reasoning_levels":[{"effort":"minimal"},{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]},{"slug":"gpt-6-luna","supported_reasoning_levels":[{"effort":"minimal"},{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]},{"slug":"gpt-6.1-sol","supported_reasoning_levels":[{"effort":"minimal"},{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]}]}
 JSON
     exit 0
 fi
@@ -27,12 +27,12 @@ for argument in "$@"; do
 done
 
 record_event() {
-    python3 - "$E2E_AGENT_LOG" "$1" "$agent" "$role" "$model" "${2:-}" <<'PY'
+    python3 - "$E2E_AGENT_LOG" "$1" "$agent" "$role" "$model" "$effort" "${2:-}" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
 
-path, event, agent, role, model, extra_json = sys.argv[1:]
+path, event, agent, role, model, effort, extra_json = sys.argv[1:]
 extra = json.loads(extra_json) if extra_json else {}
 record = {
     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -40,6 +40,7 @@ record = {
     "agent_id": agent,
     "role": role,
     "model": model,
+    "effort": effort,
     **extra,
 }
 with open(path, "a", encoding="utf-8") as stream:
@@ -79,7 +80,7 @@ PY
 }
 
 if [[ "$role" == "dev" && "$agent" == *issue-814* ]]; then
-    [[ "$(basename "$0")" == "opencode" && "${model%%#*}" == "opencode-go/deepseek-v4.1-flash" ]] || {
+    [[ "$(basename "$0")" == "codex" && "${model%%#*}" == "gpt-6-luna" && "$effort" == "xhigh" ]] || {
         printf 'unexpected recovered #814 worker model: %s\n' "$model" >&2
         exit 1
     }
@@ -210,7 +211,7 @@ fi
 
 case "$role" in
     dev)
-        [[ "$model" == "gpt-5.6-luna" ]] || {
+        [[ "$(basename "$0")" == "codex" && "$model" == "gpt-6-luna" && "$effort" == "xhigh" ]] || {
             printf 'unexpected worker model: %s\n' "$model" >&2
             exit 1
         }
@@ -259,7 +260,7 @@ PY
         done
         ;;
     reviewer)
-        [[ "$model" == "gpt-6-luna" && "$effort" == "xhigh" ]] || {
+        [[ "$(basename "$0")" == "codex" && "$model" == "gpt-6.1-sol" && "$effort" == "medium" ]] || {
             printf 'unexpected reviewer model: %s\n' "$model" >&2
             exit 1
         }
