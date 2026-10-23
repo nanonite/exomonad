@@ -1942,11 +1942,24 @@ handoffs = [
     and isinstance(entry.get("arguments"), dict)
     and entry["arguments"].get("child_scope_id") == handoff_node["node_id"]
 ]
-assert len(handoffs) == 1, f"expected one audited commit-all handoff, found {len(handoffs)}"
-assert handoffs[0].get("status") == "confirmed"
-handoff_result = handoffs[0].get("result", {}).get("result", {})
+assert handoffs, "expected an audited commit-all handoff"
+assert all(entry.get("status") == "confirmed" for entry in handoffs)
+handoff_results = [entry.get("result", {}).get("result", {}) for entry in handoffs]
+committed_handoffs = [result for result in handoff_results if result.get("outcome") == "committed"]
+assert len(committed_handoffs) == 1, (
+    f"expected one committed handoff and only no-op replays, got {handoff_results!r}"
+)
+handoff_result = committed_handoffs[0]
 assert handoff_result.get("ready") is True
 assert handoff_result.get("head_after") != sys.argv[5]
+for replay in handoff_results:
+    assert replay.get("ready") is True
+    assert replay.get("head_after") == handoff_result.get("head_after")
+    assert replay.get("outcome") in {"committed", "no_changes"}
+    if replay.get("outcome") == "no_changes":
+        assert replay.get("head_before") == replay.get("head_after")
+        assert replay.get("commit_sha") == ""
+        assert replay.get("committed_paths") == []
 handoff_dispatches = [
     entry for entry in journal
     if entry.get("operation") == "emit_controller_event"
