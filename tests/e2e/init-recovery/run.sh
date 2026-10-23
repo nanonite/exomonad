@@ -2025,8 +2025,19 @@ handoff_entries = [
     and isinstance(entry.get("arguments"), dict)
     and entry["arguments"].get("child_scope_id") == handoff_node["node_id"]
 ]
-assert len(handoff_entries) == 1
-assert handoff_entries[0]["result"]["result"]["head_after"] == sys.argv[2]
+assert handoff_entries
+committed = [
+    entry for entry in handoff_entries
+    if entry.get("result", {}).get("result", {}).get("outcome") == "committed"
+]
+assert len(committed) == 1
+assert committed[0]["result"]["result"]["head_after"] == sys.argv[2]
+assert all(
+    entry.get("status") == "confirmed"
+    and entry.get("result", {}).get("result", {}).get("head_after") == sys.argv[2]
+    and entry.get("result", {}).get("result", {}).get("outcome") in {"committed", "no_changes"}
+    for entry in handoff_entries
+)
 print(json.dumps({"child_run": child["run_id"], "handoff_commit": sys.argv[2]}))
 PY
 assert_legacy_recovery_receipt "$AGG_REPO" "$LEGACY_LOCK_CONTENTS" "$LEGACY_FINGERPRINT"
