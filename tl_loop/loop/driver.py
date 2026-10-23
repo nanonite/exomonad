@@ -24678,7 +24678,7 @@ def _completed_task_blocked_proof(
         "merge_journal_receipt",
     )
     _validate_completed_issue_closure(current, evidence, missing, store)
-    _validate_completed_push_receipt(current, evidence, missing)
+    push_proof = _completed_task_blocked_push_proof(current, state, store, evidence, missing)
     if publication.invocation_id and handoff.invocation_id != publication.invocation_id:
         missing.append("publication_handoff_invocation")
     if current.dispatch_invocation_id and handoff.invocation_id != current.dispatch_invocation_id:
@@ -24693,8 +24693,7 @@ def _completed_task_blocked_proof(
         f"merge_journal_id={evidence['merge_journal_id']}",
         f"issue_id={evidence.get('issue_id') or 'not_applicable'}",
         f"issue_close={evidence.get('issue_close_journal_id') or evidence.get('issue_close_observed_status')}",
-        f"push_receipt_id={evidence['push_receipt_id']}",
-        f"push_journal_id={evidence['push_journal_id']}",
+        *push_proof,
     )
     return proof, ()
 
@@ -24944,6 +24943,133 @@ def _validate_completed_push_receipt(
         receipt.ancestry_proof
         == f"ancestor:{receipt.pushed_commit}->{receipt.observed_remote_head}",
         "push_ancestry_proof",
+    )
+
+
+def _completed_task_blocked_push_proof(
+    current: SliceState,
+    state: RunState,
+    store: RunStore,
+    evidence: Mapping[str, str],
+    missing: list[str],
+) -> tuple[str, ...]:
+    """Accept either typed parent push evidence or a verified no-push completion."""
+    push_missing: list[str] = []
+    _validate_completed_push_receipt(current, evidence, push_missing)
+    if not push_missing:
+        return (
+            f"push_receipt_id={evidence['push_receipt_id']}",
+            f"push_journal_id={evidence['push_journal_id']}",
+        )
+    if push_missing == ["typed_parent_push_receipt"]:
+        proof = _completed_no_push_sync_proof(current, state, store, evidence)
+        if proof is not None:
+            return proof
+    missing.extend(push_missing)
+    return ()
+
+
+def _completed_no_push_sync_proof(
+    current: SliceState,
+    state: RunState,
+    store: RunStore,
+    evidence: Mapping[str, str],
+) -> tuple[str, ...] | None:
+    """Prove a completed no-changelog leaf from its confirmed parent-sync receipt."""
+    push_fields = (
+        "parent_push_intent_id",
+        "push_journal_id",
+        "push_receipt_id",
+        "expected_base_sha",
+        "pushed_commit",
+        "bookkeeping_commit",
+        "observed_remote_head",
+        "ancestry_proof",
+    )
+    if (
+        current.chainlink_issue_id is not None
+        or evidence.get("issue_close_outcome") != "not_applicable"
+        or evidence.get("changelog_decision") != "captured"
+        or evidence.get("changelog_outcome") != "captured"
+        or evidence.get("changelog_commit_sha")
+        or evidence.get("observed_remote_head")
+        or any(field in evidence for field in push_fields)
+        or type(current.pr_number) is not int
+        or current.pr_number <= 0
+    ):
+        return None
+    reconciliation = current.reconciliation
+    if not isinstance(reconciliation, Mapping):
+        return None
+    expected_base = reconciliation.get("merge_base_sha")
+    if not isinstance(expected_base, str) or not expected_base:
+        return None
+    try:
+        arguments = _parent_sync_arguments(
+            current,
+            current.pr_number,
+            evidence,
+            expected_base,
+            None,
+        )
+        identity = _parent_sync_identity_fields(arguments)
+        sync_id = stable_action_key(
+            state.run_id,
+            "post_merge_parent_sync_operation",
+            current.id,
+            identity,
+        )
+        journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+        history, history_error = _parent_sync_history(
+            journal,
+            current.id,
+            sync_id,
+            identity,
+        )
+    except (ActionJournalError, OSError, TLLoopError, TypeError, ValueError):
+        return None
+    if history_error or not history:
+        return None
+    mutations = [entry for entry in history if entry[1] == "post_merge_parent_sync"]
+    if not mutations:
+        return None
+    attempt, operation, entry = max(mutations, key=lambda item: item[0])
+    if (
+        operation != "post_merge_parent_sync"
+        or entry.get("run_id") != store.run_id
+        or entry.get("target") != current.id
+        or entry.get("status") != "confirmed"
+    ):
+        return None
+    entry_arguments = entry.get("arguments")
+    result = entry.get("result")
+    payload = result.get("result") if isinstance(result, Mapping) else None
+    if not isinstance(entry_arguments, Mapping) or not isinstance(payload, Mapping):
+        return None
+    stable_identity = entry_arguments.get("sync_operation_id") == sync_id
+    validated = _validated_sync_payload(
+        payload,
+        arguments,
+        sync_id,
+        attempt,
+        require_correlation=stable_identity,
+    )
+    if (
+        validated.get("sync_outcome") != "confirmed"
+        or validated.get("sync_phase") != "complete"
+        or not {"fetch", "fast_forward"}.issubset(
+            set(validated.get("completed_steps", ()))
+            if isinstance(validated.get("completed_steps"), list)
+            else set()
+        )
+        or validated.get("parent_commit_sha") != evidence.get("parent_commit_sha")
+        or validated.get("remote_head_sha") != reconciliation.get("remote_head_sha")
+        or validated.get("ancestry_proof") != reconciliation.get("ancestry_proof")
+    ):
+        return None
+    return (
+        f"parent_sync_operation_id={sync_id}",
+        f"parent_sync_attempt={attempt}",
     )
 
 

@@ -161,6 +161,196 @@ for event_type in required:
 PY
 }
 
+emit_completed_kani_blocker() {
+    python3 - "$PROJECT_ROOT" "$AGG_REPO" "$AGG_DIR/blocker-before.json" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+project_root = Path(sys.argv[1])
+repository = Path(sys.argv[2])
+before_path = Path(sys.argv[3])
+sys.path.insert(0, str(project_root))
+
+from tl_loop.client.transport import TransportClient
+
+root_dir = repository / ".exo/tl-loop/root"
+root = json.loads((root_dir / "run.json").read_text(encoding="utf-8"))
+kani_path = root_dir / "kani/run.json"
+kani = json.loads(kani_path.read_text(encoding="utf-8"))
+leaf = kani["slices"]["issue-814-substitution-model-kani"]
+assert leaf["status"] == "merged", "blocker replay fixture must have durable Kani completion"
+assert leaf["attempts"] > 0
+assert root["slices"]["architecture"]["status"] == "merged"
+assert root["slices"]["kani"]["status"] == "merged"
+
+response = TransportClient(project_root=repository, timeout=10).call_tool(
+    "tl",
+    "kani",
+    "emit_controller_event",
+    {
+        "event_type": "agent.task_blocked",
+        "payload": {
+            "outcome": "blocked",
+            "slice_id": "issue-814-substitution-model-kani",
+            "cause": "human_decision_required",
+            "scope_attribution": "agent_lifecycle",
+            "needs_human": True,
+            "retryable": True,
+            "recovery_action": "resume the preserved configured assignment",
+            "declared_difficulty": "standard",
+            "matched_difficulty_rule": "missing_handoff:nonzero_exit",
+            "attempt": leaf["attempts"],
+        },
+    },
+)
+assert response.get("success") is True, f"production blocker event emit failed: {response!r}"
+result = response.get("result")
+assert isinstance(result, dict), f"blocker emit omitted its durable result: {response!r}"
+event_id = result.get("event_id")
+assert isinstance(event_id, str) and event_id
+
+segments = repository / ".exo/ledger/segments"
+records = [
+    json.loads(line)
+    for segment in sorted(segments.glob("segment-*.jsonl"))
+    for line in segment.read_text(encoding="utf-8").splitlines()
+]
+matches = [record for record in records if record.get("event_id") == event_id]
+assert len(matches) == 1, "production event was not retained exactly once"
+record = matches[0]
+run_seq = record.get("run_seq")
+assert type(run_seq) is int and run_seq > 0, "canonical event omitted its durable sequence"
+runtime_run_id = (repository / ".exo/run_id").read_text(encoding="utf-8").strip()
+assert record.get("run_id") == runtime_run_id
+assert record.get("agent_id") == "kani"
+assert record.get("type") == "agent.task_blocked"
+assert record.get("invocation_id") is None and record.get("generation") is None
+assert record["data"].get("slice_id") == "issue-814-substitution-model-kani"
+assert record["data"].get("attempt") == leaf["attempts"]
+
+def fingerprint(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def optional_fingerprint(path: Path) -> str | None:
+    return fingerprint(path) if path.is_file() else None
+
+before = {
+    "event_id": event_id,
+    "run_seq": run_seq,
+    "runtime_run_id": runtime_run_id,
+    "architecture_slice": root["slices"]["architecture"],
+    "kani_slice": root["slices"]["kani"],
+    "architecture_run_sha256": fingerprint(root_dir / "architecture/run.json"),
+    "architecture_journal_sha256": optional_fingerprint(root_dir / "architecture/action-journal.json"),
+    "kani_run_sha256": fingerprint(kani_path),
+    "kani_journal_sha256": optional_fingerprint(root_dir / "kani/action-journal.json"),
+    "existing_gate_names": sorted(gate["name"] for gate in root.get("gates", [])),
+}
+before_path.write_text(json.dumps(before, sort_keys=True) + "\n", encoding="utf-8")
+
+# Reproduce the generated unresolved owner gate left by the earlier routing
+# failure. This is a pending gate, never an approval.
+sys.path.insert(0, str(project_root / "tl_loop"))
+from tl_loop.state.schema import GateStatus
+from tl_loop.state.store import RunStore
+
+RunStore("root", root_dir.parent).set_gate(f"task-blocked-owner:{run_seq}", GateStatus.PENDING)
+print(event_id, run_seq)
+PY
+}
+
+assert_completed_kani_blocker_replayed() {
+    python3 - "$PROJECT_ROOT" "$AGG_REPO" "$AGG_DIR/blocker-before.json" "$1" "$2" <<'PY'
+import hashlib
+import json
+import sys
+import time
+from pathlib import Path
+
+project_root = Path(sys.argv[1])
+repository = Path(sys.argv[2])
+before = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+event_id = sys.argv[4]
+run_seq = int(sys.argv[5])
+sys.path.insert(0, str(project_root))
+
+from tl_loop.state.store import RunStore
+
+root_dir = repository / ".exo/tl-loop/root"
+store = RunStore("root", root_dir.parent)
+deadline = time.monotonic() + 30
+state = store.load()
+dispositions = ()
+while time.monotonic() < deadline:
+    dispositions = store.task_blocked_dispositions()
+    if any(item.get("event_id") == event_id for item in dispositions):
+        state = store.load()
+        break
+    time.sleep(0.1)
+
+matching = [item for item in dispositions if item.get("event_id") == event_id]
+assert len(matching) == 1, f"expected one durable blocker disposition, got {matching!r}"
+disposition = matching[0]
+assert disposition.get("decision") == "superseded_by_durable_completion"
+assert disposition.get("reporter_id") == "kani"
+assert disposition.get("subject_slice_id") == "issue-814-substitution-model-kani"
+assert disposition.get("owner_path") == ["root", "kani"]
+assert disposition.get("run_seq") == run_seq
+assert state.events.last_consumed_offset >= run_seq, "event was not acknowledged after durable projection"
+assert not any(gate.name == f"task-blocked-owner:{run_seq}" for gate in state.gates)
+assert state.slices["architecture"].status.value == "merged"
+assert state.slices["kani"].status.value == "merged"
+assert state.current_order <= 3
+
+root_document = json.loads((root_dir / "run.json").read_text(encoding="utf-8"))
+assert root_document["slices"]["architecture"] == before["architecture_slice"]
+assert root_document["slices"]["kani"] == before["kani_slice"]
+assert root_document["slices"]["handoff-proof"]["status"] != "merged"
+
+def fingerprint(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def optional_fingerprint(path: Path) -> str | None:
+    return fingerprint(path) if path.is_file() else None
+
+for path, key in (
+    (root_dir / "architecture/run.json", "architecture_run_sha256"),
+    (root_dir / "kani/run.json", "kani_run_sha256"),
+):
+    assert fingerprint(path) == before[key], f"blocker replay mutated completed sibling evidence: {path}"
+for path, key in (
+    (root_dir / "architecture/action-journal.json", "architecture_journal_sha256"),
+    (root_dir / "kani/action-journal.json", "kani_journal_sha256"),
+):
+    assert optional_fingerprint(path) == before[key], f"blocker replay mutated retained journal state: {path}"
+
+current_gate_names = {gate.name for gate in state.gates}
+for gate_name in before["existing_gate_names"]:
+    assert gate_name in current_gate_names, f"replay removed unrelated gate {gate_name!r}"
+
+owner_scopes = []
+for checkpoint in root_dir.glob("*/run.json"):
+    child = json.loads(checkpoint.read_text(encoding="utf-8"))
+    if "issue-814-substitution-model-kani" in child.get("slices", {}):
+        owner_scopes.append(child.get("run_id"))
+assert owner_scopes == ["kani"], f"expected unique Kani leaf ownership, got {owner_scopes!r}"
+
+ledger = [
+    json.loads(line)
+    for segment in sorted((repository / ".exo/ledger/segments").glob("segment-*.jsonl"))
+    for line in segment.read_text(encoding="utf-8").splitlines()
+]
+events = [row for row in ledger if row.get("event_id") == event_id]
+assert len(events) == 1 and events[0].get("type") == "agent.task_blocked"
+assert events[0].get("run_id") == before["runtime_run_id"]
+assert events[0].get("agent_id") == "kani"
+assert events[0].get("invocation_id") is None and events[0].get("generation") is None
+print("completed Kani blocker reconciled once; child receipts/journals unchanged")
+PY
+}
+
 assert_init_status() {
     local status="$1"
     local log_path="$2"
@@ -1242,6 +1432,8 @@ PULL_PUBLICATIONS_AFTER_START="$(count_pull_publications "$AGG_DIR/mock.log")"
     || e2e_fail "first continuation published more than the recovered #814 and post-tidy leaf PRs"
 
 POST_TIDY_STATE=""
+KANI_BLOCKER_EVENT_ID=""
+KANI_BLOCKER_RUN_SEQ=""
 POST_TIDY_WAIT_SECONDS="${E2E_POST_TIDY_WAIT_SECONDS:-300}"
 [[ "$POST_TIDY_WAIT_SECONDS" =~ ^[1-9][0-9]{0,2}$ ]] \
     || e2e_fail "E2E_POST_TIDY_WAIT_SECONDS must be an integer from 1 to 900"
@@ -1306,6 +1498,38 @@ print(
 )
 PY
     2>/dev/null)" || POST_TIDY_STATE=""
+    if [[ -z "$KANI_BLOCKER_EVENT_ID" && "$(awk '{print $6}' <<< "$POST_TIDY_STATE")" == "merged" ]]; then
+        e2e_log "Injecting the raw event-108045-shaped blocker through Kani's production event tool before replay"
+        TL_PANES="$(aggregate_tl_panes)"
+        TL_PANE_COUNT="$(printf '%s\n' "$TL_PANES" | awk 'NF { count += 1 } END { print count + 0 }')"
+        [[ "$TL_PANE_COUNT" -le 1 ]] || e2e_fail "blocker replay found duplicate root TL panes ($TL_PANE_COUNT)"
+        if [[ "$TL_PANE_COUNT" == "1" ]]; then
+            read -r _BLOCKER_WINDOW BLOCKER_PANE BLOCKER_PANE_DEAD <<< "$TL_PANES"
+            if [[ "$BLOCKER_PANE_DEAD" == "0" ]]; then
+                tmux kill-pane -t "$BLOCKER_PANE"
+                for _ in $(seq 1 40); do
+                    [[ "$(aggregate_tl_panes | awk '$3 == 0 { count += 1 } END { print count + 0 }')" == "0" ]] && break
+                    sleep 0.1
+                done
+                [[ "$(aggregate_tl_panes | awk '$3 == 0 { count += 1 } END { print count + 0 }')" == "0" ]] \
+                    || e2e_fail "root TL pane stayed live while preparing blocker replay"
+            fi
+        fi
+        read -r KANI_BLOCKER_EVENT_ID KANI_BLOCKER_RUN_SEQ < <(emit_completed_kani_blocker)
+        ROOT_EPOCH_BEFORE_BLOCKER_REPLAY="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
+        BLOCKER_REPLAY_STATUS=0
+        HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
+            "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
+            > "$AGG_DIR/init-blocker-replay.log" 2>&1 || BLOCKER_REPLAY_STATUS=$?
+        assert_init_status "$BLOCKER_REPLAY_STATUS" "$AGG_DIR/init-blocker-replay.log" "init --continue after recursive blocker event"
+        rg -Fq "server_build=\"$AGGREGATE_BUILD_ID\" controller_build=\"$AGGREGATE_BUILD_ID\"" "$AGG_DIR/init-blocker-replay.log" \
+            || { cat "$AGG_DIR/init-blocker-replay.log"; e2e_fail "blocker replay did not use the verified binary/archive"; }
+        [[ "$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)" != "$ROOT_EPOCH_BEFORE_BLOCKER_REPLAY" ]] \
+            || e2e_fail "init --continue did not start a fresh controller to replay the blocker"
+        assert_one_live_window Server
+        assert_one_live_window Watcher
+        assert_completed_kani_blocker_replayed "$KANI_BLOCKER_EVENT_ID" "$KANI_BLOCKER_RUN_SEQ"
+    fi
     [[ "$POST_TIDY_STATE" == ready\ * ]] && break
     sleep 0.25
 done
@@ -1837,6 +2061,9 @@ HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
     > "$AGG_DIR/init-repeat.log" 2>&1 || REPEAT_INIT_STATUS=$?
 assert_init_status "$REPEAT_INIT_STATUS" "$AGG_DIR/init-repeat.log" "repeated aggregate init --continue"
 assert_configured_retry_dispatch_events "$AGG_REPO"
+[[ -n "$KANI_BLOCKER_EVENT_ID" && -n "$KANI_BLOCKER_RUN_SEQ" ]] \
+    || e2e_fail "actual-init recursive fixture did not replay the event-108045-shaped blocker"
+assert_completed_kani_blocker_replayed "$KANI_BLOCKER_EVENT_ID" "$KANI_BLOCKER_RUN_SEQ"
 rg -Fq "server_build=\"$AGGREGATE_BUILD_ID\" controller_build=\"$AGGREGATE_BUILD_ID\"" "$AGG_DIR/init-repeat.log" \
     || { cat "$AGG_DIR/init-repeat.log"; e2e_fail "repeat init did not attach using the verified binary/archive"; }
 assert_one_live_window Server
