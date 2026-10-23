@@ -111,6 +111,36 @@ fn active_invocation_monitors(
     ACTIVE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
+#[cfg(test)]
+fn monitor_exit_marker_pauses() -> &'static std::sync::Mutex<
+    std::collections::HashMap<InvocationMonitorKey, Arc<InvocationRegistrationPause>>,
+> {
+    static PAUSES: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<InvocationMonitorKey, Arc<InvocationRegistrationPause>>,
+        >,
+    > = std::sync::OnceLock::new();
+    PAUSES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn pause_monitor_before_exit_marker_read(
+    agent_dir: &Path,
+    invocation_id: &str,
+    pause: Arc<InvocationRegistrationPause>,
+) {
+    monitor_exit_marker_pauses()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(
+            InvocationMonitorKey {
+                agent_dir: agent_dir.to_path_buf(),
+                invocation_id: invocation_id.to_string(),
+            },
+            pause,
+        );
+}
+
 struct InvocationMonitorRegistration(InvocationMonitorKey);
 
 impl Drop for InvocationMonitorRegistration {
@@ -153,14 +183,9 @@ async fn reconcile_invocation_markers(
     agent_dir: &Path,
     invocation: &InvocationRecord,
 ) -> Result<()> {
-    for marker in ["exited_at", "exit_code"] {
-        match fs::remove_file(agent_dir.join(marker)).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).with_context(|| format!("clear stale {marker}")),
-        }
-    }
-
+    // A live reuse may race the target exit monitor. Keep exit_code and
+    // exited_at intact here; stale markers are retired only before a new
+    // invocation replaces a proven terminal one.
     for marker in ["spawned_at", LAST_ACTIVITY_FILE] {
         let path = agent_dir.join(marker);
         let current =
@@ -1148,6 +1173,8 @@ pub struct AgentControlService<C> {
     pub(crate) ordered_sub_tl_routing_override: Option<RoutingInfo>,
     #[cfg(test)]
     pub(crate) before_invocation_registration_pause: Option<Arc<InvocationRegistrationPause>>,
+    #[cfg(test)]
+    pub(crate) before_live_marker_reconciliation_pause: Option<Arc<InvocationRegistrationPause>>,
     /// This agent's birth-branch (git identity). Root TL = "main".
     pub(crate) birth_branch: BirthBranch,
     /// Legacy compatibility flag; no longer changes harness behavior.
@@ -1205,6 +1232,8 @@ impl<
             ordered_sub_tl_routing_override: None,
             #[cfg(test)]
             before_invocation_registration_pause: None,
+            #[cfg(test)]
+            before_live_marker_reconciliation_pause: None,
             birth_branch: BirthBranch::try_from_str("unset")
                 .expect("literal validated string is non-empty"),
             yolo: false,
@@ -1612,6 +1641,15 @@ impl<
                 )
                 .await
                 .with_context(|| format!("failed to reconcile startup effects for {agent_name}"))?;
+                #[cfg(test)]
+                if let Some(pause) = self.before_live_marker_reconciliation_pause.as_ref() {
+                    pause.reached.notify_one();
+                    let permit =
+                        pause.release.acquire().await.map_err(|_| {
+                            anyhow!("test live marker reconciliation pause was closed")
+                        })?;
+                    permit.forget();
+                }
                 reconcile_invocation_markers(&agent_config_dir, &reconciled).await?;
                 if let Some(record) = identity.clone() {
                     if let Err(error) = self.agent_resolver().register(record).await {
@@ -1709,25 +1747,6 @@ impl<
                 ),
             }
         }
-        if let Err(error) = fs::remove_file(agent_config_dir.join("exited_at")).await {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                warn!(
-                    agent = %agent_name,
-                    %error,
-                    "Failed to clear previous invocation tombstone"
-                );
-            }
-        }
-        if let Err(error) = fs::remove_file(agent_config_dir.join("exit_code")).await {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                warn!(
-                    agent = %agent_name,
-                    %error,
-                    "Failed to clear previous invocation exit code"
-                );
-            }
-        }
-
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1797,6 +1816,23 @@ impl<
                         consecutive_errors = 0;
                     }
                     Ok(false) => {
+                        #[cfg(test)]
+                        let marker_pause = {
+                            monitor_exit_marker_pauses()
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .remove(&InvocationMonitorKey {
+                                    agent_dir: agent_dir.clone(),
+                                    invocation_id: invocation.invocation_id.clone(),
+                                })
+                        };
+                        #[cfg(test)]
+                        if let Some(pause) = marker_pause {
+                            pause.reached.notify_one();
+                            if let Ok(permit) = pause.release.acquire().await {
+                                permit.forget();
+                            }
+                        }
                         let exit_marker = tokio::fs::read_to_string(agent_dir.join("exit_code"))
                             .await
                             .ok();

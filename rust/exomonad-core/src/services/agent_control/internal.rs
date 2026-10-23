@@ -3142,6 +3142,153 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn ordered_sub_tl_live_reuse_preserves_current_exit_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        let run_git = |args: &[&str], directory: &std::path::Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"], &project_dir);
+        run_git(
+            &["config", "user.email", "test@example.invalid"],
+            &project_dir,
+        );
+        run_git(&["config", "user.name", "Test"], &project_dir);
+        std::fs::write(project_dir.join("seed"), "seed\n").unwrap();
+        run_git(&["add", "seed"], &project_dir);
+        run_git(&["commit", "-q", "-m", "seed"], &project_dir);
+
+        let record = AgentIdentityRecord {
+            agent_name: AgentName::try_from_str("ordered-child").unwrap(),
+            slug: Slug::try_from_str("ordered-child").unwrap(),
+            agent_type: AgentType::Codex,
+            birth_branch: BirthBranch::try_from_str("main.ordered-child").unwrap(),
+            parent_branch: BirthBranch::try_from_str("main").unwrap(),
+            working_dir: project_dir.join(".exo/worktrees/ordered-child"),
+            display_name: "🤖 ordered-child".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
+            ledger_owned: true,
+            slice_id: Some("ordered-child".to_string()),
+        };
+        let agent_dir = project_dir.join(".exo/agents/ordered-child");
+        let tmux = OrderedTestTmux::new();
+        let first_target = tmux.new_target("exit-marker-race");
+        let first_routing = RoutingInfo::window(first_target.clone());
+        let first_id =
+            ordered_service_with_tmux(&project_dir, &tmux.session, first_routing.clone())
+                .await
+                .provision_ordered_sub_tl(record.clone())
+                .await
+                .unwrap();
+
+        let monitor_pause = Arc::new(super::super::InvocationRegistrationPause {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        super::super::pause_monitor_before_exit_marker_read(
+            &agent_dir,
+            &first_id,
+            monitor_pause.clone(),
+        );
+        std::fs::write(agent_dir.join("exit_code"), "23").unwrap();
+        tmux.kill_target(&first_target);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            monitor_pause.reached.notified(),
+        )
+        .await
+        .expect("monitor pauses after observing exit and before reading exit_code");
+
+        let reused_id =
+            ordered_service_with_tmux(&project_dir, &tmux.session, first_routing.clone())
+                .await
+                .provision_ordered_sub_tl(record.clone())
+                .await
+                .expect("a live checkpoint is still reused while its exit monitor is paused");
+        assert_eq!(reused_id, first_id);
+        let marker_survived_reuse = std::fs::read_to_string(agent_dir.join("exit_code")).ok();
+        monitor_pause.release.add_permits(1);
+        wait_for_invocation_retirement(&agent_dir, &first_id).await;
+        let exited = read_invocation(&agent_dir).await.unwrap().unwrap();
+        let exit_evidence_preserved = exited.status == InvocationStatus::Failed
+            && exited.exit_code == Some(23)
+            && marker_survived_reuse.as_deref() == Some("23")
+            && agent_dir.join("exited_at").exists();
+
+        let second_target = tmux.new_target("tombstone-race");
+        let second_routing = RoutingInfo::window(second_target.clone());
+        let second_id =
+            ordered_service_with_tmux(&project_dir, &tmux.session, second_routing.clone())
+                .await
+                .provision_ordered_sub_tl(record.clone())
+                .await
+                .unwrap();
+        let marker_pause = Arc::new(super::super::InvocationRegistrationPause {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let mut paused_service =
+            ordered_service_with_tmux(&project_dir, &tmux.session, second_routing.clone()).await;
+        paused_service.before_live_marker_reconciliation_pause = Some(marker_pause.clone());
+        let retry_record = record.clone();
+        let retry =
+            tokio::spawn(
+                async move { paused_service.provision_ordered_sub_tl(retry_record).await },
+            );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            marker_pause.reached.notified(),
+        )
+        .await
+        .expect("live reuse pauses after revalidation and before marker reconciliation");
+        std::fs::write(agent_dir.join("exit_code"), "17").unwrap();
+        finish_invocation_and_tombstone(
+            &agent_dir,
+            &second_routing,
+            InvocationStatus::Failed,
+            Some(17),
+        )
+        .await
+        .unwrap();
+        assert!(agent_dir.join("exited_at").exists());
+        marker_pause.release.add_permits(1);
+        let retry_error = retry
+            .await
+            .unwrap()
+            .expect_err("a concurrent terminal checkpoint is not returned as live");
+        assert!(format!("{retry_error:#}").contains("did not leave a live invocation"));
+
+        let terminal = read_invocation(&agent_dir).await.unwrap().unwrap();
+        let tombstone_evidence_preserved = terminal.invocation_id == second_id
+            && terminal.status == InvocationStatus::Failed
+            && terminal.exit_code == Some(17)
+            && agent_dir.join("exited_at").exists()
+            && std::fs::read_to_string(agent_dir.join("exit_code"))
+                .ok()
+                .as_deref()
+                == Some("17");
+        assert_eq!(
+            invocation_start_count(&project_dir, "ordered-child", &second_id),
+            1
+        );
+
+        tmux.kill_target(&second_target);
+        wait_for_invocation_retirement(&agent_dir, &second_id).await;
+        assert!(
+            exit_evidence_preserved && tombstone_evidence_preserved,
+            "exit marker evidence preserved={exit_evidence_preserved}; terminal tombstone evidence preserved={tombstone_evidence_preserved}"
+        );
+    }
+
+    #[tokio::test]
     async fn ordered_sub_tl_published_resume_requires_exact_registry_evidence() {
         use crate::services::pr_registry::{
             publish_verified_head, read_published_heads, PublicationProvenance, PublishedHead,

@@ -291,6 +291,43 @@ async fn write_atomic(agent_dir: &Path, record: &InvocationRecord) -> Result<()>
     Ok(())
 }
 
+async fn clear_terminal_invocation_markers(
+    agent_dir: &Path,
+    previous: Option<&InvocationRecord>,
+) -> Result<()> {
+    // Exit markers have no embedded generation ID. Their owner is established
+    // by the current terminal checkpoint, so retire them before its successor
+    // is saved rather than during a later live reuse.
+    let Some(previous) = previous.filter(|record| {
+        record.ended_at.is_some()
+            && matches!(
+                record.status,
+                InvocationStatus::Exited
+                    | InvocationStatus::Failed
+                    | InvocationStatus::Killed
+                    | InvocationStatus::TimedOut
+            )
+    }) else {
+        return Ok(());
+    };
+
+    for marker in ["exited_at", "exit_code"] {
+        match tokio::fs::remove_file(agent_dir.join(marker)).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to retire {marker} from terminal invocation {}",
+                        previous.invocation_id
+                    )
+                })
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn persist_routing_ownership(
     agent_dir: &Path,
     routing: &RoutingInfo,
@@ -702,6 +739,7 @@ pub async fn start_invocation_with_provenance_and_context_and_mode_with_id_guard
             ));
         }
     }
+    clear_terminal_invocation_markers(agent_dir, current.as_ref()).await?;
     // Revalidate lineage before changing the route. A concurrent service may
     // have registered a replacement after this caller read its prior record.
     // Keep route and invocation ownership updates inside the same mutation lock.
