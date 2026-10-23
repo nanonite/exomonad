@@ -333,10 +333,9 @@ mod tests {
                 .emit_event(
                     EmitEventRequest {
                         event_type: event_type.to_string(),
-                        payload: format!(
-                            r#"{{"slice_id":"leaf-a","intent_id":"intent-1","boundary":"dispatch_intended","started_at":1,"attempt":2,"route_reconciliation_source":"proven_preexecution_retry"}}"#
-                        )
-                        .into_bytes(),
+                        payload: r#"{"slice_id":"leaf-a","intent_id":"intent-1","boundary":"dispatch_intended","started_at":1,"attempt":2,"route_reconciliation_source":"proven_preexecution_retry"}"#
+                            .as_bytes()
+                            .to_vec(),
                     },
                     &context(),
                 )

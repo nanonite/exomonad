@@ -3314,6 +3314,18 @@ impl<
                 &data,
             )?;
         }
+        let resume_intent = ResumePrIntentBinding {
+            intent_id: &intent_id,
+            owner,
+            prior_invocation_id: &previous.invocation_id,
+            prior_generation: previous.generation,
+            pr_number: req.resume_pr_number,
+            head_sha,
+            head_branch,
+            base_branch: pr.base_ref.as_str(),
+            worktree: &worktree,
+            route: &desired_route,
+        };
         record_resume_pr_intent(
             self.ctx.event_log().ok_or_else(|| {
                 EffectError::invalid_input(
@@ -3321,20 +3333,7 @@ impl<
                 )
             })?,
             ctx.agent_name.as_ref(),
-            &resume_pr_intent_data(
-                &intent_id,
-                owner,
-                previous,
-                req.resume_pr_number,
-                head_sha,
-                head_branch,
-                pr.base_ref.as_str(),
-                &worktree,
-                &fingerprint,
-                desired_agent_type,
-                desired_model.as_deref(),
-                desired_effort.as_deref(),
-            ),
+            &resume_pr_intent_data(&resume_intent, &fingerprint),
         )?;
         let options = SpawnLeafOptions {
             task: req.task.clone(),
@@ -3536,18 +3535,19 @@ impl<
                 "PR response-loss adoption is blocked because durable intent history is unavailable",
             )
         })?;
-        validate_resume_pr_intent_history(
-            event_log,
+        let resume_intent = ResumePrIntentBinding {
+            intent_id: &intent_id,
             owner,
-            invocation,
-            req.resume_pr_number,
+            prior_invocation_id,
+            prior_generation: invocation.generation - 1,
+            pr_number: req.resume_pr_number,
             head_sha,
             head_branch,
-            pr.base_ref.as_str(),
+            base_branch: pr.base_ref.as_str(),
             worktree,
             route,
-            &intent_id,
-        )?;
+        };
+        validate_resume_pr_intent_history(event_log, invocation, &resume_intent)?;
         validate_terminal_invocation_history(event_log, owner, prior_invocation_id)?;
         validate_resume_pr_publication(
             self.ctx.project_dir(),
@@ -4407,35 +4407,38 @@ fn configured_route_changed(
         || owner.effort.as_deref() != effort
 }
 
-fn resume_pr_intent_data(
-    intent_id: &str,
-    owner: &AgentIdentityRecord,
-    prior: &InvocationRecord,
+struct ResumePrIntentBinding<'a> {
+    intent_id: &'a str,
+    owner: &'a AgentIdentityRecord,
+    prior_invocation_id: &'a str,
+    prior_generation: u64,
     pr_number: u64,
-    head_sha: &str,
-    head_branch: &str,
-    base_branch: &str,
-    worktree: &Path,
+    head_sha: &'a str,
+    head_branch: &'a str,
+    base_branch: &'a str,
+    worktree: &'a Path,
+    route: &'a ConfiguredRuntimeRoute,
+}
+
+fn resume_pr_intent_data(
+    binding: &ResumePrIntentBinding<'_>,
     fingerprint: &str,
-    route_agent_type: ServiceAgentType,
-    model: Option<&str>,
-    effort: Option<&str>,
 ) -> serde_json::Value {
     serde_json::json!({
-        "intent_id": intent_id,
-        "owner_agent_id": owner.agent_name,
-        "slice_id": owner.slice_id,
-        "prior_invocation_id": prior.invocation_id,
-        "prior_generation": prior.generation,
-        "pr_number": pr_number,
-        "head_sha": head_sha,
-        "head_branch": head_branch,
-        "base_branch": base_branch,
-        "worktree": worktree.to_string_lossy(),
+        "intent_id": binding.intent_id,
+        "owner_agent_id": binding.owner.agent_name,
+        "slice_id": binding.owner.slice_id,
+        "prior_invocation_id": binding.prior_invocation_id,
+        "prior_generation": binding.prior_generation,
+        "pr_number": binding.pr_number,
+        "head_sha": binding.head_sha,
+        "head_branch": binding.head_branch,
+        "base_branch": binding.base_branch,
+        "worktree": binding.worktree.to_string_lossy(),
         "worktree_fingerprint": fingerprint,
-        "configured_harness": route_agent_type.suffix(),
-        "configured_model": model,
-        "configured_effort": effort,
+        "configured_harness": binding.route.agent_type.suffix(),
+        "configured_model": binding.route.model,
+        "configured_effort": binding.route.effort,
         "authorization_source": "accepted_operator_role_configuration",
     })
 }
@@ -4507,30 +4510,31 @@ async fn read_resume_pr_intent_id(
 
 fn validate_resume_pr_intent_history(
     log: &crate::services::EventLog,
-    owner: &AgentIdentityRecord,
     invocation: &InvocationRecord,
-    pr_number: u64,
-    head_sha: &str,
-    head_branch: &str,
-    base_branch: &str,
-    worktree: &Path,
-    route: &ConfiguredRuntimeRoute,
-    intent_id: &str,
+    binding: &ResumePrIntentBinding<'_>,
 ) -> EffectResult<()> {
     let prior_id = invocation.prior_invocation_id.as_deref().ok_or_else(|| {
         EffectError::invalid_input("PR successor is missing its predecessor invocation")
     })?;
+    if prior_id != binding.prior_invocation_id
+        || invocation.generation.checked_sub(1) != Some(binding.prior_generation)
+    {
+        return Err(EffectError::invalid_input(
+            "PR successor predecessor identity conflicts with its durable resume intent",
+        ));
+    }
     let events = log.ledger().read_events().effect_err("agent")?;
     let matching = events
         .iter()
         .filter(|record| {
             record.event.event_type == "agent.resume_pr.intent"
-                && record.event.data["intent_id"].as_str() == Some(intent_id)
+                && record.event.data["intent_id"].as_str() == Some(binding.intent_id)
         })
         .collect::<Vec<_>>();
     let [record] = matching.as_slice() else {
         return Err(EffectError::invalid_input(format!(
-            "PR resume intent {intent_id} is missing or ambiguous in durable history"
+            "PR resume intent {} is missing or ambiguous in durable history",
+            binding.intent_id
         )));
     };
     let data = &record.event.data;
@@ -4539,23 +4543,24 @@ fn validate_resume_pr_intent_history(
         .strip_prefix("sha256:")
         .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
     if !valid_fingerprint
-        || data["owner_agent_id"].as_str() != Some(owner.agent_name.as_str())
-        || data["slice_id"].as_str() != owner.slice_id.as_deref()
+        || data["owner_agent_id"].as_str() != Some(binding.owner.agent_name.as_str())
+        || data["slice_id"].as_str() != binding.owner.slice_id.as_deref()
         || data["prior_invocation_id"].as_str() != Some(prior_id)
-        || data["prior_generation"].as_u64() != Some(invocation.generation - 1)
-        || data["pr_number"].as_u64() != Some(pr_number)
-        || data["head_sha"].as_str() != Some(head_sha)
-        || data["head_branch"].as_str() != Some(head_branch)
-        || data["base_branch"].as_str() != Some(base_branch)
-        || data["worktree"].as_str() != Some(worktree.to_string_lossy().as_ref())
-        || data["configured_harness"].as_str() != Some(route.agent_type.suffix())
-        || data["configured_model"].as_str() != route.model.as_deref()
-        || data["configured_effort"].as_str() != route.effort.as_deref()
+        || data["prior_generation"].as_u64() != Some(binding.prior_generation)
+        || data["pr_number"].as_u64() != Some(binding.pr_number)
+        || data["head_sha"].as_str() != Some(binding.head_sha)
+        || data["head_branch"].as_str() != Some(binding.head_branch)
+        || data["base_branch"].as_str() != Some(binding.base_branch)
+        || data["worktree"].as_str() != Some(binding.worktree.to_string_lossy().as_ref())
+        || data["configured_harness"].as_str() != Some(binding.route.agent_type.suffix())
+        || data["configured_model"].as_str() != binding.route.model.as_deref()
+        || data["configured_effort"].as_str() != binding.route.effort.as_deref()
         || data["authorization_source"].as_str() != Some("accepted_operator_role_configuration")
         || invocation.recovery_round == 0
     {
         return Err(EffectError::invalid_input(format!(
-            "PR resume intent {intent_id} does not prove the current owner, predecessor, PR, head, branch, worktree, and configured route"
+            "PR resume intent {} does not prove the current owner, predecessor, PR, head, branch, worktree, and configured route",
+            binding.intent_id
         )));
     }
     Ok(())
@@ -6079,20 +6084,19 @@ mod tests {
             model: Some("gpt-6-luna".to_string()),
             effort: Some("xhigh".to_string()),
         };
-        let intent_data = resume_pr_intent_data(
-            "resume-pr-intent-46",
-            &owner,
-            &prior,
-            PR_NUMBER,
-            &head_sha,
-            &branch,
-            "main",
-            &worktree,
-            &fingerprint,
-            route.agent_type,
-            route.model.as_deref(),
-            route.effort.as_deref(),
-        );
+        let intent_binding = ResumePrIntentBinding {
+            intent_id: "resume-pr-intent-46",
+            owner: &owner,
+            prior_invocation_id: &prior.invocation_id,
+            prior_generation: prior.generation,
+            pr_number: PR_NUMBER,
+            head_sha: &head_sha,
+            head_branch: &branch,
+            base_branch: "main",
+            worktree: &worktree,
+            route: &route,
+        };
+        let intent_data = resume_pr_intent_data(&intent_binding, &fingerprint);
         record_resume_pr_intent(&event_log, "root-controller", &intent_data)
             .expect("record original configured resume intent");
         std::fs::create_dir_all(project_dir.join(".exo")).expect("create Exo directory");
