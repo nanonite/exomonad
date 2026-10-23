@@ -3909,6 +3909,156 @@ def _nested_blocked_owner_stores(
     return root_plan, root_store, child_store
 
 
+def _sibling_blocked_owner_stores(
+    root_dir: Path,
+    run_id: str,
+    *,
+    repeated_leaf: bool = False,
+) -> tuple[WorkPlan, RunStore, dict[str, RunStore]]:
+    """Persist completed and pending sibling scopes around one blocked owner."""
+    kani_leaf = "shared-slice" if repeated_leaf else "issue-814-substitution-model-kani"
+    architecture_leaf = kani_leaf if repeated_leaf else "issue-811"
+    architecture_plan = WorkPlan.from_mapping(
+        {
+            "leaves": [
+                {
+                    "name": architecture_leaf,
+                    "task": "completed architecture sibling",
+                    "chainlink_issue_id": 811,
+                }
+            ]
+        }
+    )
+    kani_plan = WorkPlan.from_mapping(
+        {
+            "leaves": [
+                {
+                    "name": kani_leaf,
+                    "task": "blocked Kani leaf",
+                    "chainlink_issue_id": 814,
+                }
+            ]
+        }
+    )
+    later_plan = WorkPlan()
+    root_plan = WorkPlan(
+        sub_tls=(
+            SubTLTask("substitution-model-architecture-stage", architecture_plan, order=1),
+            SubTLTask("substitution-model-kani-stage", kani_plan, order=2),
+            SubTLTask("pending-stage-three", later_plan, order=3),
+            SubTLTask("pending-stage-four", later_plan, order=4),
+        )
+    )
+    config = TLLoopConfig(root_dir=root_dir, run_id=run_id)
+    manifest = driver_module._manifest_for_plan(root_plan, run_id, config)
+    root_slices = _initial_slices(root_plan, config, root_dir, run_id)
+    create(run_id, {"slices": root_slices}, root_dir=root_dir)
+    root_store = RunStore(run_id, root_dir)
+    root_store.set_plan_manifest(manifest, slices=root_slices)
+    initial = root_store.set_ordered_state(
+        1,
+        tuple(
+            driver_module.OrderedStageState(stage.order, stage.sub_tls)
+            for stage in root_plan.ordered_stages
+        ),
+        root_store.load().integration,
+    )
+    child_stores: dict[str, RunStore] = {}
+    child_plans = {
+        "substitution-model-architecture-stage": architecture_plan,
+        "substitution-model-kani-stage": kani_plan,
+    }
+    for child_name, child_plan in child_plans.items():
+        child_node = next(node for node in manifest.nodes if node.name == child_name)
+        child_manifest = manifest.child_manifests[child_node.node_id]
+        child_config = replace(
+            config,
+            run_id=child_name,
+            branch=driver_module.derive_child_branch(config.branch, child_name),
+            parent_run_id=run_id,
+            parent_branch=config.branch,
+            parent_agent_id=run_id,
+            depth=1,
+            declared_manifest=child_manifest,
+        )
+        child_slices = _initial_slices(child_plan, child_config, root_store.run_dir, child_name)
+        create(
+            child_name,
+            {
+                "slices": child_slices,
+                "owner_branch": child_config.branch,
+                "parent_branch": child_config.parent_branch,
+                "parent_run_id": run_id,
+                "parent_agent_id": run_id,
+                "depth": 1,
+            },
+            root_dir=root_store.run_dir,
+        )
+        child_store = RunStore(child_name, root_store.run_dir)
+        child_store.set_plan_manifest(child_manifest, slices=child_slices)
+        child_stores[child_name] = child_store
+
+    architecture_store = child_stores["substitution-model-architecture-stage"]
+    architecture_leaf = next(iter(architecture_store.load().slices))
+    _complete_nested_leaf(architecture_store, leaf_name=architecture_leaf, pr_number=45)
+    kani_store = child_stores["substitution-model-kani-stage"]
+    kani_state = kani_store.load()
+    active_kani_leaf = replace(
+        kani_state.slices[kani_leaf],
+        status=SliceStatus.SPAWNED,
+        attempts=6,
+        dispatch_intent_id="kani-leaf-intent",
+        dispatch_agent_id=kani_leaf,
+        dispatch_invocation_id="kani-leaf-invocation",
+        dispatch_generation=6,
+        dispatch_authoritative_event_seq=1,
+        dispatch_last_boundary="agent.spawned",
+    )
+    kani_store.checkpoint(
+        TLWaiting({kani_leaf: ChildHandle(kani_leaf, active_kani_leaf.branch or "", "worker")}),
+        {**kani_state.slices, kani_leaf: active_kani_leaf},
+        kani_state.budgets,
+        kani_state.events.last_consumed_offset,
+    )
+
+    updated_root_slices = dict(initial.slices)
+    for child_name in child_plans:
+        current = initial.slices[child_name]
+        updated_root_slices[child_name] = replace(
+            current,
+            status=(
+                SliceStatus.MERGED
+                if child_name == "substitution-model-architecture-stage"
+                else SliceStatus.SPAWNED
+            ),
+            attempts=1,
+            dispatch_intent_id=f"{child_name}-dispatch-intent",
+            dispatch_agent_id=child_name,
+            dispatch_invocation_id=f"{child_name}-invocation",
+            dispatch_generation=1,
+            dispatch_authoritative_event_seq=1,
+            dispatch_last_boundary="sub_tl_started",
+        )
+    root_store.checkpoint(
+        TLWaiting(
+            {
+                "substitution-model-kani-stage": ChildHandle(
+                    "substitution-model-kani-stage",
+                    updated_root_slices["substitution-model-kani-stage"].branch or "",
+                    "controller",
+                )
+            }
+        ),
+        updated_root_slices,
+        initial.budgets,
+        initial.events.last_consumed_offset,
+        current_order=2,
+        ordered_stages=initial.ordered_stages,
+        integration=initial.integration,
+    )
+    return root_plan, root_store, child_stores
+
+
 def _three_level_blocked_owner_stores(
     root_dir: Path,
     run_id: str,
@@ -4290,6 +4440,126 @@ def test_nested_task_blocked_recovers_child_before_ack_and_keeps_ordered_stage_g
     assert root_state.current_order == 1
     assert root_state.slices["kani"].status is SliceStatus.PENDING
     assert root_state.integration.sub_tl_recovery["architecture"].slice_id == "leaf-a"
+
+
+def test_recursive_blocker_ignores_completed_architecture_sibling_for_kani_leaf(
+    tmp_path: Path,
+) -> None:
+    run_id = "beast-shaped-recursive-blocker"
+    cancel_event = threading.Event()
+    plan, root_store, child_stores = _sibling_blocked_owner_stores(tmp_path, run_id)
+    architecture_store = child_stores["substitution-model-architecture-stage"]
+    kani_store = child_stores["substitution-model-kani-stage"]
+    architecture_before = architecture_store.load()
+    architecture_leaf_before = architecture_before.slices["issue-811"]
+    event = _blocked_event(
+        108045,
+        "issue-814-substitution-model-kani",
+        run_id,
+        reporter="substitution-model-kani-stage",
+        invocation_id=None,
+        generation=None,
+        attempt=6,
+        cause="human_decision_required",
+        role="controller",
+    )
+    lookup = driver_module._resolve_task_blocked_owner(event, root_store.load(), root_store)
+    assert lookup.owner is not None
+    assert lookup.owner.path == (run_id, "substitution-model-kani-stage")
+
+    class ObservingQueue(SyntheticQueue):
+        def acknowledge(self, observed: EventEnvelope) -> int:
+            child = kani_store.load()
+            assert child.slices["issue-814-substitution-model-kani"].recovery is not None
+            assert root_store.load().events.last_consumed_offset == observed.run_seq
+            result = super().acknowledge(observed)
+            cancel_event.set()
+            return result
+
+    transport = RecordingTransport()
+    source = ObservingQueue([event])
+    with pytest.raises(LoopCancelled):
+        driver_module._run_loop(
+            run_id,
+            plan,
+            source,
+            EffectClient(transport),
+            TLLoopConfig(
+                root_dir=tmp_path,
+                run_id=run_id,
+                max_parallel_slices=1,
+                poll_interval=0.001,
+                cancel_event=cancel_event,
+            ),
+            root_store,
+            root_store.load(),
+            [],
+            TLEventDecoder(),
+        )
+
+    final_root = root_store.load()
+    final_architecture = architecture_store.load()
+    final_kani = kani_store.load()
+    assert source.acknowledged == [108045]
+    assert final_kani.slices["issue-814-substitution-model-kani"].recovery is not None
+    assert final_root.current_order == 2
+    assert final_root.slices["pending-stage-three"].status is SliceStatus.PENDING
+    assert final_root.slices["pending-stage-four"].status is SliceStatus.PENDING
+    assert final_architecture.slices["issue-811"] == architecture_leaf_before
+    assert final_architecture.slices["issue-811"].post_merge == architecture_leaf_before.post_merge
+    assert final_kani.slices["issue-814-substitution-model-kani"].attempts == 6
+    assert final_kani.slices["issue-814-substitution-model-kani"].dispatch_invocation_id == (
+        "kani-leaf-invocation"
+    )
+    assert not {"spawn_worker", "spawn_leaf"} & {name for name, _ in transport.calls}
+
+
+def test_recursive_blocker_qualifies_repeated_local_slice_ids_by_reporter_path(
+    tmp_path: Path,
+) -> None:
+    run_id = "repeated-local-blocker-id"
+    plan, root_store, child_stores = _sibling_blocked_owner_stores(
+        tmp_path,
+        run_id,
+        repeated_leaf=True,
+    )
+    del plan
+    event = _blocked_event(
+        19,
+        "shared-slice",
+        run_id,
+        reporter="substitution-model-kani-stage",
+        invocation_id=None,
+        generation=None,
+        attempt=6,
+        cause="human_decision_required",
+        role="controller",
+    )
+
+    lookup = driver_module._resolve_task_blocked_owner(event, root_store.load(), root_store)
+
+    assert lookup.owner is not None
+    assert lookup.owner.path == (run_id, "substitution-model-kani-stage")
+    assert lookup.owner.store.path == child_stores["substitution-model-kani-stage"].path
+
+    ambiguous = _blocked_event(
+        20,
+        "shared-slice",
+        run_id,
+        reporter="unbound-controller",
+        invocation_id=None,
+        generation=None,
+        attempt=6,
+        cause="human_decision_required",
+        role="controller",
+    )
+    ambiguous_lookup = driver_module._resolve_task_blocked_owner(
+        ambiguous,
+        root_store.load(),
+        root_store,
+    )
+    assert ambiguous_lookup.owner is None
+    assert ambiguous_lookup.reason_code == "ambiguous_owner"
 
 
 @pytest.mark.parametrize("reporter", ("outer", "inner"))

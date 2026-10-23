@@ -23624,6 +23624,7 @@ class _TaskBlockedOwner:
     store: RunStore
     slice_id: str
     path: tuple[str, ...]
+    resolution: IdentityResolution
 
 
 @dataclass(frozen=True)
@@ -23936,6 +23937,10 @@ def _resolve_task_blocked_owner(
         issues,
         scopes,
     )
+    if len(matches) > 1:
+        scoped_owner = _scope_qualified_blocked_owner(event, matches, scopes)
+        if scoped_owner is not None:
+            matches = [scoped_owner]
     paths = tuple(sorted({owner.path for owner in matches}))
     slice_ids = tuple(sorted({owner.slice_id for owner in matches}))
     if len(matches) > 1:
@@ -23963,6 +23968,13 @@ def _resolve_task_blocked_owner(
                     scopes,
                 )
                 or _is_proven_descendant_subject_alias(
+                    event,
+                    owner,
+                    reporter[0],
+                    issue,
+                    scopes,
+                )
+                or _is_proven_unrelated_sibling_issue(
                     event,
                     owner,
                     reporter[0],
@@ -24056,8 +24068,10 @@ def _collect_task_blocked_owners(
     scopes[path] = (state, store)
     resolution = resolve_event_slice(event, state)
     if resolution.resolved and resolution.slice_id is not None:
-        matches.append(_TaskBlockedOwner(store, resolution.slice_id, path))
-    elif resolution.candidates or resolution.rejected_aliases:
+        matches.append(_TaskBlockedOwner(store, resolution.slice_id, path, resolution))
+    elif (resolution.candidates or resolution.rejected_aliases) and not (
+        _task_blocked_scope_is_unrelated_no_match(event, state, resolution)
+    ):
         reason = (
             "repository_identity_conflict"
             if resolution.reason == "repository_identity_conflict"
@@ -24112,6 +24126,103 @@ def _collect_task_blocked_owners(
 def _blocked_subject_id(event: EventEnvelope) -> str | None:
     """Return the typed blocked subject, never deriving it from reporter text."""
     return event.task_blocked.slice_id if event.task_blocked is not None else None
+
+
+def _task_blocked_scope_is_unrelated_no_match(
+    event: EventEnvelope,
+    state: RunState,
+    resolution: IdentityResolution,
+) -> bool:
+    """Classify an absent local subject alias as unrelated when its manifest omits it."""
+    subject = _blocked_subject_id(event)
+    manifest = state.plan_manifest
+    if subject is None or manifest is None or resolution.candidates or resolution.evidence:
+        return False
+    return set(resolution.rejected_aliases) == {
+        f"slice_id={subject}"
+    } and not _manifest_contains_blocked_slice(event, manifest)
+
+
+def _scope_qualified_blocked_owner(
+    event: EventEnvelope,
+    matches: Sequence[_TaskBlockedOwner],
+    scopes: Mapping[tuple[str, ...], tuple[RunState, RunStore]],
+) -> _TaskBlockedOwner | None:
+    """Use a durable reporter path to choose among repeated sibling-local IDs."""
+    qualified: list[_TaskBlockedOwner] = []
+    for owner in matches:
+        reporter, _ = _resolve_task_blocked_reporter(event, owner, scopes)
+        if reporter is not None and owner.path[: len(reporter[0])] == reporter[0]:
+            qualified.append(owner)
+    if len(qualified) != 1:
+        return None
+    selected = qualified[0]
+    for other in matches:
+        if other is selected:
+            continue
+        if not _scope_paths_are_siblings(other.path, selected.path):
+            return None
+        if not _resolution_matches_only_blocked_subject(other.resolution, event):
+            return None
+    return selected
+
+
+def _resolution_matches_only_blocked_subject(
+    resolution: IdentityResolution,
+    event: EventEnvelope,
+) -> bool:
+    """Permit sibling-local duplicate IDs only when they carry no other alias evidence."""
+    subject = _blocked_subject_id(event)
+    return (
+        subject is not None
+        and resolution.resolved
+        and resolution.slice_id == subject
+        and dict(resolution.evidence) == {"slice_id": (subject,)}
+        and not resolution.rejected_aliases
+    )
+
+
+def _scope_paths_are_siblings(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
+    """Return whether accepted scope paths diverge below a shared parent."""
+    if not left or not right or left[0] != right[0]:
+        return False
+    common_length = 0
+    for left_part, right_part in zip(left, right):
+        if left_part != right_part:
+            break
+        common_length += 1
+    return 0 < common_length < min(len(left), len(right))
+
+
+def _is_proven_unrelated_sibling_issue(
+    event: EventEnvelope,
+    owner: _TaskBlockedOwner,
+    reporter: tuple[tuple[str, ...], str | None, int | None] | None,
+    issue: _TaskBlockedScopeIssue,
+    scopes: Mapping[tuple[str, ...], tuple[RunState, RunStore]],
+) -> bool:
+    """Ignore only a sibling scope excluded by the accepted reporter path."""
+    if reporter is None or owner.path[: len(reporter[0])] != reporter[0]:
+        return False
+    if not _scope_paths_are_siblings(issue.path, owner.path):
+        return False
+    if issue.reason_code == "owner_identity_conflict":
+        return _task_blocked_scope_is_unrelated_no_match(event, issue.state, issue.resolution)
+    if issue.reason_code not in {"child_state_missing", "child_state_unavailable"}:
+        return False
+    parent_entry = scopes.get(issue.path[:-1])
+    if parent_entry is None:
+        return False
+    parent_state, _ = parent_entry
+    manifest = parent_state.plan_manifest
+    if manifest is None:
+        return False
+    child_node = next(
+        (node for node in manifest.nodes if node.kind == "sub_tl" and node.name == issue.path[-1]),
+        None,
+    )
+    child_manifest = manifest.child_manifests.get(child_node.node_id) if child_node else None
+    return child_manifest is not None and _manifest_contains_blocked_slice(event, child_manifest)
 
 
 def _all_conflicting_aliases(issues: Sequence[_TaskBlockedScopeIssue]) -> tuple[str, ...]:
