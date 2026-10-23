@@ -2174,6 +2174,35 @@ for operation in ("spawn_leaf", "spawn_reviewer"):
 assert leaf["status"] in {"in_review", "merged"} and leaf["pr_number"] is not None
 PY
 assert_legacy_recovery_receipt "$AGG_REPO" "$LEGACY_LOCK_CONTENTS" "$LEGACY_FINGERPRINT"
+e2e_phase "Configured resume" "Proving a pre-existing OpenCode #814 owner resumes through the production blocked-leaf tool..."
+if ! python3 "$PROJECT_ROOT/tests/e2e/task-blocked-human-gate/run.py" \
+    > "$AGG_DIR/configured-resume-blocked-leaf.json" \
+    2> "$AGG_DIR/configured-resume-blocked-leaf.stderr"; then
+    cat "$AGG_DIR/configured-resume-blocked-leaf.stderr" >&2
+    cat "$AGG_DIR/configured-resume-blocked-leaf.json" >&2
+    e2e_fail "real pre-existing OpenCode owner did not resume through resume_blocked_leaf"
+fi
+python3 - "$AGG_DIR/configured-resume-blocked-leaf.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+runs = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))["runs"]
+assert len(runs) == 3, f"expected three isolated resume runs, got {len(runs)}"
+for run in runs:
+    observed = run["observed"]
+    assert observed["same_owner"] and observed["same_branch"] and observed["same_worktree"]
+    assert observed["resumed_harness"] == "codex"
+    assert observed["resumed_model"] == "gpt-6-luna"
+    assert observed["resumed_effort"] == "xhigh"
+    assert observed["reviewer_harness"] == "codex"
+    assert observed["reviewer_model"] == "gpt-6.1-sol"
+    assert observed["reviewer_effort"] == "medium"
+    assert observed["repeat_resume_adopted"]
+    assert observed["pr_published_after_resume"]
+    assert run["negative_controls"]["stale_resume_rejected"]
+print("pre-existing OpenCode owner resumed once as Codex; exact owner and reviewer routes verified")
+PY
 e2e_log "PASS: actual init --continue recovered the merged aggregate, commit-all tidied the parent before a real worker/reviewer route, preserved ignored runtime data and completed receipts, and repeat init added no duplicate commit or dispatch (handoff=$HANDOFF_COMMIT_SHA, leaf_pr=$POST_TIDY_LEAF_PR, archive=$AGGREGATE_ARCHIVE_SHA256, host=$EXOMONAD_BIN_SHA256, devswarm=$GUEST_WASM_SHA256, e2e-test=$E2E_WASM_SHA256, build=$AGGREGATE_BUILD_ID)"
 
 echo ""
