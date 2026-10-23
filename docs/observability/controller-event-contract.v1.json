@@ -86,7 +86,8 @@
         "requested_harness",
         "model",
         "controller_epoch",
-        "dispatch_generation"
+        "dispatch_generation",
+        "route_reconciliation_source"
       ]
     },
     "tl.spawn_requested": {
@@ -102,7 +103,8 @@
         "requested_harness",
         "model",
         "controller_epoch",
-        "dispatch_generation"
+        "dispatch_generation",
+        "route_reconciliation_source"
       ]
     },
     "tl.spawn_request_accepted": {
@@ -118,7 +120,8 @@
         "requested_harness",
         "model",
         "controller_epoch",
-        "dispatch_generation"
+        "dispatch_generation",
+        "route_reconciliation_source"
       ]
     },
     "tl.spawn_request_failed": {
@@ -134,7 +137,8 @@
         "requested_harness",
         "model",
         "controller_epoch",
-        "dispatch_generation"
+        "dispatch_generation",
+        "route_reconciliation_source"
       ]
     },
     "tl.dispatch_retry_scheduled": {
@@ -169,7 +173,8 @@
         "requested_harness",
         "model",
         "controller_epoch",
-        "dispatch_generation"
+        "dispatch_generation",
+        "route_reconciliation_source"
       ]
     },
     "tl.dispatch_reconciliation_started": {

@@ -41,8 +41,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "tests" / "e2e" / "lib"))
 
-import e2e_harness.codex_home as codex_home  # noqa: E402
-import e2e_harness.tmuxio as tmuxio  # noqa: E402
+from e2e_harness import codex_home, tmuxio
 
 #: The marker ``start_server`` leaves so anything that has to stop this run's
 #: tmux session can name the server that session lives on. Without it a bare
@@ -64,6 +63,7 @@ def tmux_socket(repo: Path) -> Path:
     if not value:
         raise HarnessError(f"the tmux socket marker is empty: {marker}")
     return Path(value)
+
 
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.transport import (
@@ -908,7 +908,7 @@ def write_leaf_actor_shim(
         + "".join(
             f"export {name}={shlex.quote(value)}\n" for name, value in exports.items()
         )
-        + f"exec {shlex.quote(sys.executable)} {shlex.quote(str(actor))} \"$@\"\n",
+        + f'exec {shlex.quote(sys.executable)} {shlex.quote(str(actor))} "$@"\n',
         encoding="utf-8",
     )
     path.chmod(0o755)
@@ -927,6 +927,12 @@ def start_server(
     identity_agents: Mapping[str, str] | None = None,
     chainlink_db: Path | None = None,
     leaf_branches: Sequence[str] | None = None,
+    spawn_agent_type: str = "codex",
+    worker_model: str | None = None,
+    worker_effort: str = "medium",
+    reviewer_agent_type: str | None = None,
+    reviewer_model: str | None = None,
+    reviewer_effort: str | None = None,
 ) -> tuple[subprocess.Popen[str], TransportClient]:
     wasm = project_root / ".exo/wasm/wasm-guest-devswarm.wasm"
     binary = Path(
@@ -1066,10 +1072,23 @@ def start_server(
                 # this the run waits on an observation the server was never asked
                 # to make, and the case reports a timeout rather than a finding.
                 "poll_interval = 1",
-                'spawn_agent_type = "codex"',
+                f'spawn_agent_type = "{spawn_agent_type}"',
+                f'worker_effort_level = "{worker_effort}"',
                 f'forgejo_url = "{forgejo_url}"',
                 f'forgejo_token = "{forgejo_token}"',
                 f'forgejo_reviewer_token = "{forgejo_reviewer_token or forgejo_token}"',
+                *(
+                    [
+                        "[reviewer]",
+                        f'agent_type = "{reviewer_agent_type}"',
+                        f'model = "{reviewer_model}"' if reviewer_model else "",
+                        f'effort_level = "{reviewer_effort}"'
+                        if reviewer_effort
+                        else "",
+                    ]
+                    if reviewer_agent_type
+                    else []
+                ),
             ]
         )
         + "\n",
@@ -1088,9 +1107,35 @@ def start_server(
         reviewer_token=forgejo_reviewer_token or forgejo_token,
         leaf_branches=leaf_branches,
     )
+    if spawn_agent_type == "opencode":
+        fake_opencode = fake_bin / "opencode"
+        write_leaf_actor_shim(
+            fake_opencode,
+            project_root=project_root,
+            repo=repo,
+            forgejo_url=forgejo_url,
+            forgejo_owner=forgejo_owner,
+            forgejo_repo=forgejo_repo,
+            reviewer_token=forgejo_reviewer_token or forgejo_token,
+            leaf_branches=leaf_branches,
+        )
     test_path = f"{fake_bin}:{os.environ.get('PATH', '')}"
     socket = tmuxio.socket_path(root)
     environment = tmuxio.child_env(root, {**os.environ, "PATH": test_path})
+    environment["EXOMONAD_SPAWN_AGENT_TYPE"] = spawn_agent_type
+    if worker_model:
+        model_variable = (
+            "EXOMONAD_WORKER_MODEL"
+            if spawn_agent_type == "opencode"
+            else "EXOMONAD_CODEX_MODEL"
+        )
+        environment[model_variable] = worker_model
+    if reviewer_model:
+        environment["EXOMONAD_REVIEWER_MODEL"] = reviewer_model
+    if reviewer_effort:
+        environment["EXOMONAD_REVIEWER_EFFORT_LEVEL"] = reviewer_effort
+    if reviewer_agent_type:
+        environment["EXOMONAD_REVIEWER_AGENT_TYPE"] = reviewer_agent_type
     if chainlink_db is not None:
         environment["CHAINLINK_DB"] = str(chainlink_db)
     # Isolate Codex before the server starts. `spawn_agent_type = "codex"` above
@@ -1114,9 +1159,7 @@ def start_server(
         check=True,
         env=environment,
     )
-    tmuxio.tmux(
-        socket, "set-environment", "-t", session, "PATH", test_path, check=True
-    )
+    tmuxio.tmux(socket, "set-environment", "-t", session, "PATH", test_path, check=True)
     if chainlink_db is not None:
         tmuxio.tmux(
             socket,
@@ -1176,7 +1219,9 @@ def stop_server(process: subprocess.Popen[str], repo: Path, label: str) -> None:
         raise HarnessError(f"Codex state leaked out of the run: {error}") from error
     session_path = repo / ".exo" / "e2e-tmux-session"
     try:
-        session = session_path.read_text(encoding="utf-8").strip().removesuffix("\\n").strip()
+        session = (
+            session_path.read_text(encoding="utf-8").strip().removesuffix("\\n").strip()
+        )
     except OSError:
         return
     if session:
@@ -2175,9 +2220,7 @@ def run_live_ordered_probe(
             sub_tls=(
                 SubTLTask(
                     first_child,
-                    WorkPlan(
-                        sub_tls=(SubTLTask("nested", WorkPlan(), order=1),)
-                    ),
+                    WorkPlan(sub_tls=(SubTLTask("nested", WorkPlan(), order=1),)),
                     order=1,
                 ),
                 SubTLTask(second_child, WorkPlan(), order=1),

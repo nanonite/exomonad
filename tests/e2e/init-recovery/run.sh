@@ -101,6 +101,66 @@ print(count)
 PY
 }
 
+assert_configured_retry_dispatch_events() {
+    python3 - "$1" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repository = Path(sys.argv[1])
+required = {
+    "tl.dispatch_intended",
+    "tl.spawn_requested",
+    "tl.spawn_request_accepted",
+    "tl.dispatch_confirmed",
+}
+source = "proven_preexecution_retry"
+slice_id = "issue-814-substitution-model-kani"
+ledger = [
+    json.loads(line)
+    for segment in sorted((repository / ".exo/ledger/segments").glob("segment-*.jsonl"))
+    for line in segment.read_text(encoding="utf-8").splitlines()
+]
+accepted = [
+    event for event in ledger
+    if event.get("agent_id") == "kani"
+    and event.get("type") in required
+    and isinstance(event.get("data"), dict)
+    and event["data"].get("slice_id") == slice_id
+    and event["data"].get("route_reconciliation_source") == source
+]
+assert {event["type"] for event in accepted} == required, (
+    f"canonical ledger is missing configured retry dispatch events: "
+    f"{sorted(required - {event['type'] for event in accepted})}"
+)
+for event_type in required:
+    matching = [event for event in accepted if event["type"] == event_type]
+    assert len(matching) == 1, f"expected one canonical {event_type}, found {len(matching)}"
+
+attempts = [
+    event for event in ledger
+    if event.get("agent_id") == "kani"
+    and event.get("type") == "tool.called"
+    and isinstance(event.get("data"), dict)
+    and isinstance(event["data"].get("arguments"), dict)
+    and event["data"]["arguments"].get("event_type") in required
+    and isinstance(event["data"]["arguments"].get("payload"), dict)
+    and event["data"]["arguments"]["payload"].get("slice_id") == slice_id
+    and event["data"]["arguments"]["payload"].get("route_reconciliation_source") == source
+]
+assert {event["data"]["arguments"]["event_type"] for event in attempts} == required
+for event_type in required:
+    matching = [
+        event for event in attempts
+        if event["data"]["arguments"]["event_type"] == event_type
+    ]
+    assert len(matching) == 1, f"expected one attempted {event_type}, found {len(matching)}"
+    assert matching[0]["data"].get("success") is True, (
+        f"{event_type} controller emit was rejected: {matching[0]['data'].get('error')}"
+    )
+PY
+}
+
 assert_init_status() {
     local status="$1"
     local log_path="$2"
@@ -1354,6 +1414,7 @@ print(leaf["pr_number"])
 PY
 )"
 POST_TIDY_LEAF_PR="$leaf_pr"
+assert_configured_retry_dispatch_events "$AGG_REPO"
 read -r KANI_CONTROLLER_INVOCATION_ID KANI_CONTROLLER_GENERATION < <(python3 - "$AGG_REPO" <<'PY'
 import json
 import sys
@@ -1775,6 +1836,7 @@ HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
     "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
     > "$AGG_DIR/init-repeat.log" 2>&1 || REPEAT_INIT_STATUS=$?
 assert_init_status "$REPEAT_INIT_STATUS" "$AGG_DIR/init-repeat.log" "repeated aggregate init --continue"
+assert_configured_retry_dispatch_events "$AGG_REPO"
 rg -Fq "server_build=\"$AGGREGATE_BUILD_ID\" controller_build=\"$AGGREGATE_BUILD_ID\"" "$AGG_DIR/init-repeat.log" \
     || { cat "$AGG_DIR/init-repeat.log"; e2e_fail "repeat init did not attach using the verified binary/archive"; }
 assert_one_live_window Server

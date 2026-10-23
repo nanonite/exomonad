@@ -59,6 +59,9 @@ fn valid_field_value(event_type: &str, key: &str, value: &Value) -> bool {
     let Some(definition) = event_contract().events.get(event_type) else {
         return false;
     };
+    if key == "route_reconciliation_source" {
+        return value.as_str() == Some("proven_preexecution_retry");
+    }
     if value.is_null() {
         return true;
     }
@@ -307,6 +310,76 @@ mod tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn retains_proven_retry_route_source_in_canonical_dispatch_events() {
+        let directory = tempdir().unwrap();
+        let mut services = Services::test();
+        services.event_log = Some(Arc::new(
+            EventLog::open(directory.path().join("logs")).unwrap(),
+        ));
+        let event_log = services.event_log.clone().unwrap();
+        let handler = TlHandler::new(Arc::new(services));
+        let event_types = [
+            "tl.dispatch_intended",
+            "tl.spawn_requested",
+            "tl.spawn_request_accepted",
+            "tl.dispatch_confirmed",
+        ];
+
+        for event_type in event_types {
+            handler
+                .emit_event(
+                    EmitEventRequest {
+                        event_type: event_type.to_string(),
+                        payload: format!(
+                            r#"{{"slice_id":"leaf-a","intent_id":"intent-1","boundary":"dispatch_intended","started_at":1,"attempt":2,"route_reconciliation_source":"proven_preexecution_retry"}}"#
+                        )
+                        .into_bytes(),
+                    },
+                    &context(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let retained = event_log.ledger().read_events().unwrap();
+        for event_type in event_types {
+            let matches = retained
+                .iter()
+                .filter(|record| record.event.event_type == event_type)
+                .collect::<Vec<_>>();
+            assert_eq!(matches.len(), 1, "{event_type} should be retained once");
+            assert_eq!(
+                matches[0].event.data["route_reconciliation_source"],
+                "proven_preexecution_retry"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_unrecognized_route_reconciliation_sources() {
+        let directory = tempdir().unwrap();
+        let mut services = Services::test();
+        services.event_log = Some(Arc::new(
+            EventLog::open(directory.path().join("logs")).unwrap(),
+        ));
+        let handler = TlHandler::new(Arc::new(services));
+
+        let error = handler
+            .emit_event(
+                EmitEventRequest {
+                    event_type: "tl.dispatch_intended".to_string(),
+                    payload: br#"{"slice_id":"leaf-a","route_reconciliation_source":"unverified"}"#
+                        .to_vec(),
+                },
+                &context(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("scalar aggregate dimension"));
     }
 
     #[tokio::test]

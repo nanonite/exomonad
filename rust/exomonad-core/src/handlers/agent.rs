@@ -3096,8 +3096,8 @@ impl<
         let _resume_guard = resume_reconciliation_lock().lock().await;
         let desired_route = self.service.configured_runtime_route("dev");
         let desired_agent_type = desired_route.agent_type;
-        let desired_model = desired_route.model;
-        let desired_effort = desired_route.effort;
+        let desired_model = desired_route.model.clone();
+        let desired_effort = desired_route.effort.clone();
         let forgejo = self.ctx.forgejo_client().ok_or_else(|| {
             EffectError::invalid_input("Forgejo is not configured; cannot resume a PR")
         })?;
@@ -3198,7 +3198,6 @@ impl<
         }
         self.ensure_tl_spawn_preflight_for_child(ctx, owner.agent_name.as_str(), &req.intent_id)
             .await?;
-
         let continuation_prefix = resume_pr_prefix(
             self.ctx.as_ref(),
             &self.service,
@@ -3220,11 +3219,29 @@ impl<
                 req.resume_pr_number
             )));
         };
-        if previous.is_live() {
+        let worktree = resolve_owner_worktree(self.ctx.project_dir(), owner)?;
+        let current_branch = git_current_branch(&worktree).await?;
+        if current_branch != head_branch {
             return Err(EffectError::invalid_input(format!(
-                "PR #{} owner invocation is still active; configured runtime changes wait for its exact invocation to finish",
-                req.resume_pr_number
+                "PR #{} owner worktree branch changed: expected {}, found {}",
+                req.resume_pr_number, head_branch, current_branch
             )));
+        }
+        if previous.is_live() {
+            return self
+                .adopt_resume_pr_successor(
+                    req,
+                    ctx,
+                    owner,
+                    &owner_dir,
+                    previous,
+                    &pr,
+                    head_branch,
+                    head_sha,
+                    &desired_route,
+                    &worktree,
+                )
+                .await;
         }
         if !invocation_has_terminal_outcome(previous) {
             return Err(EffectError::invalid_input(format!(
@@ -3239,14 +3256,6 @@ impl<
             .recovery_round
             .checked_add(1)
             .ok_or_else(|| EffectError::invalid_input("PR owner recovery round is exhausted"))?;
-        let worktree = resolve_owner_worktree(self.ctx.project_dir(), owner)?;
-        let current_branch = git_current_branch(&worktree).await?;
-        if current_branch != head_branch {
-            return Err(EffectError::invalid_input(format!(
-                "PR #{} owner worktree branch changed: expected {}, found {}",
-                req.resume_pr_number, head_branch, current_branch
-            )));
-        }
         let fingerprint = worktree_fingerprint(&worktree).await?;
         let intent_id = if req.intent_id.trim().is_empty() {
             blocked_resume_intent_id(
@@ -3305,6 +3314,28 @@ impl<
                 &data,
             )?;
         }
+        record_resume_pr_intent(
+            self.ctx.event_log().ok_or_else(|| {
+                EffectError::invalid_input(
+                    "PR resume is blocked because durable intent history is unavailable",
+                )
+            })?,
+            ctx.agent_name.as_ref(),
+            &resume_pr_intent_data(
+                &intent_id,
+                owner,
+                previous,
+                req.resume_pr_number,
+                head_sha,
+                head_branch,
+                pr.base_ref.as_str(),
+                &worktree,
+                &fingerprint,
+                desired_agent_type,
+                desired_model.as_deref(),
+                desired_effort.as_deref(),
+            ),
+        )?;
         let options = SpawnLeafOptions {
             task: req.task.clone(),
             branch_name: owner.slug.to_string(),
@@ -3376,6 +3407,13 @@ impl<
                 invocation_target_label(&invocation)
             )));
         }
+        self.reconcile_owner_runtime_metadata(
+            owner,
+            desired_agent_type,
+            desired_model.as_deref(),
+            desired_effort.as_deref(),
+        )
+        .await?;
         let mut agent_info = leaf_subtree_result_to_proto(owner.slug.as_str(), &result)?;
         agent_info.alive = true;
         agent_info.is_alive = true;
@@ -3446,6 +3484,158 @@ impl<
             ),
         );
 
+        Ok(SpawnLeafSubtreeResponse {
+            agent: Some(agent_info),
+            invocation: Some(invocation_handoff),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn adopt_resume_pr_successor(
+        &self,
+        req: &SpawnLeafSubtreeRequest,
+        ctx: &crate::effects::EffectContext,
+        owner: &AgentIdentityRecord,
+        owner_dir: &Path,
+        invocation: &InvocationRecord,
+        pr: &ForgejoPullRequest,
+        head_branch: &str,
+        head_sha: &str,
+        route: &ConfiguredRuntimeRoute,
+        worktree: &Path,
+    ) -> EffectResult<SpawnLeafSubtreeResponse> {
+        let prior_invocation_id = invocation
+            .prior_invocation_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                EffectError::invalid_input(
+                    "live PR owner has no durable predecessor; refusing response-loss adoption",
+                )
+            })?;
+        if invocation.trigger != crate::services::agent_control::InvocationTrigger::ResumePr
+            || invocation.pr_number != Some(req.resume_pr_number)
+            || invocation.head_sha.as_deref() != Some(head_sha)
+            || invocation.branch.as_deref() != Some(head_branch)
+            || invocation.worktree.as_deref() != Some(owner.working_dir.to_string_lossy().as_ref())
+            || invocation.runtime != route.agent_type
+            || invocation.model.as_deref() != route.model.as_deref()
+            || invocation.effort.as_deref() != route.effort.as_deref()
+            || invocation.generation == 0
+            || invocation.runtime_agent_id.as_deref() != Some(owner.agent_name.as_str())
+            || invocation.slice_id != owner.slice_id
+        {
+            return Err(EffectError::invalid_input(format!(
+                "PR #{} response cannot be adopted: live invocation {} conflicts with the requested PR, head, owner, or configured route",
+                req.resume_pr_number, invocation.invocation_id
+            )));
+        }
+        let intent_id = read_resume_pr_intent_id(req, owner_dir, invocation).await?;
+        let event_log = self.ctx.event_log().ok_or_else(|| {
+            EffectError::invalid_input(
+                "PR response-loss adoption is blocked because durable intent history is unavailable",
+            )
+        })?;
+        validate_resume_pr_intent_history(
+            event_log,
+            owner,
+            invocation,
+            req.resume_pr_number,
+            head_sha,
+            head_branch,
+            pr.base_ref.as_str(),
+            worktree,
+            route,
+            &intent_id,
+        )?;
+        validate_terminal_invocation_history(event_log, owner, prior_invocation_id)?;
+        validate_resume_pr_publication(
+            self.ctx.project_dir(),
+            owner,
+            invocation,
+            req.resume_pr_number,
+            head_branch,
+            pr.base_ref.as_str(),
+            head_sha,
+        )
+        .await?;
+        let routing = RoutingInfo::read_from_dir(owner_dir)
+            .await
+            .map_err(|error| {
+                EffectError::invalid_input(format!(
+                    "PR response-loss adoption cannot read current routing ownership: {error}"
+                ))
+            })?;
+        if !routing.has_ownership_proof()
+            || routing.owner_agent_id.as_deref() != Some(owner.agent_name.as_str())
+            || routing.owner_invocation_id.as_deref() != Some(invocation.invocation_id.as_str())
+            || routing.owner_generation != Some(invocation.generation)
+            || !routing.same_delivery_target(&invocation.routing)
+        {
+            return Err(EffectError::invalid_input(
+                "PR response-loss adoption found missing or conflicting invocation routing ownership",
+            ));
+        }
+        self.reconcile_owner_runtime_metadata(
+            owner,
+            route.agent_type,
+            route.model.as_deref(),
+            route.effort.as_deref(),
+        )
+        .await?;
+        verify_owner_runtime_metadata(
+            self.ctx.project_dir(),
+            self.ctx.agent_resolver(),
+            owner,
+            route,
+        )
+        .await?;
+        verify_current_publication_ownership(
+            self.ctx.project_dir(),
+            self.ctx.agent_resolver(),
+            req.resume_pr_number,
+            head_branch,
+            pr.base_ref.as_str(),
+            head_sha,
+        )
+        .await
+        .map_err(|error| {
+            EffectError::invalid_input(format!(
+                "PR response-loss adoption publication ownership is not current: {error}"
+            ))
+        })?;
+        if self.service.routing_liveness(owner_dir).await != Some(true) {
+            return Err(EffectError::invalid_input(format!(
+                "PR #{} successor {} is no longer authoritatively live; retry after lifecycle reconciliation",
+                req.resume_pr_number, invocation.invocation_id
+            )));
+        }
+
+        let result = crate::services::agent_control::SpawnResult {
+            agent_dir: owner_dir.to_path_buf(),
+            worktree_path: worktree.to_path_buf(),
+            branch_name: head_branch.to_string(),
+            agent_name: owner.agent_name.clone(),
+            issue_title: owner.slug.to_string(),
+            agent_type: route.agent_type,
+            pane_id: invocation
+                .routing
+                .window_id
+                .as_ref()
+                .map(ToString::to_string),
+        };
+        let mut agent_info = leaf_subtree_result_to_proto(owner.slug.as_str(), &result)?;
+        agent_info.alive = true;
+        agent_info.is_alive = true;
+        self.register_child_supervisor(agent_info.id.as_str(), ctx)
+            .await;
+        let invocation_handoff = invocation_handoff_to_proto(
+            invocation,
+            head_branch,
+            false,
+            true,
+            "adopted_after_response_loss",
+        );
         Ok(SpawnLeafSubtreeResponse {
             agent: Some(agent_info),
             invocation: Some(invocation_handoff),
@@ -3934,25 +4124,35 @@ impl<
         model: Option<&str>,
         effort: Option<&str>,
     ) -> EffectResult<()> {
-        if owner.agent_type == agent_type
-            && owner.model.as_deref() == model
-            && owner.effort.as_deref() == effort
-        {
-            return Ok(());
-        }
         let mut updated = owner.clone();
         updated.agent_type = agent_type;
         updated.model = model.map(str::to_owned);
         updated.effort = effort.map(str::to_owned);
-        self.ctx
-            .agent_resolver()
-            .register(updated)
-            .await
-            .map_err(|error| {
-                EffectError::invalid_input(format!(
-                    "configured runtime ownership could not be reconciled: {error}"
-                ))
-            })
+        if owner.agent_type != agent_type
+            || owner.model.as_deref() != model
+            || owner.effort.as_deref() != effort
+        {
+            self.ctx
+                .agent_resolver()
+                .register(updated)
+                .await
+                .map_err(|error| {
+                    EffectError::invalid_input(format!(
+                        "configured runtime ownership could not be reconciled: {error}"
+                    ))
+                })?;
+        }
+        verify_owner_runtime_metadata(
+            self.ctx.project_dir(),
+            self.ctx.agent_resolver(),
+            owner,
+            &ConfiguredRuntimeRoute {
+                agent_type,
+                model: model.map(str::to_owned),
+                effort: effort.map(str::to_owned),
+            },
+        )
+        .await
     }
 
     async fn reject_orphan_pr_spawn(&self, req: &SpawnLeafSubtreeRequest) -> EffectResult<()> {
@@ -4205,6 +4405,281 @@ fn configured_route_changed(
         || owner.agent_type != agent_type
         || owner.model.as_deref() != model
         || owner.effort.as_deref() != effort
+}
+
+fn resume_pr_intent_data(
+    intent_id: &str,
+    owner: &AgentIdentityRecord,
+    prior: &InvocationRecord,
+    pr_number: u64,
+    head_sha: &str,
+    head_branch: &str,
+    base_branch: &str,
+    worktree: &Path,
+    fingerprint: &str,
+    route_agent_type: ServiceAgentType,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "intent_id": intent_id,
+        "owner_agent_id": owner.agent_name,
+        "slice_id": owner.slice_id,
+        "prior_invocation_id": prior.invocation_id,
+        "prior_generation": prior.generation,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
+        "head_branch": head_branch,
+        "base_branch": base_branch,
+        "worktree": worktree.to_string_lossy(),
+        "worktree_fingerprint": fingerprint,
+        "configured_harness": route_agent_type.suffix(),
+        "configured_model": model,
+        "configured_effort": effort,
+        "authorization_source": "accepted_operator_role_configuration",
+    })
+}
+
+fn record_resume_pr_intent(
+    log: &crate::services::EventLog,
+    actor: &str,
+    data: &serde_json::Value,
+) -> EffectResult<()> {
+    const EVENT_TYPE: &str = "agent.resume_pr.intent";
+    let intent_id = data["intent_id"].as_str().ok_or_else(|| {
+        EffectError::invalid_input("PR resume intent record is missing its intent ID")
+    })?;
+    let matches = log
+        .ledger()
+        .read_events()
+        .effect_err("agent")?
+        .into_iter()
+        .filter(|record| {
+            record.event.event_type == EVENT_TYPE
+                && record.event.data["intent_id"].as_str() == Some(intent_id)
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [record] if record.event.data == *data => return Ok(()),
+        [] => {}
+        _ => {
+            return Err(EffectError::invalid_input(format!(
+                "PR resume intent {intent_id} already has conflicting durable coordinates"
+            )));
+        }
+    }
+    log.append(EVENT_TYPE, actor, data).map_err(|error| {
+        EffectError::custom("agent_resume_pr_intent_write_failed", error.to_string())
+    })?;
+    Ok(())
+}
+
+async fn read_resume_pr_intent_id(
+    req: &SpawnLeafSubtreeRequest,
+    owner_dir: &Path,
+    invocation: &InvocationRecord,
+) -> EffectResult<String> {
+    let intent_id = fs::read_to_string(owner_dir.join("dispatch_intent"))
+        .await
+        .map_err(|error| {
+            EffectError::invalid_input(format!(
+                "PR #{} live successor has no durable dispatch intent: {error}",
+                req.resume_pr_number
+            ))
+        })?
+        .trim()
+        .to_string();
+    if intent_id.is_empty()
+        || (!req.intent_id.trim().is_empty() && req.intent_id.trim() != intent_id)
+    {
+        return Err(EffectError::invalid_input(format!(
+            "PR #{} live successor dispatch intent does not match this resume request",
+            req.resume_pr_number
+        )));
+    }
+    if invocation.generation < 2 {
+        return Err(EffectError::invalid_input(
+            "PR response-loss adoption requires a successor generation",
+        ));
+    }
+    Ok(intent_id)
+}
+
+fn validate_resume_pr_intent_history(
+    log: &crate::services::EventLog,
+    owner: &AgentIdentityRecord,
+    invocation: &InvocationRecord,
+    pr_number: u64,
+    head_sha: &str,
+    head_branch: &str,
+    base_branch: &str,
+    worktree: &Path,
+    route: &ConfiguredRuntimeRoute,
+    intent_id: &str,
+) -> EffectResult<()> {
+    let prior_id = invocation.prior_invocation_id.as_deref().ok_or_else(|| {
+        EffectError::invalid_input("PR successor is missing its predecessor invocation")
+    })?;
+    let events = log.ledger().read_events().effect_err("agent")?;
+    let matching = events
+        .iter()
+        .filter(|record| {
+            record.event.event_type == "agent.resume_pr.intent"
+                && record.event.data["intent_id"].as_str() == Some(intent_id)
+        })
+        .collect::<Vec<_>>();
+    let [record] = matching.as_slice() else {
+        return Err(EffectError::invalid_input(format!(
+            "PR resume intent {intent_id} is missing or ambiguous in durable history"
+        )));
+    };
+    let data = &record.event.data;
+    let fingerprint = data["worktree_fingerprint"].as_str().unwrap_or_default();
+    let valid_fingerprint = fingerprint
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    if !valid_fingerprint
+        || data["owner_agent_id"].as_str() != Some(owner.agent_name.as_str())
+        || data["slice_id"].as_str() != owner.slice_id.as_deref()
+        || data["prior_invocation_id"].as_str() != Some(prior_id)
+        || data["prior_generation"].as_u64() != Some(invocation.generation - 1)
+        || data["pr_number"].as_u64() != Some(pr_number)
+        || data["head_sha"].as_str() != Some(head_sha)
+        || data["head_branch"].as_str() != Some(head_branch)
+        || data["base_branch"].as_str() != Some(base_branch)
+        || data["worktree"].as_str() != Some(worktree.to_string_lossy().as_ref())
+        || data["configured_harness"].as_str() != Some(route.agent_type.suffix())
+        || data["configured_model"].as_str() != route.model.as_deref()
+        || data["configured_effort"].as_str() != route.effort.as_deref()
+        || data["authorization_source"].as_str() != Some("accepted_operator_role_configuration")
+        || invocation.recovery_round == 0
+    {
+        return Err(EffectError::invalid_input(format!(
+            "PR resume intent {intent_id} does not prove the current owner, predecessor, PR, head, branch, worktree, and configured route"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_terminal_invocation_history(
+    log: &crate::services::EventLog,
+    owner: &AgentIdentityRecord,
+    invocation_id: &str,
+) -> EffectResult<()> {
+    let found = log
+        .ledger()
+        .read_events()
+        .effect_err("agent")?
+        .iter()
+        .any(|record| {
+            record.event.event_type == "agent.invocation.finished"
+                && record.event.agent_id.as_deref() == Some(owner.agent_name.as_str())
+                && record.event.data["invocation_id"].as_str() == Some(invocation_id)
+        });
+    if !found {
+        return Err(EffectError::invalid_input(format!(
+            "PR successor predecessor {invocation_id} has no durable terminal lifecycle record"
+        )));
+    }
+    Ok(())
+}
+
+async fn validate_resume_pr_publication(
+    project_dir: &Path,
+    owner: &AgentIdentityRecord,
+    invocation: &InvocationRecord,
+    pr_number: u64,
+    head_branch: &str,
+    base_branch: &str,
+    head_sha: &str,
+) -> EffectResult<()> {
+    let publications = read_published_heads(project_dir).await.map_err(|error| {
+        EffectError::invalid_input(format!(
+            "PR #{pr_number} publication history is unavailable: {error}"
+        ))
+    })?;
+    let matches = publications
+        .iter()
+        .filter(|publication| {
+            publication.matches_current(pr_number, head_branch, base_branch, head_sha)
+        })
+        .collect::<Vec<_>>();
+    let [publication] = matches.as_slice() else {
+        return Err(EffectError::invalid_input(format!(
+            "PR #{pr_number} exact published head is missing or ambiguous during response-loss adoption"
+        )));
+    };
+    let prior_id = invocation
+        .prior_invocation_id
+        .as_deref()
+        .unwrap_or_default();
+    if publication.author_agent.as_deref() != Some(owner.agent_name.as_str())
+        || publication.slice_id != owner.slice_id
+        || !publication.invocation_succession.iter().any(|succession| {
+            succession.from_invocation_id == prior_id
+                && succession.to_invocation_id == invocation.invocation_id
+        })
+    {
+        return Err(EffectError::invalid_input(format!(
+            "PR #{pr_number} publication history does not authorize this exact owner successor"
+        )));
+    }
+    crate::services::pr_registry::verify_publication_ownership(
+        publication,
+        Some(owner.agent_name.as_str()),
+        Some(head_branch),
+        Some(base_branch),
+        owner.slice_id.as_deref(),
+        Some(invocation.invocation_id.as_str()),
+    )
+    .map_err(|error| {
+        EffectError::invalid_input(format!(
+            "PR #{pr_number} publication successor is not verified: {error}"
+        ))
+    })
+}
+
+async fn verify_owner_runtime_metadata(
+    project_dir: &Path,
+    resolver: &crate::services::AgentResolver,
+    owner: &AgentIdentityRecord,
+    route: &ConfiguredRuntimeRoute,
+) -> EffectResult<()> {
+    let mut expected = owner.clone();
+    expected.agent_type = route.agent_type;
+    expected.model.clone_from(&route.model);
+    expected.effort.clone_from(&route.effort);
+    let registered = resolver.get(&owner.agent_name).await;
+    if registered.as_ref() != Some(&expected) {
+        return Err(EffectError::invalid_input(format!(
+            "configured runtime owner {} was not persisted in the current resolver registry",
+            owner.agent_name
+        )));
+    }
+    let identity_path = project_dir
+        .join(".exo/agents")
+        .join(owner.agent_name.as_str())
+        .join("identity.json");
+    let contents = fs::read(&identity_path).await.map_err(|error| {
+        EffectError::invalid_input(format!(
+            "configured runtime owner {} identity is unavailable at {}: {error}",
+            owner.agent_name,
+            identity_path.display()
+        ))
+    })?;
+    let persisted: AgentIdentityRecord = serde_json::from_slice(&contents).map_err(|error| {
+        EffectError::invalid_input(format!(
+            "configured runtime owner {} identity is malformed: {error}",
+            owner.agent_name
+        ))
+    })?;
+    if persisted != expected {
+        return Err(EffectError::invalid_input(format!(
+            "configured runtime owner {} disk identity conflicts with its verified invocation",
+            owner.agent_name
+        )));
+    }
+    Ok(())
 }
 
 fn invocation_has_terminal_outcome(invocation: &InvocationRecord) -> bool {
@@ -5332,6 +5807,498 @@ mod tests {
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
+
+    struct ResumePrAdoptionFixture {
+        _temp: tempfile::TempDir,
+        _forgejo: wiremock::MockServer,
+        handler: AgentHandler<crate::services::Services>,
+        context: crate::effects::EffectContext,
+        project_dir: PathBuf,
+        owner: AgentIdentityRecord,
+        owner_dir: PathBuf,
+        invocation_id: String,
+        prior_invocation_id: String,
+        head_sha: String,
+        tmux_socket: String,
+        previous_tmux_socket: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for ResumePrAdoptionFixture {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &self.tmux_socket, "kill-server"])
+                .status();
+            if let Some(socket) = self.previous_tmux_socket.take() {
+                std::env::set_var("EXOMONAD_TMUX_SOCKET", socket);
+            } else {
+                std::env::remove_var("EXOMONAD_TMUX_SOCKET");
+            }
+        }
+    }
+
+    impl ResumePrAdoptionFixture {
+        fn request(&self) -> SpawnLeafSubtreeRequest {
+            SpawnLeafSubtreeRequest {
+                task: "resume the exact existing PR owner".to_string(),
+                intent_id: "resume-pr-intent-46".to_string(),
+                resume_pr_number: 46,
+                expected_head_sha: self.head_sha.clone(),
+                ..Default::default()
+            }
+        }
+    }
+
+    async fn resume_pr_adoption_fixture() -> ResumePrAdoptionFixture {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const OWNER: &str = "issue-814-opencode";
+        const PRIOR: &str = "opencode-prior-invocation";
+        const CURRENT: &str = "codex-successor-invocation";
+        const SLICE: &str = "issue-814-substitution-model-kani";
+        const PR_NUMBER: u64 = 46;
+        let temp = tempfile::tempdir().expect("temporary PR-resume state");
+        let project_dir = temp.path().join("repo");
+        std::fs::create_dir_all(&project_dir).expect("create repository");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&project_dir)
+                .output()
+                .expect("run fixture Git command");
+            assert!(
+                output.status.success(),
+                "Git setup failed for {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&["config", "user.name", "PR resume acceptance"]);
+        git(&["config", "user.email", "pr-resume@example.invalid"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://forgejo.local/acme/repo.git",
+        ]);
+        std::fs::write(project_dir.join(".gitignore"), ".exo/\n")
+            .expect("write fixture ignore rules");
+        std::fs::write(project_dir.join("README.md"), "PR resume fixture\n")
+            .expect("write fixture readme");
+        git(&["add", ".gitignore", "README.md"]);
+        git(&["commit", "--quiet", "-m", "PR resume baseline"]);
+        let branch = format!("main.{OWNER}");
+        let worktree = project_dir.join(".exo/worktrees").join(OWNER);
+        std::fs::create_dir_all(worktree.parent().expect("worktree parent"))
+            .expect("create worktree parent");
+        git(&[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            &branch,
+            worktree.to_str().expect("worktree path UTF-8"),
+        ]);
+        let head_sha = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&worktree)
+            .output()
+            .expect("read PR head")
+            .stdout;
+        let head_sha = String::from_utf8(head_sha)
+            .expect("head SHA UTF-8")
+            .trim()
+            .to_string();
+        let forgejo = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/acme/repo/pulls/46"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "number": PR_NUMBER,
+                "html_url": "https://forgejo.local/acme/repo/pulls/46",
+                "title": "Resume existing PR owner",
+                "body": "",
+                "state": "open",
+                "head": { "ref": branch, "sha": head_sha },
+                "base": { "ref": "main", "sha": "base-46" }
+            })))
+            .mount(&forgejo)
+            .await;
+
+        let tmux_socket = format!("exo-pr-resume-{}", std::process::id());
+        let tmux_session = format!("exo-pr-resume-{}", std::process::id());
+        let previous_tmux_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
+        std::env::set_var("EXOMONAD_TMUX_SOCKET", &tmux_socket);
+        let session = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_socket,
+                "new-session",
+                "-d",
+                "-s",
+                &tmux_session,
+                "-n",
+                "root",
+                "sleep 300",
+            ])
+            .status()
+            .expect("start isolated tmux server");
+        assert!(session.success(), "isolated tmux session must start");
+        let window = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_socket,
+                "new-window",
+                "-d",
+                "-t",
+                &tmux_session,
+                "-n",
+                "existing-owner",
+                "-P",
+                "-F",
+                "#{window_id}",
+                "sleep 300",
+            ])
+            .output()
+            .expect("create existing owner target");
+        assert!(
+            window.status.success(),
+            "existing owner tmux target must start: {}",
+            String::from_utf8_lossy(&window.stderr)
+        );
+        let window_id = String::from_utf8(window.stdout)
+            .expect("window ID UTF-8")
+            .trim()
+            .to_string();
+
+        let owner = AgentIdentityRecord {
+            agent_name: AgentName::try_from_str(OWNER).expect("owner identity"),
+            slug: Slug::try_from_str("issue-814").expect("owner slug"),
+            agent_type: ServiceAgentType::OpenCode,
+            birth_branch: BirthBranch::try_from_str(&branch).expect("owner branch"),
+            parent_branch: BirthBranch::try_from_str("main").expect("parent branch"),
+            working_dir: PathBuf::from(format!(".exo/worktrees/{OWNER}")),
+            display_name: format!("🤖 {OWNER}"),
+            topology: Topology::WorktreePerAgent,
+            model: Some("opencode-go/deepseek-v4.1-flash".to_string()),
+            effort: Some("high".to_string()),
+            ledger_owned: true,
+            slice_id: Some(SLICE.to_string()),
+        };
+        let owner_dir = project_dir.join(".exo/agents").join(OWNER);
+        std::fs::create_dir_all(&owner_dir).expect("create owner metadata directory");
+        std::fs::write(
+            owner_dir.join("identity.json"),
+            serde_json::to_vec_pretty(&owner).expect("serialize historical owner"),
+        )
+        .expect("persist historical OpenCode owner");
+        std::fs::write(owner_dir.join("dispatch_intent"), "resume-pr-intent-46\n")
+            .expect("persist exact resume intent");
+        let routing = RoutingInfo::window(
+            crate::services::tmux_ipc::WindowId::parse(&window_id).expect("window identity"),
+        )
+        .with_ownership(OWNER, CURRENT, 2);
+        routing
+            .write_to_dir(&owner_dir)
+            .await
+            .expect("persist successor routing owner");
+        let invocation = InvocationRecord {
+            invocation_id: CURRENT.to_string(),
+            runtime: ServiceAgentType::Codex,
+            trigger: InvocationTrigger::ResumePr,
+            mode: crate::services::agent_control::InvocationMode::OneShot,
+            routing,
+            started_at: 10,
+            ended_at: None,
+            status: InvocationStatus::Running,
+            exit_code: None,
+            pr_number: Some(PR_NUMBER),
+            head_sha: Some(head_sha.clone()),
+            model: Some("gpt-6-luna".to_string()),
+            effort: Some("xhigh".to_string()),
+            prior_invocation_id: Some(PRIOR.to_string()),
+            recovery_round: 1,
+            authorization_source: Some(RecoveryAuthorization::Reconciler),
+            generation: 2,
+            runtime_agent_id: Some(OWNER.to_string()),
+            slice_id: Some(SLICE.to_string()),
+            branch: Some(branch.clone()),
+            worktree: Some(owner.working_dir.to_string_lossy().into_owned()),
+            exit_reason: None,
+            exit_classification: None,
+            stderr_tail: None,
+        };
+        std::fs::write(
+            owner_dir.join("invocation.json"),
+            serde_json::to_vec_pretty(&invocation).expect("serialize live successor"),
+        )
+        .expect("persist live successor invocation");
+        let prior = InvocationRecord {
+            invocation_id: PRIOR.to_string(),
+            runtime: ServiceAgentType::OpenCode,
+            trigger: InvocationTrigger::Spawn,
+            mode: crate::services::agent_control::InvocationMode::OneShot,
+            routing: RoutingInfo::window(
+                crate::services::tmux_ipc::WindowId::parse(&window_id).expect("prior window"),
+            ),
+            started_at: 1,
+            ended_at: Some(2),
+            status: InvocationStatus::Exited,
+            exit_code: Some(1),
+            pr_number: Some(PR_NUMBER),
+            head_sha: Some(head_sha.clone()),
+            model: owner.model.clone(),
+            effort: owner.effort.clone(),
+            prior_invocation_id: None,
+            recovery_round: 0,
+            authorization_source: None,
+            generation: 1,
+            runtime_agent_id: Some(OWNER.to_string()),
+            slice_id: Some(SLICE.to_string()),
+            branch: Some(branch.clone()),
+            worktree: Some(owner.working_dir.to_string_lossy().into_owned()),
+            exit_reason: Some("review_requested_changes".to_string()),
+            exit_classification: Some("review_complete".to_string()),
+            stderr_tail: None,
+        };
+        let event_log = Arc::new(
+            crate::services::EventLog::open(project_dir.join(".exo/logs"))
+                .expect("open canonical event log"),
+        );
+        event_log
+            .append(
+                "agent.invocation.finished",
+                OWNER,
+                &serde_json::json!({ "invocation_id": PRIOR, "status": "exited" }),
+            )
+            .expect("retain terminal prior lifecycle record");
+        let fingerprint = worktree_fingerprint(&worktree)
+            .await
+            .expect("fingerprint stable owner worktree");
+        let route = ConfiguredRuntimeRoute {
+            agent_type: ServiceAgentType::Codex,
+            model: Some("gpt-6-luna".to_string()),
+            effort: Some("xhigh".to_string()),
+        };
+        let intent_data = resume_pr_intent_data(
+            "resume-pr-intent-46",
+            &owner,
+            &prior,
+            PR_NUMBER,
+            &head_sha,
+            &branch,
+            "main",
+            &worktree,
+            &fingerprint,
+            route.agent_type,
+            route.model.as_deref(),
+            route.effort.as_deref(),
+        );
+        record_resume_pr_intent(&event_log, "root-controller", &intent_data)
+            .expect("record original configured resume intent");
+        std::fs::create_dir_all(project_dir.join(".exo")).expect("create Exo directory");
+        std::fs::write(
+            project_dir.join(".exo/published-heads.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 2,
+                "heads": [{
+                    "pr_number": PR_NUMBER,
+                    "head_branch": branch,
+                    "base_branch": "main",
+                    "head_sha": head_sha,
+                    "author_agent": OWNER,
+                    "author_role": "dev",
+                    "provenance": "ledger_owned",
+                    "slice_id": SLICE,
+                    "invocation_id": PRIOR,
+                    "invocation_trigger": "spawn",
+                    "invocation_runtime": "opencode",
+                    "invocation_succession": [{
+                        "from_invocation_id": PRIOR,
+                        "to_invocation_id": CURRENT,
+                        "reason": "session_recreate",
+                        "recorded_at": 3
+                    }]
+                }]
+            }))
+            .expect("serialize current publication and succession"),
+        )
+        .expect("persist exact publication proof");
+
+        let forgejo_client =
+            crate::services::forgejo::ForgejoClient::new(&forgejo.uri(), "fixture-token")
+                .expect("construct isolated Forgejo client");
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.clone();
+        services.event_log = Some(event_log);
+        services.forgejo_client = Some(forgejo_client);
+        services.agent_resolver =
+            Arc::new(crate::services::AgentResolver::load(project_dir.clone()).await);
+        let services = Arc::new(services);
+        let service = Arc::new(
+            AgentControlService::new(services.clone())
+                .with_tmux_session(tmux_session.clone())
+                .with_birth_branch(BirthBranch::try_from_str("main").expect("root branch"))
+                .with_spawn_agent_type(ServiceAgentType::Codex)
+                .with_spawn_agent_model(Some("gpt-6-luna".to_string()))
+                .with_spawn_agent_effort(Some("xhigh".to_string())),
+        );
+        let handler = AgentHandler::new(service, services);
+        ResumePrAdoptionFixture {
+            _temp: temp,
+            _forgejo: forgejo,
+            handler,
+            context: crate::effects::EffectContext {
+                agent_name: AgentName::try_from_str("root-controller").expect("actor identity"),
+                birth_branch: BirthBranch::try_from_str("main").expect("actor branch"),
+                working_dir: project_dir.clone(),
+            },
+            project_dir,
+            owner,
+            owner_dir,
+            invocation_id: CURRENT.to_string(),
+            prior_invocation_id: PRIOR.to_string(),
+            head_sha,
+            tmux_socket,
+            previous_tmux_socket,
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resume_pr_adopts_the_exact_live_successor_after_response_loss() {
+        let fixture = resume_pr_adoption_fixture().await;
+        let invocation_path = fixture.owner_dir.join("invocation.json");
+        let invocation_before = std::fs::read(&invocation_path).expect("read successor checkpoint");
+        let publication_path = fixture.project_dir.join(".exo/published-heads.json");
+        let publication_before =
+            std::fs::read(&publication_path).expect("read publication history");
+        let invocation: InvocationRecord =
+            serde_json::from_slice(&invocation_before).expect("parse current successor");
+        assert_eq!(
+            invocation.prior_invocation_id.as_deref(),
+            Some(fixture.prior_invocation_id.as_str())
+        );
+
+        let mut wrong_intent = fixture.request();
+        wrong_intent.intent_id = "unrelated-resume-intent".to_string();
+        let refused = fixture
+            .handler
+            .spawn_leaf_subtree(wrong_intent, &fixture.context)
+            .await
+            .expect_err("a different invocation intent must not adopt the live successor");
+        assert!(refused.to_string().contains("dispatch intent"));
+        assert_eq!(std::fs::read(&invocation_path).unwrap(), invocation_before);
+
+        for _ in 0..2 {
+            let response = fixture
+                .handler
+                .spawn_leaf_subtree(fixture.request(), &fixture.context)
+                .await
+                .expect("exact response-lost successor should be adopted");
+            let handoff = response.invocation.expect("successor invocation handoff");
+            assert_eq!(handoff.invocation_id, fixture.invocation_id);
+            assert!(!handoff.fresh);
+            assert!(handoff.ready);
+            assert_eq!(handoff.outcome, "adopted_after_response_loss");
+        }
+
+        let identity_path = fixture.owner_dir.join("identity.json");
+        let identity: AgentIdentityRecord = serde_json::from_slice(
+            &std::fs::read(&identity_path).expect("read current owner identity"),
+        )
+        .expect("parse current owner identity");
+        assert_eq!(identity.agent_name, fixture.owner.agent_name);
+        assert_eq!(identity.birth_branch, fixture.owner.birth_branch);
+        assert_eq!(identity.parent_branch, fixture.owner.parent_branch);
+        assert_eq!(identity.working_dir, fixture.owner.working_dir);
+        assert_eq!(identity.slice_id, fixture.owner.slice_id);
+        assert_eq!(identity.agent_type, ServiceAgentType::Codex);
+        assert_eq!(identity.model.as_deref(), Some("gpt-6-luna"));
+        assert_eq!(identity.effort.as_deref(), Some("xhigh"));
+        assert_eq!(std::fs::read(&invocation_path).unwrap(), invocation_before);
+        assert_eq!(
+            std::fs::read(&publication_path).unwrap(),
+            publication_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixture.owner_dir.join("dispatch_intent"))
+                .unwrap()
+                .trim(),
+            "resume-pr-intent-46"
+        );
+        let event_log = crate::services::EventLog::open(fixture.project_dir.join(".exo/logs"))
+            .expect("open event ledger");
+        assert_eq!(
+            event_log
+                .ledger()
+                .read_events()
+                .unwrap()
+                .iter()
+                .filter(|record| record.event.event_type == "agent.resume_pr.intent")
+                .count(),
+            1,
+            "response-loss retries must retain one logical resume intent"
+        );
+        let windows = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &fixture.tmux_socket,
+                "list-windows",
+                "-t",
+                &format!("exo-pr-resume-{}", std::process::id()),
+                "-F",
+                "#{window_name}",
+            ])
+            .output()
+            .expect("list isolated owner windows");
+        assert!(windows.status.success());
+        assert_eq!(
+            String::from_utf8(windows.stdout)
+                .unwrap()
+                .lines()
+                .filter(|name| *name == "existing-owner")
+                .count(),
+            1,
+            "retry adoption must not start a second owner process"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resume_pr_does_not_report_success_when_owner_registration_fails() {
+        let fixture = resume_pr_adoption_fixture().await;
+        let identity_path = fixture.owner_dir.join("identity.json");
+        let original_identity = std::fs::read(&identity_path).expect("read historical identity");
+        std::fs::remove_file(&identity_path).expect("remove identity before write refusal");
+        std::fs::create_dir(&identity_path).expect("make identity target unwritable");
+        let invocation_path = fixture.owner_dir.join("invocation.json");
+        let invocation_before = std::fs::read(&invocation_path).expect("read successor checkpoint");
+
+        let refused = fixture
+            .handler
+            .spawn_leaf_subtree(fixture.request(), &fixture.context)
+            .await
+            .expect_err("owner registration failure must not be reported as success");
+        assert!(
+            refused
+                .to_string()
+                .contains("configured runtime ownership could not be reconciled"),
+            "registration failure should be actionable: {refused}"
+        );
+        assert_eq!(std::fs::read(&invocation_path).unwrap(), invocation_before);
+
+        std::fs::remove_dir(&identity_path).expect("remove injected identity fault");
+        std::fs::write(&identity_path, original_identity).expect("restore historical identity");
+        let adopted = fixture
+            .handler
+            .spawn_leaf_subtree(fixture.request(), &fixture.context)
+            .await
+            .expect("retry should repair owner metadata and adopt the existing successor");
+        let handoff = adopted.invocation.expect("adopted invocation handoff");
+        assert_eq!(handoff.invocation_id, fixture.invocation_id);
+        assert_eq!(handoff.outcome, "adopted_after_response_loss");
+        assert_eq!(std::fs::read(&invocation_path).unwrap(), invocation_before);
+    }
 
     #[tokio::test]
     async fn authenticated_agent_effect_runs_scope_handoff_in_its_current_worktree() {

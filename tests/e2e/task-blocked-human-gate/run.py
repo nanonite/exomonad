@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -28,8 +29,8 @@ import real_server_transport as real
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.events.reader import LedgerReader
 
-SLICE_ID = "base-ci-blocked-leaf"
-OWNER_HINT = "base-ci-blocked-leaf"
+SLICE_ID = "issue-814-substitution-model-kani"
+OWNER_HINT = "issue-814-substitution-model-kani"
 
 
 def wait_until(predicate: Any, description: str, timeout: float = 20.0) -> Any:
@@ -99,7 +100,8 @@ def kill_owner_target(agent_dir: Path) -> None:
     if not isinstance(target, str) or not target:
         raise real.HarnessError(f"owner has no exact tmux target: {routing!r}")
     command = "kill-pane" if target.startswith("%") else "kill-window"
-    subprocess.run(["tmux", command, "-t", target], check=True, capture_output=True)
+    repository = agent_dir.parents[2]
+    real.tmuxio.tmux(real.tmux_socket(repository), command, "-t", target, check=True)
 
 
 def issue_number(result: ToolResult) -> int:
@@ -121,6 +123,15 @@ def typed_events(repo: Path, event_type: str) -> list[dict[str, Any]]:
         {"data": dict(event.data), "event_type": event.event_type}
         for event in reader.read_from(0).events
         if event.event_type == event_type
+    ]
+
+
+def canonical_events(repo: Path) -> list[dict[str, Any]]:
+    segments = repo / ".exo/ledger/segments"
+    return [
+        json.loads(line)
+        for segment in sorted(segments.glob("segment-*.jsonl"))
+        for line in segment.read_text(encoding="utf-8").splitlines()
     ]
 
 
@@ -153,21 +164,19 @@ def stop_server_and_session(process: subprocess.Popen[str], repo: Path) -> None:
         for line in config.splitlines()
         if line.startswith("tmux_session =")
     )
-    subprocess.run(["tmux", "kill-session", "-t", session], check=False)
+    real.tmuxio.tmux(real.tmux_socket(repo), "kill-session", "-t", session, check=False)
 
 
 def cleanup_server_scaffolding(repo: Path) -> None:
-    for name in ("sub-a", "sub-b", "recursive-root", "nested", "parent"):
-        worktree = (
-            repo / ".exo/agents" / name
-            if name != "parent"
-            else repo / ".exo/worktrees/parent"
-        )
+    for name in ("sub-a", "sub-b", "sub-c", "recursive-root", "nested", "parent"):
+        branch = f"main.{name}"
+        worktree = real.agent_worktree(repo, branch)
         subprocess.run(
             ["git", "-C", str(repo), "worktree", "remove", "--force", str(worktree)],
             check=False,
             capture_output=True,
         )
+        shutil.rmtree(repo / ".exo/agents" / name, ignore_errors=True)
         subprocess.run(
             ["git", "-C", str(repo), "branch", "-D", f"main.{name}"],
             check=False,
@@ -194,8 +203,19 @@ def run_case(index: int) -> dict[str, Any]:
         server: subprocess.Popen[str] | None = None
         owner_dir: Path | None = None
         worktree: Path | None = None
+        reviewer_dir: Path | None = None
+        chainlink_db = repo / ".chainlink/issues.db"
         try:
-            server, client = real.start_server(root, repo, forgejo, PROJECT_ROOT)
+            server, client = real.start_server(
+                root,
+                repo,
+                forgejo,
+                PROJECT_ROOT,
+                spawn_agent_type="opencode",
+                worker_model="opencode-go/deepseek-v4.1-flash",
+                worker_effort="high",
+                chainlink_db=chainlink_db,
+            )
             effects = EffectClient(client, role="tl", name="root")
             created = effects.chainlink_issue_create(
                 title="E2E base CI blocked handoff",
@@ -207,11 +227,22 @@ def run_case(index: int) -> dict[str, Any]:
                 raise real.HarnessError(
                     f"real Chainlink issue creation failed: {created.raw!r}"
                 )
-            blocked_issue_id = issue_number(created)
+            created_issue_id = issue_number(created)
+            with sqlite3.connect(chainlink_db) as database:
+                database.execute(
+                    "UPDATE issues SET id = ? WHERE id = ?",
+                    (814, created_issue_id),
+                )
+                database.execute(
+                    "UPDATE sqlite_sequence SET seq = ? WHERE name = 'issues'",
+                    (814,),
+                )
+            blocked_issue_id = 814
             spawned = effects.spawn_leaf(
                 name=OWNER_HINT,
                 task=f"Work on Chainlink issue #{blocked_issue_id}; preserve base-CI attribution.",
-                agent_type="codex",
+                agent_type="opencode",
+                model="opencode-go/deepseek-v4.1-flash",
             )
             if not spawned.success:
                 raise real.HarnessError(f"real leaf spawn failed: {spawned.raw!r}")
@@ -224,8 +255,20 @@ def run_case(index: int) -> dict[str, Any]:
                 "base CI is independently failing\n", encoding="utf-8"
             )
             initial = invocation(owner_dir)
+            historical_identity = identity(owner_dir)
+            if (
+                initial.get("runtime") != "opencode"
+                or initial.get("model") != "opencode-go/deepseek-v4.1-flash"
+                or initial.get("effort") != "high"
+                or historical_identity.get("agent_type") != "opencode"
+            ):
+                raise real.HarnessError(
+                    "fixture did not create the expected historical OpenCode owner"
+                )
             branch = str(identity(owner_dir)["birth_branch"])
             fingerprint = worktree_fingerprint(worktree)
+            prior_event_log = repo / ".exo/events" / f"{owner_dir.name}.jsonl"
+            historical_events = prior_event_log.read_text(encoding="utf-8").splitlines()
             kill_owner_target(owner_dir)
             wait_until(
                 lambda: (
@@ -293,7 +336,19 @@ def run_case(index: int) -> dict[str, Any]:
             server = None
             cleanup_server_scaffolding(repo)
             shutil.rmtree(root / "fake-bin", ignore_errors=True)
-            server, restarted = real.start_server(root, repo, forgejo, PROJECT_ROOT)
+            server, restarted = real.start_server(
+                root,
+                repo,
+                forgejo,
+                PROJECT_ROOT,
+                spawn_agent_type="codex",
+                worker_model="gpt-6-luna",
+                worker_effort="xhigh",
+                reviewer_agent_type="codex",
+                reviewer_model="gpt-6.1-sol",
+                reviewer_effort="medium",
+                chainlink_db=chainlink_db,
+            )
             restarted_effects = EffectClient(restarted, role="tl", name="root")
             shown = restarted_effects.chainlink_issue_show(issue_id=blocked_issue_id)
             if not shown.success:
@@ -369,6 +424,133 @@ def run_case(index: int) -> dict[str, Any]:
                 or worktree_for(repo, owner_dir) != worktree
             ):
                 raise real.HarnessError("resume changed owner branch or worktree")
+            current_identity = identity(owner_dir)
+            if (
+                fresh.get("runtime") != "codex"
+                or fresh.get("model") != "gpt-6-luna"
+                or fresh.get("effort") != "xhigh"
+                or current_identity.get("agent_type") != "codex"
+                or current_identity.get("model") != "gpt-6-luna"
+                or current_identity.get("effort") != "xhigh"
+                or current_identity.get("agent_name")
+                != historical_identity.get("agent_name")
+                or current_identity.get("slice_id")
+                != historical_identity.get("slice_id")
+                or current_identity.get("working_dir")
+                != historical_identity.get("working_dir")
+                or fresh.get("prior_invocation_id") != initial.get("invocation_id")
+                or fresh.get("generation") != initial.get("generation", 1) + 1
+            ):
+                raise real.HarnessError(
+                    f"configured Codex successor did not preserve the logical owner: {fresh!r} {current_identity!r}"
+                )
+            current_events = prior_event_log.read_text(encoding="utf-8").splitlines()
+            if current_events[: len(historical_events)] != historical_events:
+                raise real.HarnessError(
+                    "route migration rewrote historical OpenCode lifecycle evidence"
+                )
+            if not any(
+                event.get("type") == "agent.harness_switch"
+                and event.get("data", {}).get("from_harness") == "opencode"
+                and event.get("data", {}).get("to_harness") == "codex"
+                and event.get("data", {}).get("to_model") == "gpt-6-luna"
+                and event.get("data", {}).get("to_effort") == "xhigh"
+                for event in canonical_events(repo)
+            ):
+                raise real.HarnessError(
+                    "configured route transition has no durable audit event"
+                )
+            successor_bytes = (owner_dir / "invocation.json").read_bytes()
+            resume_events = prior_event_log.read_text(encoding="utf-8").splitlines()
+            socket = real.tmux_socket(repo)
+            windows_before = real.tmuxio.tmux(
+                socket,
+                "list-windows",
+                "-a",
+                "-F",
+                "#{window_id}:#{window_name}",
+                check=True,
+            ).stdout
+            panes_before = real.tmuxio.tmux(
+                socket,
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id}:#{window_name}",
+                check=True,
+            ).stdout
+            routing = json.loads(
+                (owner_dir / "routing.json").read_text(encoding="utf-8")
+            )
+            owner_target = routing.get("pane_id") or routing.get("window_id")
+            target_inventory = (
+                panes_before
+                if isinstance(owner_target, str) and owner_target.startswith("%")
+                else windows_before
+            )
+            if not isinstance(owner_target, str) or not any(
+                row.startswith(f"{owner_target}:")
+                for row in target_inventory.splitlines()
+            ):
+                raise real.HarnessError(
+                    "current successor routing is not present in the isolated tmux server"
+                )
+            repeated = resume_blocked_leaf(
+                restarted,
+                {
+                    "chainlink_issue_id": blocked_issue_id,
+                    "expected_invocation_id": initial["invocation_id"],
+                    "expected_branch": branch,
+                    "expected_worktree_fingerprint": fingerprint,
+                    "task": "Stabilize base CI, then continue the same leaf assignment.",
+                    "human_approved": True,
+                },
+            )
+            if (
+                not repeated.success
+                or invocation(owner_dir)["invocation_id"] != fresh["invocation_id"]
+            ):
+                active_rows = {
+                    path.name: (path / "active_issue")
+                    .read_text(encoding="utf-8")
+                    .strip()
+                    for path in (repo / ".exo/agents").iterdir()
+                    if (path / "active_issue").is_file()
+                }
+                raise real.HarnessError(
+                    f"repeat resume did not adopt the same configured successor: {repeated.raw!r}; active_issue records={active_rows!r}"
+                )
+            if (owner_dir / "invocation.json").read_bytes() != successor_bytes:
+                raise real.HarnessError(
+                    "repeat resume rewrote the accepted successor invocation"
+                )
+            if (
+                prior_event_log.read_text(encoding="utf-8").splitlines()
+                != resume_events
+            ):
+                raise real.HarnessError(
+                    "repeat resume duplicated owner lifecycle history"
+                )
+            windows_after = real.tmuxio.tmux(
+                socket,
+                "list-windows",
+                "-a",
+                "-F",
+                "#{window_id}:#{window_name}",
+                check=True,
+            ).stdout
+            panes_after = real.tmuxio.tmux(
+                socket,
+                "list-panes",
+                "-a",
+                "-F",
+                "#{pane_id}:#{window_name}",
+                check=True,
+            ).stdout
+            if windows_after != windows_before or panes_after != panes_before:
+                raise real.HarnessError(
+                    "repeat resume changed tmux windows or created a duplicate worker"
+                )
             same_owner = owner_for(repo) == owner_dir
             same_branch = identity(owner_dir)["birth_branch"] == branch
             same_worktree = worktree_for(repo, owner_dir) == worktree
@@ -392,12 +574,69 @@ def run_case(index: int) -> dict[str, Any]:
                 body="The scoped leaf did not introduce the failing base check.",
                 base_branch="main",
             )
-            published_after_resume = published.success and (
-                repo / ".exo/published-heads.json"
-            ).is_file()
+            published_after_resume = (
+                published.success and (repo / ".exo/published-heads.json").is_file()
+            )
             if not published_after_resume:
                 raise real.HarnessError(
                     f"PR publication after resume failed: {published.raw!r}"
+                )
+            publication_rows = json.loads(
+                (repo / ".exo/published-heads.json").read_text(encoding="utf-8")
+            )["heads"]
+            publication = next(
+                (
+                    row
+                    for row in publication_rows
+                    if row.get("author_agent") == owner_dir.name
+                    and row.get("slice_id") == SLICE_ID
+                ),
+                None,
+            )
+            if not isinstance(publication, dict):
+                raise real.HarnessError(
+                    "Codex successor did not retain its publication binding"
+                )
+            pr_number = publication.get("pr_number")
+            head_sha = publication.get("head_sha")
+            if (
+                type(pr_number) is not int
+                or not isinstance(head_sha, str)
+                or not head_sha
+            ):
+                raise real.HarnessError(
+                    f"published owner coordinates are incomplete: {publication!r}"
+                )
+            reviewer = restarted_effects.spawn_reviewer(
+                pr_number=pr_number,
+                head_sha=head_sha,
+                acceptance_criteria=["Confirm the resumed owner's exact PR head."],
+                force=False,
+            )
+            if not reviewer.success:
+                raise real.HarnessError(
+                    f"configured reviewer spawn failed: {reviewer.raw!r}"
+                )
+            reviewer_name = str((reviewer.result or {}).get("reviewer_name") or "")
+            if not reviewer_name:
+                raise real.HarnessError(
+                    f"reviewer response has no owner identity: {reviewer.raw!r}"
+                )
+            reviewer_dir = repo / ".exo/agents" / reviewer_name
+            reviewer_invocation = invocation(reviewer_dir)
+            reviewer_identity = identity(reviewer_dir)
+            if (
+                reviewer_invocation.get("runtime") != "codex"
+                or reviewer_invocation.get("model") != "gpt-6.1-sol"
+                or reviewer_invocation.get("effort") != "medium"
+                or reviewer_identity.get("agent_type") != "codex"
+                or reviewer_identity.get("model") != "gpt-6.1-sol"
+                or reviewer_identity.get("effort") != "medium"
+                or reviewer_invocation.get("pr_number") != pr_number
+                or reviewer_invocation.get("head_sha") != head_sha
+            ):
+                raise real.HarnessError(
+                    f"reviewer did not launch on the configured exact PR head: {reviewer_invocation!r}"
                 )
             result = {
                 "run": index,
@@ -414,6 +653,13 @@ def run_case(index: int) -> dict[str, Any]:
                     "same_worktree": same_worktree,
                     "human_gate_reused": gate_reused,
                     "resumed_invocation_running": fresh.get("status") == "running",
+                    "resumed_harness": fresh.get("runtime"),
+                    "resumed_model": fresh.get("model"),
+                    "resumed_effort": fresh.get("effort"),
+                    "reviewer_harness": reviewer_invocation.get("runtime"),
+                    "reviewer_model": reviewer_invocation.get("model"),
+                    "reviewer_effort": reviewer_invocation.get("effort"),
+                    "repeat_resume_adopted": repeated.success,
                     "pr_published_after_resume": published_after_resume,
                     "difficulty_scope": payload.get("scope_attribution"),
                 },
@@ -433,6 +679,8 @@ def run_case(index: int) -> dict[str, Any]:
             real.stop_subprocess(mock, "blocked-handoff mock")
             if owner_dir is not None and owner_dir.exists():
                 shutil.rmtree(owner_dir, ignore_errors=True)
+            if reviewer_dir is not None and reviewer_dir.exists():
+                shutil.rmtree(reviewer_dir, ignore_errors=True)
             if worktree is not None and worktree.exists():
                 subprocess.run(
                     [
