@@ -97,6 +97,42 @@ pub(crate) const LAST_ACTIVITY_FILE: &str = "last_activity_at";
 pub(crate) const DIRTY_TL_SPAWN_PREFLIGHT_CODE: &str = "agent.spawn_precondition.dirty_worktree";
 const MAX_INVOCATION_STDERR_TAIL_BYTES: usize = 4096;
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct InvocationMonitorKey {
+    agent_dir: PathBuf,
+    invocation_id: String,
+}
+
+fn active_invocation_monitors(
+) -> &'static std::sync::Mutex<std::collections::HashSet<InvocationMonitorKey>> {
+    static ACTIVE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<InvocationMonitorKey>>,
+    > = std::sync::OnceLock::new();
+    ACTIVE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+struct InvocationMonitorRegistration(InvocationMonitorKey);
+
+impl Drop for InvocationMonitorRegistration {
+    fn drop(&mut self) {
+        active_invocation_monitors()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.0);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn invocation_monitor_registered(agent_dir: &Path, invocation_id: &str) -> bool {
+    active_invocation_monitors()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains(&InvocationMonitorKey {
+            agent_dir: agent_dir.to_path_buf(),
+            invocation_id: invocation_id.to_string(),
+        })
+}
+
 async fn read_invocation_stderr_tail(agent_dir: &Path) -> Option<String> {
     for filename in ["stderr_tail", "stderr.log", "stderr"] {
         let Ok(bytes) = fs::read(agent_dir.join(filename)).await else {
@@ -111,6 +147,54 @@ async fn read_invocation_stderr_tail(agent_dir: &Path) -> Option<String> {
         }
     }
     None
+}
+
+async fn reconcile_invocation_markers(
+    agent_dir: &Path,
+    invocation: &InvocationRecord,
+) -> Result<()> {
+    for marker in ["exited_at", "exit_code"] {
+        match fs::remove_file(agent_dir.join(marker)).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("clear stale {marker}")),
+        }
+    }
+
+    for marker in ["spawned_at", LAST_ACTIVITY_FILE] {
+        let path = agent_dir.join(marker);
+        let current =
+            match fs::read_to_string(&path).await {
+                Ok(value) => Some(value.trim().parse::<u64>().with_context(|| {
+                    format!("{marker} contains invalid invocation marker data")
+                })?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error).with_context(|| format!("read {marker}")),
+            };
+        if current.is_none_or(|value| value < invocation.started_at) {
+            fs::write(path, invocation.started_at.to_string())
+                .await
+                .with_context(|| format!("restore {marker} for the live invocation"))?;
+        }
+    }
+    if let Some(expected_issue) = agent_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(issue_id_from_agent_name)
+    {
+        let path = agent_dir.join("active_issue");
+        match fs::read_to_string(&path).await {
+            Ok(value) if value.trim() == expected_issue.to_string() => {}
+            Ok(_) => anyhow::bail!("active issue marker conflicts with the live invocation owner"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::write(path, expected_issue.to_string())
+                    .await
+                    .context("restore active issue marker for the live invocation")?;
+            }
+            Err(error) => return Err(error).context("read active issue marker"),
+        }
+    }
+    Ok(())
 }
 
 fn bounded_stderr_tail(bytes: &[u8]) -> String {
@@ -1507,13 +1591,34 @@ impl<
                             .downcast_ref::<std::io::Error>()
                             .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
                     {
-                        previous.routing.write_to_dir(&agent_config_dir).await?;
+                        return Err(anyhow!(
+                            "refusing to reconstruct missing live routing for {agent_name}"
+                        ));
                     }
                     Err(error) => {
                         return Err(error)
                             .with_context(|| format!("failed to read {}", routing_path.display()))
                     }
                 }
+                #[cfg(test)]
+                let tmux = self.tmux().ok();
+                #[cfg(not(test))]
+                let tmux = Some(self.tmux()?);
+                let reconciled = invocation::reconcile_live_invocation_startup(
+                    &agent_config_dir,
+                    previous,
+                    &routing,
+                    tmux.as_ref(),
+                )
+                .await
+                .with_context(|| format!("failed to reconcile startup effects for {agent_name}"))?;
+                reconcile_invocation_markers(&agent_config_dir, &reconciled).await?;
+                if let Some(record) = identity.clone() {
+                    if let Err(error) = self.agent_resolver().register(record).await {
+                        warn!(agent = %agent_name, %error, "Failed to refresh ordered controller identity");
+                    }
+                }
+                self.monitor_invocation(agent_config_dir.clone(), reconciled.clone());
                 info!(agent = %agent_name, invocation_id = %previous.invocation_id, "Reusing existing ordered sub-TL invocation");
                 return Ok(agent_config_dir);
             }
@@ -1667,7 +1772,20 @@ impl<
             return;
         };
 
+        let monitor_key = InvocationMonitorKey {
+            agent_dir: agent_dir.clone(),
+            invocation_id: invocation.invocation_id.clone(),
+        };
+        if !active_invocation_monitors()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(monitor_key.clone())
+        {
+            return;
+        }
+
         tokio::spawn(async move {
+            let _registration = InvocationMonitorRegistration(monitor_key);
             let mut ticker = tokio::time::interval(INVOCATION_MONITOR_INTERVAL);
             let mut consecutive_errors = 0u8;
             loop {

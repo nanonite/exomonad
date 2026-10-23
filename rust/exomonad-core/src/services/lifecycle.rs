@@ -272,6 +272,69 @@ pub fn record_invocation_started(agent_dir: &Path, record: &InvocationRecord) {
     );
 }
 
+/// Ensure the canonical start event exists exactly once for this invocation.
+///
+/// Invocation registration can be retried after its checkpoint was committed
+/// but before later startup effects completed. The immutable ledger is the
+/// authority for whether the event already exists; compatibility JSONL alone
+/// is not enough to authorize replay.
+pub(crate) fn ensure_invocation_started(
+    agent_dir: &Path,
+    record: &InvocationRecord,
+) -> anyhow::Result<()> {
+    let agent_id = agent_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("agent directory has no usable invocation identity"))?;
+    let Some(agents_dir) = agent_dir.parent() else {
+        return Ok(());
+    };
+    let Some(exo_dir) = agents_dir.parent() else {
+        return Ok(());
+    };
+    if agents_dir.file_name().and_then(|name| name.to_str()) != Some("agents")
+        || exo_dir.file_name().and_then(|name| name.to_str()) != Some(".exo")
+    {
+        // Standalone invocation helpers are also used by unit tests and local
+        // consumers. Match the previous best-effort recorder behavior outside
+        // the durable project agent registry.
+        return Ok(());
+    }
+    let event_dir = exo_dir.join("events");
+    let log = EventLog::open(event_dir)?;
+    let records = log.ledger().read_events()?;
+    let mut exact_event_exists = false;
+    for entry in records {
+        let event = entry.event;
+        if event.event_type != LifecycleEventKind::InvocationStarted.event_type()
+            || event.invocation_id.as_deref() != Some(record.invocation_id.as_str())
+        {
+            continue;
+        }
+        if event.agent_id.as_deref() != Some(agent_id)
+            || event.generation != Some(record.generation)
+        {
+            anyhow::bail!(
+                "invocation start event conflicts with checkpoint ownership for {agent_id}"
+            );
+        }
+        exact_event_exists = true;
+    }
+    if exact_event_exists {
+        return Ok(());
+    }
+
+    let telemetry = LifecycleTelemetry::from_invocation(record, "started");
+    let data = serde_json::to_value(telemetry)?;
+    log.append(
+        LifecycleEventKind::InvocationStarted.event_type(),
+        agent_id,
+        &data,
+    )?;
+    Ok(())
+}
+
 pub fn record_invocation_finished(agent_dir: &Path, record: &InvocationRecord) {
     record_invocation_event(
         agent_dir,

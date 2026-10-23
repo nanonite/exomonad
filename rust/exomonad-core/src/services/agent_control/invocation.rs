@@ -222,6 +222,30 @@ fn mutation_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+#[cfg(test)]
+fn invocation_save_failpoints(
+) -> &'static std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>> {
+    static FAILPOINTS: OnceLock<std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>> =
+        OnceLock::new();
+    FAILPOINTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn fail_after_next_invocation_save(agent_dir: &Path) {
+    invocation_save_failpoints()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(agent_dir.to_path_buf());
+}
+
+#[cfg(test)]
+fn take_invocation_save_failpoint(agent_dir: &Path) -> bool {
+    invocation_save_failpoints()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(agent_dir)
+}
+
 fn invocation_path(agent_dir: &Path) -> std::path::PathBuf {
     agent_dir.join(INVOCATION_FILENAME)
 }
@@ -284,11 +308,12 @@ async fn persist_routing_ownership(
         .await
 }
 
-pub(crate) async fn repair_live_routing_ownership(
+pub(crate) async fn reconcile_live_invocation_startup(
     agent_dir: &Path,
     expected: &InvocationRecord,
     requested_routing: &RoutingInfo,
-) -> Result<()> {
+    tmux: Option<&crate::services::tmux_ipc::TmuxIpc>,
+) -> Result<InvocationRecord> {
     let _guard = mutation_lock().lock().await;
     let current = require_expected_live_invocation(agent_dir, expected, requested_routing).await?;
     let persisted = RoutingInfo::read_from_dir(agent_dir).await?;
@@ -297,16 +322,61 @@ pub(crate) async fn repair_live_routing_ownership(
             "persisted routing target conflicts with the live invocation"
         ));
     }
-    if routing_has_owner_fields(&persisted) {
-        return verify_current_routing_owner(agent_dir, &persisted, &current);
+    let route_owned = routing_has_owner_fields(&persisted);
+    if route_owned {
+        verify_current_routing_owner(agent_dir, &persisted, &current)?;
     }
-    persist_routing_ownership(
-        agent_dir,
-        &current.routing,
-        &current.invocation_id,
-        current.generation,
-    )
-    .await
+    if current.routing.window_id.is_none() && current.routing.pane_id.is_none() {
+        anyhow::bail!("live invocation has no tmux target for startup recovery");
+    }
+
+    let agent_id = agent_id_from_dir(agent_dir)?;
+    if let Some(tmux) = tmux {
+        let target_alive = crate::services::tmux_ipc::routing_target_alive(&current.routing, tmux)
+            .await
+            .context("failed to validate the live invocation delivery target")?;
+        if target_alive {
+            match tmux.routing_owner_state(&current.routing).await? {
+                crate::services::tmux_ipc::RoutingOwnerState::Unowned => {
+                    tmux.set_routing_owner(
+                        &current.routing,
+                        agent_id,
+                        &current.invocation_id,
+                        current.generation,
+                    )
+                    .await?;
+                }
+                crate::services::tmux_ipc::RoutingOwnerState::Owned(owner)
+                    if owner.agent_id == agent_id
+                        && owner.invocation_id == current.invocation_id
+                        && owner.generation == current.generation => {}
+                crate::services::tmux_ipc::RoutingOwnerState::Owned(_) => {
+                    anyhow::bail!("tmux target ownership conflicts with the live invocation");
+                }
+                crate::services::tmux_ipc::RoutingOwnerState::Partial => {
+                    anyhow::bail!("tmux target has partial ownership evidence");
+                }
+            }
+        }
+    }
+    if !route_owned {
+        persist_routing_ownership(
+            agent_dir,
+            &current.routing,
+            &current.invocation_id,
+            current.generation,
+        )
+        .await?;
+    }
+    crate::services::lifecycle::ensure_invocation_started(agent_dir, &current).map(|()| current)
+}
+
+fn agent_id_from_dir(agent_dir: &Path) -> Result<&str> {
+    agent_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .context("agent directory has no usable identity for routing ownership")
 }
 
 async fn require_expected_live_invocation(
@@ -436,7 +506,7 @@ async fn start_invocation_with_context(
         record.generation,
     )
     .await?;
-    crate::services::lifecycle::record_invocation_started(agent_dir, &record);
+    crate::services::lifecycle::ensure_invocation_started(agent_dir, &record)?;
     info!(
         path = %invocation_path(agent_dir).display(),
         invocation_id = %record.invocation_id,
@@ -671,6 +741,10 @@ pub async fn start_invocation_with_provenance_and_context_and_mode_with_id_guard
         stderr_tail: None,
     };
     write_atomic(agent_dir, &record).await?;
+    #[cfg(test)]
+    if take_invocation_save_failpoint(agent_dir) {
+        anyhow::bail!("injected interruption after invocation checkpoint save");
+    }
     persist_routing_ownership(
         agent_dir,
         &record.routing,
@@ -678,7 +752,7 @@ pub async fn start_invocation_with_provenance_and_context_and_mode_with_id_guard
         record.generation,
     )
     .await?;
-    crate::services::lifecycle::record_invocation_started(agent_dir, &record);
+    crate::services::lifecycle::ensure_invocation_started(agent_dir, &record)?;
     info!(
         path = %invocation_path(agent_dir).display(),
         invocation_id = %record.invocation_id,

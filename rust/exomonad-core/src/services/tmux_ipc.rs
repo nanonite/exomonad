@@ -152,6 +152,13 @@ pub struct TmuxOwnership {
     pub generation: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoutingOwnerState {
+    Unowned,
+    Owned(TmuxOwnership),
+    Partial,
+}
+
 struct ProcessExecutionState {
     pane_exe: std::io::Result<std::path::PathBuf>,
     pane_comm: std::io::Result<String>,
@@ -750,12 +757,15 @@ impl TmuxIpc {
         option: &str,
     ) -> Result<Option<String>> {
         let output = tmux_command()
-            .args(["show-options", scope, "-t", target, "-v", option])
+            .args(["show-options", scope, "-q", "-t", target, "-v", option])
             .output()
             .await
             .context("Failed to read tmux ownership option")?;
         if !output.status.success() {
-            return Ok(None);
+            anyhow::bail!(
+                "tmux show-options failed for {option}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if value.is_empty() {
@@ -790,35 +800,41 @@ impl TmuxIpc {
     }
 
     pub async fn routing_owner(&self, routing: &RoutingInfo) -> Result<Option<TmuxOwnership>> {
+        match self.routing_owner_state(routing).await? {
+            RoutingOwnerState::Owned(owner) => Ok(Some(owner)),
+            RoutingOwnerState::Unowned | RoutingOwnerState::Partial => Ok(None),
+        }
+    }
+
+    /// Read all ownership options without collapsing partial proof into an
+    /// unowned target. Recovery may adopt only a completely unowned target.
+    pub async fn routing_owner_state(&self, routing: &RoutingInfo) -> Result<RoutingOwnerState> {
         let Some((scope, target)) = self.ownership_target(routing) else {
-            return Ok(None);
+            return Ok(RoutingOwnerState::Unowned);
         };
-        let Some(agent_id) = self
+        let agent_id = self
             .read_ownership_option(scope, &target, OWNER_AGENT_OPTION)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let Some(invocation_id) = self
+            .await?;
+        let invocation_id = self
             .read_ownership_option(scope, &target, OWNER_INVOCATION_OPTION)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let Some(generation) = self
+            .await?;
+        let generation = self
             .read_ownership_option(scope, &target, OWNER_GENERATION_OPTION)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let Ok(generation) = generation.parse() else {
-            return Ok(None);
-        };
-        Ok(Some(TmuxOwnership {
-            agent_id,
-            invocation_id,
-            generation,
-        }))
+            .await?;
+        match (agent_id, invocation_id, generation) {
+            (None, None, None) => Ok(RoutingOwnerState::Unowned),
+            (Some(agent_id), Some(invocation_id), Some(generation)) => {
+                let Ok(generation) = generation.parse() else {
+                    return Ok(RoutingOwnerState::Partial);
+                };
+                Ok(RoutingOwnerState::Owned(TmuxOwnership {
+                    agent_id,
+                    invocation_id,
+                    generation,
+                }))
+            }
+            _ => Ok(RoutingOwnerState::Partial),
+        }
     }
 
     pub async fn routing_owner_matches(

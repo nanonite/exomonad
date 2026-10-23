@@ -584,27 +584,11 @@ impl<
                         "routing ownership conflicts with the prior controller invocation",
                     ));
                 }
-                if prior.is_live() {
-                    if !persisted_routing.same_delivery_target(&routing) {
-                        return Err(ordered_provision_failure(
-                            super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
-                            "the live controller routing differs from the current TL target",
-                        ));
-                    }
-                    if !owned_by_prior {
-                        invocation::repair_live_routing_ownership(
-                            &agent_dir,
-                            prior,
-                            &routing,
-                        )
-                        .await
-                        .map_err(|_| {
-                            ordered_provision_failure(
-                                super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
-                                "the live controller routing ownership could not be safely reconciled",
-                            )
-                        })?;
-                    }
+                if prior.is_live() && !persisted_routing.same_delivery_target(&routing) {
+                    return Err(ordered_provision_failure(
+                        super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                        "the live controller routing differs from the current TL target",
+                    ));
                 }
             } else if prior.is_live() {
                 return Err(ordered_provision_failure(
@@ -2757,8 +2741,143 @@ mod tests {
         )
     }
 
+    struct OrderedTestTmux {
+        socket: String,
+        session: String,
+        previous_socket: Option<std::ffi::OsString>,
+    }
+
+    impl OrderedTestTmux {
+        fn new() -> Self {
+            let socket = format!("exo-ordered-recovery-{}", uuid::Uuid::new_v4());
+            let session = format!("exo-ordered-recovery-{}", uuid::Uuid::new_v4());
+            let previous_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
+            std::env::set_var("EXOMONAD_TMUX_SOCKET", &socket);
+            let status = Self::command(&socket)
+                .args([
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &session,
+                    "-n",
+                    "root",
+                    "sh",
+                    "-c",
+                    "sleep 300",
+                ])
+                .status()
+                .expect("start isolated tmux server");
+            assert!(status.success(), "isolated tmux session starts");
+            Self {
+                socket,
+                session,
+                previous_socket,
+            }
+        }
+
+        fn command(socket: &str) -> std::process::Command {
+            let mut command = std::process::Command::new("tmux");
+            command.args(["-L", socket]);
+            command
+        }
+
+        fn new_target(&self, name: &str) -> super::super::tmux_ipc::WindowId {
+            let output = Self::command(&self.socket)
+                .args([
+                    "new-window",
+                    "-d",
+                    "-t",
+                    &self.session,
+                    "-n",
+                    name,
+                    "-P",
+                    "-F",
+                    "#{window_id}",
+                    "sh",
+                    "-c",
+                    "sleep 300",
+                ])
+                .output()
+                .expect("create isolated target window");
+            assert!(output.status.success(), "isolated target window starts");
+            super::super::tmux_ipc::WindowId::parse(String::from_utf8_lossy(&output.stdout).trim())
+                .expect("tmux returns a valid window ID")
+        }
+
+        fn kill_target(&self, target: &super::super::tmux_ipc::WindowId) {
+            let status = Self::command(&self.socket)
+                .args(["kill-window", "-t", target.as_str()])
+                .status()
+                .expect("kill isolated target window");
+            assert!(status.success(), "isolated target window exits");
+        }
+    }
+
+    impl Drop for OrderedTestTmux {
+        fn drop(&mut self) {
+            let _ = Self::command(&self.socket).arg("kill-server").status();
+            if let Some(previous) = self.previous_socket.take() {
+                std::env::set_var("EXOMONAD_TMUX_SOCKET", previous);
+            } else {
+                std::env::remove_var("EXOMONAD_TMUX_SOCKET");
+            }
+        }
+    }
+
+    async fn ordered_service_with_tmux(
+        project_dir: &Path,
+        session: &str,
+        routing: RoutingInfo,
+    ) -> AgentControlService<crate::services::Services> {
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.to_path_buf();
+        services.git_wt = Arc::new(crate::services::git_worktree::GitWorktreeService::new(
+            project_dir.to_path_buf(),
+        ));
+        services.agent_resolver = Arc::new(AgentResolver::load(project_dir.to_path_buf()).await);
+        AgentControlService::new(Arc::new(services))
+            .with_tmux_session(session.to_string())
+            .with_ordered_sub_tl_routing_for_test(routing)
+    }
+
+    fn invocation_start_count(project_dir: &Path, agent_id: &str, invocation_id: &str) -> usize {
+        crate::services::EventLog::open(project_dir.join(".exo/events"))
+            .unwrap()
+            .ledger()
+            .read_events()
+            .unwrap()
+            .into_iter()
+            .filter(|entry| {
+                entry.event.event_type == "agent.invocation.started"
+                    && entry.event.agent_id.as_deref() == Some(agent_id)
+                    && entry.event.invocation_id.as_deref() == Some(invocation_id)
+            })
+            .count()
+    }
+
+    async fn wait_for_invocation_retirement(agent_dir: &Path, invocation_id: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            loop {
+                let current = read_invocation(agent_dir)
+                    .await
+                    .unwrap()
+                    .expect("invocation checkpoint remains present");
+                if current.invocation_id == invocation_id
+                    && !current.is_live()
+                    && !super::super::invocation_monitor_registered(agent_dir, invocation_id)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the installed exit monitor retires the invocation");
+    }
+
     #[tokio::test]
-    async fn ordered_sub_tl_reconciles_route_after_invocation_save_interruption() {
+    #[serial_test::serial]
+    async fn ordered_sub_tl_recovers_invocation_save_interruption_and_restarts_after_exit() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = temp.path().to_path_buf();
         let run_git = |args: &[&str], directory: &std::path::Path| {
@@ -2793,130 +2912,233 @@ mod tests {
             ledger_owned: true,
             slice_id: Some("ordered-child".to_string()),
         };
-        let first_service = ordered_service(&project_dir, "@91").await;
         let agent_dir = project_dir.join(".exo/agents/ordered-child");
+        let first_service = ordered_service(&project_dir, "@91").await;
         let first_id = first_service
             .provision_ordered_sub_tl(record.clone())
             .await
             .unwrap();
-        finish_invocation(&agent_dir, &first_id, InvocationStatus::Killed, Some(137))
-            .await
-            .unwrap();
+        finish_invocation_and_tombstone(
+            &agent_dir,
+            &RoutingInfo::window(super::super::tmux_ipc::WindowId::parse("@91").unwrap()),
+            InvocationStatus::Killed,
+            Some(137),
+        )
+        .await
+        .unwrap();
+        assert!(agent_dir.join("exited_at").exists());
 
-        let restart_service = ordered_service(&project_dir, "@92").await;
-        let resumed_id = restart_service
-            .provision_ordered_sub_tl(record.clone())
-            .await
-            .expect("dormant controller receives one replacement invocation");
-        let saved_invocation = read_invocation(&agent_dir)
+        let tmux = OrderedTestTmux::new();
+        let first_target = tmux.new_target("controller-recovery");
+        let first_routing = RoutingInfo::window(first_target.clone());
+        invocation::fail_after_next_invocation_save(&agent_dir);
+        let interrupted =
+            ordered_service_with_tmux(&project_dir, &tmux.session, first_routing.clone())
+                .await
+                .provision_ordered_sub_tl(record.clone())
+                .await
+                .expect_err("fault point stops immediately after invocation.json is saved");
+        assert!(format!("{interrupted:#}").contains("injected interruption"));
+
+        let saved = read_invocation(&agent_dir)
             .await
             .unwrap()
-            .expect("replacement invocation is durable");
-        assert_eq!(saved_invocation.invocation_id, resumed_id);
-        assert_eq!(saved_invocation.generation, 2);
-
-        // This is the persisted crash boundary after invocation.json was
-        // committed but before routing ownership was written.
-        saved_invocation
-            .routing
-            .write_to_dir(&agent_dir)
-            .await
-            .unwrap();
+            .expect("the injected failure retained invocation.json");
+        assert_eq!(saved.generation, 2);
+        assert_eq!(saved.trigger, InvocationTrigger::ControllerRestart);
+        assert_eq!(
+            saved.prior_invocation_id.as_deref(),
+            Some(first_id.as_str())
+        );
+        assert_eq!(saved.routing.window_id, Some(first_target.clone()));
+        assert!(saved.is_live());
         let unowned_route = RoutingInfo::read_from_dir(&agent_dir).await.unwrap();
-        assert_eq!(unowned_route.window_id.as_ref().unwrap().as_str(), "@92");
+        assert!(unowned_route.same_delivery_target(&first_routing));
         assert!(unowned_route.owner_agent_id.is_none());
         assert!(unowned_route.owner_invocation_id.is_none());
         assert!(unowned_route.owner_generation.is_none());
-        let invocation_bytes = std::fs::read(agent_dir.join("invocation.json")).unwrap();
+        assert_eq!(
+            invocation_start_count(&project_dir, "ordered-child", &saved.invocation_id),
+            0
+        );
+        assert_eq!(
+            super::super::tmux_ipc::TmuxIpc::new(&tmux.session)
+                .routing_owner_state(&first_routing)
+                .await
+                .unwrap(),
+            super::super::tmux_ipc::RoutingOwnerState::Unowned
+        );
+        assert!(!super::super::invocation_monitor_registered(
+            &agent_dir,
+            &saved.invocation_id
+        ));
 
-        let retry_service = ordered_service(&project_dir, "@92").await;
-        let retry_id = retry_service
-            .provision_ordered_sub_tl(record.clone())
-            .await
-            .expect("repeat provisioning repairs the partial save and reuses the live invocation");
-        assert_eq!(retry_id, resumed_id);
+        let invocation_bytes = std::fs::read(agent_dir.join("invocation.json")).unwrap();
+        let retry_id =
+            ordered_service_with_tmux(&project_dir, &tmux.session, first_routing.clone())
+                .await
+                .provision_ordered_sub_tl(record.clone())
+                .await
+                .expect("a fresh service reconciles the exact interrupted invocation");
+        assert_eq!(retry_id, saved.invocation_id);
         assert_eq!(
             std::fs::read(agent_dir.join("invocation.json")).unwrap(),
             invocation_bytes,
-            "route repair must not rewrite the invocation checkpoint"
+            "reconciliation keeps the saved invocation ID and generation"
         );
+        assert_eq!(
+            invocation_start_count(&project_dir, "ordered-child", &retry_id),
+            1
+        );
+        assert!(!agent_dir.join("exited_at").exists());
+        assert!(!agent_dir.join("exit_code").exists());
+        assert!(super::super::invocation_monitor_registered(
+            &agent_dir, &retry_id
+        ));
         let repaired_route = RoutingInfo::read_from_dir(&agent_dir).await.unwrap();
-        assert_eq!(repaired_route.window_id.as_ref().unwrap().as_str(), "@92");
+        assert!(repaired_route.same_delivery_target(&first_routing));
         assert_eq!(
             repaired_route.owner_agent_id.as_deref(),
             Some("ordered-child")
         );
         assert_eq!(
             repaired_route.owner_invocation_id.as_deref(),
-            Some(resumed_id.as_str())
+            Some(retry_id.as_str())
         );
+        assert_eq!(repaired_route.owner_generation, Some(saved.generation));
         assert_eq!(
-            repaired_route.owner_generation,
-            Some(saved_invocation.generation)
+            super::super::tmux_ipc::TmuxIpc::new(&tmux.session)
+                .routing_owner_state(&first_routing)
+                .await
+                .unwrap(),
+            super::super::tmux_ipc::RoutingOwnerState::Owned(
+                super::super::tmux_ipc::TmuxOwnership {
+                    agent_id: "ordered-child".to_string(),
+                    invocation_id: retry_id.clone(),
+                    generation: saved.generation,
+                }
+            )
         );
 
-        let changed_route =
-            RoutingInfo::window(super::super::tmux_ipc::WindowId::parse("@93").unwrap());
-        changed_route.write_to_dir(&agent_dir).await.unwrap();
-        let error = ordered_service(&project_dir, "@92")
+        let repeated_id =
+            ordered_service_with_tmux(&project_dir, &tmux.session, first_routing.clone())
+                .await
+                .provision_ordered_sub_tl(record.clone())
+                .await
+                .expect("repeat provisioning adopts the same fully reconciled lifecycle");
+        assert_eq!(repeated_id, retry_id);
+        assert_eq!(
+            invocation_start_count(&project_dir, "ordered-child", &retry_id),
+            1
+        );
+        assert_eq!(
+            std::fs::read(agent_dir.join("invocation.json")).unwrap(),
+            invocation_bytes
+        );
+        assert!(super::super::invocation_monitor_registered(
+            &agent_dir, &retry_id
+        ));
+
+        let tmux_ipc = super::super::tmux_ipc::TmuxIpc::new(&tmux.session);
+        let route_before_foreign_owner = std::fs::read(agent_dir.join("routing.json")).unwrap();
+        tmux_ipc
+            .set_routing_owner(&first_routing, "foreign-owner", "foreign-invocation", 99)
+            .await
+            .unwrap();
+        let foreign_error =
+            ordered_service_with_tmux(&project_dir, &tmux.session, first_routing.clone())
+                .await
+                .provision_ordered_sub_tl(record.clone())
+                .await
+                .expect_err("a live foreign tmux owner cannot be adopted");
+        assert!(format!("{foreign_error:#}").contains("tmux target ownership conflicts"));
+        assert_eq!(
+            std::fs::read(agent_dir.join("routing.json")).unwrap(),
+            route_before_foreign_owner,
+            "foreign tmux ownership is rejected before local recovery mutation"
+        );
+        assert_eq!(
+            invocation_start_count(&project_dir, "ordered-child", &retry_id),
+            1
+        );
+        tmux_ipc
+            .set_routing_owner(&first_routing, "ordered-child", &retry_id, saved.generation)
+            .await
+            .unwrap();
+
+        let changed_target =
+            RoutingInfo::window(super::super::tmux_ipc::WindowId::parse("@9999").unwrap());
+        let before_changed_rejection = std::fs::read(agent_dir.join("routing.json")).unwrap();
+        let changed_error = ordered_service_with_tmux(&project_dir, &tmux.session, changed_target)
             .await
             .provision_ordered_sub_tl(record.clone())
             .await
-            .expect_err("a changed unowned delivery target cannot be adopted");
+            .expect_err("a changed delivery target cannot be adopted");
+        assert!(format!("{changed_error:#}").contains("different delivery target"));
         assert_eq!(
-            error
-                .downcast_ref::<super::OrderedSubTLProvisionFailure>()
-                .unwrap()
-                .code(),
-            "ordered_sub_tl_lifecycle_blocked"
-        );
-        assert_eq!(
-            RoutingInfo::read_from_dir(&agent_dir)
-                .await
-                .unwrap()
-                .window_id
-                .as_ref()
-                .unwrap()
-                .as_str(),
-            "@93",
-            "mismatched route evidence remains untouched"
+            std::fs::read(agent_dir.join("routing.json")).unwrap(),
+            before_changed_rejection,
+            "changed target refusal performs no route mutation"
         );
 
-        let mut partial_route =
-            RoutingInfo::window(super::super::tmux_ipc::WindowId::parse("@92").unwrap());
+        let mut partial_route = first_routing.clone();
         partial_route.owner_invocation_id = Some("foreign-invocation".to_string());
         partial_route.write_to_dir(&agent_dir).await.unwrap();
-        let error = ordered_service(&project_dir, "@92")
+        let partial_bytes = std::fs::read(agent_dir.join("routing.json")).unwrap();
+        let partial_error =
+            ordered_service_with_tmux(&project_dir, &tmux.session, first_routing.clone())
+                .await
+                .provision_ordered_sub_tl(record.clone())
+                .await
+                .expect_err("partial route ownership is not repaired");
+        assert!(format!("{partial_error:#}").contains("routing ownership conflicts"));
+        assert_eq!(
+            std::fs::read(agent_dir.join("routing.json")).unwrap(),
+            partial_bytes,
+            "partial ownership refusal performs no route mutation"
+        );
+        repaired_route.write_to_dir(&agent_dir).await.unwrap();
+
+        tmux.kill_target(&first_target);
+        wait_for_invocation_retirement(&agent_dir, &retry_id).await;
+        assert!(!super::super::invocation_monitor_registered(
+            &agent_dir, &retry_id
+        ));
+        let retired = read_invocation(&agent_dir).await.unwrap().unwrap();
+        assert_eq!(retired.status, InvocationStatus::Killed);
+        assert_eq!(
+            invocation_start_count(&project_dir, "ordered-child", &retry_id),
+            1
+        );
+
+        let next_target = tmux.new_target("controller-restart-after-exit");
+        let next_routing = RoutingInfo::window(next_target.clone());
+        let next_id = ordered_service_with_tmux(&project_dir, &tmux.session, next_routing.clone())
+            .await
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .expect("retired target permits the next validated controller restart");
+        let next = read_invocation(&agent_dir).await.unwrap().unwrap();
+        assert_eq!(next.invocation_id, next_id);
+        assert_ne!(next_id, retry_id);
+        assert_eq!(next.generation, 3);
+        assert_eq!(next.prior_invocation_id.as_deref(), Some(retry_id.as_str()));
+        assert!(super::super::invocation_monitor_registered(
+            &agent_dir, &next_id
+        ));
+
+        let repeated_next = ordered_service_with_tmux(&project_dir, &tmux.session, next_routing)
             .await
             .provision_ordered_sub_tl(record)
             .await
-            .expect_err("partial ownership evidence remains unresolved");
+            .unwrap();
+        assert_eq!(repeated_next, next_id);
         assert_eq!(
-            error
-                .downcast_ref::<super::OrderedSubTLProvisionFailure>()
-                .unwrap()
-                .code(),
-            "ordered_sub_tl_ownership_conflict"
+            invocation_start_count(&project_dir, "ordered-child", &next_id),
+            1
         );
-        assert_eq!(
-            RoutingInfo::read_from_dir(&agent_dir)
-                .await
-                .unwrap()
-                .owner_invocation_id
-                .as_deref(),
-            Some("foreign-invocation"),
-            "partial ownership evidence remains untouched"
-        );
-        let history =
-            std::fs::read_to_string(project_dir.join(".exo/events/ordered-child.jsonl")).unwrap();
-        assert_eq!(
-            history
-                .lines()
-                .filter(|line| line.contains("\"trigger\":\"controller_restart\""))
-                .count(),
-            1,
-            "recovery must not create a duplicate invocation"
-        );
+        tmux.kill_target(&next_target);
+        wait_for_invocation_retirement(&agent_dir, &next_id).await;
     }
 
     #[tokio::test]
