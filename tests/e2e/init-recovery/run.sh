@@ -2171,15 +2171,25 @@ proof = root["slices"]["handoff-proof"]
 child = json.loads((root_dir / "handoff-proof/run.json").read_text())
 leaf = child["slices"]["post-tidy-leaf"]
 assert proof["dispatch_intent_id"] == sys.argv[2]
+handoff_scope_id = next(
+    node["node_id"] for node in root["plan_manifest"]["nodes"]
+    if node.get("kind") == "sub_tl" and node.get("name") == "handoff-proof"
+)
+handoff_actions = [
+    entry for entry in journal
+    if entry.get("operation") == "prepare_scope_handoff"
+    and entry.get("arguments", {}).get("child_scope_id") == handoff_scope_id
+]
 assert sum(
     entry.get("operation") == "prepare_scope_handoff"
-    and entry.get("arguments", {}).get("child_scope_id")
-    == next(
-        node["node_id"] for node in root["plan_manifest"]["nodes"]
-        if node.get("kind") == "sub_tl" and node.get("name") == "handoff-proof"
-    )
-    for entry in journal
+    and entry.get("result", {}).get("result", {}).get("outcome") == "committed"
+    for entry in handoff_actions
 ) == 1
+assert all(
+    entry.get("status") == "confirmed"
+    and entry.get("result", {}).get("result", {}).get("outcome") in {"committed", "no_changes"}
+    for entry in handoff_actions
+)
 assert sum(
     entry.get("operation") == "emit_controller_event"
     and entry.get("target") == "handoff-proof"
