@@ -4675,6 +4675,22 @@ def _resume_approved_blocked_leaf(
         return state
     if not config.active or not isinstance(effects, EffectClient):
         return state
+    handoff_error = _prepare_scope_handoff(proof.leaf, state, config, effects, store, effects_log)
+    if handoff_error is not None:
+        return _hold_blocked_leaf_resume(
+            state,
+            config,
+            effects,
+            store,
+            effects_log,
+            f"scope handoff before blocked-leaf resume is blocked: {handoff_error}",
+        )
+    state = store.load()
+    proof, reason = _blocked_leaf_resume_proof(plan, state, config, store)
+    if proof is None:
+        if reason is not None:
+            return _hold_blocked_leaf_resume(state, config, effects, store, effects_log, reason)
+        return state
     try:
         arguments = _blocked_leaf_resume_action_arguments(proof, state)
         intent = EffectIntent("resume_blocked_leaf", proof.leaf.name, arguments, True)
@@ -15510,7 +15526,7 @@ def _child_recovery_projection(
 
 
 def _scope_handoff_identity(
-    task: SubTLTask,
+    task: SubTLTask | LeafTask,
     state: RunState,
     config: TLLoopConfig,
     store: RunStore,
@@ -15520,11 +15536,12 @@ def _scope_handoff_identity(
     manifest = state.plan_manifest
     if manifest is None or not manifest.scope_id:
         return "accepted parent manifest is unavailable for the child handoff"
+    declaration_kind = "sub_tl" if isinstance(task, SubTLTask) else "leaf"
     declarations = [
-        node for node in manifest.nodes if node.kind == "sub_tl" and node.name == task.name
+        node for node in manifest.nodes if node.kind == declaration_kind and node.name == task.name
     ]
     if len(declarations) != 1:
-        return f"accepted parent manifest does not uniquely declare subTL {task.name!r}"
+        return f"accepted scope manifest does not uniquely declare {declaration_kind} {task.name!r}"
     if state.owner_branch is not None and state.owner_branch != config.branch:
         return "controller branch differs from its persisted owner branch"
     node = declarations[0]
@@ -15746,7 +15763,7 @@ def _invoke_scope_handoff_apply(
 
 
 def _prepare_scope_handoff(
-    task: SubTLTask,
+    task: SubTLTask | LeafTask,
     state: RunState,
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
@@ -16509,6 +16526,53 @@ def _supervise_live_sub_tl(
     return child_state
 
 
+def _ensure_ordered_parent_ready_for_provision(
+    task: SubTLTask,
+    config: TLLoopConfig,
+    store: RunStore,
+) -> RunState:
+    """Reopen only the exact, proved failed child before provisioning it."""
+    state = store.load()
+    if isinstance(state.recursive_fsm, RecursiveTLRunning):
+        return state
+    plan = _failed_ordered_parent_recovery(task, config, store, state)
+    reopened = _reopen_ordered_scope(
+        state,
+        plan,
+        store,
+        task.name,
+        expected_revision=state.revision,
+    )
+    if not isinstance(reopened.recursive_fsm, RecursiveTLRunning):
+        raise TLLoopError(f"ordered sub-TL recovery did not reopen parent scope {store.run_id!r}")
+    return reopened
+
+
+def _failed_ordered_parent_recovery(
+    task: SubTLTask,
+    config: TLLoopConfig,
+    store: RunStore,
+    state: RunState,
+) -> WorkPlan:
+    if (
+        config.ordered_recovery_child != task.name
+        or not isinstance(state.recursive_fsm, RecursiveTLFailed)
+        or state.plan_manifest is None
+    ):
+        raise TLLoopError(
+            "ordered sub-TL provisioning is blocked because the parent scope is not running "
+            f"(phase={type(state.recursive_fsm).__name__}, child={task.name!r})"
+        )
+    plan = _work_plan_from_manifest(state.plan_manifest)
+    decision = _ordered_terminal_recovery_decision(state, plan, config, store)
+    if decision is None or not decision.recoverable or decision.task_name != task.name:
+        reason = decision.reason if decision is not None else "recovery proof is unavailable"
+        raise TLLoopError(
+            f"ordered sub-TL provisioning remains blocked for {task.name!r}: {reason}"
+        )
+    return plan
+
+
 def _run_live_sub_tl(
     task: SubTLTask,
     config: TLLoopConfig,
@@ -16523,6 +16587,7 @@ def _run_live_sub_tl(
     child_store = RunStore(task.name, store.run_dir)
     owned_source: LedgerQueue | None = None
     try:
+        _ensure_ordered_parent_ready_for_provision(task, config, store)
         child_source = task.source
         if child_source is None:
             child_source, owned_source = _child_source(
@@ -16601,7 +16666,12 @@ def _checkpoint_ordered_sub_tl_invocation(
             return
         recursive_fsm = state.recursive_fsm
         if not isinstance(recursive_fsm, RecursiveTLRunning):
-            raise TLLoopError("ordered sub-TL invocation has no running parent scope")
+            raise TLLoopError(
+                "ordered sub-TL invocation has no running parent scope "
+                f"(phase={type(recursive_fsm).__name__ if recursive_fsm is not None else 'legacy'}, "
+                f"current_order={state.current_order}, child={child_id!r}, "
+                f"child_status={target.status.value}, intent={target.dispatch_intent_id!r})"
+            )
         pending_by_order = dict(recursive_fsm.pending_by_order)
         match_count = 0
         for order, records in pending_by_order.items():

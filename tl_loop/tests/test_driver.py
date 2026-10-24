@@ -15898,7 +15898,7 @@ def test_continue_records_scoped_hold_for_invalid_completed_sub_tl_receipt(
 
 
 def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnostic(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A child returned TLFailed because its approved leaf awaits controller resume."""
     issue_slice = "issue-814-substitution-model-kani"
@@ -16180,6 +16180,44 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
     assert decision.recoverable
     assert decision.task_name == "kani"
     assert "diagnostic" not in decision.reason
+    recovery_config = replace(root_config, ordered_recovery_child="kani")
+
+    @dataclass
+    class ProvisionTransport(RecordingTransport):
+        provisioned: list[dict[str, object]] = field(default_factory=list)
+
+        def provision_ordered_sub_tl(self, caller, **arguments):
+            self.provisioned.append({"caller": caller, **arguments})
+            return "server-confirmed-kani-successor"
+
+    transport = ProvisionTransport()
+
+    def child_controller(root_spec, child_config, budgets):
+        assert cast(dict[str, object], root_spec)["run_id"] == "kani"
+        assert child_config.ordered_recovery is True
+        del budgets
+        return SimpleNamespace(final_state=child_store.load())
+
+    monkeypatch.setattr(driver_module, "tl_run", child_controller)
+    driver_module._run_live_sub_tl(
+        replace(task, source=SyntheticQueue([])),
+        recovery_config,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        root_store,
+        root_store.load().budgets,
+    )
+    assert len(transport.provisioned) == 1
+    checkpointed_parent = root_store.load()
+    assert isinstance(checkpointed_parent.recursive_fsm, RecursiveTLRunning)
+    assert checkpointed_parent.slices["kani"].status is SliceStatus.SPAWNED
+    assert checkpointed_parent.slices["kani"].branch == child_branch
+    assert checkpointed_parent.slices["kani"].worktree == child_worktree
+    assert checkpointed_parent.slices["kani"].dispatch_intent_id == "accepted-kani-intent"
+    assert (
+        checkpointed_parent.slices["kani"].dispatch_invocation_id
+        == "server-confirmed-kani-successor"
+    )
 
 
 def test_ordered_recovery_keeps_declared_aggregate_not_required_outcome(
@@ -18375,6 +18413,26 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
             retry_timeout.cancel()
     resumed = store.load().slices[slice_id]
     assert any(name == "resume_blocked_leaf" for name, _ in transport.calls)
+    handoff_indexes = [
+        index for index, (name, _) in enumerate(transport.calls) if name == "prepare_scope_handoff"
+    ]
+    resume_index = next(
+        index for index, (name, _) in enumerate(transport.calls) if name == "resume_blocked_leaf"
+    )
+    first_attempt_handoffs = [index for index in handoff_indexes if index < resume_index]
+    assert len(first_attempt_handoffs) == 2
+    assert [transport.calls[index][1].get("apply") for index in first_attempt_handoffs] == [
+        False,
+        True,
+    ]
+    handoff_node = next(node for node in manifest.nodes if node.name == slice_id)
+    handoff_arguments = [transport.calls[index][1] for index in handoff_indexes]
+    assert all(
+        arguments.get("child_scope_id") == handoff_node.node_id
+        and arguments.get("parent_scope_id") == manifest.scope_id
+        and arguments.get("expected_branch") == config.branch
+        for arguments in handoff_arguments
+    )
     assert resumed.dispatch_agent_id == owner_name
     assert resumed.dispatch_invocation_id == "codex-successor-invocation"
     assert len(observed_resume_intents) == (2 if response_lost else 1)
