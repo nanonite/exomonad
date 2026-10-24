@@ -347,10 +347,10 @@ def resume(repository: Path, baseline_path: Path, output: Path) -> None:
         "reviewer_runtime": reviewer_invocation["runtime"],
         "reviewer_model": reviewer_invocation["model"],
         "reviewer_effort": reviewer_invocation["effort"],
+        "reviewer_invocation": reviewer_invocation,
         "successor_invocation_sha256": digest(owner_dir / "invocation.json"),
         "owner_history_sha256": digest(history),
         "owner_history_lines": history.read_text(encoding="utf-8").splitlines(),
-        "reviewer_invocation_sha256": digest(reviewer_dir / "invocation.json"),
         "reviewer_identity_sha256": digest(reviewer_dir / "identity.json"),
         "agent_activity": event_counts(agent_log),
         "remote_pull_publications": sum(
@@ -423,16 +423,30 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
     )
     if additions:
         delivery = json.loads(additions[0])
-        assert delivery.get("event") == "agent.guidance.delivery"
-        assert delivery.get("invocation_id") == evidence["successor_invocation_id"]
-        assert delivery.get("outcome") == "success"
-        assert delivery.get("channel") == "tmux_injection"
+        data = delivery.get("data")
+        assert delivery.get("type") == "agent.guidance.delivery"
+        assert isinstance(data, dict)
+        assert data.get("invocation_id") == evidence["successor_invocation_id"]
+        assert data.get("outcome") == "success"
+        assert data.get("channel") == "tmux_injection"
         evidence["owner_history_lines"] = history_lines
         evidence["owner_history_sha256"] = digest(history)
-    assert (
-        digest(reviewer_dir / "invocation.json")
-        == evidence["reviewer_invocation_sha256"]
+    current_reviewer = json.loads(
+        (reviewer_dir / "invocation.json").read_text(encoding="utf-8")
     )
+    for field in (
+        "invocation_id",
+        "generation",
+        "runtime",
+        "model",
+        "effort",
+        "pr_number",
+        "head_sha",
+        "trigger",
+    ):
+        assert current_reviewer.get(field) == evidence["reviewer_invocation"].get(
+            field
+        ), f"repeat init changed reviewer {field}"
     assert (
         digest(reviewer_dir / "identity.json") == evidence["reviewer_identity_sha256"]
     )
@@ -482,6 +496,15 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
     ]
     assert len(owner_invocations) == 2, (
         f"expected one OpenCode and one Codex invocation, got {len(owner_invocations)}"
+    )
+    reviewer_invocations = [
+        row
+        for row in events
+        if row.get("type") == "agent.invocation.started"
+        and row.get("agent_id") == evidence["reviewer_name"]
+    ]
+    assert len(reviewer_invocations) == 1, (
+        f"repeat init created another reviewer invocation: {reviewer_invocations!r}"
     )
     assert (
         sum(
