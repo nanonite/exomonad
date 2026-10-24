@@ -1444,8 +1444,8 @@ assert_legacy_recovery_receipt "$AGG_REPO" "$LEGACY_LOCK_CONTENTS" "$LEGACY_FING
     || e2e_fail "legacy recovery changed the remote merge observation"
 e2e_log "Actual init refused the legacy lock; compiled inspect/apply recovered approved fingerprint $LEGACY_FINGERPRINT"
 
-# Emit the blocked event before init starts a controller so its first replay
-# observes #814 as an active human-blocked leaf, not as completed work.
+# The blocker-only acceptance keeps #814 active before first replay. The normal
+# aggregate run leaves the failure proof available for its ordered retry path.
 PHASE8_SERVER_COMMAND="EXOMONAD_TMUX_SESSION=$AGGREGATE_SESSION EXOMONAD_ROOT_AGENT_TYPE=codex EXOMONAD_SPAWN_AGENT_TYPE=codex EXOMONAD_REVIEWER_AGENT_TYPE=codex EXOMONAD_CODEX_MODEL=gpt-6-luna $EXOMONAD_BIN serve"
 tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_SERVER_COMMAND"
 tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
@@ -1465,8 +1465,12 @@ PY
     sleep 0.1
 done
 [[ -S "$AGG_REPO/.exo/server.sock" ]] || e2e_fail "disposable Phase 8 server did not create its MCP socket"
-read -r KANI_BLOCKER_EVENT_ID KANI_BLOCKER_RUN_SEQ < <(emit_active_kani_blocker)
-e2e_log "Emitted active event-shaped blocker $KANI_BLOCKER_EVENT_ID at ledger sequence $KANI_BLOCKER_RUN_SEQ before controller continuation"
+KANI_BLOCKER_EVENT_ID=""
+KANI_BLOCKER_RUN_SEQ=""
+if [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
+    read -r KANI_BLOCKER_EVENT_ID KANI_BLOCKER_RUN_SEQ < <(emit_active_kani_blocker)
+    e2e_log "Emitted active event-shaped blocker $KANI_BLOCKER_EVENT_ID at ledger sequence $KANI_BLOCKER_RUN_SEQ before controller continuation"
+fi
 
 AGG_INIT_STATUS=0
 HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
@@ -1476,9 +1480,11 @@ assert_init_status "$AGG_INIT_STATUS" "$AGG_DIR/init.log" "aggregate init --cont
 [[ "$(rg -F -c 'Recovered a proven orphan native Git lock' "$AGG_DIR/init.log" || printf '0')" == "0" ]] \
     || { cat "$AGG_DIR/init.log"; e2e_fail "legacy lock was misreported as a managed orphan"; }
 [[ "$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)" != "$PRE_RECOVERY_CONTROLLER_EPOCH" ]] \
-    || e2e_fail "post-recovery init did not start the fresh controller to replay the active blocker"
+    || e2e_fail "post-recovery init did not start the fresh controller to reconcile the root run"
 assert_one_live_window Server
-assert_active_kani_blocker_replayed "$KANI_BLOCKER_EVENT_ID" "$KANI_BLOCKER_RUN_SEQ"
+if [[ -n "$KANI_BLOCKER_EVENT_ID" && -n "$KANI_BLOCKER_RUN_SEQ" ]]; then
+    assert_active_kani_blocker_replayed "$KANI_BLOCKER_EVENT_ID" "$KANI_BLOCKER_RUN_SEQ"
+fi
 if [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
     # Seed the historical owner only after both child and parent projections
     # have durably consumed the blocker. A live owner must not affect routing
@@ -2399,9 +2405,6 @@ HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
     > "$AGG_DIR/init-repeat.log" 2>&1 || REPEAT_INIT_STATUS=$?
 assert_init_status "$REPEAT_INIT_STATUS" "$AGG_DIR/init-repeat.log" "repeated aggregate init --continue"
 assert_configured_retry_dispatch_events "$AGG_REPO"
-[[ -n "$KANI_BLOCKER_EVENT_ID" && -n "$KANI_BLOCKER_RUN_SEQ" ]] \
-    || e2e_fail "actual-init recursive fixture did not replay the event-108045-shaped blocker"
-assert_kani_blocker_acknowledged_once "$KANI_BLOCKER_EVENT_ID" "$KANI_BLOCKER_RUN_SEQ"
 rg -Fq "server_build=\"$AGGREGATE_BUILD_ID\" controller_build=\"$AGGREGATE_BUILD_ID\"" "$AGG_DIR/init-repeat.log" \
     || { cat "$AGG_DIR/init-repeat.log"; e2e_fail "repeat init did not attach using the verified binary/archive"; }
 assert_one_live_window Server
