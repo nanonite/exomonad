@@ -1444,10 +1444,53 @@ assert_legacy_recovery_receipt "$AGG_REPO" "$LEGACY_LOCK_CONTENTS" "$LEGACY_FING
     || e2e_fail "legacy recovery changed the remote merge observation"
 e2e_log "Actual init refused the legacy lock; compiled inspect/apply recovered approved fingerprint $LEGACY_FINGERPRINT"
 
-# Create a real, terminal OpenCode #814 owner under its historical route in
-# the same aggregate repository. Then restart the server with the accepted
-# Codex route before emitting the active blocker and running init.
+# Emit the blocked event before init starts a controller so its first replay
+# observes #814 as an active human-blocked leaf, not as completed work.
+PHASE8_SERVER_COMMAND="EXOMONAD_TMUX_SESSION=$AGGREGATE_SESSION EXOMONAD_ROOT_AGENT_TYPE=codex EXOMONAD_SPAWN_AGENT_TYPE=codex EXOMONAD_REVIEWER_AGENT_TYPE=codex EXOMONAD_CODEX_MODEL=gpt-6-luna $EXOMONAD_BIN serve"
+tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_SERVER_COMMAND"
+tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
+for _ in $(seq 1 100); do
+    if python3 - "$AGG_REPO/.exo/server.sock" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(0.2)
+client.connect(sys.argv[1])
+client.close()
+PY
+    then
+        break
+    fi
+    sleep 0.1
+done
+[[ -S "$AGG_REPO/.exo/server.sock" ]] || e2e_fail "disposable Phase 8 server did not create its MCP socket"
+read -r KANI_BLOCKER_EVENT_ID KANI_BLOCKER_RUN_SEQ < <(emit_active_kani_blocker)
+e2e_log "Emitted active event-shaped blocker $KANI_BLOCKER_EVENT_ID at ledger sequence $KANI_BLOCKER_RUN_SEQ before controller continuation"
+
+AGG_INIT_STATUS=0
+HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
+    "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
+    > "$AGG_DIR/init.log" 2>&1 || AGG_INIT_STATUS=$?
+assert_init_status "$AGG_INIT_STATUS" "$AGG_DIR/init.log" "aggregate init --continue after legacy recovery"
+[[ "$(rg -F -c 'Recovered a proven orphan native Git lock' "$AGG_DIR/init.log" || printf '0')" == "0" ]] \
+    || { cat "$AGG_DIR/init.log"; e2e_fail "legacy lock was misreported as a managed orphan"; }
+[[ "$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)" != "$PRE_RECOVERY_CONTROLLER_EPOCH" ]] \
+    || e2e_fail "post-recovery init did not start the fresh controller to replay the active blocker"
+assert_one_live_window Server
+assert_active_kani_blocker_replayed "$KANI_BLOCKER_EVENT_ID" "$KANI_BLOCKER_RUN_SEQ"
 if [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
+    # Seed the historical owner only after both child and parent projections
+    # have durably consumed the blocker. A live owner must not affect routing
+    # or acknowledgment of the event that predates it.
+    tmux send-keys -t "$AGGREGATE_SESSION:Server" C-c
+    for _ in $(seq 1 100); do
+        [[ ! -S "$AGG_REPO/.exo/server.sock" ]] && break
+        sleep 0.1
+    done
+    [[ ! -S "$AGG_REPO/.exo/server.sock" ]] \
+        || e2e_fail "Codex server did not release its socket before historical owner setup"
+    tmux kill-window -t "$AGGREGATE_SESSION:Server" 2>/dev/null || true
     python3 - "$AGG_REPO/.exo/config.toml" <<'PY'
 import sys
 from pathlib import Path
@@ -1497,15 +1540,10 @@ text = path.read_text(encoding="utf-8")
 assert text.count('worker_effort_level = "high"') == 1
 path.write_text(text.replace('worker_effort_level = "high"', 'worker_effort_level = "xhigh"'), encoding="utf-8")
 PY
-fi
-
-# Emit the blocked event before init starts a controller so its first replay
-# observes #814 as an active human-blocked leaf, not as completed work.
-PHASE8_SERVER_COMMAND="EXOMONAD_TMUX_SESSION=$AGGREGATE_SESSION EXOMONAD_ROOT_AGENT_TYPE=codex EXOMONAD_SPAWN_AGENT_TYPE=codex EXOMONAD_REVIEWER_AGENT_TYPE=codex EXOMONAD_CODEX_MODEL=gpt-6-luna $EXOMONAD_BIN serve"
-tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_SERVER_COMMAND"
-tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
-for _ in $(seq 1 100); do
-    if python3 - "$AGG_REPO/.exo/server.sock" <<'PY' >/dev/null 2>&1
+    tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_SERVER_COMMAND"
+    tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
+    for _ in $(seq 1 100); do
+        if python3 - "$AGG_REPO/.exo/server.sock" <<'PY' >/dev/null 2>&1
 import socket
 import sys
 
@@ -1514,27 +1552,12 @@ client.settimeout(0.2)
 client.connect(sys.argv[1])
 client.close()
 PY
-    then
-        break
-    fi
-    sleep 0.1
-done
-[[ -S "$AGG_REPO/.exo/server.sock" ]] || e2e_fail "disposable Phase 8 server did not create its MCP socket"
-read -r KANI_BLOCKER_EVENT_ID KANI_BLOCKER_RUN_SEQ < <(emit_active_kani_blocker)
-e2e_log "Emitted active event-shaped blocker $KANI_BLOCKER_EVENT_ID at ledger sequence $KANI_BLOCKER_RUN_SEQ before controller continuation"
-
-AGG_INIT_STATUS=0
-HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
-    "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
-    > "$AGG_DIR/init.log" 2>&1 || AGG_INIT_STATUS=$?
-assert_init_status "$AGG_INIT_STATUS" "$AGG_DIR/init.log" "aggregate init --continue after legacy recovery"
-[[ "$(rg -F -c 'Recovered a proven orphan native Git lock' "$AGG_DIR/init.log" || printf '0')" == "0" ]] \
-    || { cat "$AGG_DIR/init.log"; e2e_fail "legacy lock was misreported as a managed orphan"; }
-[[ "$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)" != "$PRE_RECOVERY_CONTROLLER_EPOCH" ]] \
-    || e2e_fail "post-recovery init did not start the fresh controller to replay the active blocker"
-assert_one_live_window Server
-assert_active_kani_blocker_replayed "$KANI_BLOCKER_EVENT_ID" "$KANI_BLOCKER_RUN_SEQ"
-if [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
+        then
+            break
+        fi
+        sleep 0.1
+    done
+    [[ -S "$AGG_REPO/.exo/server.sock" ]] || e2e_fail "configured Codex server did not restart after owner setup"
     python3 "$SCRIPT_DIR/configured-owner-resume.py" resume \
         --repo "$AGG_REPO" --baseline "$AGG_DIR/preexisting-opencode-owner.json" \
         --output "$AGG_DIR/configured-owner-resume.json" \
