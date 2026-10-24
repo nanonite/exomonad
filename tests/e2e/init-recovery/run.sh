@@ -409,8 +409,8 @@ assert_blocked_human_gate_hold() {
         || e2e_fail "active blocker replay unexpectedly passed an unapproved human recovery gate"
     rg -Fq "required leaf recovery gate 'tl-dispatch-failed-issue-814-substitution-model-kani' is not approved" "$controller_log_path" \
         || { cat "$log_path" "$controller_log_path"; e2e_fail "active blocker replay did not stop at the precise pending leaf recovery gate"; }
-    rg -Fq 'tl-ordered-child-recovery-kani status=pending' "$log_path" \
-        || { cat "$log_path"; e2e_fail "active blocker replay omitted the pending parent recovery gate"; }
+    rg -Fq 'tl-ordered-child-recovery-kani status=pending' "$controller_log_path" \
+        || { cat "$log_path" "$controller_log_path"; e2e_fail "active blocker replay omitted the pending parent recovery gate"; }
 }
 
 assert_one_live_window() {
