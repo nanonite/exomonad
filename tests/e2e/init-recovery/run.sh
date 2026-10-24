@@ -404,10 +404,11 @@ assert_init_status() {
 assert_blocked_human_gate_hold() {
     local status="$1"
     local log_path="$2"
+    local controller_log_path="$3"
     [[ "$status" -ne 0 ]] \
         || e2e_fail "active blocker replay unexpectedly passed an unapproved human recovery gate"
-    rg -Fq "required leaf recovery gate 'tl-dispatch-failed-issue-814-substitution-model-kani' is not approved" "$log_path" \
-        || { cat "$log_path"; e2e_fail "active blocker replay did not stop at the precise pending leaf recovery gate"; }
+    rg -Fq "required leaf recovery gate 'tl-dispatch-failed-issue-814-substitution-model-kani' is not approved" "$controller_log_path" \
+        || { cat "$log_path" "$controller_log_path"; e2e_fail "active blocker replay did not stop at the precise pending leaf recovery gate"; }
     rg -Fq 'tl-ordered-child-recovery-kani status=pending' "$log_path" \
         || { cat "$log_path"; e2e_fail "active blocker replay omitted the pending parent recovery gate"; }
 }
@@ -1510,7 +1511,8 @@ HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer
     "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
     > "$AGG_DIR/init.log" 2>&1 || AGG_INIT_STATUS=$?
 if [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
-    assert_blocked_human_gate_hold "$AGG_INIT_STATUS" "$AGG_DIR/init.log"
+    assert_blocked_human_gate_hold "$AGG_INIT_STATUS" "$AGG_DIR/init.log" \
+        "$AGG_REPO/.exo/tl-loop/root/controller-output.log"
 else
     assert_init_status "$AGG_INIT_STATUS" "$AGG_DIR/init.log" "aggregate init --continue after legacy recovery"
 fi
