@@ -1605,7 +1605,7 @@ PY
         --name "tl-ordered-child-recovery-kani" --approve \
         > "$AGG_DIR/approve-kani-ordered-recovery.log" 2>&1 \
         || { cat "$AGG_DIR/approve-kani-ordered-recovery.log"; e2e_fail "could not approve the retained ordered Kani recovery gate"; }
-    PYTHONPATH="$PROJECT_ROOT" "$PROJECT_ROOT/tl_loop/.venv/bin/python" -m tl_loop gate --project-root "$AGG_REPO" --run-id kani \
+    PYTHONPATH="$PROJECT_ROOT" "$PROJECT_ROOT/tl_loop/.venv/bin/python" -m tl_loop gate --project-root "$AGG_REPO" --run-id kani --parent-run-id root \
         --name "tl-dispatch-failed-issue-814-substitution-model-kani" --approve \
         > "$AGG_DIR/approve-kani-dispatch-recovery.log" 2>&1 \
         || { cat "$AGG_DIR/approve-kani-dispatch-recovery.log"; e2e_fail "could not approve the retained Kani dispatch recovery gate"; }

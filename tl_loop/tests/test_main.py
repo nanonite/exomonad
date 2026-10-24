@@ -189,6 +189,56 @@ def test_gate_answer_reaches_a_gate_whose_slice_id_contains_a_slash(
     ]
 
 
+def test_gate_command_can_answer_a_nested_child_run_gate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    transport = RecordingTransport()
+    project_root = tmp_path
+    state_root = project_root / ".exo" / "tl-loop"
+    create("root", {}, root_dir=state_root)
+    child_store = RunStore("kani", RunStore("root", state_root).run_dir)
+    create("kani", {}, root_dir=RunStore("root", state_root).run_dir)
+    child_store.set_gate("tl-dispatch-failed-issue-814")
+    monkeypatch.setattr(launcher, "TransportClient", lambda project_root: transport)
+
+    assert (
+        launcher.main(
+            [
+                "gate",
+                "--project-root",
+                str(project_root),
+                "--run-id",
+                "kani",
+                "--parent-run-id",
+                "root",
+                "--name",
+                "tl-dispatch-failed-issue-814",
+                "--approve",
+            ]
+        )
+        == 0
+    )
+
+    assert [(gate.name, gate.status.value) for gate in child_store.load().gates] == [
+        ("tl-dispatch-failed-issue-814", "approved")
+    ]
+    assert not RunStore("root", state_root).load().gates
+    assert transport.calls == [
+        (
+            "emit_controller_event",
+            {
+                "event_type": "tl.gate_answered",
+                "payload": {
+                    "gate_name": "tl-dispatch-failed-issue-814",
+                    "decision": "approved",
+                    "source": "cli",
+                },
+            },
+        )
+    ]
+
+
 def test_a_gate_name_containing_a_slash_is_distinct_from_its_encoded_form(
     tmp_path: Path,
 ) -> None:

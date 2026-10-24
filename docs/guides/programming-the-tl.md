@@ -1458,7 +1458,13 @@ python3 ~/.exo/tl_loop.pyz run    --project-root . --plan .exo/tl-loop/plan.json
 python3 ~/.exo/tl_loop.pyz status --project-root . --run-id root
 python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name <gate> --approve
 python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name <gate> --reject
+# A gate stored by a direct child scope can be answered explicitly as well.
+python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id kani --parent-run-id root \
+  --name <child-gate> --approve
 ```
+
+`--parent-run-id` selects a child RunStore beneath the named parent; without
+it, `--run-id` addresses a top-level RunStore as before.
 
 `run` flags: `--max-events` (default 256), `--task-timeout` (3600s; `0` disables),
 `--poll-interval` (0.25s), `--wait-for-plan` (block until `plan.json` appears),

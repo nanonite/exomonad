@@ -261,6 +261,10 @@ def _parser() -> argparse.ArgumentParser:
     gate = subcommands.add_parser("gate", help="answer a durable human gate")
     _add_project_options(gate)
     gate.add_argument("--run-id", default=os.environ.get("EXOMONAD_TL_LOOP_RUN_ID", DEFAULT_RUN_ID))
+    gate.add_argument(
+        "--parent-run-id",
+        help="answer a gate in a child RunStore beneath this parent run",
+    )
     gate.add_argument("--name", required=True)
     decision = gate.add_mutually_exclusive_group(required=True)
     decision.add_argument("--approve", action="store_true")
@@ -1003,7 +1007,11 @@ def _status_message(
 def _set_gate(args: argparse.Namespace) -> None:
     project_root = args.project_root.expanduser().resolve()
     root = project_root / ".exo" / "tl-loop"
-    store = RunStore(args.run_id, root)
+    state_root = root
+    parent_run_id = getattr(args, "parent_run_id", None)
+    if parent_run_id is not None:
+        state_root = RunStore(parent_run_id, root).run_dir
+    store = RunStore(args.run_id, state_root)
     status = GateStatus.APPROVED.value if args.approve else GateStatus.REJECTED.value
     try:
         store.answer_gate(args.name, GateStatus(status))
