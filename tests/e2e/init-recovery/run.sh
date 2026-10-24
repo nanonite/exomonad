@@ -1565,13 +1565,15 @@ PY
         || { cat "$AGG_DIR/configured-owner-resume.stdout"; e2e_fail "same-checkpoint blocked owner did not resume through Codex"; }
     ROOT_EPOCH_AFTER_BLOCKER="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
     BLOCKER_EFFECTS_BEFORE="$AGG_DIR/blocker-effects-before-repeat.json"
-    python3 - "$AGG_REPO" "$AGG_DIR/mock.log" "$AGENT_EVENT_LOG" "$BLOCKER_EFFECTS_BEFORE" <<'PY'
+    # Agent actions can complete asynchronously between init invocations; the
+    # owner verifier checks exact worker/reviewer counts instead of log bytes.
+    python3 - "$AGG_REPO" "$AGG_DIR/mock.log" "$BLOCKER_EFFECTS_BEFORE" <<'PY'
 import hashlib
 import json
 import sys
 from pathlib import Path
 
-repo, mock_log, agent_log, output = map(Path, sys.argv[1:])
+repo, mock_log, output = map(Path, sys.argv[1:])
 root_dir = repo / ".exo/tl-loop/root"
 root = json.loads((root_dir / "run.json").read_text())
 kani = json.loads((root_dir / "kani/run.json").read_text())
@@ -1640,7 +1642,6 @@ output.write_text(json.dumps({
     "kani_dispatch_invocation_id": root["slices"]["kani"].get("dispatch_invocation_id"),
     "dispatch_event_ids": [row.get("event_id") for row in dispatch_events],
     "remote_mutations": remote_mutations(mock_log),
-    "agent_log": digest(agent_log),
 }, sort_keys=True) + "\n", encoding="utf-8")
 PY
     REPEAT_BLOCKER_STATUS=0
@@ -1656,14 +1657,14 @@ PY
         || { cat "$AGG_DIR/configured-owner-resume-repeat.stdout"; e2e_fail "repeat init duplicated the same-checkpoint Codex owner, PR or review"; }
     [[ "$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)" != "$ROOT_EPOCH_AFTER_BLOCKER" ]] \
         || e2e_fail "fresh repeat continuation did not create its own controller epoch"
-    python3 - "$AGG_REPO" "$AGG_DIR/mock.log" "$AGENT_EVENT_LOG" "$BLOCKER_EFFECTS_BEFORE" <<'PY' \
+    python3 - "$AGG_REPO" "$AGG_DIR/mock.log" "$BLOCKER_EFFECTS_BEFORE" <<'PY' \
         || e2e_fail "repeat blocker continuation duplicated work or rewrote historical effects"
 import hashlib
 import json
 import sys
 from pathlib import Path
 
-repo, mock_log, agent_log, before_path = map(Path, sys.argv[1:])
+repo, mock_log, before_path = map(Path, sys.argv[1:])
 before = json.loads(before_path.read_text(encoding="utf-8"))
 root_dir = repo / ".exo/tl-loop/root"
 root = json.loads((root_dir / "run.json").read_text())
@@ -1733,7 +1734,6 @@ after = {
     "kani_dispatch_invocation_id": root["slices"]["kani"].get("dispatch_invocation_id"),
     "dispatch_event_ids": [row.get("event_id") for row in dispatch_events],
     "remote_mutations": remote_mutations(mock_log),
-    "agent_log": digest(agent_log),
 }
 assert after == before, f"repeat continuation changed durable or external leaf effects: {before!r} -> {after!r}"
 assert root["current_order"] == 2
