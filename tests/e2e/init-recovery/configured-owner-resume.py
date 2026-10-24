@@ -210,25 +210,63 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
             if row.get("author_agent") == baseline["owner_agent_name"]
             and row.get("slice_id") == OWNER_SLICE
         ]
+        publication = leaf.get("publication")
+        handoff = leaf.get("handoff")
+        publication_head = (
+            publication.get("head_sha") if isinstance(publication, dict) else None
+        )
+        publication_pr = (
+            publication.get("pr_number") if isinstance(publication, dict) else None
+        )
+        head_sha = publication_head
+        successor_finished_successfully = current_invocation.get("status") not in {
+            "failed",
+            "killed",
+        } and (
+            current_invocation.get("status") != "exited"
+            or (
+                current_invocation.get("exit_code") == 0
+                and current_invocation.get("exit_classification") == "one_shot_complete"
+            )
+        )
         if (
             current_invocation.get("invocation_id")
             != baseline["prior_invocation"]["invocation_id"]
-            and current_invocation.get("status") not in {"failed", "exited", "killed"}
-            and leaf.get("status") not in {"blocked", "pending"}
+            and successor_finished_successfully
+            and leaf.get("status") in {"spawned", "in_review", "repairing", "merged"}
             and leaf.get("dispatch_agent_id") == baseline["owner_agent_name"]
             and leaf.get("dispatch_invocation_id")
             == current_invocation.get("invocation_id")
+            and leaf.get("branch") == baseline["branch"]
+            and Path(leaf.get("worktree", "")).resolve()
+            == Path(baseline["worktree"]).resolve()
             and isinstance(leaf.get("pr_number"), int)
-            and isinstance(leaf.get("head_sha"), str)
+            and isinstance(head_sha, str)
             and len(publication_matches) == 1
             and publication_matches[0].get("pr_number") == leaf.get("pr_number")
-            and publication_matches[0].get("head_sha") == leaf.get("head_sha")
+            and publication_matches[0].get("head_sha") == head_sha
+            and publication_pr == leaf.get("pr_number")
+            and publication.get("head_branch") == baseline["branch"]
+            and publication.get("base_branch") == "main.kani"
+            and publication.get("invocation_id")
+            == current_invocation.get("invocation_id")
+            and (leaf.get("head_sha") is None or leaf.get("head_sha") == head_sha)
+            and isinstance(handoff, dict)
+            and handoff.get("pr_number") == leaf.get("pr_number")
+            and handoff.get("head_sha") == head_sha
+            and handoff.get("invocation_id") == current_invocation.get("invocation_id")
+            and publication_matches[0].get("invocation_id")
+            == current_invocation.get("invocation_id")
         ):
-            reviewers = _reviewer_invocations(
-                repository, leaf["pr_number"], leaf["head_sha"]
-            )
-            activities = event_counts(agent_log)
-            if len(reviewers) == 1 and activities.get("reviewer_approved", 0) == 1:
+            reviewers = _reviewer_invocations(repository, leaf["pr_number"], head_sha)
+            reviewer_approvals = [
+                row
+                for row in read_json_lines(agent_log)
+                if row.get("event") == "reviewer_approved"
+                and row.get("pr_number") == leaf["pr_number"]
+                and row.get("head_sha") == head_sha
+            ]
+            if len(reviewers) == 1 and len(reviewer_approvals) == 1:
                 accepted = (child, current_invocation, reviewers[0])
                 break
         time.sleep(0.1)
@@ -240,6 +278,8 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
 
     child, successor, reviewer = accepted
     leaf = child["slices"][OWNER_SLICE]
+    publication = leaf["publication"]
+    head_sha = publication["head_sha"]
     identity = json.loads((owner_dir / "identity.json").read_text(encoding="utf-8"))
     prior = baseline["prior_invocation"]
     if (
@@ -281,29 +321,29 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
         "recovery_worker_started",
         "recovery_worker_filed_pr",
         "recovery_worker_notified_parent",
-        "reviewer_approved",
     ):
         if activity.get(event) != 1:
             raise RuntimeError(
                 f"expected one real {event} activity, got {activity.get(event, 0)}"
             )
-
-    reviewer_dir = repository / ".exo/agents" / reviewer["agent_name"]
-    reviewer_identity = json.loads(
-        (reviewer_dir / "identity.json").read_text(encoding="utf-8")
-    )
-    reviewer_invocation = json.loads(
-        (reviewer_dir / "invocation.json").read_text(encoding="utf-8")
-    )
+    reviewer_invocation = reviewer["invocation"]
+    reviewer_approvals = [
+        row
+        for row in read_json_lines(agent_log)
+        if row.get("event") == "reviewer_approved"
+        and row.get("pr_number") == leaf["pr_number"]
+        and row.get("head_sha") == head_sha
+    ]
     if (
         reviewer_invocation.get("runtime") != "codex"
-        or reviewer_invocation.get("model") != "gpt-6.1-sol"
-        or reviewer_invocation.get("effort") != "medium"
+        or reviewer_invocation.get("role") != "reviewer"
+        or reviewer_invocation.get("trigger") != "review"
         or reviewer_invocation.get("pr_number") != leaf["pr_number"]
-        or reviewer_invocation.get("head_sha") != leaf["head_sha"]
-        or reviewer_identity.get("agent_type") != "codex"
-        or reviewer_identity.get("model") != "gpt-6.1-sol"
-        or reviewer_identity.get("effort") != "medium"
+        or reviewer_invocation.get("head_sha") != head_sha
+        or len(reviewer_approvals) != 1
+        or reviewer_approvals[0].get("agent_id") != reviewer["agent_name"]
+        or reviewer_approvals[0].get("model") != "gpt-6.1-sol"
+        or reviewer_approvals[0].get("effort") != "medium"
     ):
         raise RuntimeError(
             "controller reviewer is not bound to the configured exact PR head"
@@ -390,13 +430,13 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
         "model": successor["model"],
         "effort": successor["effort"],
         "pr_number": leaf["pr_number"],
-        "head_sha": leaf["head_sha"],
+        "head_sha": head_sha,
         "reviewer_name": reviewer["agent_name"],
         "reviewer_invocation": reviewer_invocation,
+        "reviewer_invocation_event_id": reviewer["event_id"],
         "successor_invocation_sha256": digest(owner_dir / "invocation.json"),
         "owner_identity_sha256": digest(owner_dir / "identity.json"),
         "owner_history_lines": history_lines,
-        "reviewer_identity_sha256": digest(reviewer_dir / "identity.json"),
         "leaf_status": leaf["status"],
         "leaf_dispatch_generation": leaf["dispatch_generation"],
         "lifecycle_event_ids": [row.get("event_id") for row in lifecycle],
@@ -412,23 +452,23 @@ def _reviewer_invocations(
     repository: Path, pr_number: int, head_sha: str
 ) -> list[dict[str, Any]]:
     reviewers: list[dict[str, Any]] = []
-    owners = repository / ".exo/agents"
-    if not owners.is_dir():
-        return reviewers
-    for owner_dir in owners.iterdir():
-        invocation_path = owner_dir / "invocation.json"
-        if not invocation_path.is_file():
-            continue
-        try:
-            value = json.loads(invocation_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
+    for row in canonical_events(repository):
+        value = row.get("data")
         if (
-            value.get("trigger") == "review"
+            row.get("type") == "agent.invocation.started"
+            and isinstance(value, dict)
+            and value.get("role") == "reviewer"
+            and value.get("trigger") == "review"
             and value.get("pr_number") == pr_number
             and value.get("head_sha") == head_sha
         ):
-            reviewers.append({"agent_name": owner_dir.name, "invocation": value})
+            reviewers.append(
+                {
+                    "agent_name": row.get("agent_id"),
+                    "event_id": row.get("event_id"),
+                    "invocation": value,
+                }
+            )
     return reviewers
 
 
@@ -459,7 +499,6 @@ def canonical_events(repository: Path) -> list[dict[str, Any]]:
 def verify_repeat(repository: Path, evidence_path: Path) -> None:
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     owner_dir, _ = owner_for(repository)
-    reviewer_dir = repository / ".exo/agents" / evidence["reviewer_name"]
     if retained_rejected_request(repository) != evidence["rejected_request"]:
         raise RuntimeError("repeat init changed the original rejected Kani request")
     assert (
@@ -485,24 +524,21 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
         assert data.get("channel") == "tmux_injection"
         evidence["owner_history_lines"] = history_lines
         evidence["owner_history_sha256"] = digest(history)
-    current_reviewer = json.loads(
-        (reviewer_dir / "invocation.json").read_text(encoding="utf-8")
+    reviewer_events = [
+        row
+        for row in canonical_events(repository)
+        if row.get("type") == "agent.invocation.started"
+        and row.get("agent_id") == evidence["reviewer_name"]
+        and row.get("data", {}).get("role") == "reviewer"
+        and row.get("data", {}).get("trigger") == "review"
+        and row.get("data", {}).get("pr_number") == evidence["pr_number"]
+        and row.get("data", {}).get("head_sha") == evidence["head_sha"]
+    ]
+    assert len(reviewer_events) == 1, (
+        f"repeat init duplicated the reviewer invocation: {reviewer_events!r}"
     )
-    for field in (
-        "invocation_id",
-        "generation",
-        "runtime",
-        "model",
-        "effort",
-        "pr_number",
-        "head_sha",
-        "trigger",
-    ):
-        assert current_reviewer.get(field) == evidence["reviewer_invocation"].get(
-            field
-        ), f"repeat init changed reviewer {field}"
     assert (
-        digest(reviewer_dir / "identity.json") == evidence["reviewer_identity_sha256"]
+        reviewer_events[0].get("event_id") == evidence["reviewer_invocation_event_id"]
     )
     assert digest(owner_dir / "identity.json") == evidence["owner_identity_sha256"]
     assert (
