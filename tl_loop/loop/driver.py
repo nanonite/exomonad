@@ -4907,13 +4907,19 @@ def _validated_blocked_resume_result(
     runtime = invocation.get("runtime")
     if (
         payload.get("chainlink_issue_id") != proof.owner.issue_id
-        or agent.get("id") != proof.owner.agent_name
-        or agent.get("issue") != proof.leaf.name
-        or agent.get("intent_id") != proof.intent_id
+        or any(
+            key in agent and agent[key] != expected
+            for key, expected in (
+                ("id", proof.owner.agent_name),
+                ("issue", proof.leaf.name),
+                ("intent_id", proof.intent_id),
+            )
+        )
+        or agent.get("agent_type") != runtime
         or agent.get("branch_name") != proof.owner.branch
         or Path(str(agent.get("worktree_path", ""))).resolve() != proof.owner.worktree
         or invocation.get("trigger") != "resume_blocked"
-        or invocation.get("branch_name") != proof.owner.branch
+        or ("branch_name" in invocation and invocation.get("branch_name") != proof.owner.branch)
         or invocation.get("ready") is not True
         or invocation.get("outcome") not in {"started", "adopted_after_response_loss"}
         or invocation.get("fresh") is not (invocation.get("outcome") == "started")

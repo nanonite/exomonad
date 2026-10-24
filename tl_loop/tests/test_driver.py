@@ -18565,9 +18565,7 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
                     "result": {
                         "chainlink_issue_id": 814,
                         "agent": {
-                            "id": owner_name,
-                            "issue": slice_id,
-                            "intent_id": expected_intent,
+                            "agent_type": "codex",
                             "branch_name": branch,
                             "worktree_path": str(worktree),
                         },
@@ -18575,7 +18573,6 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
                             "invocation_id": "codex-successor-invocation",
                             "trigger": "resume_blocked",
                             "runtime": "codex",
-                            "branch_name": branch,
                             "ready": True,
                             "fresh": len(observed_resume_intents) == 1,
                             "outcome": (
