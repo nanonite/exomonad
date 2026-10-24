@@ -83,9 +83,12 @@ PERSISTED_FIELDS = (
 )
 #: The boundary events a dispatch pass emits from the one attempt.
 BOUNDARY_EVENTS = ("tl.dispatch_intended", "tl.spawn_requested", "tl.spawn_request_accepted")
-#: The only source sites allowed to construct an attempt. A reconstruction goes
-#: through ``DispatchAttempt.recorded_for``; a fresh identity is minted here.
-AUDITED_CONSTRUCTIONS = frozenset({"_new_dispatch_attempt", "_prepare_sub_tl_stage"})
+#: Source sites allowed to construct an attempt. The blocked-leaf recovery
+#: constructor is separately audited against its durable resume intent and
+#: generation in the controller integration tests.
+AUDITED_CONSTRUCTIONS = frozenset(
+    {"_new_dispatch_attempt", "_prepare_sub_tl_stage", "_blocked_leaf_dispatch_attempt"}
+)
 
 
 @dataclass

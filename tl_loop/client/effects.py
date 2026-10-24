@@ -114,6 +114,7 @@ TOOL_METHODS: tuple[str, ...] = (
     "restart_review",
     "replace_close_pr",
     "resume_pr",
+    "resume_blocked_leaf",
     "resolve_live_pr_for_slice",
     "watcher_pr_state",
     "repository_identity",
@@ -288,6 +289,29 @@ class EffectClient:
                 "pr_number": pr_number,
                 "expected_head_sha": expected_head_sha,
                 "task": task,
+            },
+        )
+
+    def resume_blocked_leaf(
+        self,
+        *,
+        chainlink_issue_id: int,
+        expected_invocation_id: str,
+        expected_branch: str,
+        expected_worktree_fingerprint: str,
+        task: str,
+        human_approved: bool,
+    ) -> ToolResult:
+        """Resume one approved leaf in its existing owner and worktree."""
+        return self._call(
+            "resume_blocked_leaf",
+            {
+                "chainlink_issue_id": chainlink_issue_id,
+                "expected_invocation_id": expected_invocation_id,
+                "expected_branch": expected_branch,
+                "expected_worktree_fingerprint": expected_worktree_fingerprint,
+                "task": task,
+                "human_approved": human_approved,
             },
         )
 

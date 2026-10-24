@@ -277,6 +277,14 @@ def _invoke_sample_effects(client: EffectClient) -> None:
         operator_context="approved",
     )
     client.resume_pr(pr_number=1, expected_head_sha="abc123", task="resume")
+    client.resume_blocked_leaf(
+        chainlink_issue_id=814,
+        expected_invocation_id="prior-invocation",
+        expected_branch="main.kani.leaf",
+        expected_worktree_fingerprint="sha256:abc123",
+        task="resume the approved blocked leaf",
+        human_approved=True,
+    )
     client.resolve_live_pr_for_slice(slice_id="slice-a")
     client.watcher_pr_state(pr_number=1)
     client.repository_identity()

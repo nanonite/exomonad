@@ -17780,3 +17780,320 @@ def test_recovery_consistency_gate_clears_when_projection_is_restored(tmp_path: 
         and cast("dict[str, Any]", entry["arguments"]).get("event_type") == "tl.recovery_boundary"
     ]
     assert "consistency_restored" in reasons
+
+
+@pytest.mark.parametrize("response_lost", [False, True])
+def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
+    tmp_path: Path, response_lost: bool
+) -> None:
+    """The child controller checkpoints the host's same-owner resume response."""
+    run_id = "kani"
+    slice_id = "issue-814-substitution-model-kani"
+    owner_name = f"{slice_id}-opencode"
+    cancel_event = threading.Event()
+    project = tmp_path / "repo"
+    root_dir = project / ".exo" / "tl-loop"
+    branch = "main.kani.issue-814-substitution-model-kani"
+    controller_worktree = project / ".exo" / "worktrees" / "kani"
+    controller_worktree.mkdir(parents=True)
+    worktree = project / ".exo" / "worktrees" / "kani" / slice_id
+    worktree.mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", "-b", branch, str(worktree)],
+        check=True,
+        capture_output=True,
+    )
+    owner_dir = project / ".exo" / "agents" / owner_name
+    owner_dir.mkdir(parents=True)
+    (owner_dir / "active_issue").write_text("814\n", encoding="utf-8")
+    identity = {
+        "agent_name": owner_name,
+        "slug": slice_id,
+        "slice_id": slice_id,
+        "agent_type": "opencode",
+        "model": "opencode-go/deepseek-v4.1-flash",
+        "effort": "high",
+        "birth_branch": branch,
+        "parent_branch": "main.kani",
+        "working_dir": str(worktree),
+        "topology": "worktree_per_agent",
+        "ledger_owned": False,
+    }
+    (owner_dir / "identity.json").write_text(json.dumps(identity), encoding="utf-8")
+    prior_invocation = {
+        "invocation_id": "opencode-prior-invocation",
+        "generation": 1,
+        "status": "failed",
+        "runtime": "opencode",
+        "model": "opencode-go/deepseek-v4.1-flash",
+        "effort": "high",
+        "trigger": "spawn",
+        "branch": branch,
+        "worktree": str(worktree),
+        "pr_number": None,
+        "head_sha": None,
+        "prior_invocation_id": None,
+    }
+    (owner_dir / "invocation.json").write_text(json.dumps(prior_invocation), encoding="utf-8")
+    plan = WorkPlan.from_mapping(
+        {
+            "leaves": [
+                {
+                    "name": slice_id,
+                    "task": "Complete the Kani stage recovery fixture for issue 814",
+                    "chainlink_issue_id": 814,
+                    "agent_type": "opencode/opencode-go/deepseek-v4.1-flash",
+                }
+            ]
+        }
+    )
+    config = TLLoopConfig(
+        active=True,
+        run_id=run_id,
+        root_dir=root_dir,
+        project_root=project,
+        parent_run_id="root",
+        parent_branch="main",
+        parent_agent_id="kani",
+        branch="main.kani",
+        worktree=controller_worktree,
+        session_mode="continue",
+        ordered_recovery=True,
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+        poll_interval=0.001,
+        cancel_event=cancel_event,
+    )
+    manifest = driver_module._candidate_manifest(plan, run_id, config)
+    slices = _initial_slices(plan, config, root_dir, run_id)
+    state = create(
+        run_id,
+        {
+            "owner_branch": config.branch,
+            "owner_worktree": str(project / ".exo" / "worktrees" / "kani"),
+            "parent_run_id": "root",
+            "parent_branch": "main",
+            "parent_agent_id": "kani",
+            "depth": 1,
+            "plan_manifest": manifest.to_document(),
+            "slices": slices,
+        },
+        root_dir=root_dir,
+    )
+    store = RunStore(run_id, root_dir)
+    current = state.slices[slice_id]
+    recovery = driver_module.transition_recovery(
+        begin_recovery(
+            cause="human_decision_required",
+            owner_run_id=run_id,
+            slice_attempt=1,
+            owner_agent_id=None,
+            invocation_generation=0,
+            plan_revision=manifest.manifest_revision,
+            evidence={
+                "slice_id": slice_id,
+                "authorization_source": "human",
+                "outcome": "blocked",
+                "needs_human": True,
+            },
+            next_action="open_human_gate",
+        ),
+        RecoveryPhase.HUMAN_GATE,
+        next_action="resume_blocked_leaf",
+    )
+    blocked = replace(
+        current,
+        status=SliceStatus.BLOCKED,
+        park_cause=ParkCause.HUMAN_DECISION_REQUIRED,
+        dispatch_intent_id="seed-issue-814-rejected-spawn-intent",
+        dispatch_generation=1,
+        dispatch_started_at=1700000001.0,
+        dispatch_last_boundary="spawn_request_failed",
+        dispatch_error=(
+            "BLOCKED: cannot spawn agent into a dirty TL worktree. 2 file(s) have uncommitted changes:\n"
+            "  .exo/harness_policy.toml\n  CHANGELOG.md\n"
+            "Commit the scaffold (per scaffold-fork-converge) or run `discard_worker_output` "
+            "if throwaway, then retry. Workers spawn in-place and would inherit this state; "
+            "dev-leaves fork from your branch HEAD and would not see your uncommitted work."
+        ),
+        dispatch_error_code="agent_error",
+        attempts=1,
+        recovery=recovery,
+        chainlink_issue_id=814,
+    )
+    store.checkpoint(
+        RecursiveTLFailed(
+            "previous child invocation returned with the blocked leaf pending",
+            scope_path=(manifest.scope_id,),
+        ),
+        {**state.slices, slice_id: blocked},
+        state.budgets,
+        state.events.last_consumed_offset,
+        plan_manifest=manifest,
+    )
+    gate_name = f"{driver_module.DISPATCH_FAILURE_GATE_PREFIX}{slice_id}"
+    store.set_gate(gate_name, GateStatus.PENDING)
+    store.answer_gate(gate_name, GateStatus.APPROVED)
+    journal = EffectJournal(run_id, store.run_dir / "action-journal.json")
+    rejected_intent = EffectIntent(
+        "spawn_leaf",
+        slice_id,
+        {
+            "name": slice_id,
+            "task": plan.leaves[0].task,
+            "intent_id": "seed-issue-814-rejected-spawn-intent",
+        },
+        True,
+    )
+    journal.append(rejected_intent)
+    journal.mark_result(
+        rejected_intent,
+        ToolResult(
+            {
+                "success": False,
+                "result": None,
+                "error": blocked.dispatch_error,
+                "error_kind": None,
+                "error_context": None,
+            },
+            False,
+            None,
+            blocked.dispatch_error,
+        ),
+    )
+
+    owner = driver_module.resolve_dormant_owner_for_slice(
+        project,
+        slice_id=slice_id,
+        expected_issue_id=814,
+        expected_parent_branch="main.kani",
+    )
+    expected_intent = driver_module.blocked_resume_intent_id(owner)
+    observed_resume_intents: list[str] = []
+
+    class ResumeTransport(RecordingTransport):
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: JsonObject,
+        ) -> JsonObject:
+            if tool_name == "resume_blocked_leaf":
+                self.calls.append((tool_name, arguments))
+                observed_resume_intents.append(expected_intent)
+                if len(observed_resume_intents) == 1:
+                    identity_path = owner_dir / "identity.json"
+                    updated_identity = json.loads(identity_path.read_text(encoding="utf-8"))
+                    updated_identity.update(
+                        {"agent_type": "codex", "model": "gpt-6-luna", "effort": "xhigh"}
+                    )
+                    identity_path.write_text(json.dumps(updated_identity), encoding="utf-8")
+                    invocation_path = owner_dir / "invocation.json"
+                    updated_invocation = {
+                        "invocation_id": "codex-successor-invocation",
+                        "generation": 2,
+                        "status": "running",
+                        "runtime": "codex",
+                        "model": "gpt-6-luna",
+                        "effort": "xhigh",
+                        "trigger": "resume_blocked",
+                        "branch": branch,
+                        "worktree": str(worktree),
+                        "prior_invocation_id": "opencode-prior-invocation",
+                        "pr_number": None,
+                        "head_sha": None,
+                    }
+                    invocation_path.write_text(json.dumps(updated_invocation), encoding="utf-8")
+                    (owner_dir / "dispatch_intent").write_text(
+                        expected_intent + "\n", encoding="utf-8"
+                    )
+                    (owner_dir / "routing.json").write_text(
+                        json.dumps(
+                            {
+                                "owner_agent_id": owner_name,
+                                "owner_invocation_id": "codex-successor-invocation",
+                                "owner_generation": 2,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    if response_lost:
+                        cancel_event.set()
+                        raise OSError("simulated response loss after durable host launch")
+                cancel_event.set()
+                return {
+                    "success": True,
+                    "result": {
+                        "chainlink_issue_id": 814,
+                        "agent": {
+                            "id": owner_name,
+                            "issue": slice_id,
+                            "intent_id": expected_intent,
+                            "branch_name": branch,
+                            "worktree_path": str(worktree),
+                        },
+                        "invocation": {
+                            "invocation_id": "codex-successor-invocation",
+                            "trigger": "resume_blocked",
+                            "runtime": "codex",
+                            "branch_name": branch,
+                            "ready": True,
+                            "fresh": len(observed_resume_intents) == 1,
+                            "outcome": (
+                                "started"
+                                if len(observed_resume_intents) == 1
+                                else "adopted_after_response_loss"
+                            ),
+                        },
+                    },
+                }
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = ResumeTransport()
+    timeout = threading.Timer(2, cancel_event.set)
+    timeout.start()
+    try:
+        with pytest.raises(LoopCancelled):
+            run_tl_loop(
+                run_id,
+                plan,
+                SyntheticQueue([]),
+                EffectClient(transport),
+                config=config,
+                root_dir=root_dir,
+            )
+    finally:
+        timeout.cancel()
+    if response_lost:
+        held = store.load().slices[slice_id]
+        assert held.status is SliceStatus.BLOCKED
+        assert held.dispatch_invocation_id is None
+        assert journal.entries_for("resume_blocked_leaf", slice_id)[0]["status"] == "unknown"
+        cancel_event.clear()
+        retry_timeout = threading.Timer(2, cancel_event.set)
+        retry_timeout.start()
+        try:
+            with pytest.raises(LoopCancelled):
+                run_tl_loop(
+                    run_id,
+                    plan,
+                    SyntheticQueue([]),
+                    EffectClient(transport),
+                    config=config,
+                    root_dir=root_dir,
+                )
+        finally:
+            retry_timeout.cancel()
+    resumed = store.load().slices[slice_id]
+    assert any(name == "resume_blocked_leaf" for name, _ in transport.calls)
+    assert resumed.dispatch_agent_id == owner_name
+    assert resumed.dispatch_invocation_id == "codex-successor-invocation"
+    assert len(observed_resume_intents) == (2 if response_lost else 1)
+    assert resumed.dispatch_intent_id == observed_resume_intents[0]
+    assert resumed.branch == branch
+    assert resumed.worktree == str(worktree)
+    assert resumed.status is SliceStatus.DISPATCH_UNCONFIRMED
+    assert resumed.recovery is None
+    assert resumed.park_cause is ParkCause.DISPATCH_UNCONFIRMED
+    assert journal.entries_for("spawn_leaf", slice_id)[0]["status"] == "rejected"
+    assert journal.entries_for("resume_blocked_leaf", slice_id)[0]["status"] == "confirmed"

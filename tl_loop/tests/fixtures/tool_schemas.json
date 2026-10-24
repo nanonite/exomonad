@@ -274,6 +274,47 @@
       "name": "resume_pr"
     },
     {
+      "description": "Resume a human-approved, pre-publication blocked leaf in its existing owner, branch, and worktree. The host verifies the prior invocation and worktree fingerprint before starting the configured successor.",
+      "inputSchema": {
+        "properties": {
+          "chainlink_issue_id": {
+            "description": "Chainlink issue currently assigned to the blocked leaf owner.",
+            "type": "integer"
+          },
+          "expected_invocation_id": {
+            "description": "Exact terminal invocation being continued.",
+            "type": "string"
+          },
+          "expected_branch": {
+            "description": "Exact accepted owner branch.",
+            "type": "string"
+          },
+          "expected_worktree_fingerprint": {
+            "description": "Fingerprint of the owner worktree approved for retry.",
+            "type": "string"
+          },
+          "task": {
+            "description": "Accepted leaf task to continue under the current configured worker route.",
+            "type": "string"
+          },
+          "human_approved": {
+            "description": "Whether the leaf's durable human recovery gate was approved.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "chainlink_issue_id",
+          "expected_invocation_id",
+          "expected_branch",
+          "expected_worktree_fingerprint",
+          "task",
+          "human_approved"
+        ],
+        "type": "object"
+      },
+      "name": "resume_blocked_leaf"
+    },
+    {
       "description": "Resolve the current live Forgejo PR for a TL slice through the publication effect. The typed result distinguishes never_published, all_attempts_abandoned, and live; absence is a successful diagnosis, not an error.",
       "inputSchema": {
         "properties": {

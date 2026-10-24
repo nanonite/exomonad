@@ -325,6 +325,14 @@ from tl_loop.state.store import (
     create,
 )
 
+from .blocked_leaf_resume import (
+    BlockedLeafOwner,
+    BlockedLeafOwnerError,
+    blocked_resume_intent_id,
+    resolve_dormant_owner_for_slice,
+    resolve_owner_for_resume_retry,
+    validate_resumed_owner,
+)
 from .dispatch_classification import (
     DEFAULT_RETRY_BASE_DELAY_SECONDS,
     DEFAULT_RETRY_LIMIT,
@@ -2689,8 +2697,26 @@ def _ordered_child_recovery_reason(
         IntegrationLifecycle.MERGING,
     }:
         return _hard_failure("child integration has completed or in-flight merge evidence")
+    blocked_proof: _BlockedLeafResumeProof | None = None
+    if any(item.status is SliceStatus.BLOCKED for item in child_state.slices.values()):
+        child_config = _ordered_child_config(config, task, branch, worktree, parent_branch)
+        blocked_proof, blocked_reason = _blocked_leaf_resume_proof(
+            task.plan, child_state, child_config, child_store
+        )
+        if blocked_proof is None:
+            return _hard_failure(
+                blocked_reason or "child has a blocked slice without a unique approved resume proof"
+            )
     for slice_state in child_state.slices.values():
-        if slice_state.status in {SliceStatus.FAILED, SliceStatus.PARKED, SliceStatus.BLOCKED}:
+        if slice_state.status in {
+            SliceStatus.FAILED,
+            SliceStatus.PARKED,
+            SliceStatus.BLOCKED,
+        } and not (
+            blocked_proof is not None
+            and slice_state.id == blocked_proof.leaf.name
+            and slice_state.status is SliceStatus.BLOCKED
+        ):
             return _hard_failure(f"child slice {slice_state.id!r} has an unsafe terminal status")
         if slice_state.status is SliceStatus.MERGED:
             return _hard_failure(f"child slice {slice_state.id!r} already completed")
@@ -2718,9 +2744,46 @@ def _ordered_child_recovery_reason(
         pending = EffectJournal(task.name, journal_path).pending_entries()
     except ActionJournalError as error:
         return _hard_failure(f"child action journal cannot be verified: {error}")
-    if pending:
+    if pending and not _pending_blocked_resume_is_proven(pending, blocked_proof):
         return _hard_failure("child action journal contains an unreconciled effect")
     return _ChildRecoveryProof(None, False)
+
+
+def _ordered_child_config(
+    config: TLLoopConfig,
+    task: SubTLTask,
+    branch: str,
+    worktree: str,
+    parent_branch: str,
+) -> TLLoopConfig:
+    return replace(
+        config,
+        run_id=task.name,
+        branch=branch,
+        worktree=worktree,
+        parent_run_id=config.run_id,
+        parent_branch=parent_branch,
+        parent_agent_id=_child_controller_name(task),
+        depth=config.depth + 1,
+        ordered_recovery=True,
+    )
+
+
+def _pending_blocked_resume_is_proven(
+    pending: Sequence[Mapping[str, object]],
+    proof: _BlockedLeafResumeProof | None,
+) -> bool:
+    if proof is None or len(pending) != 1:
+        return False
+    entry = pending[0]
+    arguments = entry.get("arguments")
+    return (
+        entry.get("operation") == "resume_blocked_leaf"
+        and entry.get("target") == proof.leaf.name
+        and isinstance(arguments, Mapping)
+        and arguments.get("dispatch_intent_id") == proof.intent_id
+        and arguments.get("expected_invocation_id") == proof.owner.prior_invocation_id
+    )
 
 
 class _PreExecutionDispatchRejection(NamedTuple):
@@ -4322,9 +4385,581 @@ def _activate_startup_work(
         pending_quarantine=len(_replayable_quarantine_documents(store)),
         boundary_run_seq=boundary_run_seq,
     )
+    if config.ordered_recovery:
+        state = _resume_approved_blocked_leaf(plan, state, config, effects, store, effects_log)
     state = _dispatch_children(plan, state, config, effects, effects_log, store)
     state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
     return state
+
+
+class _BlockedLeafResumeProof(NamedTuple):
+    """Accepted leaf, old host owner, and immutable refusal evidence."""
+
+    leaf: LeafTask
+    current: SliceState
+    owner: BlockedLeafOwner
+    gate_name: str
+    rejected_spawn: Mapping[str, object]
+    intent_id: str
+    action_arguments: Mapping[str, object] | None
+
+
+def _blocked_leaf_resume_proof(
+    plan: WorkPlan,
+    state: RunState,
+    config: TLLoopConfig,
+    store: RunStore,
+) -> tuple[_BlockedLeafResumeProof | None, str | None]:
+    """Bind one approved human-gated leaf to its old owner and rejected spawn."""
+    blocked = [
+        leaf
+        for leaf in plan.leaves
+        if (current := state.slices.get(leaf.name)) is not None
+        and current.status is SliceStatus.BLOCKED
+        and current.recovery is not None
+        and current.recovery.phase is RecoveryPhase.HUMAN_GATE
+    ]
+    if not blocked:
+        return None, None
+    if len(blocked) != 1:
+        return None, "multiple human-gated leaves prevent a unique blocked-owner resume"
+    leaf = blocked[0]
+    current = state.slices[leaf.name]
+    recovery = current.recovery
+    if recovery is None or recovery.owner_run_id != state.run_id:
+        return None, "blocked leaf recovery is not owned by this scope"
+    evidence = recovery.evidence
+    boundary_failures = [
+        label
+        for label, invalid in (
+            ("recovery cause", recovery.cause != "human_decision_required"),
+            ("recovery slice", evidence.get("slice_id") != leaf.name),
+            ("recovery outcome", evidence.get("outcome") != "blocked"),
+            ("human decision", evidence.get("needs_human") is not True),
+            ("park cause", current.park_cause is not ParkCause.HUMAN_DECISION_REQUIRED),
+            ("dispatch boundary", current.dispatch_last_boundary != "spawn_request_failed"),
+            (
+                "preflight error code",
+                current.dispatch_error_code
+                not in {"agent_error", "agent.spawn_precondition.dirty_worktree"},
+            ),
+            ("dispatch intent", not current.dispatch_intent_id),
+            ("dispatch timestamp", current.dispatch_started_at is None),
+            ("dispatch agent", current.dispatch_agent_id is not None),
+            ("dispatch invocation", current.dispatch_invocation_id is not None),
+            ("authoritative event", current.dispatch_authoritative_event_seq is not None),
+            ("PR binding", current.pr_number is not None),
+            ("publication", current.publication is not None),
+            ("active action", current.action is not None),
+        )
+        if invalid
+    ]
+    if boundary_failures:
+        return None, (
+            "blocked leaf checkpoint lacks a proven pre-execution human recovery boundary: "
+            + ", ".join(boundary_failures)
+        )
+    if leaf.chainlink_issue_id is not None and current.chainlink_issue_id not in {
+        None,
+        leaf.chainlink_issue_id,
+    }:
+        return None, "blocked leaf issue binding conflicts with the accepted declaration"
+    if state.plan_manifest is None:
+        return None, "blocked leaf has no accepted plan manifest"
+    declared_node = next(
+        (node for node in state.plan_manifest.nodes if node.name == leaf.name),
+        None,
+    )
+    if (
+        declared_node is None
+        or declared_node.node_id != current.manifest_node_id
+        or declared_node.task != leaf.task
+        or declared_node.chainlink_issue_id != leaf.chainlink_issue_id
+    ):
+        return None, "blocked leaf declaration does not match its accepted manifest binding"
+    expected_slice = _initial_slices(plan, config, store.root_dir, state.run_id).get(leaf.name)
+    if (
+        expected_slice is None
+        or current.branch != expected_slice.get("branch")
+        or current.worktree != expected_slice.get("worktree")
+        or current.base_ref != config.branch
+    ):
+        return None, "blocked leaf branch or worktree differs from the accepted scope coordinates"
+    gate_name = _dispatch_failure_gate_name(leaf.name, current.dispatch_error_code)
+    gate = next((item for item in state.gates if item.name == gate_name), None)
+    if gate is None or gate.status is not GateStatus.APPROVED:
+        return None, f"required leaf recovery gate {gate_name!r} is not approved"
+    rejected = _rejected_spawn_journal_entry(store, leaf.name, current.dispatch_intent_id)
+    if rejected is None:
+        return None, "matching rejected spawn journal evidence is missing or ambiguous"
+    arguments = rejected.get("arguments")
+    if (
+        not isinstance(arguments, Mapping)
+        or arguments.get("name") != leaf.name
+        or arguments.get("task") != leaf.task
+        or _journal_result_dirty_preflight_format(rejected, current) is None
+    ):
+        return None, "rejected spawn journal does not prove this leaf's pre-execution refusal"
+
+    try:
+        proof = _resolve_blocked_leaf_owner(state, config, store, leaf, current)
+    except BlockedLeafOwnerError as error:
+        return None, str(error)
+    checkpoint_worktree = Path(current.worktree) if current.worktree is not None else None
+    if checkpoint_worktree is not None and not checkpoint_worktree.is_absolute():
+        checkpoint_worktree = Path(config.project_root or store.root_dir) / checkpoint_worktree
+    lineage_conflicts = [
+        label
+        for label, invalid in (
+            ("owner branch", proof.owner.branch != current.branch),
+            (
+                (f"owner worktree checkpoint={checkpoint_worktree} owner={proof.owner.worktree}"),
+                checkpoint_worktree is None
+                or proof.owner.worktree != checkpoint_worktree.resolve(),
+            ),
+            ("parent branch", proof.owner.parent_branch != current.base_ref),
+            (
+                "evidence owner",
+                evidence.get("owner_agent_id") not in {None, proof.owner.agent_name},
+            ),
+            (
+                "evidence invocation",
+                evidence.get("invocation_id") not in {None, proof.owner.prior_invocation_id},
+            ),
+            (
+                "evidence generation",
+                evidence.get("generation") not in {None, 0, proof.owner.generation},
+            ),
+            ("recovery owner", recovery.owner_agent_id not in {None, proof.owner.agent_name}),
+            (
+                "recovery generation",
+                recovery.invocation_generation not in {0, proof.owner.generation},
+            ),
+        )
+        if invalid
+    ]
+    if lineage_conflicts:
+        return None, (
+            "blocked leaf owner evidence conflicts with accepted identity: "
+            + ", ".join(lineage_conflicts)
+        )
+    return proof, None
+
+
+def _resolve_blocked_leaf_owner(
+    state: RunState,
+    config: TLLoopConfig,
+    store: RunStore,
+    leaf: LeafTask,
+    current: SliceState,
+) -> _BlockedLeafResumeProof:
+    if config.project_root is None:
+        raise BlockedLeafOwnerError("blocked leaf owner lookup requires the project root")
+    child_store = store
+    entries = EffectJournal(state.run_id, child_store.run_dir / "action-journal.json").entries_for(
+        "resume_blocked_leaf", leaf.name
+    )
+    if len(entries) > 1:
+        raise BlockedLeafOwnerError("multiple blocked-leaf resume actions require reconciliation")
+    if entries:
+        entry = entries[0]
+        args = entry.get("arguments")
+        if not isinstance(args, Mapping):
+            raise BlockedLeafOwnerError("blocked-leaf resume journal arguments are malformed")
+        expected = {
+            "chainlink_issue_id": args.get("chainlink_issue_id"),
+            "expected_invocation_id": args.get("expected_invocation_id"),
+            "expected_branch": args.get("expected_branch"),
+            "expected_worktree_fingerprint": args.get("expected_worktree_fingerprint"),
+            "task": leaf.task,
+            "human_approved": True,
+        }
+        if any(args.get(key) != value for key, value in expected.items()):
+            raise BlockedLeafOwnerError(
+                "blocked-leaf resume journal conflicts with this declaration"
+            )
+        if entry.get("status") == "rejected":
+            raise BlockedLeafOwnerError("the exact blocked-leaf resume request was rejected")
+        if (
+            not isinstance(args.get("owner_agent_name"), str)
+            or type(args.get("prior_generation")) is not int
+            or not isinstance(args.get("expected_worktree"), str)
+            or not isinstance(args.get("expected_worktree_recorded"), str)
+            or not isinstance(args.get("dispatch_intent_id"), str)
+            or type(args.get("chainlink_issue_id")) is not int
+            or not isinstance(args.get("expected_invocation_id"), str)
+            or not isinstance(args.get("expected_branch"), str)
+            or not isinstance(args.get("expected_worktree_fingerprint"), str)
+        ):
+            raise BlockedLeafOwnerError("blocked-leaf resume journal lacks owner lineage")
+        owner, _successor = resolve_owner_for_resume_retry(
+            config.project_root,
+            slice_id=leaf.name,
+            issue_id=int(args["chainlink_issue_id"]),
+            expected_parent_branch=config.branch,
+            expected_agent_name=str(args["owner_agent_name"]),
+            prior_invocation_id=str(args["expected_invocation_id"]),
+            prior_generation=int(args["prior_generation"]),
+            expected_branch=str(args["expected_branch"]),
+            expected_worktree=str(args["expected_worktree"]),
+            expected_worktree_recorded=str(args["expected_worktree_recorded"]),
+            expected_worktree_fingerprint=str(args["expected_worktree_fingerprint"]),
+            dispatch_intent_id=str(args["dispatch_intent_id"]),
+        )
+        issue_id = int(args["chainlink_issue_id"])
+        if leaf.chainlink_issue_id is not None and issue_id != leaf.chainlink_issue_id:
+            raise BlockedLeafOwnerError(
+                "journaled issue differs from the accepted leaf declaration"
+            )
+        if blocked_resume_intent_id(owner) != args["dispatch_intent_id"]:
+            raise BlockedLeafOwnerError("journaled resume idempotency identity is inconsistent")
+        return _BlockedLeafResumeProof(
+            leaf,
+            current,
+            owner,
+            _dispatch_failure_gate_name(leaf.name, current.dispatch_error_code),
+            _rejected_spawn_journal_entry(child_store, leaf.name, current.dispatch_intent_id) or {},
+            str(args["dispatch_intent_id"]),
+            args,
+        )
+
+    owner = resolve_dormant_owner_for_slice(
+        config.project_root,
+        slice_id=leaf.name,
+        expected_issue_id=leaf.chainlink_issue_id,
+        expected_parent_branch=config.branch,
+    )
+    if current.chainlink_issue_id is not None and current.chainlink_issue_id != owner.issue_id:
+        raise BlockedLeafOwnerError("owner issue differs from the blocked leaf checkpoint")
+    return _BlockedLeafResumeProof(
+        leaf,
+        current,
+        owner,
+        _dispatch_failure_gate_name(leaf.name, current.dispatch_error_code),
+        _rejected_spawn_journal_entry(child_store, leaf.name, current.dispatch_intent_id) or {},
+        blocked_resume_intent_id(owner),
+        None,
+    )
+
+
+def _resume_approved_blocked_leaf(
+    plan: WorkPlan,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Resume one exactly proved, operator-approved leaf through its owner."""
+    proof, reason = _blocked_leaf_resume_proof(plan, state, config, store)
+    if proof is None:
+        if reason is not None:
+            return _hold_blocked_leaf_resume(state, config, effects, store, effects_log, reason)
+        return state
+    if not config.active or not isinstance(effects, EffectClient):
+        return state
+    try:
+        arguments = _blocked_leaf_resume_action_arguments(proof, state)
+        intent = EffectIntent("resume_blocked_leaf", proof.leaf.name, arguments, True)
+        journal = effects_log if isinstance(effects_log, EffectJournal) else None
+        if journal is None:
+            raise ActionJournalError("blocked-leaf resume requires a durable action journal")
+        existing = journal.existing(intent)
+        status = existing.get("status") if existing is not None else None
+        if status == "confirmed" or status == "rejected":
+            result = journal.replay(existing)
+        else:
+            journal.append(intent)
+            attempt = _blocked_leaf_dispatch_attempt(arguments, proof.current)
+            dispatch_intended = _record_controller_event(
+                proof.leaf.name,
+                "tl.dispatch_intended",
+                _dispatch_payload(proof.leaf.name, attempt, "dispatch_intended"),
+                config,
+                effects,
+                effects_log,
+            )
+            spawn_requested = _record_controller_event(
+                proof.leaf.name,
+                "tl.spawn_requested",
+                _dispatch_payload(proof.leaf.name, attempt, "spawn_requested"),
+                config,
+                effects,
+                effects_log,
+            )
+            if not (
+                dispatch_intended is not None
+                and dispatch_intended.success is True
+                and spawn_requested is not None
+                and spawn_requested.success is True
+            ):
+                journal.mark_not_dispatched(intent)
+                return _hold_blocked_leaf_resume(
+                    state,
+                    config,
+                    effects,
+                    store,
+                    effects_log,
+                    "controller dispatch intent could not be recorded before owner resume",
+                )
+            try:
+                result = effects.resume_blocked_leaf(
+                    chainlink_issue_id=proof.owner.issue_id,
+                    expected_invocation_id=proof.owner.prior_invocation_id,
+                    expected_branch=proof.owner.branch,
+                    expected_worktree_fingerprint=proof.owner.worktree_fingerprint,
+                    task=proof.leaf.task,
+                    human_approved=True,
+                )
+            except Exception as error:  # noqa: BLE001 - journal and safely retry exact owner intent
+                journal.mark_unknown(intent, error)
+                return _hold_blocked_leaf_resume(
+                    state,
+                    config,
+                    effects,
+                    store,
+                    effects_log,
+                    f"blocked-leaf resume outcome is unknown: {type(error).__name__}",
+                )
+            journal.mark_result(intent, result)
+        if result.success is not True:
+            return _hold_blocked_leaf_resume(
+                state,
+                config,
+                effects,
+                store,
+                effects_log,
+                "configured blocked-leaf resume was rejected; inspect the exact owner evidence",
+            )
+        successor = _validated_blocked_resume_result(proof, result)
+        if successor is None:
+            return _hold_blocked_leaf_resume(
+                state,
+                config,
+                effects,
+                store,
+                effects_log,
+                "blocked-leaf resume response does not match the persisted owner successor",
+            )
+        invocation_id, runtime, model, effort = successor
+        attempt = _blocked_leaf_dispatch_attempt(arguments, proof.current).routed(
+            harness=f"{runtime}/{model}" if model else runtime,
+            agent_type=runtime,
+            model=model,
+            requested_harness=proof.current.requested_harness,
+            route_reconciliation_source="proven_preexecution_retry",
+        )
+        accepted = _record_controller_event(
+            proof.leaf.name,
+            "tl.spawn_request_accepted",
+            _dispatch_payload(proof.leaf.name, attempt, "spawn_request_accepted"),
+            config,
+            effects,
+            effects_log,
+        )
+        if accepted is None or accepted.success is not True:
+            return _hold_blocked_leaf_resume(
+                state,
+                config,
+                effects,
+                store,
+                effects_log,
+                "controller could not durably record the confirmed owner response",
+            )
+        state = _checkpoint_blocked_leaf_successor(
+            proof, state, store, attempt, invocation_id, runtime, model, effort
+        )
+        return _reconcile_dispatches(state, config, effects, store, effects_log)
+    except (
+        BlockedLeafOwnerError,
+        ActionJournalError,
+        KeyError,
+        TypeError,
+        ValueError,
+        OSError,
+    ) as error:
+        return _hold_blocked_leaf_resume(state, config, effects, store, effects_log, str(error))
+
+
+def _blocked_leaf_resume_action_arguments(
+    proof: _BlockedLeafResumeProof,
+    state: RunState,
+) -> Mapping[str, object]:
+    if proof.action_arguments is not None:
+        return proof.action_arguments
+    return {
+        "chainlink_issue_id": proof.owner.issue_id,
+        "expected_invocation_id": proof.owner.prior_invocation_id,
+        "expected_branch": proof.owner.branch,
+        "expected_worktree_fingerprint": proof.owner.worktree_fingerprint,
+        "task": proof.leaf.task,
+        "human_approved": True,
+        "owner_agent_name": proof.owner.agent_name,
+        "prior_generation": proof.owner.generation,
+        "expected_worktree": str(proof.owner.worktree),
+        "expected_worktree_recorded": proof.owner.worktree_recorded,
+        "dispatch_intent_id": proof.intent_id,
+        "dispatch_attempt": proof.current.attempts + 1,
+        "dispatch_started_at": time.time(),
+        "dispatch_generation": proof.owner.generation + 1,
+        "dispatch_ledger_floor": state.events.last_consumed_offset,
+        "controller_epoch": state.controller_epoch,
+        "route_reconciliation_source": "proven_preexecution_retry",
+        "requested_harness": proof.current.requested_harness,
+    }
+
+
+def _blocked_leaf_dispatch_attempt(
+    arguments: Mapping[str, object], current: SliceState
+) -> DispatchAttempt:
+    return DispatchAttempt(
+        intent_id=cast(str, arguments["dispatch_intent_id"]),
+        started_at=float(arguments["dispatch_started_at"]),
+        harness="",
+        requested_harness=current.requested_harness,
+        route_reconciliation_source="proven_preexecution_retry",
+        attempt=int(arguments["dispatch_attempt"]),
+        controller_epoch=cast(str | None, arguments.get("controller_epoch")),
+        dispatch_generation=int(arguments["dispatch_generation"]),
+        ledger_floor=int(arguments["dispatch_ledger_floor"]),
+    )
+
+
+def _validated_blocked_resume_result(
+    proof: _BlockedLeafResumeProof,
+    result: ToolResult,
+) -> tuple[str, str, str | None, str | None] | None:
+    payload = result.result
+    if not isinstance(payload, Mapping):
+        return None
+    agent = payload.get("agent")
+    invocation = payload.get("invocation")
+    if not isinstance(agent, Mapping) or not isinstance(invocation, Mapping):
+        return None
+    invocation_id = invocation.get("invocation_id")
+    runtime = invocation.get("runtime")
+    if (
+        payload.get("chainlink_issue_id") != proof.owner.issue_id
+        or agent.get("id") != proof.owner.agent_name
+        or agent.get("issue") != proof.leaf.name
+        or agent.get("intent_id") != proof.intent_id
+        or agent.get("branch_name") != proof.owner.branch
+        or Path(str(agent.get("worktree_path", ""))).resolve() != proof.owner.worktree
+        or invocation.get("trigger") != "resume_blocked"
+        or invocation.get("branch_name") != proof.owner.branch
+        or invocation.get("ready") is not True
+        or invocation.get("outcome") not in {"started", "adopted_after_response_loss"}
+        or invocation.get("fresh") is not (invocation.get("outcome") == "started")
+        or not isinstance(invocation_id, str)
+        or not invocation_id
+        or not isinstance(runtime, str)
+        or not runtime
+    ):
+        return None
+    try:
+        identity, _persisted = validate_resumed_owner(
+            proof.owner,
+            invocation_id=invocation_id,
+            dispatch_intent_id=proof.intent_id,
+            runtime=runtime,
+        )
+    except BlockedLeafOwnerError:
+        return None
+    return (
+        invocation_id,
+        runtime,
+        _optional_nonempty_text(identity.get("model")),
+        _optional_nonempty_text(identity.get("effort")),
+    )
+
+
+def _optional_nonempty_text(value: object) -> str | None:
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _checkpoint_blocked_leaf_successor(
+    proof: _BlockedLeafResumeProof,
+    state: RunState,
+    store: RunStore,
+    attempt: DispatchAttempt,
+    invocation_id: str,
+    runtime: str,
+    model: str | None,
+    effort: str | None,
+) -> RunState:
+    current = proof.current
+    updated = replace(
+        slice_transition(current, SliceStatusChanged(SliceStatus.DISPATCH_UNCONFIRMED)),
+        base_ref=proof.owner.parent_branch,
+        branch=proof.owner.branch,
+        worktree=str(proof.owner.worktree),
+        agent_type=runtime,
+        model=model,
+        resolved_harness=f"{runtime}/{model}" if model else runtime,
+        attempts=attempt.attempt,
+        dispatch_uses_current_role_configuration=True,
+        dispatch_intent_id=proof.intent_id,
+        dispatch_started_at=attempt.started_at,
+        dispatch_last_boundary="spawn_request_accepted",
+        dispatch_error=None,
+        dispatch_error_code=None,
+        dispatch_ledger_floor=attempt.ledger_floor,
+        dispatch_generation=attempt.dispatch_generation,
+        dispatch_next_attempt_at=None,
+        dispatch_retry_for_attempt=0,
+        dispatch_agent_id=proof.owner.agent_name,
+        dispatch_invocation_id=invocation_id,
+        dispatch_authoritative_event_seq=None,
+        park_cause=ParkCause.DISPATCH_UNCONFIRMED,
+        recovery=None,
+    )
+    clear_gates = {proof.gate_name}
+    proof_gate = f"tl-blocked-leaf-resume-proof-{proof.leaf.name}"
+    if any(gate.name == proof_gate for gate in state.gates):
+        clear_gates.add(proof_gate)
+    return store.checkpoint(
+        _phase_from_state(state),
+        {**state.slices, proof.leaf.name: updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        clear_gates=tuple(sorted(clear_gates)),
+    )
+
+
+def _hold_blocked_leaf_resume(
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    reason: str,
+) -> RunState:
+    blocked = next(
+        (
+            item
+            for item in state.slices.values()
+            if item.status is SliceStatus.BLOCKED and item.recovery is not None
+        ),
+        None,
+    )
+    if blocked is None:
+        return state
+    gate_name = f"tl-blocked-leaf-resume-proof-{blocked.id}"
+    if not any(gate.name == gate_name for gate in state.gates):
+        state = store.set_gate(gate_name, GateStatus.PENDING)
+        _record_controller_event(
+            blocked.id,
+            "tl.gate_opened",
+            {"gate_name": gate_name, "run_id": state.run_id},
+            config,
+            effects,
+            effects_log,
+        )
+    LOGGER.warning("blocked-leaf resume held slice=%s reason=%s", blocked.id, reason)
+    return store.load()
 
 
 def _apply_deferred_startup_recovery(
@@ -11298,6 +11933,12 @@ def _reconcile_action_journal(
     if not isinstance(effects_log, EffectJournal):
         return state
     for entry in effects_log.pending_entries():
+        if entry.get("operation") == "resume_blocked_leaf":
+            # This exact same-owner operation has an authoritative idempotency
+            # key and its owner-specific reconciler validates the persisted
+            # successor before replay. A generic gate cannot establish that
+            # lineage and would prevent safe response-loss adoption.
+            continue
         if entry.get("operation") == "prepare_scope_handoff":
             if isinstance(effects, EffectClient):
                 _reconcile_pending_scope_handoff(entry, effects_log, effects)
@@ -15616,11 +16257,17 @@ def _run_sub_tl_batch(
             retrying_failed_child = (
                 config.ordered_recovery_child == task.name and child_phase is TLPhase.TLFailed
             )
+            retrying_approved_blocked_leaf = retrying_failed_child and (
+                _approved_blocked_leaf_child_retry(task, child_state, config, store)
+            )
             if _child_handoff_ready(child_state, store.run_id) and not retrying_failed_child:
                 return task, child_phase, child_state
-            if child_phase is TLPhase.TLFailed and config.ordered_recovery_child != task.name:
+            if child_phase is TLPhase.TLFailed and not retrying_failed_child:
                 return task, child_phase, child_state
-            if _child_recovery_projection(child_state, store.run_id) is not None:
+            if (
+                _child_recovery_projection(child_state, store.run_id) is not None
+                and not retrying_approved_blocked_leaf
+            ):
                 return task, child_phase, child_state
         child_config = _child_config(
             config,
@@ -15682,12 +16329,16 @@ def _run_live_sub_tl_batch(
             retrying_failed_child = (
                 config.ordered_recovery_child == task.name and child_phase is TLPhase.TLFailed
             )
-            if (
-                _child_handoff_ready(child_state, store.run_id) and not retrying_failed_child
-            ) or _child_recovery_projection(child_state, store.run_id) is not None:
+            retrying_approved_blocked_leaf = retrying_failed_child and (
+                _approved_blocked_leaf_child_retry(task, child_state, config, store)
+            )
+            if (_child_handoff_ready(child_state, store.run_id) and not retrying_failed_child) or (
+                _child_recovery_projection(child_state, store.run_id) is not None
+                and not retrying_approved_blocked_leaf
+            ):
                 existing[task.name] = (task, child_phase, child_state)
                 continue
-            if child_phase is TLPhase.TLFailed and config.ordered_recovery_child != task.name:
+            if child_phase is TLPhase.TLFailed and not retrying_failed_child:
                 existing[task.name] = (task, child_phase, child_state)
                 continue
         runnable.append(task)
@@ -15715,6 +16366,25 @@ def _run_live_sub_tl_batch(
         )
         outcomes_by_name[task.name] = (task, phase, child_state)
     return tuple(outcomes_by_name[task.name] for task in tasks)
+
+
+def _approved_blocked_leaf_child_retry(
+    task: SubTLTask,
+    child_state: RunState,
+    parent_config: TLLoopConfig,
+    parent_store: RunStore,
+) -> bool:
+    """Bypass a retained child gate only for the exact approved resume proof."""
+    branch = derive_child_branch(parent_config.branch, _child_controller_name(task))
+    worktree = str(
+        _sub_tl_worktree(parent_config, parent_store.root_dir, parent_store.run_id, task)
+    )
+    child_config = _ordered_child_config(
+        parent_config, task, branch, worktree, parent_config.branch
+    )
+    child_store = RunStore(task.name, parent_store.run_dir)
+    proof, _reason = _blocked_leaf_resume_proof(task.plan, child_state, child_config, child_store)
+    return proof is not None
 
 
 def _persist_child_startup_failure(child_store: RunStore, reason: str) -> None:

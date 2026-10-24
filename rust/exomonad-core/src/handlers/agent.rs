@@ -3417,6 +3417,7 @@ impl<
         let mut agent_info = leaf_subtree_result_to_proto(owner.slug.as_str(), &result)?;
         agent_info.alive = true;
         agent_info.is_alive = true;
+        agent_info.intent_id = intent_id.clone();
         let invocation_handoff = invocation_handoff_to_proto(
             &invocation,
             &result.branch_name,
@@ -3629,6 +3630,7 @@ impl<
         let mut agent_info = leaf_subtree_result_to_proto(owner.slug.as_str(), &result)?;
         agent_info.alive = true;
         agent_info.is_alive = true;
+        agent_info.intent_id = intent_id.to_owned();
         self.register_child_supervisor(agent_info.id.as_str(), ctx)
             .await;
         let invocation_handoff = invocation_handoff_to_proto(

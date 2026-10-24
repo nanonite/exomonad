@@ -15,7 +15,7 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from tl_loop.client.effects import EffectClient, ToolResult
+from tl_loop.client.effects import EffectClient
 from tl_loop.client.transport import TransportClient
 
 OWNER_SLICE = "issue-814-substitution-model-kani"
@@ -173,132 +173,122 @@ def seed(repository: Path, output: Path) -> None:
     )
 
 
-def resume(repository: Path, baseline_path: Path, output: Path) -> None:
-    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
-    transport = TransportClient(project_root=repository, timeout=20)
-    owner_dir, identity = owner_for(repository)
-    if str(owner_dir) != baseline["owner_dir"]:
-        raise RuntimeError("the #814 logical owner changed before resume")
-    prior = invocation(owner_dir)
-    if prior != baseline["prior_invocation"]:
-        raise RuntimeError("the historical OpenCode invocation changed before resume")
-    if retained_rejected_request(repository) != baseline["rejected_request"]:
-        raise RuntimeError("the original rejected Kani request changed before resume")
-    child = json.loads(
-        (repository / ".exo/tl-loop/root/kani/run.json").read_text(encoding="utf-8")
-    )
-    leaf = child["slices"][OWNER_SLICE]
-    if (
-        leaf.get("status") != "blocked"
-        or leaf.get("recovery", {}).get("phase") != "human_gate"
-    ):
-        raise RuntimeError("resume requires the durable active blocker projection")
-    if leaf.get("pr_number") is not None or leaf.get("publication") is not None:
-        raise RuntimeError("pre-publication recovery unexpectedly acquired PR evidence")
-
-    request = {
-        "chainlink_issue_id": BLOCKED_ISSUE_ID,
-        "expected_invocation_id": prior["invocation_id"],
-        "expected_branch": baseline["branch"],
-        "expected_worktree_fingerprint": baseline["worktree_fingerprint"],
-        "task": baseline["task"],
-        "human_approved": True,
-    }
-    first = ToolResult.from_raw(
-        transport.call_tool("tl", "kani", "resume_blocked_leaf", request)
-    )
-    if first.success is not True:
-        raise RuntimeError(
-            f"resume_blocked_leaf rejected the proven owner: {first.raw!r}"
-        )
-    deadline = time.monotonic() + 30
-    successor: dict[str, Any] | None = None
+def wait_for_agent_event(path: Path, expected: str) -> None:
+    deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
-        current = invocation(owner_dir)
-        if current.get("invocation_id") != prior["invocation_id"]:
-            successor = current
-            break
+        if path.is_file() and any(
+            row.get("event") == expected for row in read_json_lines(path)
+        ):
+            return
         time.sleep(0.1)
-    if successor is None:
+    raise RuntimeError(f"worker did not record actual activity {expected!r}")
+
+
+def verify_controller(repository: Path, baseline_path: Path, output: Path) -> None:
+    """Verify recovery, publication and review came from the continued controller."""
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    root_dir = repository / ".exo/tl-loop/root"
+    child_path = root_dir / "kani/run.json"
+    owner_dir = Path(baseline["owner_dir"])
+    agent_log = Path(os.environ["E2E_AGENT_LOG"])
+    deadline = time.monotonic() + 180
+    accepted: tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None = None
+    while time.monotonic() < deadline:
+        child = json.loads(child_path.read_text(encoding="utf-8"))
+        leaf = child.get("slices", {}).get(OWNER_SLICE, {})
+        try:
+            current_invocation = invocation(owner_dir)
+            publications = json.loads(
+                (repository / ".exo/published-heads.json").read_text(encoding="utf-8")
+            ).get("heads", [])
+        except (OSError, json.JSONDecodeError):
+            time.sleep(0.1)
+            continue
+        publication_matches = [
+            row
+            for row in publications
+            if row.get("author_agent") == baseline["owner_agent_name"]
+            and row.get("slice_id") == OWNER_SLICE
+        ]
+        if (
+            current_invocation.get("invocation_id")
+            != baseline["prior_invocation"]["invocation_id"]
+            and current_invocation.get("status") not in {"failed", "exited", "killed"}
+            and leaf.get("status") not in {"blocked", "pending"}
+            and leaf.get("dispatch_agent_id") == baseline["owner_agent_name"]
+            and leaf.get("dispatch_invocation_id")
+            == current_invocation.get("invocation_id")
+            and isinstance(leaf.get("pr_number"), int)
+            and isinstance(leaf.get("head_sha"), str)
+            and len(publication_matches) == 1
+            and publication_matches[0].get("pr_number") == leaf.get("pr_number")
+            and publication_matches[0].get("head_sha") == leaf.get("head_sha")
+        ):
+            reviewers = _reviewer_invocations(
+                repository, leaf["pr_number"], leaf["head_sha"]
+            )
+            activities = event_counts(agent_log)
+            if len(reviewers) == 1 and activities.get("reviewer_approved", 0) == 1:
+                accepted = (child, current_invocation, reviewers[0])
+                break
+        time.sleep(0.1)
+    if accepted is None:
         raise RuntimeError(
-            "resume_blocked_leaf did not register its successor invocation"
+            "production controller did not checkpoint the resumed #814 owner, adopt its PR, "
+            "and launch the exact-head reviewer before timeout"
         )
-    current_identity = json.loads(
-        (owner_dir / "identity.json").read_text(encoding="utf-8")
-    )
+
+    child, successor, reviewer = accepted
+    leaf = child["slices"][OWNER_SLICE]
+    identity = json.loads((owner_dir / "identity.json").read_text(encoding="utf-8"))
+    prior = baseline["prior_invocation"]
     if (
         successor.get("runtime") != "codex"
         or successor.get("model") != "gpt-6-luna"
         or successor.get("effort") != "xhigh"
         or successor.get("prior_invocation_id") != prior["invocation_id"]
         or successor.get("generation") != prior.get("generation", 1) + 1
-        or current_identity.get("agent_type") != "codex"
-        or current_identity.get("model") != "gpt-6-luna"
-        or current_identity.get("effort") != "xhigh"
-        or current_identity.get("agent_name") != baseline["identity"]["agent_name"]
-        or current_identity.get("slice_id") != baseline["identity"]["slice_id"]
-        or current_identity.get("birth_branch") != baseline["branch"]
-        or current_identity.get("working_dir") != baseline["identity"]["working_dir"]
+        or identity.get("agent_type") != "codex"
+        or identity.get("model") != "gpt-6-luna"
+        or identity.get("effort") != "xhigh"
+        or identity.get("agent_name") != baseline["owner_agent_name"]
+        or identity.get("slice_id") != OWNER_SLICE
+        or identity.get("birth_branch") != baseline["branch"]
+        or Path(identity.get("working_dir", "")).resolve()
+        != Path(baseline["worktree"]).resolve()
+        or leaf.get("branch") != baseline["branch"]
+        or Path(leaf.get("worktree", "")).resolve()
+        != Path(baseline["worktree"]).resolve()
+        or leaf.get("dispatch_agent_id") != baseline["owner_agent_name"]
+        or leaf.get("dispatch_invocation_id") != successor.get("invocation_id")
+        or leaf.get("status") in {"blocked", "pending"}
     ):
         raise RuntimeError(
-            f"Codex successor did not preserve owner lineage: {successor!r} {current_identity!r}"
+            "controller checkpoint does not match the configured same-owner successor"
         )
-
-    # The process log is deliberately outside the disposable repository.
-    agent_log = Path(os.environ["E2E_AGENT_LOG"])
-    wait_for_agent_event(agent_log, "recovery_worker_filed_pr")
-    wait_for_agent_event(agent_log, "recovery_worker_notified_parent")
-    history = repository / ".exo/events" / f"{identity['agent_name']}.jsonl"
+    if retained_rejected_request(repository) != baseline["rejected_request"]:
+        raise RuntimeError(
+            "controller recovery changed the original rejected OpenCode spawn"
+        )
+    history = repository / ".exo/events" / f"{baseline['owner_agent_name']}.jsonl"
     history_lines = history.read_text(encoding="utf-8").splitlines()
     if history_lines[: len(baseline["history_lines"])] != baseline["history_lines"]:
-        raise RuntimeError("resume rewrote the historical OpenCode lifecycle records")
-    switch_events = [
-        row
-        for row in canonical_events(repository)
-        if row.get("type") == "agent.harness_switch"
-    ]
-    if not any(
-        row.get("agent_id") == "kani"
-        and row.get("data", {}).get("to_harness") == "codex"
-        and row.get("data", {}).get("to_model") == "gpt-6-luna"
-        and row.get("data", {}).get("to_effort") == "xhigh"
-        for row in switch_events
-    ):
         raise RuntimeError(
-            "configured OpenCode-to-Codex switch has no durable audit evidence"
+            "controller recovery rewrote historical OpenCode lifecycle records"
         )
+    activity = event_counts(agent_log)
+    for event in (
+        "recovery_worker_started",
+        "recovery_worker_filed_pr",
+        "recovery_worker_notified_parent",
+        "reviewer_approved",
+    ):
+        if activity.get(event) != 1:
+            raise RuntimeError(
+                f"expected one real {event} activity, got {activity.get(event, 0)}"
+            )
 
-    publication_rows = json.loads(
-        (repository / ".exo/published-heads.json").read_text(encoding="utf-8")
-    )["heads"]
-    publication = next(
-        (
-            row
-            for row in publication_rows
-            if row.get("author_agent") == identity["agent_name"]
-            and row.get("slice_id") == OWNER_SLICE
-        ),
-        None,
-    )
-    if (
-        not isinstance(publication, dict)
-        or not isinstance(publication.get("pr_number"), int)
-        or not publication.get("head_sha")
-    ):
-        raise RuntimeError(
-            "Codex successor did not publish one authoritative PR/head binding"
-        )
-    pr_number, head_sha = publication["pr_number"], publication["head_sha"]
-    reviewer = EffectClient(transport, role="tl", name="root").spawn_reviewer(
-        pr_number=pr_number,
-        head_sha=head_sha,
-        acceptance_criteria=["Confirm the resumed owner's exact PR head."],
-        force=False,
-    )
-    if reviewer.success is not True:
-        raise RuntimeError(f"configured reviewer spawn failed: {reviewer.raw!r}")
-    reviewer_name = str((reviewer.result or {}).get("reviewer_name") or "")
-    reviewer_dir = repository / ".exo/agents" / reviewer_name
+    reviewer_dir = repository / ".exo/agents" / reviewer["agent_name"]
     reviewer_identity = json.loads(
         (reviewer_dir / "identity.json").read_text(encoding="utf-8")
     )
@@ -309,58 +299,108 @@ def resume(repository: Path, baseline_path: Path, output: Path) -> None:
         reviewer_invocation.get("runtime") != "codex"
         or reviewer_invocation.get("model") != "gpt-6.1-sol"
         or reviewer_invocation.get("effort") != "medium"
+        or reviewer_invocation.get("pr_number") != leaf["pr_number"]
+        or reviewer_invocation.get("head_sha") != leaf["head_sha"]
         or reviewer_identity.get("agent_type") != "codex"
         or reviewer_identity.get("model") != "gpt-6.1-sol"
         or reviewer_identity.get("effort") != "medium"
-        or reviewer_invocation.get("pr_number") != pr_number
-        or reviewer_invocation.get("head_sha") != head_sha
     ):
-        raise RuntimeError("reviewer did not launch on the configured exact PR head")
+        raise RuntimeError(
+            "controller reviewer is not bound to the configured exact PR head"
+        )
 
-    successor_bytes = (owner_dir / "invocation.json").read_bytes()
-    history_bytes = history.read_bytes()
-    repeat = ToolResult.from_raw(
-        transport.call_tool("tl", "kani", "resume_blocked_leaf", request)
+    root = json.loads((root_dir / "run.json").read_text(encoding="utf-8"))
+    root_kani = root.get("slices", {}).get("kani", {})
+    if not root_kani.get("dispatch_agent_id") or not root_kani.get(
+        "dispatch_invocation_id"
+    ):
+        raise RuntimeError(
+            "parent RunStore lacks its Kani controller invocation projection"
+        )
+    original_journal = retained_rejected_request(repository)
+    action_rows = json.loads(
+        (root_dir / "kani/action-journal.json").read_text(encoding="utf-8")
     )
-    if repeat.success is not True:
+    resume_rows = [
+        row
+        for row in action_rows
+        if row.get("operation") == "resume_blocked_leaf"
+        and row.get("target") == OWNER_SLICE
+        and row.get("status") == "confirmed"
+    ]
+    if len(resume_rows) != 1:
         raise RuntimeError(
-            f"same-request repeat did not adopt the successor: {repeat.raw!r}"
+            f"controller did not retain exactly one confirmed resume action: {resume_rows!r}"
         )
+    ledger = canonical_events(repository)
+    owner_invocations = [
+        row
+        for row in ledger
+        if row.get("type") == "agent.invocation.started"
+        and row.get("agent_id") == baseline["owner_agent_name"]
+    ]
     if (
-        owner_dir / "invocation.json"
-    ).read_bytes() != successor_bytes or history.read_bytes() != history_bytes:
-        raise RuntimeError(
-            "same-request repeat duplicated successor invocation or owner events"
+        len(owner_invocations) != 2
+        or sum(
+            row.get("data", {}).get("runtime") == "opencode"
+            for row in owner_invocations
         )
+        != 1
+        or sum(
+            row.get("data", {}).get("runtime") == "codex" for row in owner_invocations
+        )
+        != 1
+    ):
+        raise RuntimeError(
+            f"owner history does not show exactly one OpenCode predecessor and Codex successor: {owner_invocations!r}"
+        )
+    lifecycle = [
+        row
+        for row in ledger
+        if row.get("type")
+        in {
+            "tl.dispatch_intended",
+            "tl.spawn_requested",
+            "tl.spawn_request_accepted",
+            "tl.dispatch_confirmed",
+        }
+        and isinstance(row.get("data"), dict)
+        and row["data"].get("slice_id") == OWNER_SLICE
+        and row["data"].get("dispatch_generation") == leaf.get("dispatch_generation")
+    ]
+    expected_events = {
+        "tl.dispatch_intended",
+        "tl.spawn_requested",
+        "tl.spawn_request_accepted",
+        "tl.dispatch_confirmed",
+    }
+    if {row.get("type") for row in lifecycle} != expected_events or len(lifecycle) != 4:
+        raise RuntimeError(
+            f"controller dispatch lifecycle is incomplete or duplicated: {lifecycle!r}"
+        )
+
     record = {
-        "owner_agent_name": identity["agent_name"],
+        "owner_agent_name": baseline["owner_agent_name"],
         "prior_invocation_id": prior["invocation_id"],
-        "rejected_request": baseline["rejected_request"],
+        "rejected_request": original_journal,
         "successor_invocation_id": successor["invocation_id"],
         "branch": baseline["branch"],
-        "worktree": str(baseline["worktree"]),
+        "worktree": baseline["worktree"],
         "runtime": successor["runtime"],
         "model": successor["model"],
         "effort": successor["effort"],
-        "pr_number": pr_number,
-        "head_sha": head_sha,
-        "reviewer_name": reviewer_name,
-        "reviewer_runtime": reviewer_invocation["runtime"],
-        "reviewer_model": reviewer_invocation["model"],
-        "reviewer_effort": reviewer_invocation["effort"],
+        "pr_number": leaf["pr_number"],
+        "head_sha": leaf["head_sha"],
+        "reviewer_name": reviewer["agent_name"],
         "reviewer_invocation": reviewer_invocation,
         "successor_invocation_sha256": digest(owner_dir / "invocation.json"),
-        "owner_history_sha256": digest(history),
-        "owner_history_lines": history.read_text(encoding="utf-8").splitlines(),
+        "owner_identity_sha256": digest(owner_dir / "identity.json"),
+        "owner_history_lines": history_lines,
         "reviewer_identity_sha256": digest(reviewer_dir / "identity.json"),
-        "agent_activity": event_counts(agent_log),
-        "remote_pull_publications": sum(
-            row.get("method") == "POST"
-            and str(row.get("path", ""))
-            .split("?", 1)[0]
-            .endswith("/api/v1/repos/owner/repo/pulls")
-            for row in read_json_lines(Path(os.environ["E2E_MOCK_LOG"]))
-        ),
+        "leaf_status": leaf["status"],
+        "leaf_dispatch_generation": leaf["dispatch_generation"],
+        "lifecycle_event_ids": [row.get("event_id") for row in lifecycle],
+        "agent_activity": activity,
     }
     output.write_text(
         json.dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8"
@@ -368,15 +408,28 @@ def resume(repository: Path, baseline_path: Path, output: Path) -> None:
     print(json.dumps(record, sort_keys=True))
 
 
-def wait_for_agent_event(path: Path, expected: str) -> None:
-    deadline = time.monotonic() + 45
-    while time.monotonic() < deadline:
-        if path.is_file() and any(
-            row.get("event") == expected for row in read_json_lines(path)
+def _reviewer_invocations(
+    repository: Path, pr_number: int, head_sha: str
+) -> list[dict[str, Any]]:
+    reviewers: list[dict[str, Any]] = []
+    owners = repository / ".exo/agents"
+    if not owners.is_dir():
+        return reviewers
+    for owner_dir in owners.iterdir():
+        invocation_path = owner_dir / "invocation.json"
+        if not invocation_path.is_file():
+            continue
+        try:
+            value = json.loads(invocation_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (
+            value.get("trigger") == "review"
+            and value.get("pr_number") == pr_number
+            and value.get("head_sha") == head_sha
         ):
-            return
-        time.sleep(0.1)
-    raise RuntimeError(f"worker did not record actual activity {expected!r}")
+            reviewers.append({"agent_name": owner_dir.name, "invocation": value})
+    return reviewers
 
 
 def read_json_lines(path: Path) -> list[dict[str, Any]]:
@@ -451,6 +504,7 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
     assert (
         digest(reviewer_dir / "identity.json") == evidence["reviewer_identity_sha256"]
     )
+    assert digest(owner_dir / "identity.json") == evidence["owner_identity_sha256"]
     assert (
         len(
             [
@@ -533,7 +587,7 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("seed", "resume", "verify-repeat"))
+    parser.add_argument("mode", choices=("seed", "verify-controller", "verify-repeat"))
     parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--output", type=Path)
@@ -542,10 +596,10 @@ def main() -> None:
         if arguments.output is None:
             parser.error("seed requires --output")
         seed(arguments.repo, arguments.output)
-    elif arguments.mode == "resume":
+    elif arguments.mode == "verify-controller":
         if arguments.baseline is None or arguments.output is None:
-            parser.error("resume requires --baseline and --output")
-        resume(arguments.repo, arguments.baseline, arguments.output)
+            parser.error("verify-controller requires --baseline and --output")
+        verify_controller(arguments.repo, arguments.baseline, arguments.output)
     else:
         if arguments.baseline is None:
             parser.error("verify-repeat requires --baseline")

@@ -1574,11 +1574,25 @@ PY
         sleep 0.1
     done
     [[ -S "$AGG_REPO/.exo/server.sock" ]] || e2e_fail "configured Codex server did not restart after owner setup"
-    python3 "$SCRIPT_DIR/configured-owner-resume.py" resume \
+    tl_loop/.venv/bin/python -m tl_loop gate --project-root "$AGG_REPO" --run-id root \
+        --name "tl-ordered-child-recovery-kani" --approve \
+        > "$AGG_DIR/approve-kani-ordered-recovery.log" 2>&1 \
+        || { cat "$AGG_DIR/approve-kani-ordered-recovery.log"; e2e_fail "could not approve the retained ordered Kani recovery gate"; }
+    tl_loop/.venv/bin/python -m tl_loop gate --project-root "$AGG_REPO" --run-id kani \
+        --name "tl-dispatch-failed-issue-814-substitution-model-kani" --approve \
+        > "$AGG_DIR/approve-kani-dispatch-recovery.log" 2>&1 \
+        || { cat "$AGG_DIR/approve-kani-dispatch-recovery.log"; e2e_fail "could not approve the retained Kani dispatch recovery gate"; }
+    BLOCKER_INIT_STATUS=0
+    HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
+        "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
+        > "$AGG_DIR/init-blocker-controller-recovery.log" 2>&1 || BLOCKER_INIT_STATUS=$?
+    assert_init_status "$BLOCKER_INIT_STATUS" "$AGG_DIR/init-blocker-controller-recovery.log" \
+        "controller recovery of active #814 human gate"
+    python3 "$SCRIPT_DIR/configured-owner-resume.py" verify-controller \
         --repo "$AGG_REPO" --baseline "$AGG_DIR/preexisting-opencode-owner.json" \
         --output "$AGG_DIR/configured-owner-resume.json" \
         > "$AGG_DIR/configured-owner-resume.stdout" \
-        || { cat "$AGG_DIR/configured-owner-resume.stdout"; e2e_fail "same-checkpoint blocked owner did not resume through Codex"; }
+        || { cat "$AGG_DIR/configured-owner-resume.stdout"; e2e_fail "controller did not checkpoint the resumed Codex owner and publication"; }
     ROOT_EPOCH_AFTER_BLOCKER="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
     BLOCKER_EFFECTS_BEFORE="$AGG_DIR/blocker-effects-before-repeat.json"
     # Agent actions can complete asynchronously between init invocations; the
@@ -1652,8 +1666,13 @@ output.write_text(json.dumps({
     "kani_identity": digest(repo / ".exo/agents/kani/identity.json"),
     "leaf_attempts": leaf["attempts"],
     "leaf_status": leaf["status"],
-    "leaf_recovery_phase": leaf["recovery"]["phase"],
+    "leaf_recovery_phase": leaf.get("recovery", {}).get("phase"),
     "leaf_pr_number": leaf.get("pr_number"),
+    "leaf_head_sha": leaf.get("head_sha"),
+    "leaf_dispatch_agent_id": leaf.get("dispatch_agent_id"),
+    "leaf_dispatch_invocation_id": leaf.get("dispatch_invocation_id"),
+    "leaf_dispatch_intent_id": leaf.get("dispatch_intent_id"),
+    "leaf_dispatch_generation": leaf.get("dispatch_generation"),
     "kani_dispatch_intent_id": root["slices"]["kani"].get("dispatch_intent_id"),
     "kani_dispatch_invocation_id": root["slices"]["kani"].get("dispatch_invocation_id"),
     "dispatch_event_ids": [row.get("event_id") for row in dispatch_events],
@@ -1744,19 +1763,22 @@ after = {
     "kani_identity": digest(repo / ".exo/agents/kani/identity.json"),
     "leaf_attempts": leaf["attempts"],
     "leaf_status": leaf["status"],
-    "leaf_recovery_phase": leaf["recovery"]["phase"],
+    "leaf_recovery_phase": leaf.get("recovery", {}).get("phase"),
     "leaf_pr_number": leaf.get("pr_number"),
+    "leaf_head_sha": leaf.get("head_sha"),
+    "leaf_dispatch_agent_id": leaf.get("dispatch_agent_id"),
+    "leaf_dispatch_invocation_id": leaf.get("dispatch_invocation_id"),
+    "leaf_dispatch_intent_id": leaf.get("dispatch_intent_id"),
+    "leaf_dispatch_generation": leaf.get("dispatch_generation"),
     "kani_dispatch_intent_id": root["slices"]["kani"].get("dispatch_intent_id"),
     "kani_dispatch_invocation_id": root["slices"]["kani"].get("dispatch_invocation_id"),
     "dispatch_event_ids": [row.get("event_id") for row in dispatch_events],
     "remote_mutations": remote_mutations(mock_log),
 }
 assert after == before, f"repeat continuation changed durable or external leaf effects: {before!r} -> {after!r}"
-assert root["current_order"] == 2
-assert root["slices"]["kani"]["status"] != "merged"
-assert root["slices"]["handoff-proof"]["status"] == "pending"
-assert leaf["status"] == "blocked" and leaf["recovery"]["phase"] == "human_gate"
-assert leaf.get("pr_number") is None
+assert leaf["status"] != "blocked" and leaf.get("recovery") is None
+assert leaf.get("dispatch_agent_id") and leaf.get("dispatch_invocation_id")
+assert leaf.get("pr_number") and leaf.get("head_sha")
 PY
     python3 - "$AGG_REPO" <<'PY' || e2e_fail "repeat blocker init released a later stage or duplicate worker"
 import json
@@ -1767,11 +1789,10 @@ repo = Path(sys.argv[1])
 root = json.loads((repo / ".exo/tl-loop/root/run.json").read_text())
 kani = json.loads((repo / ".exo/tl-loop/root/kani/run.json").read_text())
 leaf = kani["slices"]["issue-814-substitution-model-kani"]
-assert root["current_order"] == 2
-assert root["slices"]["kani"]["status"] != "merged"
-assert root["slices"]["handoff-proof"]["status"] == "pending"
-assert leaf["recovery"]["phase"] == "human_gate"
-assert leaf["pr_number"] is None
+assert root["slices"]["kani"].get("dispatch_invocation_id")
+assert leaf["status"] != "blocked" and leaf.get("recovery") is None
+assert leaf.get("dispatch_agent_id") and leaf.get("dispatch_invocation_id")
+assert leaf.get("pr_number") and leaf.get("head_sha")
 PY
     ROOT_EPOCH_AFTER_FIRST_REPEAT="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
     SECOND_REPEAT_STATUS=0
