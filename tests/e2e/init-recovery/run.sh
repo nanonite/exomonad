@@ -1574,11 +1574,11 @@ PY
         sleep 0.1
     done
     [[ -S "$AGG_REPO/.exo/server.sock" ]] || e2e_fail "configured Codex server did not restart after owner setup"
-    tl_loop/.venv/bin/python -m tl_loop gate --project-root "$AGG_REPO" --run-id root \
+    "$PROJECT_ROOT/tl_loop/.venv/bin/python" -m tl_loop gate --project-root "$AGG_REPO" --run-id root \
         --name "tl-ordered-child-recovery-kani" --approve \
         > "$AGG_DIR/approve-kani-ordered-recovery.log" 2>&1 \
         || { cat "$AGG_DIR/approve-kani-ordered-recovery.log"; e2e_fail "could not approve the retained ordered Kani recovery gate"; }
-    tl_loop/.venv/bin/python -m tl_loop gate --project-root "$AGG_REPO" --run-id kani \
+    "$PROJECT_ROOT/tl_loop/.venv/bin/python" -m tl_loop gate --project-root "$AGG_REPO" --run-id kani \
         --name "tl-dispatch-failed-issue-814-substitution-model-kani" --approve \
         > "$AGG_DIR/approve-kani-dispatch-recovery.log" 2>&1 \
         || { cat "$AGG_DIR/approve-kani-dispatch-recovery.log"; e2e_fail "could not approve the retained Kani dispatch recovery gate"; }
