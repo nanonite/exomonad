@@ -80,6 +80,13 @@ PY
 }
 
 if [[ "$role" == "dev" && "$agent" == *issue-814* ]]; then
+    if [[ "$(basename "$0")" == "opencode" ]]; then
+        record_event historical_opencode_owner_failed '{"reason":"pre-publication OpenCode invocation exited before work began"}'
+        # Let the host observe a live routed pane before recording the
+        # historical pre-publication failure.
+        sleep "${E2E_OPENCODE_FAIL_DELAY:-4}"
+        exit 42
+    fi
     [[ "$(basename "$0")" == "codex" && "${model%%#*}" == "gpt-6-luna" && "$effort" == "xhigh" ]] || {
         printf 'unexpected recovered #814 worker model: %s\n' "$model" >&2
         exit 1

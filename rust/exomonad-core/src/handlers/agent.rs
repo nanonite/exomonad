@@ -3317,6 +3317,7 @@ impl<
         let resume_intent = ResumePrIntentBinding {
             intent_id: &intent_id,
             owner,
+            requested_task: &req.task,
             prior_invocation_id: &previous.invocation_id,
             prior_generation: previous.generation,
             pr_number: req.resume_pr_number,
@@ -3538,6 +3539,7 @@ impl<
         let resume_intent = ResumePrIntentBinding {
             intent_id: &intent_id,
             owner,
+            requested_task: &req.task,
             prior_invocation_id,
             prior_generation: invocation.generation - 1,
             pr_number: req.resume_pr_number,
@@ -4410,6 +4412,7 @@ fn configured_route_changed(
 struct ResumePrIntentBinding<'a> {
     intent_id: &'a str,
     owner: &'a AgentIdentityRecord,
+    requested_task: &'a str,
     prior_invocation_id: &'a str,
     prior_generation: u64,
     pr_number: u64,
@@ -4428,6 +4431,7 @@ fn resume_pr_intent_data(
         "intent_id": binding.intent_id,
         "owner_agent_id": binding.owner.agent_name,
         "slice_id": binding.owner.slice_id,
+        "requested_task": binding.requested_task,
         "prior_invocation_id": binding.prior_invocation_id,
         "prior_generation": binding.prior_generation,
         "pr_number": binding.pr_number,
@@ -4545,6 +4549,7 @@ fn validate_resume_pr_intent_history(
     if !valid_fingerprint
         || data["owner_agent_id"].as_str() != Some(binding.owner.agent_name.as_str())
         || data["slice_id"].as_str() != binding.owner.slice_id.as_deref()
+        || data["requested_task"].as_str() != Some(binding.requested_task)
         || data["prior_invocation_id"].as_str() != Some(prior_id)
         || data["prior_generation"].as_u64() != Some(binding.prior_generation)
         || data["pr_number"].as_u64() != Some(binding.pr_number)
@@ -4559,7 +4564,7 @@ fn validate_resume_pr_intent_history(
         || invocation.recovery_round == 0
     {
         return Err(EffectError::invalid_input(format!(
-            "PR resume intent {} does not prove the current owner, predecessor, PR, head, branch, worktree, and configured route",
+            "PR resume intent {} does not prove the requested task, owner, predecessor, PR, head, branch, worktree, and configured route",
             binding.intent_id
         )));
     }
@@ -5845,7 +5850,9 @@ mod tests {
         fn request(&self) -> SpawnLeafSubtreeRequest {
             SpawnLeafSubtreeRequest {
                 task: "resume the exact existing PR owner".to_string(),
-                intent_id: "resume-pr-intent-46".to_string(),
+                // The production Python client intentionally omits intent_id;
+                // the host resolves the durable successor intent from the owner.
+                intent_id: String::new(),
                 resume_pr_number: 46,
                 expected_head_sha: self.head_sha.clone(),
                 ..Default::default()
@@ -6087,6 +6094,7 @@ mod tests {
         let intent_binding = ResumePrIntentBinding {
             intent_id: "resume-pr-intent-46",
             owner: &owner,
+            requested_task: "resume the exact existing PR owner",
             prior_invocation_id: &prior.invocation_id,
             prior_generation: prior.generation,
             pr_number: PR_NUMBER,
@@ -6191,6 +6199,55 @@ mod tests {
             .await
             .expect_err("a different invocation intent must not adopt the live successor");
         assert!(refused.to_string().contains("dispatch intent"));
+        assert_eq!(std::fs::read(&invocation_path).unwrap(), invocation_before);
+
+        let mut changed_task = fixture.request();
+        changed_task.task = "different guidance for the same PR".to_string();
+        let refused = fixture
+            .handler
+            .spawn_leaf_subtree(changed_task, &fixture.context)
+            .await
+            .expect_err("different guidance cannot be silently dropped on response-loss adoption");
+        assert!(
+            refused.to_string().contains("requested task"),
+            "task mismatch should produce an actionable refusal: {refused}"
+        );
+        assert_eq!(std::fs::read(&invocation_path).unwrap(), invocation_before);
+
+        let mut wrong_pr = fixture.request();
+        wrong_pr.resume_pr_number = 47;
+        assert!(fixture
+            .handler
+            .spawn_leaf_subtree(wrong_pr, &fixture.context)
+            .await
+            .is_err());
+        let mut wrong_head = fixture.request();
+        wrong_head.expected_head_sha = "different-reviewed-head".to_string();
+        let refused = fixture
+            .handler
+            .spawn_leaf_subtree(wrong_head, &fixture.context)
+            .await
+            .expect_err("a changed PR head must not adopt the saved successor");
+        assert!(refused.to_string().contains("head SHA changed"));
+
+        let invocation_before_owner_check =
+            std::fs::read(&invocation_path).expect("read successor owner binding");
+        let mut conflicting_owner: InvocationRecord = serde_json::from_slice(&invocation_before_owner_check)
+            .expect("parse successor invocation");
+        conflicting_owner.runtime_agent_id = Some("issue-814-foreign-owner".to_string());
+        std::fs::write(
+            &invocation_path,
+            serde_json::to_vec_pretty(&conflicting_owner).expect("serialize conflicting owner"),
+        )
+        .expect("write conflicting owner binding");
+        let refused = fixture
+            .handler
+            .spawn_leaf_subtree(fixture.request(), &fixture.context)
+            .await
+            .expect_err("a different runtime owner cannot adopt the saved PR successor");
+        assert!(refused.to_string().contains("requested PR, head, owner"));
+        std::fs::write(&invocation_path, &invocation_before_owner_check)
+            .expect("restore successor owner binding");
         assert_eq!(std::fs::read(&invocation_path).unwrap(), invocation_before);
 
         for _ in 0..2 {

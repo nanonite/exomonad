@@ -1270,6 +1270,7 @@ export E2E_ROOT_ONLY_DIRTY_FILE="$ROOT_ONLY_DIRTY_FILE"
 export E2E_HANDOFF_HEAD_FILE="$HANDOFF_HEAD_FILE"
 export E2E_MOCK_URL="$AGG_MOCK_URL"
 export E2E_MCP_SOCKET="$AGG_REPO/.exo/server.sock"
+export E2E_MOCK_LOG="$AGG_DIR/mock.log"
 python3 - "$AGG_REPO/.git/hooks/post-checkout" "$HANDOFF_WORKTREE" "$ROOT_ONLY_DIRTY_FILE" \
     "$ROOT_DIRTY_MARKER" "$HANDOFF_HEAD_FILE" <<'PY'
 import shlex
@@ -1443,9 +1444,63 @@ assert_legacy_recovery_receipt "$AGG_REPO" "$LEGACY_LOCK_CONTENTS" "$LEGACY_FING
     || e2e_fail "legacy recovery changed the remote merge observation"
 e2e_log "Actual init refused the legacy lock; compiled inspect/apply recovered approved fingerprint $LEGACY_FINGERPRINT"
 
-# Start only the disposable MCP server after Git readiness. Emit the blocked
-# event before init starts a controller so its first replay observes #814 as
-# an active human-blocked leaf, not as completed work.
+# Create a real, terminal OpenCode #814 owner under its historical route in
+# the same aggregate repository. Then restart the server with the accepted
+# Codex route before emitting the active blocker and running init.
+if [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
+    python3 - "$AGG_REPO/.exo/config.toml" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+assert text.count('worker_effort_level = "xhigh"') == 1
+path.write_text(text.replace('worker_effort_level = "xhigh"', 'worker_effort_level = "high"'), encoding="utf-8")
+PY
+    PHASE8_OPENCODE_SERVER_COMMAND="EXOMONAD_TMUX_SESSION=$AGGREGATE_SESSION EXOMONAD_ROOT_AGENT_TYPE=codex EXOMONAD_SPAWN_AGENT_TYPE=opencode EXOMONAD_WORKER_MODEL=opencode-go/deepseek-v4.1-flash EXOMONAD_WORKER_EFFORT_LEVEL=high EXOMONAD_REVIEWER_AGENT_TYPE=codex EXOMONAD_CODEX_MODEL=gpt-6-luna $EXOMONAD_BIN serve"
+    tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_OPENCODE_SERVER_COMMAND"
+    tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
+    for _ in $(seq 1 100); do
+        if python3 - "$AGG_REPO/.exo/server.sock" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(0.2)
+client.connect(sys.argv[1])
+client.close()
+PY
+        then
+            break
+        fi
+        sleep 0.1
+    done
+    [[ -S "$AGG_REPO/.exo/server.sock" ]] || e2e_fail "historical OpenCode server did not create its MCP socket"
+    python3 "$SCRIPT_DIR/configured-owner-resume.py" seed \
+        --repo "$AGG_REPO" --output "$AGG_DIR/preexisting-opencode-owner.json" \
+        > "$AGG_DIR/preexisting-opencode-owner-seed.json" \
+        || { cat "$AGG_DIR/preexisting-opencode-owner-seed.json"; e2e_fail "failed to create a real historical OpenCode #814 owner"; }
+    tmux send-keys -t "$AGGREGATE_SESSION:Server" C-c
+    for _ in $(seq 1 100); do
+        [[ ! -S "$AGG_REPO/.exo/server.sock" ]] && break
+        sleep 0.1
+    done
+    [[ ! -S "$AGG_REPO/.exo/server.sock" ]] \
+        || e2e_fail "historical OpenCode server did not release its socket before route migration"
+    tmux kill-window -t "$AGGREGATE_SESSION:Server" 2>/dev/null || true
+    python3 - "$AGG_REPO/.exo/config.toml" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+assert text.count('worker_effort_level = "high"') == 1
+path.write_text(text.replace('worker_effort_level = "high"', 'worker_effort_level = "xhigh"'), encoding="utf-8")
+PY
+fi
+
+# Emit the blocked event before init starts a controller so its first replay
+# observes #814 as an active human-blocked leaf, not as completed work.
 PHASE8_SERVER_COMMAND="EXOMONAD_TMUX_SESSION=$AGGREGATE_SESSION EXOMONAD_ROOT_AGENT_TYPE=codex EXOMONAD_SPAWN_AGENT_TYPE=codex EXOMONAD_REVIEWER_AGENT_TYPE=codex EXOMONAD_CODEX_MODEL=gpt-6-luna $EXOMONAD_BIN serve"
 tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_SERVER_COMMAND"
 tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
@@ -1480,6 +1535,11 @@ assert_init_status "$AGG_INIT_STATUS" "$AGG_DIR/init.log" "aggregate init --cont
 assert_one_live_window Server
 assert_active_kani_blocker_replayed "$KANI_BLOCKER_EVENT_ID" "$KANI_BLOCKER_RUN_SEQ"
 if [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
+    python3 "$SCRIPT_DIR/configured-owner-resume.py" resume \
+        --repo "$AGG_REPO" --baseline "$AGG_DIR/preexisting-opencode-owner.json" \
+        --output "$AGG_DIR/configured-owner-resume.json" \
+        > "$AGG_DIR/configured-owner-resume.stdout" \
+        || { cat "$AGG_DIR/configured-owner-resume.stdout"; e2e_fail "same-checkpoint blocked owner did not resume through Codex"; }
     ROOT_EPOCH_AFTER_BLOCKER="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
     BLOCKER_EFFECTS_BEFORE="$AGG_DIR/blocker-effects-before-repeat.json"
     python3 - "$AGG_REPO" "$AGG_DIR/mock.log" "$AGENT_EVENT_LOG" "$BLOCKER_EFFECTS_BEFORE" <<'PY'
@@ -1567,6 +1627,10 @@ PY
     assert_init_status "$REPEAT_BLOCKER_STATUS" "$AGG_DIR/init-blocker-repeat.log" \
         "repeat init --continue with active #814 human gate"
     assert_kani_blocker_acknowledged_once "$KANI_BLOCKER_EVENT_ID" "$KANI_BLOCKER_RUN_SEQ"
+    python3 "$SCRIPT_DIR/configured-owner-resume.py" verify-repeat \
+        --repo "$AGG_REPO" --baseline "$AGG_DIR/configured-owner-resume.json" \
+        > "$AGG_DIR/configured-owner-resume-repeat.stdout" \
+        || { cat "$AGG_DIR/configured-owner-resume-repeat.stdout"; e2e_fail "repeat init duplicated the same-checkpoint Codex owner, PR or review"; }
     [[ "$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)" != "$ROOT_EPOCH_AFTER_BLOCKER" ]] \
         || e2e_fail "fresh repeat continuation did not create its own controller epoch"
     python3 - "$AGG_REPO" "$AGG_DIR/mock.log" "$AGENT_EVENT_LOG" "$BLOCKER_EFFECTS_BEFORE" <<'PY' \
@@ -1670,6 +1734,19 @@ assert root["slices"]["handoff-proof"]["status"] == "pending"
 assert leaf["recovery"]["phase"] == "human_gate"
 assert leaf["pr_number"] is None
 PY
+    ROOT_EPOCH_AFTER_FIRST_REPEAT="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
+    SECOND_REPEAT_STATUS=0
+    HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
+        "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
+        > "$AGG_DIR/init-blocker-second-repeat.log" 2>&1 || SECOND_REPEAT_STATUS=$?
+    assert_init_status "$SECOND_REPEAT_STATUS" "$AGG_DIR/init-blocker-second-repeat.log" \
+        "second repeat init --continue with active #814 human gate"
+    python3 "$SCRIPT_DIR/configured-owner-resume.py" verify-repeat \
+        --repo "$AGG_REPO" --baseline "$AGG_DIR/configured-owner-resume.json" \
+        > "$AGG_DIR/configured-owner-resume-second-repeat.stdout" \
+        || { cat "$AGG_DIR/configured-owner-resume-second-repeat.stdout"; e2e_fail "second repeat init duplicated owner, PR, review, or guidance effects"; }
+    [[ "$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)" != "$ROOT_EPOCH_AFTER_FIRST_REPEAT" ]] \
+        || e2e_fail "second repeat continuation did not create a fresh controller epoch"
     echo "active blocker init-recovery E2E: passed"
     exit 0
 fi
