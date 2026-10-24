@@ -2022,6 +2022,165 @@ def test_live_waiting_child_is_not_terminated_by_elapsed_supervision() -> None:
     assert not process.terminated
 
 
+def test_live_supervisor_waits_for_approved_blocked_leaf_successor_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """Do not project the pre-resume human gate before the child binds its successor."""
+    issue_slice = "issue-814-substitution-model-kani"
+    plan = WorkPlan.from_mapping(
+        {
+            "leaves": [
+                {
+                    "name": issue_slice,
+                    "task": "Resume the configured Kani assignment",
+                    "chainlink_issue_id": 814,
+                }
+            ]
+        }
+    )
+    project = tmp_path / "repo"
+    project.mkdir()
+    worktree = project / ".exo/worktrees/kani"
+    config = TLLoopConfig(
+        active=True,
+        run_id="kani",
+        root_dir=tmp_path,
+        project_root=project,
+        branch="main.kani",
+        worktree=worktree,
+        parent_run_id="root",
+        parent_branch="main",
+        parent_agent_id="kani",
+        session_mode="continue",
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+    )
+    manifest = driver_module._candidate_manifest(plan, "kani", config)
+    slices = _initial_slices(plan, config, tmp_path, "kani")
+    state = create(
+        "kani",
+        {
+            "owner_branch": "main.kani",
+            "owner_worktree": str(worktree),
+            "parent_run_id": "root",
+            "parent_branch": "main",
+            "parent_agent_id": "kani",
+            "depth": 1,
+            "repository_identity": config.repository_identity.to_document(),
+            "plan_manifest": manifest.to_document(),
+            "slices": slices,
+        },
+        root_dir=tmp_path,
+    )
+    store = RunStore("kani", tmp_path)
+    blocked_intent = "approved-blocked-resume-intent"
+    leaf = plan.leaves[0]
+    recovery = driver_module.transition_recovery(
+        begin_recovery(
+            cause="human_decision_required",
+            owner_run_id="kani",
+            slice_attempt=1,
+            owner_agent_id=None,
+            invocation_generation=0,
+            plan_revision=manifest.manifest_revision,
+            evidence={
+                "slice_id": issue_slice,
+                "authorization_source": "human",
+                "outcome": "blocked",
+                "needs_human": True,
+            },
+            next_action="open_human_gate",
+        ),
+        RecoveryPhase.HUMAN_GATE,
+        next_action="open_human_gate",
+    )
+    blocked = replace(
+        state.slices[issue_slice],
+        status=SliceStatus.BLOCKED,
+        dispatch_intent_id=blocked_intent,
+        park_cause=ParkCause.HUMAN_DECISION_REQUIRED,
+        recovery=recovery,
+    )
+    store.checkpoint(
+        RecursiveTLFailed("approved human recovery awaits controller resume"),
+        {**state.slices, issue_slice: blocked},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    recovery_gate = driver_module._dispatch_failure_gate_name(issue_slice, "agent_error")
+    store.set_gate(recovery_gate, GateStatus.PENDING)
+    store.answer_gate(recovery_gate, GateStatus.APPROVED)
+    proof = driver_module._BlockedLeafResumeProof(
+        leaf,
+        blocked,
+        object(),
+        recovery_gate,
+        {},
+        blocked_intent,
+        None,
+    )
+
+    class DelayedControllerProcess:
+        """Expose the old checkpoint once, then persist the host response projection."""
+
+        exitcode = None
+
+        def __init__(self) -> None:
+            self.alive = True
+            self.join_calls: list[float | None] = []
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+        def join(self, timeout: float | None = None) -> None:
+            self.join_calls.append(timeout)
+            current_state = store.load()
+            current = current_state.slices[issue_slice]
+            resumed = replace(
+                driver_module.slice_transition(
+                    current,
+                    driver_module.SliceStatusChanged(SliceStatus.DISPATCH_UNCONFIRMED),
+                ),
+                dispatch_agent_id=f"{issue_slice}-opencode",
+                dispatch_invocation_id="codex-successor-invocation",
+                dispatch_authoritative_event_seq=21,
+                dispatch_generation=2,
+                park_cause=ParkCause.DISPATCH_UNCONFIRMED,
+                recovery=None,
+            )
+            store.checkpoint(
+                RecursiveTLRunning(
+                    current_order=0,
+                    pending_by_order={},
+                    parallel_pending=(ChildRecord(issue_slice, ChildKind.LEAF),),
+                    scope_path=(manifest.scope_id,),
+                    plan_digest=manifest.digest,
+                    dispatch_intents={issue_slice: blocked_intent},
+                ),
+                {**current_state.slices, issue_slice: resumed},
+                current_state.budgets,
+                current_state.events.last_consumed_offset,
+            )
+            self.alive = False
+
+    process = DelayedControllerProcess()
+    observed = driver_module._supervise_live_sub_tl(
+        process,
+        store,
+        config,
+        task=SubTLTask("kani", plan, order=2),
+        blocked_leaf_resume_proof=proof,
+    )
+
+    assert len(process.join_calls) == 1
+    assert process.join_calls[0] is not None and process.join_calls[0] >= 0.05
+    assert observed is not None
+    resumed = observed.slices[issue_slice]
+    assert resumed.status is SliceStatus.DISPATCH_UNCONFIRMED
+    assert resumed.dispatch_agent_id == f"{issue_slice}-opencode"
+    assert resumed.dispatch_invocation_id == "codex-successor-invocation"
+    assert resumed.recovery is None
+
+
 def test_recursive_tl_waiting_child_is_not_marked_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -15930,7 +16089,9 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
         branch="main",
         agent_id="root-controller",
         session_mode="continue",
-        ordered_recovery=True,
+        # Controller recovery must follow the approved durable child gate even
+        # when the parent process's invocation-local selector is not inherited.
+        ordered_recovery=False,
     )
     root_manifest = driver_module._manifest_for_plan(plan, "root", root_config)
     root_slices = _initial_slices(plan, root_config, tmp_path, "root")
@@ -16080,7 +16241,7 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
             next_action="open_human_gate",
         ),
         RecoveryPhase.HUMAN_GATE,
-        next_action="resume_blocked_leaf",
+        next_action="open_human_gate",
     )
     blocked_leaf = replace(
         leaf,
@@ -16184,7 +16345,9 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
     assert decision.recoverable
     assert decision.task_name == "kani"
     assert "diagnostic" not in decision.reason
-    recovery_config = replace(root_config, ordered_recovery_child="kani")
+    # The caller may not carry the parent recovery target across a restart;
+    # provisioning must derive it again from the accepted parent/child proof.
+    recovery_config = root_config
 
     @dataclass
     class ProvisionTransport(RecordingTransport):
@@ -16216,15 +16379,45 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
         del budgets
         return SimpleNamespace(final_state=child_store.load())
 
+    class InlineProcess:
+        def __init__(self, target, args, name):
+            self.target = target
+            self.args = args
+            self.name = name
+            self.exitcode = None
+
+        def start(self):
+            parent = root_store.load()
+            assert isinstance(parent.recursive_fsm, RecursiveTLRunning)
+            assert parent.slices["kani"].status is SliceStatus.SPAWNED
+            self.target(*self.args)
+            self.exitcode = 0
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            del timeout
+
+    class InlineContext:
+        def Process(self, *, target, args, name):
+            return InlineProcess(target, args, name)
+
     monkeypatch.setattr(driver_module, "tl_run", child_controller)
-    driver_module._run_live_sub_tl(
-        replace(task, source=SyntheticQueue([])),
+    monkeypatch.setattr(
+        driver_module.multiprocessing, "get_context", lambda _method: InlineContext()
+    )
+    outcomes = driver_module._run_live_sub_tl_batch(
+        (replace(task, source=SyntheticQueue([])),),
         recovery_config,
         SyntheticQueue([]),
         EffectClient(transport),
         root_store,
         root_store.load().budgets,
     )
+    assert len(outcomes) == 1
+    assert outcomes[0][0].name == "kani"
+    assert outcomes[0][1] is TLPhase.TLFailed
     assert len(transport.provisioned) == 1
     assert transport.parent_terminalized_after_provision
     checkpointed_parent = root_store.load()
@@ -18202,7 +18395,7 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
         branch="main.kani",
         worktree=controller_worktree,
         session_mode="continue",
-        ordered_recovery=True,
+        ordered_recovery=False,
         repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
         poll_interval=0.001,
         cancel_event=cancel_event,
@@ -18244,7 +18437,7 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
             next_action="open_human_gate",
         ),
         RecoveryPhase.HUMAN_GATE,
-        next_action="resume_blocked_leaf",
+        next_action="open_human_gate",
     )
     blocked = replace(
         current,

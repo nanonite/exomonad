@@ -1709,6 +1709,20 @@ def run_tl_loop(
                         worktree=existing_state.owner_worktree or selected.worktree,
                     )
                     terminal_recovery_reopened = True
+                if not terminal_recovery_reopened and _has_approved_blocked_leaf_resume_gate(
+                    recovery_plan, existing_state
+                ):
+                    resume_proof, _reason = _blocked_leaf_resume_proof(
+                        recovery_plan, existing_state, selected, store
+                    )
+                    if resume_proof is not None:
+                        existing_state = _reopen_ordered_scope(
+                            existing_state,
+                            recovery_plan,
+                            store,
+                            None,
+                        )
+                        terminal_recovery_reopened = True
             if selected.ordered_recovery and isinstance(
                 existing_state.recursive_fsm, RecursiveTLFailed
             ):
@@ -4393,7 +4407,7 @@ def _activate_startup_work(
         pending_quarantine=len(_replayable_quarantine_documents(store)),
         boundary_run_seq=boundary_run_seq,
     )
-    if config.ordered_recovery:
+    if config.ordered_recovery or _has_approved_blocked_leaf_resume_gate(plan, state):
         state = _resume_approved_blocked_leaf(plan, state, config, effects, store, effects_log)
     state = _dispatch_children(plan, state, config, effects, effects_log, store)
     state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
@@ -4812,6 +4826,26 @@ def _resume_approved_blocked_leaf(
         OSError,
     ) as error:
         return _hold_blocked_leaf_resume(state, config, effects, store, effects_log, str(error))
+
+
+def _has_approved_blocked_leaf_resume_gate(plan: WorkPlan, state: RunState) -> bool:
+    """Detect durable approved leaf recovery even when invocation-local routing was lost."""
+    for leaf in plan.leaves:
+        current = state.slices.get(leaf.name)
+        if (
+            current is None
+            or current.status is not SliceStatus.BLOCKED
+            or current.recovery is None
+            or current.recovery.phase is not RecoveryPhase.HUMAN_GATE
+            or current.recovery.next_action not in {"open_human_gate", "resume_blocked_leaf"}
+        ):
+            continue
+        gate_name = _dispatch_failure_gate_name(leaf.name, current.dispatch_error_code)
+        if any(
+            gate.name == gate_name and gate.status is GateStatus.APPROVED for gate in state.gates
+        ):
+            return True
+    return False
 
 
 def _blocked_leaf_resume_action_arguments(
@@ -16285,15 +16319,19 @@ def _run_sub_tl_batch(
         branch = derive_child_branch(config.branch, _child_controller_name(task))
         worktree = str(_sub_tl_worktree(config, store.root_dir, store.run_id, task))
         child_store = RunStore(task.name, store.run_dir)
+        retrying_failed_child = False
         if child_store.path.exists():
             child_state = child_store.load()
             child_phase = _child_completion_phase(child_state)
-            retrying_failed_child = (
-                config.ordered_recovery_child == task.name and child_phase is TLPhase.TLFailed
+            blocked_leaf_resume_proof = (
+                _approved_blocked_leaf_child_retry_proof(task, child_state, config, store)
+                if child_phase is TLPhase.TLFailed
+                else None
             )
-            retrying_approved_blocked_leaf = retrying_failed_child and (
-                _approved_blocked_leaf_child_retry(task, child_state, config, store)
+            retrying_failed_child = child_phase is TLPhase.TLFailed and (
+                config.ordered_recovery_child == task.name or blocked_leaf_resume_proof is not None
             )
+            retrying_approved_blocked_leaf = blocked_leaf_resume_proof is not None
             if _child_handoff_ready(child_state, store.run_id) and not retrying_failed_child:
                 return task, child_phase, child_state
             if child_phase is TLPhase.TLFailed and not retrying_failed_child:
@@ -16303,15 +16341,18 @@ def _run_sub_tl_batch(
                 and not retrying_approved_blocked_leaf
             ):
                 return task, child_phase, child_state
+        effective_config = _ensure_ordered_parent_ready_for_provision(task, config, store)
+        if retrying_failed_child and effective_config.ordered_recovery_child != task.name:
+            effective_config = replace(effective_config, ordered_recovery_child=task.name)
         child_config = _child_config(
-            config,
+            effective_config,
             task,
             source,
             effects,
             store,
             branch,
             worktree,
-            ordered_recovery=config.ordered_recovery_child == task.name,
+            ordered_recovery=effective_config.ordered_recovery_child == task.name,
         )
         try:
             child_result = tl_run({"run_id": task.name, "plan": task.plan}, child_config, budgets)
@@ -16355,17 +16396,23 @@ def _run_live_sub_tl_batch(
     child_source_spec = _child_source_spec(source)
     existing: dict[str, tuple[SubTLTask, TLPhase | None, RunState | None]] = {}
     runnable: list[SubTLTask] = []
+    blocked_leaf_resume_proofs: dict[str, _BlockedLeafResumeProof] = {}
     for task in tasks:
         child_store = RunStore(task.name, store.run_dir)
         if child_store.path.exists():
             child_state = child_store.load()
             child_phase = _child_completion_phase(child_state)
-            retrying_failed_child = (
-                config.ordered_recovery_child == task.name and child_phase is TLPhase.TLFailed
+            blocked_leaf_resume_proof = (
+                _approved_blocked_leaf_child_retry_proof(task, child_state, config, store)
+                if child_phase is TLPhase.TLFailed
+                else None
             )
-            retrying_approved_blocked_leaf = retrying_failed_child and (
-                _approved_blocked_leaf_child_retry(task, child_state, config, store)
+            retrying_failed_child = child_phase is TLPhase.TLFailed and (
+                config.ordered_recovery_child == task.name or blocked_leaf_resume_proof is not None
             )
+            if blocked_leaf_resume_proof is not None:
+                blocked_leaf_resume_proofs[task.name] = blocked_leaf_resume_proof
+            retrying_approved_blocked_leaf = blocked_leaf_resume_proof is not None
             if (_child_handoff_ready(child_state, store.run_id) and not retrying_failed_child) or (
                 _child_recovery_projection(child_state, store.run_id) is not None
                 and not retrying_approved_blocked_leaf
@@ -16376,12 +16423,28 @@ def _run_live_sub_tl_batch(
                 existing[task.name] = (task, child_phase, child_state)
                 continue
         runnable.append(task)
+    effective_configs: dict[str, TLLoopConfig] = {}
+    for task in runnable:
+        retrying_failed_child = task.name in blocked_leaf_resume_proofs or (
+            config.ordered_recovery_child == task.name
+        )
+        effective_config = _ensure_ordered_parent_ready_for_provision(task, config, store)
+        if retrying_failed_child and effective_config.ordered_recovery_child != task.name:
+            effective_config = replace(effective_config, ordered_recovery_child=task.name)
+        effective_configs[task.name] = effective_config
     processes = [
         (
             task,
             context.Process(
                 target=_run_live_sub_tl,
-                args=(task, config, child_source_spec, effects, store, budgets),
+                args=(
+                    task,
+                    effective_configs[task.name],
+                    child_source_spec,
+                    effects,
+                    store,
+                    budgets,
+                ),
                 name=f"tl-sub-{task.name}",
             ),
         )
@@ -16394,7 +16457,13 @@ def _run_live_sub_tl_batch(
     }
     for task, process in processes:
         child_store = RunStore(task.name, store.run_dir)
-        child_state = _supervise_live_sub_tl(process, child_store, config)
+        child_state = _supervise_live_sub_tl(
+            process,
+            child_store,
+            config,
+            task=task,
+            blocked_leaf_resume_proof=blocked_leaf_resume_proofs.get(task.name),
+        )
         phase = (
             _child_completion_phase(child_state) if child_state is not None else TLPhase.TLFailed
         )
@@ -16402,13 +16471,13 @@ def _run_live_sub_tl_batch(
     return tuple(outcomes_by_name[task.name] for task in tasks)
 
 
-def _approved_blocked_leaf_child_retry(
+def _approved_blocked_leaf_child_retry_proof(
     task: SubTLTask,
     child_state: RunState,
     parent_config: TLLoopConfig,
     parent_store: RunStore,
-) -> bool:
-    """Bypass a retained child gate only for the exact approved resume proof."""
+) -> _BlockedLeafResumeProof | None:
+    """Return the exact approved resume proof used to keep supervising a retry."""
     branch = derive_child_branch(parent_config.branch, _child_controller_name(task))
     worktree = str(
         _sub_tl_worktree(parent_config, parent_store.root_dir, parent_store.run_id, task)
@@ -16418,7 +16487,7 @@ def _approved_blocked_leaf_child_retry(
     )
     child_store = RunStore(task.name, parent_store.run_dir)
     proof, _reason = _blocked_leaf_resume_proof(task.plan, child_state, child_config, child_store)
-    return proof is not None
+    return proof
 
 
 def _persist_child_startup_failure(child_store: RunStore, reason: str) -> None:
@@ -16457,6 +16526,9 @@ def _supervise_live_sub_tl(
     process: multiprocessing.Process,
     child_store: RunStore,
     config: TLLoopConfig,
+    *,
+    task: SubTLTask | None = None,
+    blocked_leaf_resume_proof: _BlockedLeafResumeProof | None = None,
 ) -> RunState | None:
     """Supervise a child until it resolves or explicit cancellation is requested."""
     poll_interval = max(config.poll_interval, 0.05)
@@ -16474,7 +16546,11 @@ def _supervise_live_sub_tl(
             child_state = child_store.load()
         except (OSError, ValueError):
             child_state = None
-        if _child_recovery_projection(child_state, getattr(child_store, "run_id", "")) is not None:
+        if _child_recovery_projection(
+            child_state, getattr(child_store, "run_id", "")
+        ) is not None and not _blocked_leaf_resume_is_pending(
+            child_state, task, blocked_leaf_resume_proof
+        ):
             return child_state
         process.join(timeout=poll_interval)
     exitcode = getattr(process, "exitcode", None)
@@ -16526,17 +16602,51 @@ def _supervise_live_sub_tl(
     return child_state
 
 
+def _blocked_leaf_resume_is_pending(
+    child_state: RunState | None,
+    task: SubTLTask | None,
+    proof: _BlockedLeafResumeProof | None,
+) -> bool:
+    """Keep supervising only while the proven gate awaits its bound successor."""
+    if proof is None or child_state is None or task is None:
+        return False
+    current = child_state.slices.get(proof.leaf.name)
+    if (
+        current is None
+        or current.status is not SliceStatus.BLOCKED
+        or current.dispatch_intent_id != proof.current.dispatch_intent_id
+        or current.recovery is None
+        or current.recovery.phase is not RecoveryPhase.HUMAN_GATE
+        or current.recovery.next_action not in {"open_human_gate", "resume_blocked_leaf"}
+    ):
+        return False
+    if any(
+        gate.name == f"tl-blocked-leaf-resume-proof-{proof.leaf.name}" for gate in child_state.gates
+    ):
+        return False
+    return any(leaf.name == proof.leaf.name for leaf in task.plan.leaves)
+
+
 def _ensure_ordered_parent_ready_for_provision(
     task: SubTLTask,
     config: TLLoopConfig,
     store: RunStore,
 ) -> TLLoopConfig:
     """Revalidate and reopen only the proved child before binding its invocation."""
-    if config.ordered_recovery_child != task.name or not store.path.exists():
+    if not store.path.exists():
         return config
     state = store.load()
     if isinstance(state.recursive_fsm, RecursiveTLRunning):
-        return _continued_ordered_recovery_config(state, config)
+        recovery_config = _continued_ordered_recovery_config(state, config)
+        if recovery_config.ordered_recovery_child == task.name:
+            return recovery_config
+        return config
+    recovery_gate = _ordered_recovery_gate_name(task.name)
+    gate_approved = any(
+        gate.name == recovery_gate and gate.status is GateStatus.APPROVED for gate in state.gates
+    )
+    if config.ordered_recovery_child != task.name and not gate_approved:
+        return config
     decision = _failed_ordered_parent_recovery(task, config, store, state)
     plan = _work_plan_from_manifest(state.plan_manifest)
     reopened = _reopen_ordered_scope(
@@ -16558,11 +16668,7 @@ def _failed_ordered_parent_recovery(
     store: RunStore,
     state: RunState,
 ) -> OrderedRecoveryDecision:
-    if (
-        config.ordered_recovery_child != task.name
-        or not isinstance(state.recursive_fsm, RecursiveTLFailed)
-        or state.plan_manifest is None
-    ):
+    if not isinstance(state.recursive_fsm, RecursiveTLFailed) or state.plan_manifest is None:
         raise TLLoopError(
             "ordered sub-TL provisioning is blocked because the parent scope is not running "
             f"(phase={type(state.recursive_fsm).__name__}, child={task.name!r})"
