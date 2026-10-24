@@ -1719,8 +1719,9 @@ PY
         --repo "$AGG_REPO" --baseline "$AGG_DIR/configured-owner-resume.json" \
         > "$AGG_DIR/configured-owner-resume-repeat.stdout" \
         || { cat "$AGG_DIR/configured-owner-resume-repeat.stdout"; e2e_fail "repeat init duplicated the same-checkpoint Codex owner, PR or review"; }
-    [[ "$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)" != "$ROOT_EPOCH_AFTER_BLOCKER" ]] \
-        || e2e_fail "fresh repeat continuation did not create its own controller epoch"
+    [[ "$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)" == "$ROOT_EPOCH_AFTER_BLOCKER" ]] \
+        || e2e_fail "repeat init replaced the controller that still owns the recovered Kani stage"
+    assert_one_live_window TL
     python3 - "$AGG_REPO" "$AGG_DIR/mock.log" "$BLOCKER_EFFECTS_BEFORE" <<'PY' \
         || e2e_fail "repeat blocker continuation duplicated work or rewrote historical effects"
 import hashlib
@@ -1734,6 +1735,8 @@ root_dir = repo / ".exo/tl-loop/root"
 root = json.loads((root_dir / "run.json").read_text())
 kani = json.loads((root_dir / "kani/run.json").read_text())
 leaf = kani["slices"]["issue-814-substitution-model-kani"]
+publication = leaf.get("publication") or {}
+handoff = leaf.get("handoff") or {}
 def digest(path: Path) -> str | None:
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
 def remote_mutations(path: Path) -> dict[str, int]:
@@ -1807,7 +1810,11 @@ after = {
 assert after == before, f"repeat continuation changed durable or external leaf effects: {before!r} -> {after!r}"
 assert leaf["status"] != "blocked" and leaf.get("recovery") is None
 assert leaf.get("dispatch_agent_id") and leaf.get("dispatch_invocation_id")
-assert leaf.get("pr_number") and leaf.get("head_sha")
+assert publication.get("pr_number") == leaf.get("pr_number")
+assert publication.get("head_sha") and publication.get("invocation_id") == leaf.get("dispatch_invocation_id")
+assert handoff.get("pr_number") == leaf.get("pr_number")
+assert handoff.get("head_sha") == publication.get("head_sha")
+assert handoff.get("invocation_id") == leaf.get("dispatch_invocation_id")
 PY
     python3 - "$AGG_REPO" <<'PY' || e2e_fail "repeat blocker init released a later stage or duplicate worker"
 import json
@@ -1818,10 +1825,18 @@ repo = Path(sys.argv[1])
 root = json.loads((repo / ".exo/tl-loop/root/run.json").read_text())
 kani = json.loads((repo / ".exo/tl-loop/root/kani/run.json").read_text())
 leaf = kani["slices"]["issue-814-substitution-model-kani"]
+publication = leaf.get("publication") or {}
+handoff = leaf.get("handoff") or {}
 assert root["slices"]["kani"].get("dispatch_invocation_id")
+assert root["current_order"] == 2
+assert root["slices"]["handoff-proof"]["status"] == "pending"
 assert leaf["status"] != "blocked" and leaf.get("recovery") is None
 assert leaf.get("dispatch_agent_id") and leaf.get("dispatch_invocation_id")
-assert leaf.get("pr_number") and leaf.get("head_sha")
+assert publication.get("pr_number") == leaf.get("pr_number")
+assert publication.get("head_sha") and publication.get("invocation_id") == leaf.get("dispatch_invocation_id")
+assert handoff.get("pr_number") == leaf.get("pr_number")
+assert handoff.get("head_sha") == publication.get("head_sha")
+assert handoff.get("invocation_id") == leaf.get("dispatch_invocation_id")
 PY
     ROOT_EPOCH_AFTER_FIRST_REPEAT="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
     SECOND_REPEAT_STATUS=0
@@ -1834,8 +1849,9 @@ PY
         --repo "$AGG_REPO" --baseline "$AGG_DIR/configured-owner-resume.json" \
         > "$AGG_DIR/configured-owner-resume-second-repeat.stdout" \
         || { cat "$AGG_DIR/configured-owner-resume-second-repeat.stdout"; e2e_fail "second repeat init duplicated owner, PR, review, or guidance effects"; }
-    [[ "$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)" != "$ROOT_EPOCH_AFTER_FIRST_REPEAT" ]] \
-        || e2e_fail "second repeat continuation did not create a fresh controller epoch"
+    [[ "$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)" == "$ROOT_EPOCH_AFTER_FIRST_REPEAT" ]] \
+        || e2e_fail "second repeat init replaced the controller that still owns the recovered Kani stage"
+    assert_one_live_window TL
     echo "active blocker init-recovery E2E: passed"
     exit 0
 fi
