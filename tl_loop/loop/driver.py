@@ -4486,13 +4486,8 @@ def _blocked_leaf_resume_proof(
     ):
         return None, "blocked leaf declaration does not match its accepted manifest binding"
     expected_slice = _initial_slices(plan, config, store.root_dir, state.run_id).get(leaf.name)
-    if (
-        expected_slice is None
-        or current.branch != expected_slice.get("branch")
-        or current.worktree != expected_slice.get("worktree")
-        or current.base_ref != config.branch
-    ):
-        return None, "blocked leaf branch or worktree differs from the accepted scope coordinates"
+    if expected_slice is None:
+        return None, "blocked leaf is absent from the accepted scope coordinates"
     gate_name = _dispatch_failure_gate_name(leaf.name, current.dispatch_error_code)
     gate = next((item for item in state.gates if item.name == gate_name), None)
     if gate is None or gate.status is not GateStatus.APPROVED:
@@ -4516,15 +4511,29 @@ def _blocked_leaf_resume_proof(
     checkpoint_worktree = Path(current.worktree) if current.worktree is not None else None
     if checkpoint_worktree is not None and not checkpoint_worktree.is_absolute():
         checkpoint_worktree = Path(config.project_root or store.root_dir) / checkpoint_worktree
+    planned_worktree = Path(str(expected_slice.get("worktree", "")))
+    if not planned_worktree.is_absolute():
+        planned_worktree = Path(config.project_root or store.root_dir) / planned_worktree
+    planned_coordinates_match = (
+        current.branch == expected_slice.get("branch")
+        and checkpoint_worktree is not None
+        and checkpoint_worktree.resolve() == planned_worktree.resolve()
+    )
+    owner_coordinates_match = (
+        current.branch == proof.owner.branch
+        and checkpoint_worktree is not None
+        and checkpoint_worktree.resolve() == proof.owner.worktree
+    )
+    if current.base_ref != config.branch or not (
+        planned_coordinates_match or owner_coordinates_match
+    ):
+        return None, (
+            "blocked leaf branch or worktree matches neither the accepted planned coordinates "
+            "nor its verified durable owner"
+        )
     lineage_conflicts = [
         label
         for label, invalid in (
-            ("owner branch", proof.owner.branch != current.branch),
-            (
-                (f"owner worktree checkpoint={checkpoint_worktree} owner={proof.owner.worktree}"),
-                checkpoint_worktree is None
-                or proof.owner.worktree != checkpoint_worktree.resolve(),
-            ),
             ("parent branch", proof.owner.parent_branch != current.base_ref),
             (
                 "evidence owner",

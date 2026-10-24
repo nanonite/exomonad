@@ -319,6 +319,10 @@ def _owner_from_records(
     parent_branch = _required_text(identity, "parent_branch", "owner identity")
     if parent_branch != expected_parent_branch:
         raise BlockedLeafOwnerError("owner parent branch differs from the accepted child scope")
+    if branch != f"{parent_branch}.{agent_name}":
+        raise BlockedLeafOwnerError(
+            "owner branch does not match its registered parent and agent identity"
+        )
     worktree = _owner_worktree(project_root, identity)
     invocation = _read_object(directory / "invocation.json", "owner invocation")
     invocation_id = _required_text(invocation, "invocation_id", "owner invocation")

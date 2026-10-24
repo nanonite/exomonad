@@ -16005,14 +16005,15 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
     child_store = RunStore("kani", root_store.run_dir)
     child_store.set_plan_manifest(child_manifest, slices=child_slices)
     leaf = child_store.load().slices[issue_slice]
-    owner_worktree = Path(leaf.worktree or "")
+    owner_name = f"{issue_slice}-opencode"
+    owner_branch = f"{child_branch}.{owner_name}"
+    owner_worktree = project / ".exo" / "worktrees" / owner_name
     owner_worktree.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["git", "init", "-b", cast(str, leaf.branch), str(owner_worktree)],
+        ["git", "init", "-b", owner_branch, str(owner_worktree)],
         check=True,
         capture_output=True,
     )
-    owner_name = f"{issue_slice}-opencode"
     owner_dir = project / ".exo" / "agents" / owner_name
     owner_dir.mkdir(parents=True)
     (owner_dir / "active_issue").write_text("814\n", encoding="utf-8")
@@ -16025,7 +16026,7 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
                 "agent_type": "opencode",
                 "model": "opencode-go/deepseek-v4.1-flash",
                 "effort": "high",
-                "birth_branch": leaf.branch,
+                "birth_branch": owner_branch,
                 "parent_branch": child_branch,
                 "working_dir": str(owner_worktree),
                 "topology": "worktree_per_agent",
@@ -16044,7 +16045,7 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
                 "model": "opencode-go/deepseek-v4.1-flash",
                 "effort": "high",
                 "trigger": "spawn",
-                "branch": leaf.branch,
+                "branch": owner_branch,
                 "worktree": str(owner_worktree),
                 "pr_number": None,
                 "head_sha": None,
@@ -16140,6 +16141,34 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
     )
 
     child_store.answer_gate(child_dispatch_gate, GateStatus.APPROVED)
+    state = child_store.load()
+    blocked = state.slices[issue_slice]
+    conflicting = replace(
+        blocked,
+        branch=f"{child_branch}.foreign-owner",
+        worktree=str(project / ".exo" / "worktrees" / "foreign-owner"),
+    )
+    child_store.checkpoint(
+        state.recursive_fsm or state.fsm,
+        {**state.slices, issue_slice: conflicting},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    conflicting_proof, conflicting_reason = driver_module._blocked_leaf_resume_proof(
+        leaf_plan, child_store.load(), child_config, child_store
+    )
+    assert conflicting_proof is None
+    assert conflicting_reason == (
+        "blocked leaf branch or worktree matches neither the accepted planned coordinates "
+        "nor its verified durable owner"
+    )
+    current = child_store.load()
+    child_store.checkpoint(
+        current.recursive_fsm or current.fsm,
+        {**current.slices, issue_slice: blocked},
+        current.budgets,
+        current.events.last_consumed_offset,
+    )
     decision = driver_module._ordered_terminal_recovery_decision(
         root_state,
         plan,
@@ -18049,10 +18078,12 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
     cancel_event = threading.Event()
     project = tmp_path / "repo"
     root_dir = project / ".exo" / "tl-loop"
-    branch = "main.kani.issue-814-substitution-model-kani"
+    planned_branch = "main.kani.issue-814-substitution-model-kani"
+    branch = f"main.kani.{owner_name}"
     controller_worktree = project / ".exo" / "worktrees" / "kani"
     controller_worktree.mkdir(parents=True)
-    worktree = project / ".exo" / "worktrees" / "kani" / slice_id
+    planned_worktree = project / ".exo" / "worktrees" / "kani" / slice_id
+    worktree = project / ".exo" / "worktrees" / owner_name
     worktree.mkdir(parents=True)
     subprocess.run(
         ["git", "init", "-b", branch, str(worktree)],
@@ -18137,6 +18168,8 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
     )
     store = RunStore(run_id, root_dir)
     current = state.slices[slice_id]
+    assert current.branch == planned_branch
+    assert current.worktree == str(planned_worktree)
     recovery = driver_module.transition_recovery(
         begin_recovery(
             cause="human_decision_required",
