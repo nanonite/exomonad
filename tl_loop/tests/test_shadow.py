@@ -216,6 +216,43 @@ def test_shadow_loop_acknowledges_pr_published_without_a_transition(
     assert result.final_state.slices["leaf-a"].pr_number == 42
 
 
+def test_shadow_loop_acknowledges_recovery_started_after_durable_projection(
+    tmp_path: Path,
+) -> None:
+    run_id = "shadow-recovery-started"
+    raw = {
+        "schema_version": 1,
+        "event_id": "recovery-started-event",
+        "id": "recovery-started-event",
+        "event_time": "2026-08-12T00:00:00Z",
+        "observed_at": "2026-08-12T00:00:00Z",
+        "run_seq": 1,
+        "type": "agent.recovery.started",
+        "agent_id": "kani",
+        "run_id": run_id,
+        "session_id": "session-1",
+        "invocation_id": "invocation-1",
+        "generation": 1,
+        "lifecycle_state": "observed",
+        "data": {"slice_id": "issue-814", "cause": "human_decision_required"},
+    }
+    source = SyntheticQueue([project(raw)])
+    loop = ShadowLoop.for_run(
+        source,
+        run_id,
+        readonly_client=ReadOnlyEffectClient(EffectClient(_RecordingTransport())),
+        repository_identity=SHADOW_REPOSITORY_IDENTITY,
+        root_dir=tmp_path,
+    )
+    checkpoint_before = loop.store.path.read_bytes()
+
+    result = loop.run()
+
+    assert source.acknowledged == [1]
+    assert result.actions == ()
+    assert loop.store.path.read_bytes() == checkpoint_before
+
+
 def test_shadow_recovery_stays_nonterminal_until_pr_is_filed() -> None:
     current = SliceState(
         id="slice-a",

@@ -25,6 +25,7 @@ from tl_loop.fsm.event import (
     PRMerged,
     PRUpdated,
     PublicationObserved,
+    RecoveryObserved,
     TLEvent,
 )
 from tl_loop.fsm.phase import (
@@ -223,6 +224,10 @@ class TLEventDecoder:
             # Inbox delivery is consumed through the inbox API. These ledger
             # rows are telemetry for the TL FSM, not phase transitions.
             return InboxNotificationObserved(event.event_type)
+        if event.kind is EventKind.AGENT_RECOVERY_STARTED:
+            # The owning scope checkpoints recovery before emitting this row.
+            # It is durable audit telemetry, not a second recovery transition.
+            return RecoveryObserved(event.event_type)
         if event.kind is EventKind.PR_MERGED:
             return PRMerged(_positive_int(event.data, "pr_number", event.event_type), _agent(event))
         raise ShadowLoopError(f"no shadow FSM mapping for {event.event_type!r}")
@@ -369,7 +374,10 @@ class ShadowLoop:
                 self.source.acknowledge(event)
                 continue
             fsm_event = self.decoder.decode(event)
-            if isinstance(fsm_event, (PublicationObserved, InboxNotificationObserved)):
+            if isinstance(
+                fsm_event,
+                (PublicationObserved, InboxNotificationObserved, RecoveryObserved),
+            ):
                 # Telemetry-only rows are acknowledged without an FSM transition
                 # or slice mutation; the immutable ledger retains their payload.
                 self.source.acknowledge(event)

@@ -58,6 +58,7 @@ from tl_loop.fsm.event import (
     PRMerged,
     PRUpdated,
     PublicationObserved,
+    RecoveryObserved,
     TLEvent,
 )
 from tl_loop.fsm.lane import (
@@ -5313,7 +5314,10 @@ def _run_loop(
             fsm_event = decoder.decode(event)
         except Exception as error:
             raise TLLoopError(str(error)) from error
-        if isinstance(fsm_event, (PublicationObserved, InboxNotificationObserved)):
+        if isinstance(
+            fsm_event,
+            (PublicationObserved, InboxNotificationObserved, RecoveryObserved),
+        ):
             # Telemetry-only rows are acknowledged without an FSM transition or
             # slice mutation; the immutable ledger retains their audit payload.
             diagnostics.correlated += 1

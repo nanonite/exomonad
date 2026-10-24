@@ -715,6 +715,21 @@ def seed_root(
     )
     kani_state = kani_store.load()
     kani_failure = kani_state.recursive_fsm.reason
+    # This acceptance fixture represents the current #814 task-blocked state
+    # alongside the immutable earlier dirty-preflight rejection. Keep the
+    # attempt and journal exactly as recorded, but make the leaf an active
+    # human-blocked attempt so event 108045 is replayed before any PR exists.
+    blocked_leaf = replace(
+        kani_state.slices[failed_leaf_name],
+        status=SliceStatus.BLOCKED,
+        park_cause=ParkCause.HUMAN_DECISION_REQUIRED,
+    )
+    kani_state = kani_store.checkpoint(
+        kani_state.recursive_fsm,
+        {**kani_state.slices, failed_leaf_name: blocked_leaf},
+        kani_state.budgets,
+        kani_state.events.last_consumed_offset,
+    )
     failed_kani = replace(
         root_state.slices["kani"],
         status=SliceStatus.FAILED,

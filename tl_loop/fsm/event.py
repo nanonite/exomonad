@@ -100,6 +100,13 @@ class InboxNotificationObserved(TLEvent):
 
 
 @dataclass(frozen=True)
+class RecoveryObserved(TLEvent):
+    """Telemetry for recovery checkpoints already projected by the owning scope."""
+
+    event_type: str
+
+
+@dataclass(frozen=True)
 class AllChildrenDone(TLEvent):
     """All children have completed their lifecycle."""
 
