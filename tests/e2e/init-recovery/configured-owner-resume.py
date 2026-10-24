@@ -247,6 +247,7 @@ def resume(repository: Path, baseline_path: Path, output: Path) -> None:
     # The process log is deliberately outside the disposable repository.
     agent_log = Path(os.environ["E2E_AGENT_LOG"])
     wait_for_agent_event(agent_log, "recovery_worker_filed_pr")
+    wait_for_agent_event(agent_log, "recovery_worker_notified_parent")
     history = repository / ".exo/events" / f"{identity['agent_name']}.jsonl"
     history_lines = history.read_text(encoding="utf-8").splitlines()
     if history_lines[: len(baseline["history_lines"])] != baseline["history_lines"]:
@@ -521,6 +522,7 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
     assert activity.get("historical_opencode_owner_failed") == 1
     assert activity.get("recovery_worker_started") == 1
     assert activity.get("recovery_worker_filed_pr") == 1
+    assert activity.get("recovery_worker_notified_parent") == 1
     evidence_path.write_text(
         json.dumps(evidence, sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
