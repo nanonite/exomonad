@@ -16530,22 +16530,26 @@ def _ensure_ordered_parent_ready_for_provision(
     task: SubTLTask,
     config: TLLoopConfig,
     store: RunStore,
-) -> RunState:
-    """Reopen only the exact, proved failed child before provisioning it."""
+) -> TLLoopConfig:
+    """Revalidate and reopen only the proved child before binding its invocation."""
+    if config.ordered_recovery_child != task.name or not store.path.exists():
+        return config
     state = store.load()
     if isinstance(state.recursive_fsm, RecursiveTLRunning):
-        return state
-    plan = _failed_ordered_parent_recovery(task, config, store, state)
+        return _continued_ordered_recovery_config(state, config)
+    decision = _failed_ordered_parent_recovery(task, config, store, state)
+    plan = _work_plan_from_manifest(state.plan_manifest)
     reopened = _reopen_ordered_scope(
         state,
         plan,
         store,
         task.name,
+        authorized=decision.authorized,
         expected_revision=state.revision,
     )
     if not isinstance(reopened.recursive_fsm, RecursiveTLRunning):
         raise TLLoopError(f"ordered sub-TL recovery did not reopen parent scope {store.run_id!r}")
-    return reopened
+    return replace(config, ordered_recovery_child=task.name)
 
 
 def _failed_ordered_parent_recovery(
@@ -16553,7 +16557,7 @@ def _failed_ordered_parent_recovery(
     config: TLLoopConfig,
     store: RunStore,
     state: RunState,
-) -> WorkPlan:
+) -> OrderedRecoveryDecision:
     if (
         config.ordered_recovery_child != task.name
         or not isinstance(state.recursive_fsm, RecursiveTLFailed)
@@ -16570,7 +16574,7 @@ def _failed_ordered_parent_recovery(
         raise TLLoopError(
             f"ordered sub-TL provisioning remains blocked for {task.name!r}: {reason}"
         )
-    return plan
+    return decision
 
 
 def _run_live_sub_tl(
@@ -16587,13 +16591,13 @@ def _run_live_sub_tl(
     child_store = RunStore(task.name, store.run_dir)
     owned_source: LedgerQueue | None = None
     try:
-        _ensure_ordered_parent_ready_for_provision(task, config, store)
+        effective_config = _ensure_ordered_parent_ready_for_provision(task, config, store)
         child_source = task.source
         if child_source is None:
             child_source, owned_source = _child_source(
                 source,
                 task,
-                config,
+                effective_config,
                 store,
                 child_store,
             )
@@ -16614,9 +16618,15 @@ def _run_live_sub_tl(
                 pr_number=published_pr_number,
                 head_sha=published_head_sha,
             )
+            # A host may have started the replacement controller just before a
+            # concurrent recovery write restored the parent's terminal label.
+            # Re-prove the same selected child before binding the response.
+            effective_config = _ensure_ordered_parent_ready_for_provision(
+                task, effective_config, store
+            )
             _checkpoint_ordered_sub_tl_invocation(store, task.name, invocation_id)
         child_config = _child_config(
-            config,
+            effective_config,
             task,
             child_source,
             effects,
@@ -16624,7 +16634,7 @@ def _run_live_sub_tl(
             branch,
             worktree,
             keep_alive_on_waiting=True,
-            ordered_recovery=config.ordered_recovery_child == task.name,
+            ordered_recovery=effective_config.ordered_recovery_child == task.name,
         )
         result = tl_run({"run_id": task.name, "plan": task.plan}, child_config, budgets)
         final_state = getattr(result, "final_state", None)

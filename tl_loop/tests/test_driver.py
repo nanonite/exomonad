@@ -15973,6 +15973,10 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
         current_order=1,
         ordered_stages=ordered_stages,
     )
+    root_recovery_gate = driver_module._ordered_recovery_gate_name("kani")
+    root_store.set_gate(root_recovery_gate, GateStatus.PENDING)
+    root_store.answer_gate(root_recovery_gate, GateStatus.APPROVED)
+    root_state = root_store.load()
     child_manifest = root_manifest.child_manifests[
         next(node.node_id for node in root_manifest.nodes if node.name == "kani")
     ]
@@ -16185,9 +16189,23 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
     @dataclass
     class ProvisionTransport(RecordingTransport):
         provisioned: list[dict[str, object]] = field(default_factory=list)
+        parent_terminalized_after_provision: bool = False
 
         def provision_ordered_sub_tl(self, caller, **arguments):
             self.provisioned.append({"caller": caller, **arguments})
+            parent = root_store.load()
+            assert isinstance(parent.recursive_fsm, RecursiveTLRunning)
+            failed_kani = replace(parent.slices["kani"], status=SliceStatus.FAILED)
+            root_store.checkpoint(
+                RecursiveTLFailed("interrupted parent recovery projection"),
+                {**parent.slices, "kani": failed_kani},
+                parent.budgets,
+                parent.events.last_consumed_offset,
+                current_order=parent.current_order,
+                ordered_stages=parent.ordered_stages,
+                integration=parent.integration,
+            )
+            self.parent_terminalized_after_provision = True
             return "server-confirmed-kani-successor"
 
     transport = ProvisionTransport()
@@ -16208,6 +16226,7 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
         root_store.load().budgets,
     )
     assert len(transport.provisioned) == 1
+    assert transport.parent_terminalized_after_provision
     checkpointed_parent = root_store.load()
     assert isinstance(checkpointed_parent.recursive_fsm, RecursiveTLRunning)
     assert checkpointed_parent.slices["kani"].status is SliceStatus.SPAWNED
