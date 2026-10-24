@@ -1352,6 +1352,7 @@ tmux set-environment -t "$AGGREGATE_SESSION" E2E_AGG_REPO "$AGG_REPO"
 # The accepted Kani declaration keeps its historical OpenCode route. The
 # replacement invocation must use the operator's current Codex configuration.
 tmux set-environment -t "$AGGREGATE_SESSION" CODEX_HOME "$CODEX_HOME"
+tmux set-environment -t "$AGGREGATE_SESSION" HOME "$AGG_HOME"
 tmux set-window-option -t "$AGGREGATE_SESSION:TL" remain-on-exit on
 [[ "$(tmux show-environment -t "$AGGREGATE_SESSION" GIT_SSH_COMMAND)" == \
     "GIT_SSH_COMMAND=$AGG_DIR/git-ssh" ]] \
