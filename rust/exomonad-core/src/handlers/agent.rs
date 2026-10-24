@@ -6232,8 +6232,9 @@ mod tests {
 
         let invocation_before_owner_check =
             std::fs::read(&invocation_path).expect("read successor owner binding");
-        let mut conflicting_owner: InvocationRecord = serde_json::from_slice(&invocation_before_owner_check)
-            .expect("parse successor invocation");
+        let mut conflicting_owner: InvocationRecord =
+            serde_json::from_slice(&invocation_before_owner_check)
+                .expect("parse successor invocation");
         conflicting_owner.runtime_agent_id = Some("issue-814-foreign-owner".to_string());
         std::fs::write(
             &invocation_path,

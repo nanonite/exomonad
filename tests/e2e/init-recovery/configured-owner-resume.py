@@ -53,6 +53,28 @@ def invocation(owner_dir: Path) -> dict[str, Any]:
     return json.loads((owner_dir / "invocation.json").read_text(encoding="utf-8"))
 
 
+def retained_rejected_request(repository: Path) -> dict[str, Any]:
+    journal = json.loads(
+        (repository / ".exo/tl-loop/root/kani/action-journal.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    matches = [
+        row
+        for row in journal
+        if row.get("operation") == "spawn_leaf"
+        and row.get("target") == OWNER_SLICE
+        and row.get("status") == "rejected"
+        and row.get("arguments", {}).get("intent_id")
+        == "seed-issue-814-rejected-spawn-intent"
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"expected one immutable original rejected Kani request, found {len(matches)}"
+        )
+    return matches[0]
+
+
 def wait_for_terminal(owner_dir: Path) -> dict[str, Any]:
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -126,6 +148,7 @@ def seed(repository: Path, output: Path) -> None:
         "identity": identity,
         "prior_invocation": original,
         "task": planned_task,
+        "rejected_request": retained_rejected_request(repository),
         "prior_invocation_file_sha256": digest(invocation_path),
         "branch": identity["birth_branch"],
         "worktree": str(worktree),
@@ -156,6 +179,8 @@ def resume(repository: Path, baseline_path: Path, output: Path) -> None:
     prior = invocation(owner_dir)
     if prior != baseline["prior_invocation"]:
         raise RuntimeError("the historical OpenCode invocation changed before resume")
+    if retained_rejected_request(repository) != baseline["rejected_request"]:
+        raise RuntimeError("the original rejected Kani request changed before resume")
     child = json.loads(
         (repository / ".exo/tl-loop/root/kani/run.json").read_text(encoding="utf-8")
     )
@@ -306,6 +331,7 @@ def resume(repository: Path, baseline_path: Path, output: Path) -> None:
     record = {
         "owner_agent_name": identity["agent_name"],
         "prior_invocation_id": prior["invocation_id"],
+        "rejected_request": baseline["rejected_request"],
         "successor_invocation_id": successor["invocation_id"],
         "branch": baseline["branch"],
         "worktree": str(baseline["worktree"]),
@@ -377,6 +403,8 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     owner_dir, _ = owner_for(repository)
     reviewer_dir = repository / ".exo/agents" / evidence["reviewer_name"]
+    if retained_rejected_request(repository) != evidence["rejected_request"]:
+        raise RuntimeError("repeat init changed the original rejected Kani request")
     assert (
         digest(owner_dir / "invocation.json") == evidence["successor_invocation_sha256"]
     )
