@@ -88,10 +88,13 @@ def wait_for_terminal(owner_dir: Path) -> dict[str, Any]:
 def seed(repository: Path, output: Path) -> None:
     transport = TransportClient(project_root=repository, timeout=15)
     controller = EffectClient(transport, role="tl", name="kani")
-    child = json.loads(
-        (repository / ".exo/tl-loop/root/kani/run.json").read_text(encoding="utf-8")
+    snapshot = json.loads(
+        (repository / ".exo/tl-loop/plan.snapshot").read_text(encoding="utf-8")
     )
-    planned_task = child["slices"][OWNER_SLICE]["task"]
+    declarations = snapshot["plan"]["sub_tls"]
+    kani_declaration = next(row for row in declarations if row["name"] == "kani")
+    leaves = kani_declaration["plan"]["leaves"]
+    planned_task = next(row for row in leaves if row["name"] == OWNER_SLICE)["task"]
     if not isinstance(planned_task, str) or not planned_task.strip():
         raise RuntimeError(
             "accepted Kani declaration has no task for its historical owner"
