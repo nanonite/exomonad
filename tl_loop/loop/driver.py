@@ -2668,28 +2668,6 @@ def _ordered_child_recovery_reason(
     )
     if expected_child is None or child_state.plan_manifest.digest != expected_child.digest:
         return _hard_failure("child checkpoint plan manifest does not match the parent declaration")
-    diagnostic = child_store.exit_diagnostics()
-    rejection = _proven_preexecution_dispatch_rejection(child_state, child_store)
-    if isinstance(diagnostic, Mapping):
-        binding_error = _ordered_exit_diagnostic_binding_error(diagnostic, child_state)
-        if binding_error is not None:
-            return _hard_failure(binding_error)
-    elif rejection is None:
-        return _hard_failure(
-            "durable child exit diagnostic is missing and checkpoint/journal do not prove "
-            "a pre-execution dispatch refusal"
-        )
-    exit_reason = diagnostic.get("reason") if isinstance(diagnostic, Mapping) else None
-    if rejection is None and (not isinstance(exit_reason, str) or not exit_reason):
-        return _hard_failure("durable child exit diagnostic has no failure reason")
-    if rejection is None and not _retryable_ordered_exit_reason(cast(str, exit_reason)):
-        # Every ownership, publication, and effect proof above already holds, so
-        # the only thing left unproven is how this message is classified. That
-        # judgement is exactly what an operator is being asked to make.
-        return _ChildRecoveryProof(
-            f"child exit is not a retryable startup, transport, or process failure: {exit_reason}",
-            True,
-        )
     integration = child_state.integration
     if integration.lifecycle in {
         IntegrationLifecycle.MERGED,
@@ -2707,6 +2685,36 @@ def _ordered_child_recovery_reason(
             return _hard_failure(
                 blocked_reason or "child has a blocked slice without a unique approved resume proof"
             )
+    diagnostic = child_store.exit_diagnostics()
+    rejection = _proven_preexecution_dispatch_rejection(child_state, child_store)
+    if isinstance(diagnostic, Mapping):
+        binding_error = _ordered_exit_diagnostic_binding_error(diagnostic, child_state)
+        if binding_error is not None:
+            return _hard_failure(binding_error)
+    elif rejection is None and blocked_proof is None:
+        return _hard_failure(
+            "durable child exit diagnostic is missing and checkpoint/journal do not prove "
+            "a pre-execution dispatch refusal"
+        )
+    exit_reason = diagnostic.get("reason") if isinstance(diagnostic, Mapping) else None
+    if (
+        rejection is None
+        and blocked_proof is None
+        and (not isinstance(exit_reason, str) or not exit_reason)
+    ):
+        return _hard_failure("durable child exit diagnostic has no failure reason")
+    if (
+        rejection is None
+        and blocked_proof is None
+        and not _retryable_ordered_exit_reason(cast(str, exit_reason))
+    ):
+        # Every ownership, publication, and effect proof above already holds, so
+        # the only thing left unproven is how this message is classified. That
+        # judgement is exactly what an operator is being asked to make.
+        return _ChildRecoveryProof(
+            f"child exit is not a retryable startup, transport, or process failure: {exit_reason}",
+            True,
+        )
     for slice_state in child_state.slices.values():
         if slice_state.status in {
             SliceStatus.FAILED,

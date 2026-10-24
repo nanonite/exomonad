@@ -15897,6 +15897,262 @@ def test_continue_records_scoped_hold_for_invalid_completed_sub_tl_receipt(
     )
 
 
+def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnostic(
+    tmp_path: Path,
+) -> None:
+    """A child returned TLFailed because its approved leaf awaits controller resume."""
+    issue_slice = "issue-814-substitution-model-kani"
+    leaf_plan = WorkPlan.from_mapping(
+        {
+            "leaves": [
+                {
+                    "name": issue_slice,
+                    "task": "Resume the configured Kani assignment",
+                    "chainlink_issue_id": 814,
+                    "agent_type": "codex/gpt-6-luna",
+                }
+            ]
+        }
+    )
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask("kani", leaf_plan, order=1),
+            SubTLTask("later", WorkPlan(), order=2),
+        )
+    )
+    project = tmp_path / "repo"
+    project.mkdir()
+    root_config = replace(
+        _config(),
+        run_id="root",
+        root_dir=tmp_path,
+        project_root=project,
+        branch="main",
+        agent_id="root-controller",
+        session_mode="continue",
+        ordered_recovery=True,
+    )
+    root_manifest = driver_module._manifest_for_plan(plan, "root", root_config)
+    root_slices = _initial_slices(plan, root_config, tmp_path, "root")
+    create(
+        "root",
+        {
+            "slices": root_slices,
+            "repository_identity": {"remote_url": root_config.repository_identity.remote_url},
+        },
+        root_dir=tmp_path,
+    )
+    root_store = RunStore("root", tmp_path)
+    root_store.set_plan_manifest(root_manifest, slices=root_slices)
+    ordered_stages = tuple(
+        driver_module.OrderedStageState(stage.order, stage.sub_tls) for stage in plan.ordered_stages
+    )
+    root_state = root_store.set_ordered_state(1, ordered_stages, root_store.load().integration)
+    task = plan.sub_tls[0]
+    child_branch = driver_module.derive_child_branch(root_config.branch, "kani")
+    child_worktree = str(
+        driver_module._sub_tl_worktree(root_config, root_store.run_dir, "root", task)
+    )
+    parent_slice = replace(
+        root_state.slices["kani"],
+        status=SliceStatus.FAILED,
+        attempts=1,
+        branch=child_branch,
+        worktree=child_worktree,
+        dispatch_intent_id="accepted-kani-intent",
+        dispatch_agent_id="kani",
+        dispatch_invocation_id="dormant-kani-invocation",
+        dispatch_authoritative_event_seq=1,
+        dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
+    )
+    root_state = root_store.checkpoint(
+        RecursiveTLFailed("previous root invocation returned after child recovery parked"),
+        {**root_state.slices, "kani": parent_slice},
+        root_state.budgets,
+        root_state.events.last_consumed_offset,
+        current_order=1,
+        ordered_stages=ordered_stages,
+    )
+    child_manifest = root_manifest.child_manifests[
+        next(node.node_id for node in root_manifest.nodes if node.name == "kani")
+    ]
+    child_config = replace(
+        root_config,
+        run_id="kani",
+        branch=child_branch,
+        worktree=child_worktree,
+        parent_run_id="root",
+        parent_branch="main",
+        parent_agent_id="kani",
+        depth=1,
+        declared_manifest=child_manifest,
+    )
+    child_slices = _initial_slices(leaf_plan, child_config, root_store.run_dir, "kani")
+    create(
+        "kani",
+        {
+            "slices": child_slices,
+            "repository_identity": {"remote_url": root_config.repository_identity.remote_url},
+            "owner_branch": child_branch,
+            "owner_worktree": child_worktree,
+            "parent_run_id": "root",
+            "parent_branch": "main",
+            "parent_agent_id": "kani",
+            "depth": 1,
+        },
+        root_dir=root_store.run_dir,
+    )
+    child_store = RunStore("kani", root_store.run_dir)
+    child_store.set_plan_manifest(child_manifest, slices=child_slices)
+    leaf = child_store.load().slices[issue_slice]
+    owner_worktree = Path(leaf.worktree or "")
+    owner_worktree.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "-b", cast(str, leaf.branch), str(owner_worktree)],
+        check=True,
+        capture_output=True,
+    )
+    owner_name = f"{issue_slice}-opencode"
+    owner_dir = project / ".exo" / "agents" / owner_name
+    owner_dir.mkdir(parents=True)
+    (owner_dir / "active_issue").write_text("814\n", encoding="utf-8")
+    (owner_dir / "identity.json").write_text(
+        json.dumps(
+            {
+                "agent_name": owner_name,
+                "slug": issue_slice,
+                "slice_id": issue_slice,
+                "agent_type": "opencode",
+                "model": "opencode-go/deepseek-v4.1-flash",
+                "effort": "high",
+                "birth_branch": leaf.branch,
+                "parent_branch": child_branch,
+                "working_dir": str(owner_worktree),
+                "topology": "worktree_per_agent",
+                "ledger_owned": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (owner_dir / "invocation.json").write_text(
+        json.dumps(
+            {
+                "invocation_id": "failed-opencode-invocation",
+                "generation": 1,
+                "status": "failed",
+                "runtime": "opencode",
+                "model": "opencode-go/deepseek-v4.1-flash",
+                "effort": "high",
+                "trigger": "spawn",
+                "branch": leaf.branch,
+                "worktree": str(owner_worktree),
+                "pr_number": None,
+                "head_sha": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    refusal = (
+        "BLOCKED: cannot spawn agent into a dirty TL worktree. 2 file(s) have uncommitted changes:\n"
+        "  .exo/harness_policy.toml\n  CHANGELOG.md\n"
+        "Commit the scaffold (per scaffold-fork-converge) or run `discard_worker_output` if throwaway, then retry. "
+        "Workers spawn in-place and would inherit this state; dev-leaves fork from your branch HEAD and would not see your uncommitted work."
+    )
+    recovery = driver_module.transition_recovery(
+        begin_recovery(
+            cause="human_decision_required",
+            owner_run_id="kani",
+            slice_attempt=1,
+            owner_agent_id=None,
+            invocation_generation=0,
+            plan_revision=child_manifest.manifest_revision,
+            evidence={
+                "slice_id": issue_slice,
+                "authorization_source": "human",
+                "outcome": "blocked",
+                "needs_human": True,
+            },
+            next_action="open_human_gate",
+        ),
+        RecoveryPhase.HUMAN_GATE,
+        next_action="resume_blocked_leaf",
+    )
+    blocked_leaf = replace(
+        leaf,
+        status=SliceStatus.BLOCKED,
+        attempts=1,
+        dispatch_intent_id="rejected-opencode-spawn-intent",
+        dispatch_generation=1,
+        dispatch_started_at=1700000001.0,
+        dispatch_last_boundary="spawn_request_failed",
+        dispatch_error=refusal,
+        dispatch_error_code="agent_error",
+        park_cause=ParkCause.HUMAN_DECISION_REQUIRED,
+        recovery=recovery,
+    )
+    child_store.checkpoint(
+        RecursiveTLFailed("child returned while its approved leaf was blocked"),
+        {**child_slices, issue_slice: blocked_leaf},
+        child_store.load().budgets,
+        child_store.load().events.last_consumed_offset,
+    )
+    child_dispatch_gate = driver_module._dispatch_failure_gate_name(issue_slice, "agent_error")
+    child_store.set_gate(child_dispatch_gate, GateStatus.PENDING)
+    rejected = EffectIntent(
+        "spawn_leaf",
+        issue_slice,
+        {
+            "name": issue_slice,
+            "task": leaf_plan.leaves[0].task,
+            "intent_id": "rejected-opencode-spawn-intent",
+        },
+        True,
+    )
+    journal = EffectJournal("kani", child_store.run_dir / "action-journal.json")
+    journal.append(rejected)
+    journal.mark_result(
+        rejected,
+        ToolResult(
+            {
+                "success": False,
+                "result": None,
+                "error": refusal,
+                "error_kind": None,
+                "error_context": None,
+            },
+            False,
+            None,
+            refusal,
+        ),
+    )
+    assert not child_store.exit_diagnostics()
+
+    pending_decision = driver_module._ordered_terminal_recovery_decision(
+        root_state,
+        plan,
+        root_config,
+        root_store,
+    )
+    assert pending_decision is not None
+    assert not pending_decision.recoverable
+    assert pending_decision.reason == (
+        f"required leaf recovery gate {child_dispatch_gate!r} is not approved"
+    )
+
+    child_store.answer_gate(child_dispatch_gate, GateStatus.APPROVED)
+    decision = driver_module._ordered_terminal_recovery_decision(
+        root_state,
+        plan,
+        root_config,
+        root_store,
+    )
+
+    assert decision is not None
+    assert decision.recoverable
+    assert decision.task_name == "kani"
+    assert "diagnostic" not in decision.reason
+
+
 def test_ordered_recovery_keeps_declared_aggregate_not_required_outcome(
     tmp_path: Path,
 ) -> None:

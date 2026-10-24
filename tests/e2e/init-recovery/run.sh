@@ -304,6 +304,10 @@ assert recovery.slice_attempt == 1
 assert recovery.evidence.get("matched_difficulty_rule") == "missing_handoff:nonzero_exit"
 assert state.events.last_consumed_offset >= run_seq, "event was not acknowledged after durable projection"
 assert not any(gate.name == f"task-blocked-owner:{run_seq}" for gate in state.gates)
+assert any(
+    gate.name == "tl-ordered-child-recovery-kani" and gate.status.value == "pending"
+    for gate in state.gates
+), "root recovery projection did not retain its pending approval gate"
 assert state.slices["architecture"].status.value == "merged"
 assert state.slices["kani"].status.value != "merged"
 assert state.current_order == 2
@@ -312,6 +316,14 @@ root_document = json.loads((root_dir / "run.json").read_text(encoding="utf-8"))
 assert root_document["slices"]["architecture"] == before["architecture_slice"]
 assert root_document["slices"]["kani"]["status"] == before["kani_slice"]["status"]
 assert root_document["slices"]["handoff-proof"]["status"] == "pending"
+assert root_document["slices"]["kani"]["dispatch_intent_id"] == before["kani_slice"]["dispatch_intent_id"]
+assert root_document["slices"]["kani"]["dispatch_invocation_id"] == before["kani_slice"]["dispatch_invocation_id"]
+assert leaf_state.status.value == "blocked"
+assert any(
+    gate.name == "tl-dispatch-failed-issue-814-substitution-model-kani"
+    and gate.status.value == "pending"
+    for gate in child_state.gates
+), "child human-recovery projection did not retain its pending approval gate"
 
 def fingerprint(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -387,6 +399,17 @@ assert_init_status() {
     fi
     cat "$log_path"
     e2e_fail "$context exited with status $status"
+}
+
+assert_blocked_human_gate_hold() {
+    local status="$1"
+    local log_path="$2"
+    [[ "$status" -ne 0 ]] \
+        || e2e_fail "active blocker replay unexpectedly passed an unapproved human recovery gate"
+    rg -Fq "required leaf recovery gate 'tl-dispatch-failed-issue-814-substitution-model-kani' is not approved" "$log_path" \
+        || { cat "$log_path"; e2e_fail "active blocker replay did not stop at the precise pending leaf recovery gate"; }
+    rg -Fq 'tl-ordered-child-recovery-kani status=pending' "$log_path" \
+        || { cat "$log_path"; e2e_fail "active blocker replay omitted the pending parent recovery gate"; }
 }
 
 assert_one_live_window() {
@@ -1486,7 +1509,11 @@ AGG_INIT_STATUS=0
 HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
     "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
     > "$AGG_DIR/init.log" 2>&1 || AGG_INIT_STATUS=$?
-assert_init_status "$AGG_INIT_STATUS" "$AGG_DIR/init.log" "aggregate init --continue after legacy recovery"
+if [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
+    assert_blocked_human_gate_hold "$AGG_INIT_STATUS" "$AGG_DIR/init.log"
+else
+    assert_init_status "$AGG_INIT_STATUS" "$AGG_DIR/init.log" "aggregate init --continue after legacy recovery"
+fi
 [[ "$(rg -F -c 'Recovered a proven orphan native Git lock' "$AGG_DIR/init.log" || printf '0')" == "0" ]] \
     || { cat "$AGG_DIR/init.log"; e2e_fail "legacy lock was misreported as a managed orphan"; }
 [[ "$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)" != "$PRE_RECOVERY_CONTROLLER_EPOCH" ]] \
