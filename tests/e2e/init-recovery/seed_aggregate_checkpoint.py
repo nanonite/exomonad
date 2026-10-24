@@ -369,6 +369,7 @@ def seed_root(
     aggregate_head: str,
     base_sha: str,
     merged_remote_head: str,
+    active_kani_blocker: bool,
 ) -> dict[str, object]:
     from tl_loop.client.effects import EffectClient, ToolResult
     from tl_loop.fsm.lane import LanePhase, LaneState
@@ -715,21 +716,20 @@ def seed_root(
     )
     kani_state = kani_store.load()
     kani_failure = kani_state.recursive_fsm.reason
-    # This acceptance fixture represents the current #814 task-blocked state
-    # alongside the immutable earlier dirty-preflight rejection. Keep the
-    # attempt and journal exactly as recorded, but make the leaf an active
-    # human-blocked attempt so event 108045 is replayed before any PR exists.
-    blocked_leaf = replace(
-        kani_state.slices[failed_leaf_name],
-        status=SliceStatus.BLOCKED,
-        park_cause=ParkCause.HUMAN_DECISION_REQUIRED,
-    )
-    kani_state = kani_store.checkpoint(
-        kani_state.recursive_fsm,
-        {**kani_state.slices, failed_leaf_name: blocked_leaf},
-        kani_state.budgets,
-        kani_state.events.last_consumed_offset,
-    )
+    if active_kani_blocker:
+        # The event-108045 fixture keeps the leaf actively human-blocked before
+        # replay; the ordinary retry fixture retains the proven dispatch refusal.
+        blocked_leaf = replace(
+            kani_state.slices[failed_leaf_name],
+            status=SliceStatus.BLOCKED,
+            park_cause=ParkCause.HUMAN_DECISION_REQUIRED,
+        )
+        kani_state = kani_store.checkpoint(
+            kani_state.recursive_fsm,
+            {**kani_state.slices, failed_leaf_name: blocked_leaf},
+            kani_state.budgets,
+            kani_state.events.last_consumed_offset,
+        )
     failed_kani = replace(
         root_state.slices["kani"],
         status=SliceStatus.FAILED,
@@ -1290,6 +1290,7 @@ def main() -> None:
     parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--mock-url", required=True)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--active-kani-blocker", action="store_true")
     args = parser.parse_args()
     (
         leaf_pr,
@@ -1308,7 +1309,9 @@ def main() -> None:
         aggregate_head=aggregate_head,
         base_sha=base_sha,
         merged_remote_head=merged_remote_head,
+        active_kani_blocker=args.active_kani_blocker,
     )
+    result["active_kani_blocker"] = args.active_kani_blocker
     seed_dormant_kani_controller(args.repo, result)
     result["dormant_controller_invocation_id"] = DORMANT_KANI_INVOCATION_ID
     result["preserved_local_edits"] = seed_local_edits(args.repo)

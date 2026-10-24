@@ -1146,8 +1146,13 @@ export E2E_GIT_REMOTE_DIR="$AGG_REMOTE"
 [[ "$(git -C "$AGG_REPO" config --get core.sshCommand)" == "$AGG_DIR/git-ssh" ]] \
     || e2e_fail "Phase 8 Git transport does not target its isolated remote"
 
+SEED_AGGREGATE_ARGS=()
+if [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
+    SEED_AGGREGATE_ARGS+=(--active-kani-blocker)
+fi
 PYTHONPATH="$PROJECT_ROOT" python3 "$SCRIPT_DIR/seed_aggregate_checkpoint.py" \
     --repo "$AGG_REPO" --mock-url "$AGG_MOCK_URL" --output "$AGG_DIR/seed.json" \
+    "${SEED_AGGREGATE_ARGS[@]}" \
     > "$AGG_DIR/seed.log" \
     || { cat "$AGG_DIR/seed.log"; cat "$AGG_DIR/mock.stderr"; e2e_fail "failed to seed completed-aggregate/later-child recovery state"; }
 python3 - "$AGG_REPO" "$AGG_DIR/seed.json" <<'PY' \
@@ -1189,11 +1194,15 @@ assert kani["dispatch_intent_id"] and kani["dispatch_authoritative_event_seq"] =
 assert kani_child["run_id"] == "kani"
 assert kani_child["parent_run_id"] == "root"
 assert kani_child["fsm"]["phase"] == "tl_failed"
-assert failed_leaf["status"] == "blocked"
+if seed["active_kani_blocker"]:
+    assert failed_leaf["status"] == "blocked"
+    assert failed_leaf["park_cause"] == "human_decision_required"
+else:
+    assert failed_leaf["status"] == "dispatch_failed"
+    assert failed_leaf["park_cause"] == "dispatch_failed"
 assert failed_leaf["requested_harness"] == "opencode/opencode-go/deepseek-v4.1-flash"
 assert failed_leaf["dispatch_last_boundary"] == "spawn_request_failed"
 assert failed_leaf.get("dispatch_invocation_id") is None
-assert failed_leaf["park_cause"] == "human_decision_required"
 assert len(rejected_spawns) == 1
 assert rejected_spawns[0]["arguments"]["intent_id"] == failed_leaf["dispatch_intent_id"]
 assert rejected_spawns[0]["result"]["error"] == failed_leaf["dispatch_error"]
