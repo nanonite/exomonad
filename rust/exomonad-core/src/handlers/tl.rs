@@ -326,6 +326,8 @@ mod tests {
             "tl.spawn_requested",
             "tl.spawn_request_accepted",
             "tl.dispatch_confirmed",
+            "tl.dispatch_reconciliation_started",
+            "tl.dispatch_reconciliation_completed",
         ];
 
         for event_type in event_types {

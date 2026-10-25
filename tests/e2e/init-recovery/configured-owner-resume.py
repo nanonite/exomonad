@@ -501,6 +501,61 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
     owner_dir, _ = owner_for(repository)
     if retained_rejected_request(repository) != evidence["rejected_request"]:
         raise RuntimeError("repeat init changed the original rejected Kani request")
+    action_rows = json.loads(
+        (repository / ".exo/tl-loop/root/kani/action-journal.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    root_action_rows = json.loads(
+        (repository / ".exo/tl-loop/root/action-journal.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    rejected_controller_events = [
+        row
+        for row in [*action_rows, *root_action_rows]
+        if row.get("operation") == "emit_controller_event"
+        and row.get("status") == "rejected"
+    ]
+    if rejected_controller_events:
+        raise RuntimeError(
+            "repeat init retained rejected controller event calls: "
+            f"{rejected_controller_events!r}"
+        )
+    resume_actions = [
+        row
+        for row in action_rows
+        if row.get("operation") == "resume_blocked_leaf"
+        and row.get("target") == OWNER_SLICE
+        and row.get("status") == "confirmed"
+    ]
+    if (
+        len(resume_actions) != 1
+        or (resume_actions[0].get("result") or {})
+        .get("result", {})
+        .get("agent", {})
+        .get("invocation_id")
+        != evidence["successor_invocation_id"]
+    ):
+        raise RuntimeError(
+            "repeat init did not retain exactly one successful resume for the same successor"
+        )
+    reviewer_actions = [
+        row
+        for row in action_rows
+        if row.get("operation") == "spawn_reviewer"
+        and row.get("target") == OWNER_SLICE
+        and row.get("status") == "confirmed"
+        and row.get("arguments", {}).get("pr_number") == evidence["pr_number"]
+        and row.get("arguments", {}).get("head_sha") == evidence["head_sha"]
+    ]
+    if len(reviewer_actions) != 1 or (
+        (reviewer_actions[0].get("result") or {}).get("result", {}).get("reviewer_name")
+        != evidence["reviewer_name"]
+    ):
+        raise RuntimeError(
+            "repeat init did not retain exactly one configured reviewer action for the same PR head"
+        )
     assert (
         digest(owner_dir / "invocation.json") == evidence["successor_invocation_sha256"]
     )

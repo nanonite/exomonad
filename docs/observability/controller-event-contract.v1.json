@@ -190,7 +190,8 @@
         "requested_harness",
         "model",
         "controller_epoch",
-        "dispatch_generation"
+        "dispatch_generation",
+        "route_reconciliation_source"
       ]
     },
     "tl.dispatch_reconciliation_completed": {
@@ -206,7 +207,8 @@
         "requested_harness",
         "model",
         "controller_epoch",
-        "dispatch_generation"
+        "dispatch_generation",
+        "route_reconciliation_source"
       ]
     },
     "tl.dispatch_event_rejected": {

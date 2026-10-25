@@ -1690,7 +1690,6 @@ dispatch_events = [
 ]
 output.write_text(json.dumps({
     "root_journal_effects": journal_effect_fingerprint(root_dir / "action-journal.json"),
-    "kani_journal": digest(root_dir / "kani/action-journal.json"),
     "kani_invocation": digest(repo / ".exo/agents/kani/invocation.json"),
     "kani_identity": digest(repo / ".exo/agents/kani/identity.json"),
     "leaf_attempts": leaf["attempts"],
@@ -1790,7 +1789,6 @@ dispatch_events = [
 ]
 after = {
     "root_journal_effects": journal_effect_fingerprint(root_dir / "action-journal.json"),
-    "kani_journal": digest(root_dir / "kani/action-journal.json"),
     "kani_invocation": digest(repo / ".exo/agents/kani/invocation.json"),
     "kani_identity": digest(repo / ".exo/agents/kani/identity.json"),
     "leaf_attempts": leaf["attempts"],
