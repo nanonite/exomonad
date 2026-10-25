@@ -5295,6 +5295,7 @@ struct TlLoopTimeouts {
     transport: f64,
     active_tail: f64,
     task: f64,
+    worker_effort_level: String,
     dispatch_retry_limit: u32,
     dispatch_retry_base_delay: f64,
     dispatch_retry_max_delay: f64,
@@ -5306,6 +5307,7 @@ impl From<&Config> for TlLoopTimeouts {
             transport: config.tl_transport_timeout_seconds,
             active_tail: config.tl_active_tail_timeout_seconds,
             task: config.tl_task_timeout_seconds,
+            worker_effort_level: config.worker_effort_level.level.to_string(),
             dispatch_retry_limit: config.tl_dispatch_retry_limit,
             dispatch_retry_base_delay: config.tl_dispatch_retry_base_delay_seconds,
             dispatch_retry_max_delay: config.tl_dispatch_retry_max_delay_seconds,
@@ -5341,8 +5343,9 @@ fn tl_loop_command(
             )
         })
         .unwrap_or_default();
+    let worker_effort = shell_escape::escape(timeouts.worker_effort_level.as_str().into());
     let controller = format!(
-        "EXOMONAD_BINARY={binary} EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl {} {package} run --project-root {project} --plan {plan} --run-id root --wait-for-plan{expected_plan_arg} \
+        "EXOMONAD_BINARY={binary} EXOMONAD_AGENT_ID=root EXOMONAD_ROLE=tl EXOMONAD_WORKER_EFFORT_LEVEL={worker_effort} {} {package} run --project-root {project} --plan {plan} --run-id root --wait-for-plan{expected_plan_arg} \
            --transport-timeout {} --active-tail-timeout {} --task-timeout {} \
            --dispatch-retry-limit {} --dispatch-retry-base-delay {} --dispatch-retry-max-delay {}",
         shell_escape::escape(tl_loop_python(cwd).into()),
@@ -13395,6 +13398,7 @@ mod tests {
             transport: 45.5,
             active_tail: 60.0,
             task: 90.0,
+            worker_effort_level: "xhigh".to_owned(),
             dispatch_retry_limit: 7,
             dispatch_retry_base_delay: 2.5,
             dispatch_retry_max_delay: 30.0,
@@ -13407,6 +13411,7 @@ mod tests {
         );
         assert!(command.contains("EXOMONAD_BINARY="));
         assert!(command.contains("EXOMONAD_ROLE=tl"));
+        assert!(command.contains("EXOMONAD_WORKER_EFFORT_LEVEL=xhigh"));
         assert!(!command.contains("PYTHONPATH="));
         assert!(command.contains("python3 /tmp/exo run"));
         assert!(command.contains("--wait-for-plan"));
@@ -13426,6 +13431,7 @@ mod tests {
             transport: 1.0,
             active_tail: 2.0,
             task: 3.0,
+            worker_effort_level: "medium".to_owned(),
             dispatch_retry_limit: DEFAULT_TL_DISPATCH_RETRY_LIMIT,
             dispatch_retry_base_delay: DEFAULT_TL_DISPATCH_RETRY_BASE_DELAY_SECONDS,
             dispatch_retry_max_delay: DEFAULT_TL_DISPATCH_RETRY_MAX_DELAY_SECONDS,
@@ -13576,6 +13582,7 @@ mod tests {
             transport: 1.0,
             active_tail: 2.0,
             task: 3.0,
+            worker_effort_level: "medium".to_owned(),
             dispatch_retry_limit: DEFAULT_TL_DISPATCH_RETRY_LIMIT,
             dispatch_retry_base_delay: DEFAULT_TL_DISPATCH_RETRY_BASE_DELAY_SECONDS,
             dispatch_retry_max_delay: DEFAULT_TL_DISPATCH_RETRY_MAX_DELAY_SECONDS,

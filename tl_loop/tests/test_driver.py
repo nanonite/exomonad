@@ -18669,6 +18669,10 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
 
 def _seed_terminal_provider_failure_leaf(
     tmp_path: Path,
+    *,
+    prior_runtime: str = "opencode",
+    prior_model: str = "opencode-go/deepseek-v4.1-flash",
+    prior_effort: str = "high",
 ) -> tuple[WorkPlan, TLLoopConfig, RunStore, Path, str, str]:
     """Build the retained accepted-launch / terminal-provider-failure shape."""
     run_id = "substitution-model-kani-stage"
@@ -18697,7 +18701,7 @@ def _seed_terminal_provider_failure_leaf(
                     "name": slice_id,
                     "task": "Implement the Kani substitution model proof for issue 814",
                     "chainlink_issue_id": 814,
-                    "agent_type": "opencode/opencode-go/deepseek-v4.1-flash",
+                    "agent_type": f"{prior_runtime}/{prior_model}",
                     "boundary": ["crates/beast-rs-core/tests/kani_f64_substitution_model.rs"],
                     "verify": ["cargo kani -p beast-rs-core --tests"],
                 }
@@ -18731,6 +18735,7 @@ def _seed_terminal_provider_failure_leaf(
         capabilities=CapabilityMap({"codex/gpt-6-luna": Difficulty.STANDARD}),
         catalog=catalog,
         requested_model="gpt-6-luna",
+        worker_effort_level="xhigh",
         max_events=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
@@ -18825,9 +18830,9 @@ def _seed_terminal_provider_failure_leaf(
         branch=branch,
         worktree=str(planned_worktree),
         base_ref=config.branch,
-        agent_type="opencode",
-        model="opencode-go/deepseek-v4.1-flash",
-        resolved_harness="opencode/opencode-go/deepseek-v4.1-flash",
+        agent_type=prior_runtime,
+        model=prior_model,
+        resolved_harness=f"{prior_runtime}/{prior_model}",
         attempts=2,
         dispatch_intent_id=dispatch_intent_id,
         dispatch_started_at=1792734760.6998312,
@@ -18872,8 +18877,9 @@ def _seed_terminal_provider_failure_leaf(
             "name": slice_id,
             "task": plan.leaves[0].task,
             "intent_id": dispatch_intent_id,
-            "agent_type": "opencode",
-            "model": "opencode-go/deepseek-v4.1-flash",
+            "agent_type": prior_runtime,
+            "model": prior_model,
+            "effort": prior_effort,
             "branch_name": branch,
             "worktree_path": str(owner_worktree),
         },
@@ -18904,9 +18910,9 @@ def _seed_terminal_provider_failure_leaf(
                 "agent_name": owner_name,
                 "slug": slice_id,
                 "slice_id": slice_id,
-                "agent_type": "opencode",
-                "model": "opencode-go/deepseek-v4.1-flash",
-                "effort": "high",
+                "agent_type": prior_runtime,
+                "model": prior_model,
+                "effort": prior_effort,
                 "birth_branch": branch,
                 "parent_branch": config.branch,
                 "working_dir": str(owner_worktree),
@@ -18922,9 +18928,9 @@ def _seed_terminal_provider_failure_leaf(
                 "invocation_id": invocation_id,
                 "generation": 1,
                 "status": "failed",
-                "runtime": "opencode",
-                "model": "opencode-go/deepseek-v4.1-flash",
-                "effort": "high",
+                "runtime": prior_runtime,
+                "model": prior_model,
+                "effort": prior_effort,
                 "trigger": "spawn",
                 "branch": branch,
                 "worktree": str(owner_worktree),
@@ -18961,7 +18967,7 @@ def _seed_terminal_provider_failure_leaf(
                 "generation": 1,
                 "invocation_id": invocation_id,
                 "outcome": "started",
-                "runtime": "opencode",
+                "runtime": prior_runtime,
                 "slice_id": slice_id,
                 "status": "running",
                 "trigger": "spawn",
@@ -18981,13 +18987,13 @@ def _seed_terminal_provider_failure_leaf(
             "generation": None,
             "lifecycle_state": "emitted",
             "data": {
-                "agent_type": "OpenCode",
+                "agent_type": prior_runtime,
                 "branch": branch,
                 "child_agent": owner_name,
-                "effort": "high",
+                "effort": prior_effort,
                 "intent_id": dispatch_intent_id,
                 "invocation_id": invocation_id,
-                "model": "opencode-go/deepseek-v4.1-flash",
+                "model": prior_model,
                 "spawn_type": "leaf_subtree",
                 "topology": "worktreeperagent",
             },
@@ -19011,7 +19017,7 @@ def _seed_terminal_provider_failure_leaf(
                 "generation": 1,
                 "invocation_id": invocation_id,
                 "outcome": "finished",
-                "runtime": "opencode",
+                "runtime": prior_runtime,
                 "slice_id": slice_id,
                 "status": "failed",
                 "stderr_tail": "Upstream request failed: Insufficient account funds",
@@ -19063,6 +19069,8 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
     cancel_event = threading.Event()
     config = replace(config, cancel_event=cancel_event)
     successor_id = "codex-terminal-failure-successor"
+    gate_name = driver_module._terminal_owner_recovery_gate_name(plan.leaves[0].name)
+    store.set_gate(gate_name, GateStatus.PENDING)
     owner = driver_module.resolve_dormant_owner_for_slice(
         config.project_root,
         slice_id=plan.leaves[0].name,
@@ -19124,6 +19132,7 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
                 ),
                 encoding="utf-8",
             )
+            store.answer_gate(gate_name, GateStatus.REJECTED)
             cancel_event.set()
             return {
                 "success": True,
@@ -19173,6 +19182,10 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
     assert resumed.worktree == str(owner.worktree)
     assert resumed.dispatch_uses_current_role_configuration is True
     assert resumed.recovery is None
+    assert (
+        next(gate for gate in store.load().gates if gate.name == gate_name).status
+        is GateStatus.REJECTED
+    )
     assert resumed.pr_number is None and resumed.publication is None
     assert resumed.dispatch_last_boundary == "spawn_request_accepted"
     journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
@@ -19196,6 +19209,272 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
     assert (
         Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
     ).read_bytes() == original_ledger
+
+
+def test_startup_preserves_rejected_terminal_owner_recovery_gate(
+    tmp_path: Path,
+) -> None:
+    plan, config, store, _owner_dir, _owner_name, _prior_invocation_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    gate_name = driver_module._terminal_owner_recovery_gate_name(plan.leaves[0].name)
+    store.set_gate(gate_name, GateStatus.PENDING)
+    rejected = store.answer_gate(gate_name, GateStatus.REJECTED)
+    transport = RecordingTransport()
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+
+    result = driver_module._activate_startup_work(
+        plan,
+        rejected,
+        SyntheticQueue([]),
+        config,
+        EffectClient(transport),
+        store,
+        journal,
+        rejected.events.last_consumed_offset,
+    )
+
+    leaf = result.slices[plan.leaves[0].name]
+    assert leaf.status is SliceStatus.SPAWNED
+    assert leaf.recovery is not None and leaf.recovery.phase is RecoveryPhase.HUMAN_GATE
+    assert leaf.recovery.evidence.get("terminal_owner_recovery_hold")
+    assert (
+        next(gate for gate in result.gates if gate.name == gate_name).status is GateStatus.REJECTED
+    )
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in transport.calls)
+
+    freshly_approved = store.answer_gate(gate_name, GateStatus.APPROVED)
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, freshly_approved, config, store
+    )
+    assert proof is not None and reason is None
+
+
+def test_terminal_owner_rejection_after_route_authorization_blocks_resume(
+    tmp_path: Path,
+) -> None:
+    plan, config, store, _owner_dir, _owner_name, _prior_invocation_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    gate_name = driver_module._terminal_owner_recovery_gate_name(plan.leaves[0].name)
+    store.set_gate(gate_name, GateStatus.PENDING)
+    state = store.load()
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
+    assert proof is not None and reason is None
+    state = driver_module._persist_terminal_route_authorization(proof, state, store)
+    rejected = store.answer_gate(gate_name, GateStatus.REJECTED)
+    transport = RecordingTransport()
+
+    result = driver_module._resume_terminal_owner_failure(
+        plan,
+        rejected,
+        config,
+        EffectClient(transport),
+        store,
+        EffectJournal(store.run_id, store.run_dir / "action-journal.json"),
+    )
+
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in transport.calls)
+    assert (
+        next(gate for gate in result.gates if gate.name == gate_name).status is GateStatus.REJECTED
+    )
+    assert result.slices[plan.leaves[0].name].recovery.evidence.get("terminal_owner_recovery_hold")
+    prior_authorization = result.slices[plan.leaves[0].name].recovery.evidence[
+        "configured_route_authorization"
+    ]
+    approved = store.answer_gate(gate_name, GateStatus.APPROVED)
+    fresh_proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, approved, config, store
+    )
+    assert fresh_proof is not None and reason is None
+    assert fresh_proof.route_authorization["recovery_gate_authorization"]["status"] == "approved"
+    authorized = driver_module._persist_terminal_route_authorization(fresh_proof, approved, store)
+    recovery_evidence = authorized.slices[plan.leaves[0].name].recovery.evidence
+    assert recovery_evidence["configured_route_authorization_history"] == [prior_authorization]
+    assert recovery_evidence["configured_route_authorization"] == fresh_proof.route_authorization
+
+
+def test_terminal_owner_rejection_at_dispatch_boundary_prevents_resume_call(
+    tmp_path: Path,
+) -> None:
+    plan, config, store, _owner_dir, _owner_name, _prior_invocation_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    gate_name = driver_module._terminal_owner_recovery_gate_name(plan.leaves[0].name)
+    store.set_gate(gate_name, GateStatus.PENDING)
+
+    class RejectBeforeResume(RecordingTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            if (
+                tool_name == "emit_controller_event"
+                and arguments.get("event_type") == "tl.spawn_requested"
+            ):
+                store.answer_gate(gate_name, GateStatus.REJECTED)
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = RejectBeforeResume()
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    result = driver_module._resume_terminal_owner_failure(
+        plan, store.load(), config, EffectClient(transport), store, journal
+    )
+
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in transport.calls)
+    assert (
+        next(gate for gate in result.gates if gate.name == gate_name).status is GateStatus.REJECTED
+    )
+    assert result.slices[plan.leaves[0].name].recovery.evidence.get(
+        "terminal_owner_recovery_gate_rejection"
+    )
+    approval = store.answer_gate(gate_name, GateStatus.APPROVED)
+    fresh_proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, approval, config, store
+    )
+    assert fresh_proof is not None and reason is None
+    assert fresh_proof.resume.action_arguments is None
+    assert fresh_proof.resume.recovery_gate_authorization["status"] == "approved"
+
+
+def test_terminal_owner_rejection_blocks_confirmed_result_replay(
+    tmp_path: Path,
+) -> None:
+    plan, config, store, _owner_dir, _owner_name, _prior_invocation_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    gate_name = driver_module._terminal_owner_recovery_gate_name(plan.leaves[0].name)
+    store.set_gate(gate_name, GateStatus.PENDING)
+    state = store.load()
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
+    assert proof is not None and reason is None
+    state = driver_module._persist_terminal_route_authorization(proof, state, store)
+    arguments = driver_module._blocked_leaf_resume_action_arguments(proof.resume, state)
+    intent = EffectIntent("resume_blocked_leaf", plan.leaves[0].name, arguments, True)
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    journal.append(intent)
+    journal.mark_result(intent, ToolResult.from_raw({"success": True, "result": {"ready": True}}))
+    rejected = store.answer_gate(gate_name, GateStatus.REJECTED)
+    transport = RecordingTransport()
+
+    result = driver_module._resume_terminal_owner_failure(
+        plan, rejected, config, EffectClient(transport), store, journal
+    )
+
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in transport.calls)
+    assert (
+        next(gate for gate in result.gates if gate.name == gate_name).status is GateStatus.REJECTED
+    )
+    assert (
+        journal.entries_for("resume_blocked_leaf", plan.leaves[0].name)[0]["status"] == "confirmed"
+    )
+
+
+def test_terminal_provider_recovery_authorizes_effort_only_route_change(
+    tmp_path: Path,
+) -> None:
+    plan, config, store, owner_dir, owner_name, prior_invocation_id = (
+        _seed_terminal_provider_failure_leaf(
+            tmp_path,
+            prior_runtime="codex",
+            prior_model="gpt-6-luna",
+            prior_effort="high",
+        )
+    )
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+
+    assert proof is not None and reason is None
+    assert proof.resume.desired_effort == "xhigh"
+    authorization = proof.route_authorization
+    assert authorization["prior_effort"] == "high"
+    assert authorization["effort"] == "xhigh"
+    state = driver_module._persist_terminal_route_authorization(proof, store.load(), store)
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
+    assert proof is not None and reason is None
+    arguments = driver_module._blocked_leaf_resume_action_arguments(proof.resume, state)
+    assert arguments["prior_effort"] == "high"
+    assert arguments["desired_effort"] == "xhigh"
+
+    identity_path = owner_dir / "identity.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    identity.update({"agent_type": "codex", "model": "gpt-6-luna", "effort": "high"})
+    identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    (owner_dir / "invocation.json").write_text(
+        json.dumps(
+            {
+                "invocation_id": "effort-only-successor",
+                "generation": 2,
+                "status": "running",
+                "runtime": "codex",
+                "model": "gpt-6-luna",
+                "effort": "high",
+                "trigger": "resume_blocked",
+                "branch": proof.resume.owner.branch,
+                "worktree": str(proof.resume.owner.worktree),
+                "prior_invocation_id": prior_invocation_id,
+                "pr_number": None,
+                "head_sha": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (owner_dir / "dispatch_intent").write_text(proof.resume.intent_id + "\n", encoding="utf-8")
+    (owner_dir / "routing.json").write_text(
+        json.dumps(
+            {
+                "owner_agent_id": owner_name,
+                "owner_invocation_id": "effort-only-successor",
+                "owner_generation": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    response = ToolResult.from_raw(
+        {
+            "success": True,
+            "result": {
+                "chainlink_issue_id": 814,
+                "agent": {
+                    "id": owner_name,
+                    "issue": plan.leaves[0].name,
+                    "intent_id": proof.resume.intent_id,
+                    "agent_type": "codex",
+                    "branch_name": proof.resume.owner.branch,
+                    "worktree_path": str(proof.resume.owner.worktree),
+                },
+                "invocation": {
+                    "invocation_id": "effort-only-successor",
+                    "trigger": "resume_blocked",
+                    "runtime": "codex",
+                    "ready": True,
+                    "fresh": True,
+                    "outcome": "started",
+                },
+            },
+        }
+    )
+    assert driver_module._validated_blocked_resume_result(proof.resume, response) is None
+
+    identity["effort"] = "xhigh"
+    identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    successor = json.loads((owner_dir / "invocation.json").read_text(encoding="utf-8"))
+    successor["effort"] = "xhigh"
+    (owner_dir / "invocation.json").write_text(json.dumps(successor), encoding="utf-8")
+    assert driver_module._validated_blocked_resume_result(proof.resume, response) == (
+        "effort-only-successor",
+        "codex",
+        "gpt-6-luna",
+        "xhigh",
+    )
+
+    unchanged_plan, unchanged_config, unchanged_store, *_ = _seed_terminal_provider_failure_leaf(
+        tmp_path / "unchanged",
+        prior_runtime="codex",
+        prior_model="gpt-6-luna",
+        prior_effort="xhigh",
+    )
+    unchanged, unchanged_reason = driver_module._terminal_owner_recovery_proof(
+        unchanged_plan, unchanged_store.load(), unchanged_config, unchanged_store
+    )
+    assert unchanged is None
+    assert "route and effort do not authorize" in str(unchanged_reason)
 
 
 def test_parent_schedules_terminal_provider_failure_before_human_gate_projection(
@@ -19429,7 +19708,12 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
     tmp_path: Path,
 ) -> None:
     plan, config, store, owner_dir, owner_name, prior_invocation_id = (
-        _seed_terminal_provider_failure_leaf(tmp_path)
+        _seed_terminal_provider_failure_leaf(
+            tmp_path,
+            prior_runtime="codex",
+            prior_model="gpt-6-luna",
+            prior_effort="high",
+        )
     )
     state = store.load()
     terminal, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
