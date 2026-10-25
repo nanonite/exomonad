@@ -19542,3 +19542,151 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
     )
     assert repeated.slices[plan.leaves[0].name] == leaf
     assert transport.resume_calls == 1
+
+
+def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpoint_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, config, store, owner_dir, owner_name, prior_invocation_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    state = store.load()
+    terminal, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
+    assert terminal is not None and reason is None
+    state = driver_module._persist_terminal_route_authorization(terminal, state, store)
+    terminal, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
+    assert terminal is not None and reason is None
+    leaf = terminal.resume.leaf
+    owner = terminal.resume.owner
+    successor_id = "codex-terminal-checkpoint-crash-successor"
+    resume_calls = 0
+
+    class ConfirmedResumeTransport(RecordingTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            nonlocal resume_calls
+            if tool_name != "resume_blocked_leaf":
+                return super().call_tool(role, name, tool_name, arguments)
+            self.calls.append((tool_name, arguments))
+            resume_calls += 1
+            identity_path = owner_dir / "identity.json"
+            identity = json.loads(identity_path.read_text(encoding="utf-8"))
+            identity.update({"agent_type": "codex", "model": "gpt-6-luna", "effort": "xhigh"})
+            identity_path.write_text(json.dumps(identity), encoding="utf-8")
+            (owner_dir / "invocation.json").write_text(
+                json.dumps(
+                    {
+                        "invocation_id": successor_id,
+                        "generation": owner.generation + 1,
+                        "status": "running",
+                        "runtime": "codex",
+                        "model": "gpt-6-luna",
+                        "effort": "xhigh",
+                        "trigger": "resume_blocked",
+                        "branch": owner.branch,
+                        "worktree": str(owner.worktree),
+                        "prior_invocation_id": prior_invocation_id,
+                        "pr_number": None,
+                        "head_sha": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (owner_dir / "dispatch_intent").write_text(
+                terminal.resume.intent_id + "\n", encoding="utf-8"
+            )
+            (owner_dir / "routing.json").write_text(
+                json.dumps(
+                    {
+                        "owner_agent_id": owner_name,
+                        "owner_invocation_id": successor_id,
+                        "owner_generation": owner.generation + 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return {
+                "success": True,
+                "result": {
+                    "chainlink_issue_id": owner.issue_id,
+                    "agent": {
+                        "id": owner_name,
+                        "issue": leaf.name,
+                        "intent_id": terminal.resume.intent_id,
+                        "agent_type": "codex",
+                        "branch_name": owner.branch,
+                        "worktree_path": str(owner.worktree),
+                    },
+                    "invocation": {
+                        "invocation_id": successor_id,
+                        "trigger": "resume_blocked",
+                        "runtime": "codex",
+                        "ready": True,
+                        "fresh": True,
+                        "outcome": "started",
+                    },
+                },
+            }
+
+    transport = ConfirmedResumeTransport()
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    original_checkpoint = RunStore.checkpoint
+
+    def crash_before_successor_checkpoint(
+        checkpoint_store: RunStore,
+        fsm,
+        slices,
+        budgets,
+        offset,
+        **kwargs,
+    ):
+        updated = slices.get(leaf.name)
+        if updated is not None and updated.dispatch_invocation_id == successor_id:
+            raise SystemExit("simulated crash after confirmed owner result")
+        return original_checkpoint(checkpoint_store, fsm, slices, budgets, offset, **kwargs)
+
+    monkeypatch.setattr(RunStore, "checkpoint", crash_before_successor_checkpoint)
+    with pytest.raises(SystemExit, match="simulated crash after confirmed owner result"):
+        driver_module._resume_terminal_owner_failure(
+            plan, state, config, EffectClient(transport), store, journal
+        )
+    journal_entry = journal.entries_for("resume_blocked_leaf", leaf.name)
+    assert len(journal_entry) == 1 and journal_entry[0]["status"] == "confirmed"
+    assert resume_calls == 1
+    interrupted = store.load().slices[leaf.name]
+    assert interrupted.status is SliceStatus.SPAWNED
+    assert interrupted.dispatch_invocation_id == prior_invocation_id
+    assert (
+        interrupted.recovery is not None and interrupted.recovery.phase is RecoveryPhase.HUMAN_GATE
+    )
+
+    monkeypatch.setattr(RunStore, "checkpoint", original_checkpoint)
+    replay_transport = RecordingTransport()
+    replayed = driver_module._resume_terminal_owner_failure(
+        plan,
+        store.load(),
+        config,
+        EffectClient(replay_transport),
+        store,
+        EffectJournal(store.run_id, store.run_dir / "action-journal.json"),
+    )
+    recovered = replayed.slices[leaf.name]
+    assert recovered.dispatch_invocation_id == successor_id
+    assert recovered.dispatch_agent_id == owner_name
+    assert recovered.branch == owner.branch and recovered.worktree == str(owner.worktree)
+    assert recovered.status is SliceStatus.DISPATCH_UNCONFIRMED
+    assert recovered.recovery is None
+    assert not any(tool_name == "resume_blocked_leaf" for tool_name, _ in replay_transport.calls)
+    assert len(journal.entries_for("resume_blocked_leaf", leaf.name)) == 1
+    assert len(journal.entries_for("spawn_leaf", leaf.name)) == 1
+
+    repeated = driver_module._resume_terminal_owner_failure(
+        plan,
+        store.load(),
+        config,
+        EffectClient(replay_transport),
+        store,
+        EffectJournal(store.run_id, store.run_dir / "action-journal.json"),
+    )
+    assert repeated.slices[leaf.name] == recovered
+    assert not any(tool_name == "resume_blocked_leaf" for tool_name, _ in replay_transport.calls)
