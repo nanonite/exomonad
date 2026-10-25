@@ -32,6 +32,7 @@ class BlockedLeafOwner:
     worktree: Path
     worktree_recorded: str
     worktree_fingerprint: str
+    invocation_record: Mapping[str, object]
 
 
 def resolve_dormant_owner(
@@ -197,6 +198,7 @@ def resolve_owner_for_resume_retry(
             worktree=worktree,
             worktree_recorded=recorded_worktree,
             worktree_fingerprint=expected_worktree_fingerprint,
+            invocation_record=invocation,
         ),
         successor,
     )
@@ -356,6 +358,7 @@ def _owner_from_records(
         worktree=worktree,
         worktree_recorded=_required_text(identity, "working_dir", "owner identity"),
         worktree_fingerprint=fingerprint,
+        invocation_record=invocation,
     )
 
 

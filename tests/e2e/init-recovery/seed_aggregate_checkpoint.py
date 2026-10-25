@@ -6,12 +6,11 @@ import argparse
 import hashlib
 import json
 import subprocess
-import urllib.request
 import time
+import urllib.request
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
-
 
 DORMANT_KANI_INVOCATION_ID = "seed-kani-dormant-controller-invocation"
 
@@ -370,8 +369,10 @@ def seed_root(
     base_sha: str,
     merged_remote_head: str,
     active_kani_blocker: bool,
+    terminal_provider_failure: bool = False,
 ) -> dict[str, object]:
     from tl_loop.client.effects import EffectClient, ToolResult
+    from tl_loop.fsm.child import ChildKind, ChildRecord
     from tl_loop.fsm.lane import LanePhase, LaneState
     from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
     from tl_loop.fsm.post_merge_events import (
@@ -380,6 +381,7 @@ def seed_root(
         UnlinkedChangelogJudged,
     )
     from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
+    from tl_loop.fsm.scope import TLRunning as RecursiveTLRunning
     from tl_loop.loop.driver import (
         AGGREGATE_PUBLICATION_GATE_PREFIX,
         ORDERED_RECOVERY_GATE_PREFIX,
@@ -450,7 +452,9 @@ def seed_root(
                             "name": "issue-814-substitution-model-kani",
                             "task": "Complete the Kani stage recovery fixture for issue 814",
                             "agent_type": "opencode/opencode-go/deepseek-v4.1-flash",
-                            "chainlink_issue_id": None,
+                            "chainlink_issue_id": 814
+                            if terminal_provider_failure
+                            else None,
                             "boundary": ["kani-recovery.txt"],
                             "verify": ["test -s kani-recovery.txt"],
                         }
@@ -482,6 +486,12 @@ def seed_root(
             },
         ]
     }
+    if terminal_provider_failure:
+        # Keep the terminal-owner acceptance focused on the declared two-stage
+        # architecture -> Kani workflow. The generic fixture's later handoff
+        # stage belongs to #1267 and can fail independently after this recovery
+        # has completed, preventing its repeat-init assertions from running.
+        plan_spec["sub_tls"] = plan_spec["sub_tls"][:2]
     work_plan = WorkPlan.from_mapping(plan_spec)
     state_root.mkdir(parents=True, exist_ok=True)
     root_agent_dir = repository / ".exo" / "agents" / "root"
@@ -542,10 +552,9 @@ def seed_root(
     root_store.set_plan_manifest(manifest, slices=root_slices)
     root_state = root_store.set_ordered_state(
         1,
-        (
-            OrderedStageState(1, ("architecture",)),
-            OrderedStageState(2, ("kani",)),
-            OrderedStageState(3, ("handoff-proof",)),
+        tuple(
+            OrderedStageState(int(row["order"]), (str(row["name"]),))
+            for row in plan_spec["sub_tls"]
         ),
         IntegrationRuntimeState(
             sub_tl_states={
@@ -631,118 +640,142 @@ def seed_root(
     kani_state = _reopen_ordered_scope(kani_state, kani_task_plan, kani_store, None)
     failed_leaf_name = "issue-814-substitution-model-kani"
     failed_leaf_task = kani_task_plan.leaves[0]
-    failed_intent_id = "seed-issue-814-rejected-spawn-intent"
-    dirty_preflight_error = (
-        "BLOCKED: cannot spawn agent into a dirty TL worktree. 2 file(s) have uncommitted changes:\n"
-        "  .exo/harness_policy.toml\n"
-        "  CHANGELOG.md\n"
-        "Commit the scaffold (per scaffold-fork-converge) or run `discard_worker_output` "
-        "if throwaway, then retry. Workers spawn in-place and would inherit this state; "
-        "dev-leaves fork from your branch HEAD and would not see your uncommitted work."
-    )
-    failed_leaf = replace(
-        kani_state.slices[failed_leaf_name],
-        status=SliceStatus.DISPATCHING,
-        attempts=1,
-        dispatch_intent_id=failed_intent_id,
-        dispatch_started_at=1700000001.0,
-        dispatch_generation=1,
-        dispatch_ledger_floor=0,
-        dispatch_last_boundary="dispatch_intended",
-    )
-    kani_state = kani_store.checkpoint(
-        kani_state.recursive_fsm,
-        {**kani_state.slices, failed_leaf_name: failed_leaf},
-        kani_state.budgets,
-        kani_state.events.last_consumed_offset,
-    )
-    failed_attempt = DispatchAttempt(
-        intent_id=failed_intent_id,
-        started_at=1700000001.0,
-        harness="codex",
-        agent_type="codex",
-        attempt=1,
-        controller_epoch=kani_state.controller_epoch,
-        dispatch_generation=1,
-        ledger_floor=0,
-    )
-    failed_spawn = EffectIntent(
-        "spawn_leaf",
-        failed_leaf_name,
-        {
-            "name": failed_leaf_name,
-            "task": failed_leaf_task.task,
-            "intent_id": failed_intent_id,
-        },
-        True,
-    )
-    kani_journal = EffectJournal("kani", kani_store.run_dir / "action-journal.json")
-    kani_journal.append(failed_spawn)
-    kani_journal.mark_result(
-        failed_spawn,
-        ToolResult.from_raw(
-            {
-                "success": False,
-                "result": None,
-                "error": dirty_preflight_error,
-                "error_kind": None,
-                "error_context": None,
-            }
-        ),
-    )
-
-    class _SeedTransport:
-        def call_tool(
-            self, role: str, name: str, tool_name: str, arguments: dict[str, object]
-        ) -> dict[str, object]:
-            del role, name, tool_name, arguments
-            raise AssertionError("offline historical fixture must not call tools")
-
-    failure_config = replace(
-        kani_config,
-        active=False,
-        session_mode="continue",
-    )
-    _record_terminal_dispatch_failure(
-        kani_store,
-        kani_state,
-        failed_leaf_name,
-        failed_attempt,
-        dirty_preflight_error,
-        "agent_error",
-        failure_config,
-        EffectClient(_SeedTransport()),
-        kani_journal,
-    )
-    kani_state = kani_store.load()
-    kani_failure = kani_state.recursive_fsm.reason
-    if active_kani_blocker:
-        # The event-108045 fixture keeps the leaf actively human-blocked before
-        # replay; the ordinary retry fixture retains the proven dispatch refusal.
-        blocked_leaf = replace(
+    if terminal_provider_failure:
+        if not active_kani_blocker:
+            raise ValueError(
+                "terminal-provider failure fixture requires the #814 human gate"
+            )
+        if kani_state.slices[failed_leaf_name].chainlink_issue_id != 814:
+            raise ValueError(
+                "terminal-provider failure fixture requires the accepted #814 binding"
+            )
+        kani_failure = None
+        failed_kani = replace(
+            root_state.slices["kani"],
+            status=SliceStatus.SPAWNED,
+            attempts=1,
+            branch=kani_branch,
+            worktree=kani_worktree,
+            dispatch_intent_id="seed-kani-dispatch-intent",
+            dispatch_agent_id=_child_controller_name(kani_task),
+            dispatch_invocation_id=DORMANT_KANI_INVOCATION_ID,
+            dispatch_generation=1,
+            dispatch_authoritative_event_seq=1,
+            dispatch_last_boundary="sub_tl_started",
+        )
+    else:
+        failed_intent_id = "seed-issue-814-rejected-spawn-intent"
+        dirty_preflight_error = (
+            "BLOCKED: cannot spawn agent into a dirty TL worktree. 2 file(s) have uncommitted changes:\n"
+            "  .exo/harness_policy.toml\n"
+            "  CHANGELOG.md\n"
+            "Commit the scaffold (per scaffold-fork-converge) or run `discard_worker_output` "
+            "if throwaway, then retry. Workers spawn in-place and would inherit this state; "
+            "dev-leaves fork from your branch HEAD and would not see your uncommitted work."
+        )
+        failed_leaf = replace(
             kani_state.slices[failed_leaf_name],
-            status=SliceStatus.BLOCKED,
-            park_cause=ParkCause.HUMAN_DECISION_REQUIRED,
+            status=SliceStatus.DISPATCHING,
+            attempts=1,
+            dispatch_intent_id=failed_intent_id,
+            dispatch_started_at=1700000001.0,
+            dispatch_generation=1,
+            dispatch_ledger_floor=0,
+            dispatch_last_boundary="dispatch_intended",
         )
         kani_state = kani_store.checkpoint(
             kani_state.recursive_fsm,
-            {**kani_state.slices, failed_leaf_name: blocked_leaf},
+            {**kani_state.slices, failed_leaf_name: failed_leaf},
             kani_state.budgets,
             kani_state.events.last_consumed_offset,
         )
-    failed_kani = replace(
-        root_state.slices["kani"],
-        status=SliceStatus.FAILED,
-        attempts=1,
-        branch=kani_branch,
-        worktree=kani_worktree,
-        dispatch_intent_id="seed-kani-dispatch-intent",
-        dispatch_agent_id=_child_controller_name(kani_task),
-        dispatch_invocation_id=DORMANT_KANI_INVOCATION_ID,
-        dispatch_generation=1,
-        dispatch_authoritative_event_seq=1,
-        dispatch_last_boundary="sub_tl_started",
-    )
+        failed_attempt = DispatchAttempt(
+            intent_id=failed_intent_id,
+            started_at=1700000001.0,
+            harness="codex",
+            agent_type="codex",
+            attempt=1,
+            controller_epoch=kani_state.controller_epoch,
+            dispatch_generation=1,
+            ledger_floor=0,
+        )
+        failed_spawn = EffectIntent(
+            "spawn_leaf",
+            failed_leaf_name,
+            {
+                "name": failed_leaf_name,
+                "task": failed_leaf_task.task,
+                "intent_id": failed_intent_id,
+            },
+            True,
+        )
+        kani_journal = EffectJournal("kani", kani_store.run_dir / "action-journal.json")
+        kani_journal.append(failed_spawn)
+        kani_journal.mark_result(
+            failed_spawn,
+            ToolResult.from_raw(
+                {
+                    "success": False,
+                    "result": None,
+                    "error": dirty_preflight_error,
+                    "error_kind": None,
+                    "error_context": None,
+                }
+            ),
+        )
+
+    if not terminal_provider_failure:
+
+        class _SeedTransport:
+            def call_tool(
+                self, role: str, name: str, tool_name: str, arguments: dict[str, object]
+            ) -> dict[str, object]:
+                del role, name, tool_name, arguments
+                raise AssertionError("offline historical fixture must not call tools")
+
+        failure_config = replace(
+            kani_config,
+            active=False,
+            session_mode="continue",
+        )
+        _record_terminal_dispatch_failure(
+            kani_store,
+            kani_state,
+            failed_leaf_name,
+            failed_attempt,
+            dirty_preflight_error,
+            "agent_error",
+            failure_config,
+            EffectClient(_SeedTransport()),
+            kani_journal,
+        )
+        kani_state = kani_store.load()
+        kani_failure = kani_state.recursive_fsm.reason
+        if active_kani_blocker:
+            blocked_leaf = replace(
+                kani_state.slices[failed_leaf_name],
+                status=SliceStatus.BLOCKED,
+                park_cause=ParkCause.HUMAN_DECISION_REQUIRED,
+            )
+            kani_state = kani_store.checkpoint(
+                kani_state.recursive_fsm,
+                {**kani_state.slices, failed_leaf_name: blocked_leaf},
+                kani_state.budgets,
+                kani_state.events.last_consumed_offset,
+            )
+        failed_kani = replace(
+            root_state.slices["kani"],
+            status=SliceStatus.FAILED,
+            attempts=1,
+            branch=kani_branch,
+            worktree=kani_worktree,
+            dispatch_intent_id="seed-kani-dispatch-intent",
+            dispatch_agent_id=_child_controller_name(kani_task),
+            dispatch_invocation_id=DORMANT_KANI_INVOCATION_ID,
+            dispatch_generation=1,
+            dispatch_authoritative_event_seq=1,
+            dispatch_last_boundary="sub_tl_started",
+        )
     merge_tree = subprocess.run(
         (
             "git",
@@ -1048,8 +1081,34 @@ def seed_root(
         aggregate_approval_receipts=approval_history,
         active_aggregate_approval_id=approval_receipt.receipt_id,
     )
+    if terminal_provider_failure:
+        root_phase = RecursiveTLRunning(
+            current_order=2,
+            pending_by_order={
+                2: (
+                    ChildRecord(
+                        "kani",
+                        ChildKind.SUB_TL,
+                        dispatch_intent_id="seed-kani-dispatch-intent",
+                        invocation_id=DORMANT_KANI_INVOCATION_ID,
+                        manifest_node_id=next(
+                            node.node_id
+                            for node in manifest.nodes
+                            if node.name == "kani"
+                        ),
+                        manifest_revision=manifest.manifest_revision,
+                    ),
+                )
+            },
+            scope_path=(manifest.scope_id,),
+            plan_digest=manifest.digest,
+        )
+        kani_lifecycle = IntegrationLifecycle.RUNNING
+    else:
+        root_phase = RecursiveTLFailed(f"Kani child failed: {kani_failure}")
+        kani_lifecycle = IntegrationLifecycle.FAILED
     root_store.checkpoint(
-        RecursiveTLFailed(f"Kani child failed: {kani_failure}"),
+        root_phase,
         {**root_state.slices, "architecture": parked_architecture},
         root_state.budgets,
         root_state.events.last_consumed_offset,
@@ -1138,8 +1197,34 @@ def seed_root(
         phase=LanePhase.IDLE,
         last_lane_epoch=2,
     )
+    if terminal_provider_failure:
+        root_phase = RecursiveTLRunning(
+            current_order=2,
+            pending_by_order={
+                2: (
+                    ChildRecord(
+                        "kani",
+                        ChildKind.SUB_TL,
+                        dispatch_intent_id="seed-kani-dispatch-intent",
+                        invocation_id=DORMANT_KANI_INVOCATION_ID,
+                        manifest_node_id=next(
+                            node.node_id
+                            for node in manifest.nodes
+                            if node.name == "kani"
+                        ),
+                        manifest_revision=manifest.manifest_revision,
+                    ),
+                )
+            },
+            scope_path=(manifest.scope_id,),
+            plan_digest=manifest.digest,
+        )
+        kani_lifecycle = IntegrationLifecycle.RUNNING
+    else:
+        root_phase = RecursiveTLFailed(f"Kani child failed: {kani_failure}")
+        kani_lifecycle = IntegrationLifecycle.FAILED
     root_store.checkpoint(
-        RecursiveTLFailed(f"Kani child failed: {kani_failure}"),
+        root_phase,
         {
             **synced.slices,
             "architecture": synced_architecture,
@@ -1154,11 +1239,12 @@ def seed_root(
             lanes={lane_key: idle_lane},
             sub_tl_states={
                 **synced.integration.sub_tl_states,
-                "kani": IntegrationLifecycle.FAILED,
+                "kani": kani_lifecycle,
             },
         ),
     )
-    root_store.set_gate(f"{ORDERED_RECOVERY_GATE_PREFIX}kani", GateStatus.PENDING)
+    if not terminal_provider_failure:
+        root_store.set_gate(f"{ORDERED_RECOVERY_GATE_PREFIX}kani", GateStatus.PENDING)
     git(repository, "merge", "--ff-only", merged_remote_head)
     return {
         "root": str(root_store.path),
@@ -1291,6 +1377,7 @@ def main() -> None:
     parser.add_argument("--mock-url", required=True)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--active-kani-blocker", action="store_true")
+    parser.add_argument("--terminal-provider-failure", action="store_true")
     args = parser.parse_args()
     (
         leaf_pr,
@@ -1310,8 +1397,10 @@ def main() -> None:
         base_sha=base_sha,
         merged_remote_head=merged_remote_head,
         active_kani_blocker=args.active_kani_blocker,
+        terminal_provider_failure=args.terminal_provider_failure,
     )
     result["active_kani_blocker"] = args.active_kani_blocker
+    result["terminal_provider_failure"] = args.terminal_provider_failure
     seed_dormant_kani_controller(args.repo, result)
     result["dormant_controller_invocation_id"] = DORMANT_KANI_INVOCATION_ID
     result["preserved_local_edits"] = seed_local_edits(args.repo)

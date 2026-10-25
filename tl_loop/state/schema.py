@@ -40,6 +40,9 @@ BLOCK_CAUSE_VALUES = frozenset(
 LEGACY_IDENTITY_CHECKPOINT_VERSION = 4
 SCHEMA_VERSION = 5
 REDUCER_VERSION = 1
+DISPATCH_ROUTE_RECONCILIATION_SOURCES = frozenset(
+    {"proven_preexecution_retry", "proven_terminal_provider_failure"}
+)
 
 
 class ReviewPolicySource(str, Enum):
@@ -633,6 +636,7 @@ SLICE_KEYS = frozenset(
         "dispatch_error",
         "dispatch_error_code",
         "dispatch_uses_current_role_configuration",
+        "dispatch_route_reconciliation_source",
         "dispatch_retry_attempt",
         "dispatch_next_attempt_at",
         "dispatch_retry_for_attempt",
@@ -898,6 +902,7 @@ class SliceState:
     dispatch_error: str | None = None
     dispatch_error_code: str | None = None
     dispatch_uses_current_role_configuration: bool = False
+    dispatch_route_reconciliation_source: str | None = None
     dispatch_retry_attempt: int = 0
     dispatch_next_attempt_at: float | None = None
     dispatch_retry_for_attempt: int = 0
@@ -1623,6 +1628,19 @@ def _validate_slice(
     _nullable_string(value, "dispatch_error_code", path, errors)
     if "dispatch_uses_current_role_configuration" in value:
         _boolean(value, "dispatch_uses_current_role_configuration", path, errors)
+    _nullable_string(value, "dispatch_route_reconciliation_source", path, errors)
+    route_source = value.get("dispatch_route_reconciliation_source")
+    if (
+        route_source is not None
+        and isinstance(route_source, str)
+        and route_source not in DISPATCH_ROUTE_RECONCILIATION_SOURCES
+    ):
+        errors.append(
+            (
+                f"{path}.dispatch_route_reconciliation_source",
+                "must name a supported dispatch route reconciliation source",
+            )
+        )
     if "dispatch_retry_attempt" in value:
         _non_negative_int(value, "dispatch_retry_attempt", path, errors)
     _nullable_number(value, "dispatch_next_attempt_at", path, errors)

@@ -3915,6 +3915,7 @@ def test_nested_controller_reporter_routes_legacy_blocker_to_child_before_ack(
     config = TLLoopConfig(
         root_dir=tmp_path,
         run_id=run_id,
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
         max_parallel_slices=1,
         poll_interval=0.001,
         cancel_event=cancel_event,
@@ -3978,7 +3979,11 @@ def _nested_blocked_owner_stores(
             ),
         ),
     )
-    config = TLLoopConfig(root_dir=root_dir, run_id=run_id)
+    config = TLLoopConfig(
+        root_dir=root_dir,
+        run_id=run_id,
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+    )
     root_manifest = driver_module._manifest_for_plan(root_plan, run_id, config)
     root_slices = _initial_slices(root_plan, config, root_dir, run_id)
     create(run_id, {"slices": root_slices}, root_dir=root_dir)
@@ -4108,7 +4113,11 @@ def _sibling_blocked_owner_stores(
             SubTLTask("pending-stage-four", later_plan, order=4),
         )
     )
-    config = TLLoopConfig(root_dir=root_dir, run_id=run_id)
+    config = TLLoopConfig(
+        root_dir=root_dir,
+        run_id=run_id,
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+    )
     manifest = driver_module._manifest_for_plan(root_plan, run_id, config)
     root_slices = _initial_slices(root_plan, config, root_dir, run_id)
     create(run_id, {"slices": root_slices}, root_dir=root_dir)
@@ -4646,6 +4655,9 @@ def test_recursive_blocker_ignores_completed_architecture_sibling_for_kani_leaf(
             TLLoopConfig(
                 root_dir=tmp_path,
                 run_id=run_id,
+                repository_identity=RepositoryIdentity(
+                    "https://forge.example.test/test/repository.git"
+                ),
                 max_parallel_slices=1,
                 poll_interval=0.001,
                 cancel_event=cancel_event,
@@ -18653,3 +18665,880 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
     assert resumed.park_cause is ParkCause.DISPATCH_UNCONFIRMED
     assert journal.entries_for("spawn_leaf", slice_id)[0]["status"] == "rejected"
     assert journal.entries_for("resume_blocked_leaf", slice_id)[0]["status"] == "confirmed"
+
+
+def _seed_terminal_provider_failure_leaf(
+    tmp_path: Path,
+) -> tuple[WorkPlan, TLLoopConfig, RunStore, Path, str, str]:
+    """Build the retained accepted-launch / terminal-provider-failure shape."""
+    run_id = "substitution-model-kani-stage"
+    ledger_run_id = "9ed1de9e-b0ff-4205-bed2-5f4538009254"
+    slice_id = "issue-814-substitution-model-kani"
+    owner_name = "issue-814-substitution-model-kani-opencode"
+    invocation_id = "f4460477-40bf-4824-941b-dcc3d0ebc9a1"
+    dispatch_intent_id = "3de1582769362ea8f2769a89c24291e2"
+    project = tmp_path / "repo"
+    tl_loop_dir = project / ".exo" / "tl-loop"
+    root_dir = tl_loop_dir / "root"
+    controller_worktree = project / ".exo" / "worktrees" / "substitution-model-kani-stage"
+    planned_worktree = controller_worktree / slice_id
+    owner_worktree = project / ".exo" / "worktrees" / owner_name
+    owner_worktree.mkdir(parents=True)
+    branch = "main.substitution-model-kani-stage.issue-814-substitution-model-kani-opencode"
+    subprocess.run(
+        ["git", "init", "-b", branch, str(owner_worktree)],
+        check=True,
+        capture_output=True,
+    )
+    plan = WorkPlan.from_mapping(
+        {
+            "leaves": [
+                {
+                    "name": slice_id,
+                    "task": "Implement the Kani substitution model proof for issue 814",
+                    "chainlink_issue_id": 814,
+                    "agent_type": "opencode/opencode-go/deepseek-v4.1-flash",
+                    "boundary": ["crates/beast-rs-core/tests/kani_f64_substitution_model.rs"],
+                    "verify": ["cargo kani -p beast-rs-core --tests"],
+                }
+            ]
+        }
+    )
+    role = {
+        "allow": ["codex/gpt-6-luna"],
+        "cost_rank": {"codex/gpt-6-luna": 1},
+        "token_budget": 120000,
+        "per_harness_budget": {"codex/gpt-6-luna": 80000},
+        "escalate_after_attempts": 1,
+    }
+    policy = validate_policy(
+        {"roles": {"tl": dict(role), "worker": dict(role), "reviewer": dict(role)}}
+    )
+    catalog = ModelCatalog.from_payload(
+        {"models": [{"harness": "codex", "model_id": "gpt-6-luna"}]}
+    )
+    parent_config = TLLoopConfig(
+        active=True,
+        run_id="root",
+        root_dir=tl_loop_dir,
+        project_root=project,
+        branch="main",
+        worktree=project,
+        session_mode="continue",
+        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+        ledger_run_id=ledger_run_id,
+        policy=policy,
+        capabilities=CapabilityMap({"codex/gpt-6-luna": Difficulty.STANDARD}),
+        catalog=catalog,
+        requested_model="gpt-6-luna",
+        max_events=1,
+        poll_interval=0.001,
+        keep_alive_on_waiting=False,
+    )
+    sub_tl = SubTLTask(run_id, plan, order=2)
+    parent_plan = WorkPlan(sub_tls=(SubTLTask("architecture", WorkPlan(), order=1), sub_tl))
+    parent_manifest = driver_module._candidate_manifest(parent_plan, "root", parent_config)
+    declaration = next(node for node in parent_manifest.nodes if node.name == run_id)
+    manifest = parent_manifest.child_manifests[declaration.node_id]
+    config = replace(
+        parent_config,
+        run_id=run_id,
+        root_dir=root_dir,
+        parent_run_id="root",
+        parent_branch="main",
+        parent_agent_id="root",
+        branch="main.substitution-model-kani-stage",
+        worktree=controller_worktree,
+        depth=1,
+        declared_manifest=manifest,
+    )
+    slices = _initial_slices(plan, config, root_dir, run_id)
+    create(
+        run_id,
+        {
+            "owner_branch": config.branch,
+            "owner_worktree": str(controller_worktree),
+            "parent_run_id": "root",
+            "parent_branch": "main",
+            "parent_agent_id": run_id,
+            "depth": 1,
+            "ledger_run_id": ledger_run_id,
+            "plan_manifest": manifest.to_document(),
+            "slices": slices,
+        },
+        root_dir=root_dir,
+    )
+    store = RunStore(run_id, root_dir)
+    store.set_plan_manifest(manifest)
+    planned_state = store.load()
+    node = next(item for item in manifest.nodes if item.name == slice_id)
+    store.checkpoint(
+        RecursiveTLRunning(
+            current_order=0,
+            pending_by_order={},
+            parallel_pending=(
+                ChildRecord(
+                    slice_id,
+                    ChildKind.LEAF,
+                    manifest_node_id=node.node_id,
+                    manifest_revision=manifest.manifest_revision,
+                ),
+            ),
+            scope_path=(manifest.scope_id,),
+            plan_digest=manifest.digest,
+        ),
+        planned_state.slices,
+        planned_state.budgets,
+        planned_state.events.last_consumed_offset,
+        plan_manifest=manifest,
+    )
+    pre_recovery_state = store.load()
+    current = pre_recovery_state.slices[slice_id]
+    recovery = driver_module.transition_recovery(
+        begin_recovery(
+            cause="human_decision_required",
+            owner_run_id=run_id,
+            slice_attempt=2,
+            owner_agent_id=owner_name,
+            invocation_generation=0,
+            plan_revision=pre_recovery_state.revision,
+            evidence={
+                "slice_id": slice_id,
+                "invocation_id": invocation_id,
+                "attempt": 2,
+                "generation": None,
+                "scope_attribution": "agent_lifecycle",
+                "matched_difficulty_rule": "missing_handoff:nonzero_exit",
+                "outcome": "blocked",
+                "needs_human": True,
+                "retryable": True,
+                "recovery_action": "inspect preserved worktree and resume or abandon the invocation",
+            },
+            next_action="open_human_gate",
+        ),
+        RecoveryPhase.HUMAN_GATE,
+        next_action="open_human_gate",
+    )
+    spawned = replace(
+        current,
+        status=SliceStatus.SPAWNED,
+        branch=branch,
+        worktree=str(planned_worktree),
+        base_ref=config.branch,
+        agent_type="opencode",
+        model="opencode-go/deepseek-v4.1-flash",
+        resolved_harness="opencode/opencode-go/deepseek-v4.1-flash",
+        attempts=2,
+        dispatch_intent_id=dispatch_intent_id,
+        dispatch_started_at=1792734760.6998312,
+        dispatch_last_boundary="agent.spawned",
+        dispatch_generation=2,
+        dispatch_ledger_floor=84207,
+        dispatch_agent_id=owner_name,
+        dispatch_invocation_id=invocation_id,
+        dispatch_authoritative_event_seq=108015,
+        chainlink_issue_id=814,
+        recovery=recovery,
+    )
+    running = RecursiveTLRunning(
+        current_order=0,
+        pending_by_order={},
+        scope_path=(manifest.scope_id,),
+        plan_digest=manifest.digest,
+        parallel_pending=(
+            ChildRecord(
+                slice_id,
+                ChildKind.LEAF,
+                dispatch_intent_id=dispatch_intent_id,
+                invocation_id=invocation_id,
+                manifest_node_id=node.node_id,
+                manifest_revision=manifest.manifest_revision,
+            ),
+        ),
+    )
+    store.checkpoint(
+        running,
+        {slice_id: spawned},
+        store.load().budgets,
+        108045,
+        plan_manifest=manifest,
+    )
+    assert recovery.plan_revision != manifest.manifest_revision
+    assert recovery.plan_revision < store.load().revision
+    accepted_launch = EffectIntent(
+        "spawn_leaf",
+        slice_id,
+        {
+            "name": slice_id,
+            "task": plan.leaves[0].task,
+            "intent_id": dispatch_intent_id,
+            "agent_type": "opencode",
+            "model": "opencode-go/deepseek-v4.1-flash",
+            "branch_name": branch,
+            "worktree_path": str(owner_worktree),
+        },
+        True,
+    )
+    launch_journal = EffectJournal(run_id, store.run_dir / "action-journal.json")
+    launch_journal.append(accepted_launch)
+    launch_journal.mark_result(
+        accepted_launch,
+        ToolResult.from_raw(
+            {
+                "success": True,
+                "result": {
+                    "agent_id": owner_name,
+                    "invocation_id": invocation_id,
+                    "branch_name": branch,
+                    "worktree_path": str(owner_worktree),
+                },
+            }
+        ),
+    )
+    owner_dir = project / ".exo" / "agents" / owner_name
+    owner_dir.mkdir(parents=True)
+    (owner_dir / "active_issue").write_text("814\n", encoding="utf-8")
+    (owner_dir / "identity.json").write_text(
+        json.dumps(
+            {
+                "agent_name": owner_name,
+                "slug": slice_id,
+                "slice_id": slice_id,
+                "agent_type": "opencode",
+                "model": "opencode-go/deepseek-v4.1-flash",
+                "effort": "high",
+                "birth_branch": branch,
+                "parent_branch": config.branch,
+                "working_dir": str(owner_worktree),
+                "topology": "worktree_per_agent",
+                "ledger_owned": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (owner_dir / "invocation.json").write_text(
+        json.dumps(
+            {
+                "invocation_id": invocation_id,
+                "generation": 1,
+                "status": "failed",
+                "runtime": "opencode",
+                "model": "opencode-go/deepseek-v4.1-flash",
+                "effort": "high",
+                "trigger": "spawn",
+                "branch": branch,
+                "worktree": str(owner_worktree),
+                "slice_id": slice_id,
+                "pr_number": None,
+                "head_sha": None,
+                "ended_at": 1792734776,
+                "exit_code": 1,
+                "exit_reason": "tmux_target_exited_with_nonzero_code",
+                "exit_classification": "nonzero_exit",
+                "stderr_tail": "Upstream request failed: Insufficient account funds",
+                "prior_invocation_id": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    ledger = project / ".exo" / "ledger" / "segments"
+    ledger.mkdir(parents=True)
+    events = [
+        {
+            "schema_version": 1,
+            "event_id": "terminal-provider-invocation-started",
+            "event_time": "2026-10-23T05:52:46.014Z",
+            "observed_at": "2026-10-23T05:52:46.014Z",
+            "run_seq": 108014,
+            "type": "agent.invocation.started",
+            "agent_id": owner_name,
+            "run_id": ledger_run_id,
+            "invocation_id": invocation_id,
+            "generation": 1,
+            "lifecycle_state": "emitted",
+            "data": {
+                "branch": branch,
+                "generation": 1,
+                "invocation_id": invocation_id,
+                "outcome": "started",
+                "runtime": "opencode",
+                "slice_id": slice_id,
+                "status": "running",
+                "trigger": "spawn",
+                "worktree": str(owner_worktree),
+            },
+        },
+        {
+            "schema_version": 1,
+            "event_id": "accepted-opencode-spawn",
+            "event_time": "2026-10-23T05:52:46.015Z",
+            "observed_at": "2026-10-23T05:52:46.015Z",
+            "run_seq": 108015,
+            "type": "agent.spawned",
+            "agent_id": run_id,
+            "run_id": ledger_run_id,
+            "invocation_id": invocation_id,
+            "generation": None,
+            "lifecycle_state": "emitted",
+            "data": {
+                "agent_type": "OpenCode",
+                "branch": branch,
+                "child_agent": owner_name,
+                "effort": "high",
+                "intent_id": dispatch_intent_id,
+                "invocation_id": invocation_id,
+                "model": "opencode-go/deepseek-v4.1-flash",
+                "spawn_type": "leaf_subtree",
+                "topology": "worktreeperagent",
+            },
+        },
+        {
+            "schema_version": 1,
+            "event_id": "terminal-provider-invocation-finished",
+            "event_time": "2026-10-23T05:53:31.102Z",
+            "observed_at": "2026-10-23T05:53:31.102Z",
+            "run_seq": 108044,
+            "type": "agent.invocation.finished",
+            "agent_id": owner_name,
+            "run_id": ledger_run_id,
+            "invocation_id": invocation_id,
+            "generation": 1,
+            "lifecycle_state": "emitted",
+            "data": {
+                "branch": branch,
+                "exit_classification": "nonzero_exit",
+                "exit_code": 1,
+                "generation": 1,
+                "invocation_id": invocation_id,
+                "outcome": "finished",
+                "runtime": "opencode",
+                "slice_id": slice_id,
+                "status": "failed",
+                "stderr_tail": "Upstream request failed: Insufficient account funds",
+                "trigger": "spawn",
+                "worktree": str(owner_worktree),
+            },
+        },
+        {
+            "schema_version": 1,
+            "event_id": "blocked-after-provider-exit",
+            "event_time": "2026-10-23T05:53:31.103Z",
+            "observed_at": "2026-10-23T05:53:31.103Z",
+            "run_seq": 108045,
+            "type": "agent.task_blocked",
+            "agent_id": run_id,
+            "run_id": ledger_run_id,
+            "invocation_id": None,
+            "generation": None,
+            "lifecycle_state": "emitted",
+            "data": {
+                "attempt": 2,
+                "cause": "human_decision_required",
+                "declared_difficulty": "standard",
+                "matched_difficulty_rule": "missing_handoff:nonzero_exit",
+                "needs_human": True,
+                "outcome": "blocked",
+                "retryable": True,
+                "recovery_action": "inspect preserved worktree and resume or abandon the invocation",
+                "scope_attribution": "agent_lifecycle",
+                "slice_id": slice_id,
+            },
+        },
+    ]
+    (ledger / "segment-000000108015.jsonl").write_text(
+        "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    assert planned_worktree != owner_worktree
+    return plan, config, store, owner_dir, owner_name, invocation_id
+
+
+def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
+    tmp_path: Path,
+) -> None:
+    """A confirmed terminal launch can migrate only after exact recovery proof."""
+    plan, config, store, owner_dir, owner_name, prior_invocation_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    cancel_event = threading.Event()
+    config = replace(config, cancel_event=cancel_event)
+    successor_id = "codex-terminal-failure-successor"
+    owner = driver_module.resolve_dormant_owner_for_slice(
+        config.project_root,
+        slice_id=plan.leaves[0].name,
+        expected_issue_id=814,
+        expected_parent_branch=config.branch,
+    )
+    failed_leaf = store.load().slices[plan.leaves[0].name]
+    assert failed_leaf.dispatch_generation == 2
+    assert failed_leaf.recovery is not None
+    assert failed_leaf.recovery.invocation_generation == 0
+    assert failed_leaf.recovery.evidence.get("generation") is None
+    assert owner.generation == 1
+    terminal_proof, proof_reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert terminal_proof is not None and proof_reason is None
+    resume_identity = driver_module.blocked_resume_intent_id(owner)
+    original_invocation = json.loads((owner_dir / "invocation.json").read_text(encoding="utf-8"))
+    original_ledger = (
+        Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
+    ).read_bytes()
+
+    class TerminalResumeTransport(RecordingTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            if tool_name != "resume_blocked_leaf":
+                return super().call_tool(role, name, tool_name, arguments)
+            self.calls.append((tool_name, arguments))
+            identity_path = owner_dir / "identity.json"
+            identity = json.loads(identity_path.read_text(encoding="utf-8"))
+            identity.update({"agent_type": "codex", "model": "gpt-6-luna", "effort": "xhigh"})
+            identity_path.write_text(json.dumps(identity), encoding="utf-8")
+            (owner_dir / "invocation.json").write_text(
+                json.dumps(
+                    {
+                        "invocation_id": successor_id,
+                        "generation": 2,
+                        "status": "running",
+                        "runtime": "codex",
+                        "model": "gpt-6-luna",
+                        "effort": "xhigh",
+                        "trigger": "resume_blocked",
+                        "branch": identity["birth_branch"],
+                        "worktree": identity["working_dir"],
+                        "prior_invocation_id": prior_invocation_id,
+                        "pr_number": None,
+                        "head_sha": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (owner_dir / "dispatch_intent").write_text(resume_identity + "\n", encoding="utf-8")
+            (owner_dir / "routing.json").write_text(
+                json.dumps(
+                    {
+                        "owner_agent_id": owner_name,
+                        "owner_invocation_id": successor_id,
+                        "owner_generation": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cancel_event.set()
+            return {
+                "success": True,
+                "result": {
+                    "chainlink_issue_id": 814,
+                    "agent": {
+                        "id": owner_name,
+                        "issue": plan.leaves[0].name,
+                        "intent_id": resume_identity,
+                        "agent_type": "codex",
+                        "branch_name": identity["birth_branch"],
+                        "worktree_path": identity["working_dir"],
+                    },
+                    "invocation": {
+                        "invocation_id": successor_id,
+                        "trigger": "resume_blocked",
+                        "runtime": "codex",
+                        "ready": True,
+                        "fresh": True,
+                        "outcome": "started",
+                    },
+                },
+            }
+
+    transport = TerminalResumeTransport()
+    config = replace(config, effects=EffectClient(transport))
+    try:
+        run_tl_loop(
+            config.run_id,
+            plan,
+            SyntheticQueue([]),
+            EffectClient(transport),
+            config=config,
+            root_dir=config.root_dir,
+        )
+    except LoopCancelled:
+        pass
+
+    resumed = store.load().slices[plan.leaves[0].name]
+    assert any(name == "resume_blocked_leaf" for name, _ in transport.calls)
+    assert resumed.status is SliceStatus.DISPATCH_UNCONFIRMED
+    assert resumed.dispatch_agent_id == owner_name
+    assert resumed.dispatch_invocation_id == successor_id
+    assert resumed.dispatch_generation == 3
+    assert resumed.attempts == 3
+    assert resumed.branch == "main.substitution-model-kani-stage." + owner_name
+    assert resumed.worktree == str(owner.worktree)
+    assert resumed.dispatch_uses_current_role_configuration is True
+    assert resumed.recovery is None
+    assert resumed.pr_number is None and resumed.publication is None
+    assert resumed.dispatch_last_boundary == "spawn_request_accepted"
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    retained_launch = journal.entries_for("spawn_leaf", plan.leaves[0].name)
+    assert len(retained_launch) == 1 and retained_launch[0]["status"] == "confirmed"
+    assert retained_launch[0]["result"]["result"]["invocation_id"] == prior_invocation_id
+    migration = journal.entries_for("resume_blocked_leaf", plan.leaves[0].name)
+    assert len(migration) == 1 and migration[0]["status"] == "confirmed"
+    assert migration[0]["arguments"]["prior_dispatch_invocation_id"] == prior_invocation_id
+    assert (
+        migration[0]["arguments"]["route_reconciliation_source"]
+        == "proven_terminal_provider_failure"
+    )
+    assert (
+        migration[0]["arguments"]["route_authorization_source"]
+        == "accepted_operator_role_configuration"
+    )
+    assert migration[0]["arguments"]["terminal_invocation_digest"] == (
+        driver_module._terminal_invocation_digest(original_invocation)
+    )
+    assert (
+        Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
+    ).read_bytes() == original_ledger
+
+
+def test_parent_schedules_terminal_provider_failure_before_human_gate_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, child_config, child_store, _owner_dir, _owner_name, _invocation_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    parent_plan = WorkPlan(
+        sub_tls=(
+            SubTLTask("substitution-model-architecture-stage", WorkPlan(), order=1),
+            SubTLTask("substitution-model-kani-stage", plan, order=2),
+        )
+    )
+    parent_root = Path(child_config.root_dir).parent
+    project = Path(child_config.project_root)
+    parent_config = replace(
+        child_config,
+        run_id="root",
+        root_dir=parent_root,
+        branch="main",
+        worktree=project,
+        parent_run_id=None,
+        parent_branch=None,
+        parent_agent_id=None,
+        depth=0,
+        declared_manifest=None,
+        active=True,
+    )
+    manifest = driver_module._candidate_manifest(parent_plan, "root", parent_config)
+    slices = _initial_slices(parent_plan, parent_config, parent_root, "root")
+    initial = create(
+        "root",
+        {
+            "owner_branch": "main",
+            "owner_worktree": str(project),
+            "plan_manifest": manifest.to_document(),
+            "slices": slices,
+        },
+        root_dir=parent_root,
+    )
+    parent_store = RunStore("root", parent_root)
+    parent_store.set_plan_manifest(manifest)
+    initial = parent_store.load()
+    summary = ChildRecoverySummary(
+        owner_run_id=child_store.run_id,
+        child_path=("root", child_store.run_id, plan.leaves[0].name),
+        slice_id=plan.leaves[0].name,
+        cause="human_decision_required",
+        recovery_round=0,
+        next_probe_at=None,
+    )
+    kani = initial.slices["substitution-model-kani-stage"]
+    architecture = initial.slices["substitution-model-architecture-stage"]
+    integration = replace(
+        initial.integration,
+        sub_tl_states={
+            "substitution-model-architecture-stage": IntegrationLifecycle.MERGED,
+            "substitution-model-kani-stage": SubTLLifecycle.HUMAN_GATE,
+        },
+        sub_tl_recovery={"substitution-model-kani-stage": summary},
+    )
+    running = RecursiveTLRunning(
+        current_order=2,
+        pending_by_order={2: (ChildRecord("substitution-model-kani-stage", ChildKind.SUB_TL),)},
+        scope_path=(manifest.scope_id,),
+        plan_digest=manifest.digest,
+    )
+    parent_store.checkpoint(
+        running,
+        {
+            **initial.slices,
+            "substitution-model-architecture-stage": replace(
+                architecture, status=SliceStatus.MERGED
+            ),
+            "substitution-model-kani-stage": kani,
+        },
+        initial.budgets,
+        initial.events.last_consumed_offset,
+        current_order=2,
+        ordered_stages=(
+            OrderedStageState(1, ("substitution-model-architecture-stage",)),
+            OrderedStageState(2, ("substitution-model-kani-stage",)),
+        ),
+        integration=integration,
+        plan_manifest=manifest,
+    )
+    calls: list[tuple[str, str | None]] = []
+
+    def run_child(spec: Mapping[str, object], config: TLLoopConfig, budgets: BudgetLedger):
+        del budgets
+        calls.append(
+            (
+                str(spec["run_id"]),
+                config.declared_manifest.digest if config.declared_manifest else None,
+            )
+        )
+        return SimpleNamespace(final_state=child_store.load())
+
+    monkeypatch.setattr(driver_module, "tl_run", run_child)
+    outcome = driver_module._run_sub_tl_batch(
+        (parent_plan.sub_tls[1],),
+        parent_config,
+        SyntheticQueue([]),
+        EffectClient(RecordingTransport()),
+        parent_store,
+        parent_store.load().budgets,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] == "substitution-model-kani-stage"
+    assert (
+        calls[0][1]
+        == manifest.child_manifests[
+            next(
+                node.node_id
+                for node in manifest.nodes
+                if node.name == "substitution-model-kani-stage"
+            )
+        ].digest
+    )
+    assert len(outcome) == 1 and outcome[0][2] is not None
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    (
+        "live_invocation",
+        "unclassified_failure",
+        "conflicting_worktree",
+        "live_publication",
+        "malformed_publication",
+        "conflicting_recovery_generation",
+        "conflicting_evidence_generation",
+    ),
+)
+def test_terminal_provider_recovery_holds_unproven_or_conflicting_evidence(
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    plan, config, store, owner_dir, owner_name, _invocation_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    invocation_path = owner_dir / "invocation.json"
+    invocation = json.loads(invocation_path.read_text(encoding="utf-8"))
+    if scenario == "live_invocation":
+        invocation.update(
+            {
+                "status": "running",
+                "exit_code": None,
+                "ended_at": None,
+                "exit_classification": None,
+            }
+        )
+        invocation_path.write_text(json.dumps(invocation), encoding="utf-8")
+    elif scenario == "unclassified_failure":
+        invocation["stderr_tail"] = "Worker exited before returning a handoff"
+        invocation_path.write_text(json.dumps(invocation), encoding="utf-8")
+    elif scenario == "conflicting_worktree":
+        identity_path = owner_dir / "identity.json"
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        identity["working_dir"] = str(tmp_path / "foreign-worktree")
+        identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    state = store.load()
+    if scenario in {"conflicting_recovery_generation", "conflicting_evidence_generation"}:
+        leaf = state.slices[plan.leaves[0].name]
+        assert leaf.recovery is not None
+        recovery = leaf.recovery
+        if scenario == "conflicting_recovery_generation":
+            recovery = replace(recovery, invocation_generation=2)
+        else:
+            recovery = replace(
+                recovery,
+                evidence={**recovery.evidence, "generation": 2},
+            )
+        state = replace(
+            state,
+            slices={**state.slices, plan.leaves[0].name: replace(leaf, recovery=recovery)},
+        )
+
+    class HoldTransport(RecordingTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "resolve_live_pr_for_slice":
+                self.calls.append((tool_name, arguments))
+                if scenario == "live_publication":
+                    return {
+                        "success": True,
+                        "result": {
+                            "resolution": "live",
+                            "slice_id": plan.leaves[0].name,
+                            "pr_number": 814,
+                            "publication": {
+                                "slice_id": plan.leaves[0].name,
+                                "invocation_id": _invocation_id,
+                            },
+                        },
+                    }
+                if scenario == "malformed_publication":
+                    return {
+                        "success": True,
+                        "result": {"resolution": "unknown", "slice_id": plan.leaves[0].name},
+                    }
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = HoldTransport()
+    effects = EffectClient(transport)
+    result = driver_module._resume_terminal_owner_failure(
+        plan,
+        state,
+        config,
+        effects,
+        store,
+        EffectJournal(store.run_id, store.run_dir / "action-journal.json"),
+    )
+    leaf = result.slices[plan.leaves[0].name]
+    assert leaf.status is SliceStatus.SPAWNED
+    assert leaf.recovery is not None and leaf.recovery.phase is RecoveryPhase.HUMAN_GATE
+    assert leaf.dispatch_agent_id == owner_name
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in transport.calls)
+    hold = next(
+        gate
+        for gate in result.gates
+        if gate.name == driver_module._terminal_owner_recovery_gate_name(plan.leaves[0].name)
+    )
+    assert hold.status is GateStatus.PENDING
+    assert leaf.recovery.evidence.get("terminal_owner_recovery_hold")
+
+
+def test_terminal_provider_recovery_adopts_response_lost_successor_once(
+    tmp_path: Path,
+) -> None:
+    plan, config, store, owner_dir, owner_name, prior_invocation_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    state = store.load()
+    terminal, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
+    assert terminal is not None and reason is None
+    state = driver_module._persist_terminal_route_authorization(terminal, state, store)
+    terminal, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
+    assert terminal is not None and reason is None
+    arguments = driver_module._blocked_leaf_resume_action_arguments(terminal.resume, state)
+    intent = EffectIntent("resume_blocked_leaf", plan.leaves[0].name, arguments, True)
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    journal.append(intent)
+    journal.mark_unknown(intent, TimeoutError("simulated lost response after accepted launch"))
+
+    owner = terminal.resume.owner
+    successor_id = "codex-terminal-response-loss-successor"
+    identity_path = owner_dir / "identity.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    identity.update({"agent_type": "codex", "model": "gpt-6-luna", "effort": "xhigh"})
+    identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    (owner_dir / "invocation.json").write_text(
+        json.dumps(
+            {
+                "invocation_id": successor_id,
+                "generation": owner.generation + 1,
+                "status": "running",
+                "runtime": "codex",
+                "model": "gpt-6-luna",
+                "effort": "xhigh",
+                "trigger": "resume_blocked",
+                "branch": owner.branch,
+                "worktree": str(owner.worktree),
+                "prior_invocation_id": prior_invocation_id,
+                "pr_number": None,
+                "head_sha": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (owner_dir / "dispatch_intent").write_text(terminal.resume.intent_id + "\n", encoding="utf-8")
+    (owner_dir / "routing.json").write_text(
+        json.dumps(
+            {
+                "owner_agent_id": owner_name,
+                "owner_invocation_id": successor_id,
+                "owner_generation": owner.generation + 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class AdoptionTransport(RecordingTransport):
+        resume_calls = 0
+
+        def call_tool(self, role, name, tool_name, call_arguments):
+            if tool_name == "resume_blocked_leaf":
+                self.calls.append((tool_name, call_arguments))
+                self.resume_calls += 1
+                return {
+                    "success": True,
+                    "result": {
+                        "chainlink_issue_id": 814,
+                        "agent": {
+                            "id": owner_name,
+                            "issue": plan.leaves[0].name,
+                            "intent_id": terminal.resume.intent_id,
+                            "agent_type": "codex",
+                            "branch_name": owner.branch,
+                            "worktree_path": str(owner.worktree),
+                        },
+                        "invocation": {
+                            "invocation_id": successor_id,
+                            "trigger": "resume_blocked",
+                            "runtime": "codex",
+                            "ready": True,
+                            "fresh": False,
+                            "outcome": "adopted_after_response_loss",
+                        },
+                    },
+                }
+            return super().call_tool(role, name, tool_name, call_arguments)
+
+    transport = AdoptionTransport()
+    result = driver_module._resume_terminal_owner_failure(
+        plan,
+        store.load(),
+        config,
+        EffectClient(transport),
+        store,
+        journal,
+    )
+    leaf = result.slices[plan.leaves[0].name]
+    assert transport.resume_calls == 1
+    assert leaf.status is SliceStatus.DISPATCH_UNCONFIRMED
+    assert leaf.dispatch_agent_id == owner_name
+    assert leaf.dispatch_invocation_id == successor_id
+    assert leaf.branch == owner.branch and leaf.worktree == str(owner.worktree)
+    assert leaf.recovery is None
+    assert (
+        journal.entries_for("resume_blocked_leaf", plan.leaves[0].name)[0]["status"] == "confirmed"
+    )
+    assert len(journal.entries_for("spawn_leaf", plan.leaves[0].name)) == 1
+
+    repeated = driver_module._resume_terminal_owner_failure(
+        plan,
+        store.load(),
+        config,
+        EffectClient(transport),
+        store,
+        journal,
+    )
+    assert repeated.slices[plan.leaves[0].name] == leaf
+    assert transport.resume_calls == 1

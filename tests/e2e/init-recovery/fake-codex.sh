@@ -81,10 +81,11 @@ PY
 
 if [[ "$role" == "dev" && "$agent" == *issue-814* ]]; then
     if [[ "$(basename "$0")" == "opencode" ]]; then
-        record_event historical_opencode_owner_failed '{"reason":"pre-publication OpenCode invocation exited before work began"}'
+        record_event historical_opencode_owner_failed '{"reason":"accepted OpenCode invocation ended in a terminal provider failure"}'
         # Let the host observe a live routed pane before recording the
-        # historical pre-publication failure.
+        # terminal provider failure after the invocation was accepted.
         sleep "${E2E_OPENCODE_FAIL_DELAY:-4}"
+        printf '%s\n' 'Insufficient account funds' >&2
         exit 42
     fi
     [[ "$(basename "$0")" == "codex" && "${model%%#*}" == "gpt-6-luna" && "$effort" == "xhigh" ]] || {

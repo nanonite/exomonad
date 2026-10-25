@@ -268,6 +268,7 @@ from tl_loop.state.repository_identity_migration import RepositoryIdentityMigrat
 from tl_loop.state.review_validation import review_validation_disposition
 from tl_loop.state.schema import (
     CI_STATUS_VALUES,
+    DISPATCH_ROUTE_RECONCILIATION_SOURCES,
     LEGACY_IDENTITY_CHECKPOINT_VERSION,
     REDUCER_VERSION,
     SCHEMA_VERSION,
@@ -941,11 +942,7 @@ class DispatchAttempt:
             agent_type=slice_state.agent_type or "",
             model=slice_state.model,
             requested_harness=slice_state.requested_harness,
-            route_reconciliation_source=(
-                "proven_preexecution_retry"
-                if slice_state.dispatch_uses_current_role_configuration
-                else None
-            ),
+            route_reconciliation_source=slice_state.dispatch_route_reconciliation_source,
             attempt=max(1, slice_state.attempts),
             controller_epoch=controller_epoch,
             dispatch_generation=slice_state.dispatch_generation,
@@ -4407,7 +4404,9 @@ def _activate_startup_work(
         pending_quarantine=len(_replayable_quarantine_documents(store)),
         boundary_run_seq=boundary_run_seq,
     )
-    if config.ordered_recovery or _has_approved_blocked_leaf_resume_gate(plan, state):
+    if _terminal_owner_recovery_candidate(plan, state):
+        state = _resume_terminal_owner_failure(plan, state, config, effects, store, effects_log)
+    elif config.ordered_recovery or _has_approved_blocked_leaf_resume_gate(plan, state):
         state = _resume_approved_blocked_leaf(plan, state, config, effects, store, effects_log)
     state = _dispatch_children(plan, state, config, effects, effects_log, store)
     state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
@@ -4424,6 +4423,27 @@ class _BlockedLeafResumeProof(NamedTuple):
     rejected_spawn: Mapping[str, object]
     intent_id: str
     action_arguments: Mapping[str, object] | None
+    recovery_mode: str = "preexecution_refusal"
+    route_reconciliation_source: str = "proven_preexecution_retry"
+    desired_harness: str | None = None
+    desired_agent_type: str | None = None
+    desired_model: str | None = None
+    configured_role: str | None = None
+    route_authorization_digest: str | None = None
+    accepted_spawn_event_seq: int | None = None
+    blocker_event_seq: int | None = None
+
+
+class _TerminalOwnerRecoveryProof(NamedTuple):
+    """One accepted launch whose exact owner invocation failed terminally."""
+
+    resume: _BlockedLeafResumeProof
+    prior_dispatch_intent_id: str
+    prior_dispatch_generation: int
+    prior_dispatch_attempt: int
+    planned_worktree: str
+    terminal_invocation_digest: str
+    route_authorization: Mapping[str, object]
 
 
 def _blocked_leaf_resume_proof(
@@ -4673,7 +4693,552 @@ def _resolve_blocked_leaf_owner(
     )
 
 
-def _resume_approved_blocked_leaf(
+def _terminal_owner_recovery_candidate(plan: WorkPlan, state: RunState) -> bool:
+    """Identify a launched human-gated leaf without treating it as a preflight retry."""
+    return any(
+        (current := state.slices.get(leaf.name)) is not None
+        and current.status is SliceStatus.SPAWNED
+        and current.dispatch_last_boundary == "agent.spawned"
+        and current.dispatch_intent_id is not None
+        and current.dispatch_agent_id is not None
+        and current.dispatch_invocation_id is not None
+        and current.dispatch_authoritative_event_seq is not None
+        and current.recovery is not None
+        and current.recovery.phase is RecoveryPhase.HUMAN_GATE
+        for leaf in plan.leaves
+    )
+
+
+def _terminal_owner_recovery_proof(
+    plan: WorkPlan,
+    state: RunState,
+    config: TLLoopConfig,
+    store: RunStore,
+) -> tuple[_TerminalOwnerRecoveryProof | None, str | None]:
+    """Prove a terminal failed invocation after an accepted leaf launch.
+
+    The accepted spawn event, current human-recovery event, checkpoint declaration,
+    host identity and terminal invocation remain separate evidence. The planned
+    nested worktree is checked against the accepted manifest; the host's actual
+    owner worktree is checked against the exact identity and invocation records.
+    """
+    candidates = [
+        leaf
+        for leaf in plan.leaves
+        if (current := state.slices.get(leaf.name)) is not None
+        and current.status is SliceStatus.SPAWNED
+        and current.dispatch_last_boundary == "agent.spawned"
+        and current.recovery is not None
+        and current.recovery.phase is RecoveryPhase.HUMAN_GATE
+    ]
+    if not candidates:
+        return None, None
+    if len(candidates) != 1:
+        return None, "multiple launched human-gated leaves prevent unique terminal-owner recovery"
+    leaf = candidates[0]
+    current = state.slices[leaf.name]
+    recovery = current.recovery
+    if recovery is None:
+        return None, "terminal-owner recovery state disappeared"
+    if config.project_root is None or config.ledger_run_id is None:
+        return None, "terminal-owner recovery requires the project and authoritative ledger"
+    if state.plan_manifest is None:
+        return None, "terminal-owner recovery requires the accepted plan manifest"
+    node = next((item for item in state.plan_manifest.nodes if item.name == leaf.name), None)
+    if (
+        node is None
+        or node.node_id != current.manifest_node_id
+        or node.task != leaf.task
+        or node.chainlink_issue_id != leaf.chainlink_issue_id
+        or leaf.chainlink_issue_id is None
+        or current.chainlink_issue_id != leaf.chainlink_issue_id
+        or current.base_ref != config.branch
+    ):
+        return None, "terminal-owner leaf differs from its accepted task, issue, or parent binding"
+    if (
+        recovery.cause != "human_decision_required"
+        or recovery.phase is not RecoveryPhase.HUMAN_GATE
+        or recovery.owner_run_id != state.run_id
+        or recovery.owner_agent_id != current.dispatch_agent_id
+        or recovery.slice_attempt != current.attempts
+        or recovery.invocation_generation < 0
+        or recovery.plan_revision < 1
+        or recovery.plan_revision >= state.revision
+    ):
+        return None, "terminal-owner recovery does not match the accepted human-gate binding"
+    evidence = recovery.evidence
+    if any(
+        evidence.get(key) != value
+        for key, value in (
+            ("slice_id", leaf.name),
+            ("attempt", current.attempts),
+            ("invocation_id", current.dispatch_invocation_id),
+            ("scope_attribution", "agent_lifecycle"),
+            ("matched_difficulty_rule", "missing_handoff:nonzero_exit"),
+            ("outcome", "blocked"),
+            ("needs_human", True),
+            ("retryable", True),
+        )
+    ):
+        return None, "terminal-owner human-recovery evidence conflicts with the accepted dispatch"
+    if (
+        not current.dispatch_intent_id
+        or not current.dispatch_agent_id
+        or not current.dispatch_invocation_id
+        or current.dispatch_authoritative_event_seq is None
+        or current.dispatch_generation < 1
+        or current.pr_number is not None
+        or current.publication is not None
+        or current.handoff is not None
+        or current.action is not None
+    ):
+        return (
+            None,
+            "terminal-owner checkpoint has incomplete dispatch identity or publication state",
+        )
+    expected = _initial_slices(plan, config, store.root_dir, state.run_id).get(leaf.name)
+    if not isinstance(expected, Mapping):
+        return None, "terminal-owner leaf is missing from accepted planned coordinates"
+    planned_worktree = Path(str(expected.get("worktree", "")))
+    if not planned_worktree.is_absolute():
+        planned_worktree = Path(config.project_root) / planned_worktree
+    checkpoint_worktree = Path(current.worktree or "")
+    if not checkpoint_worktree.is_absolute():
+        checkpoint_worktree = Path(config.project_root) / checkpoint_worktree
+    if checkpoint_worktree.resolve() != planned_worktree.resolve():
+        return None, "terminal-owner checkpoint planned worktree conflicts with its manifest"
+    if not isinstance(expected.get("branch"), str) or not current.branch:
+        return None, "terminal-owner checkpoint branch is missing from accepted coordinates"
+    declared_branch = str(expected["branch"])
+    if (
+        node.owned_branch != declared_branch
+        or node.parent_integration_target != config.branch
+        or current.base_ref != node.parent_integration_target
+        or not (
+            current.branch == declared_branch
+            or current.branch.startswith(f"{declared_branch}.")
+            or current.branch.startswith(f"{declared_branch}-")
+        )
+    ):
+        return None, "terminal-owner branch is not anchored to the accepted parent declaration"
+    try:
+        resolved = _resolve_blocked_leaf_owner(state, config, store, leaf, current)
+    except (BlockedLeafOwnerError, OSError, ValueError) as error:
+        return (
+            None,
+            f"terminal owner registry evidence is unavailable or conflicting: {type(error).__name__}",
+        )
+    owner = resolved.owner
+    if (
+        owner.agent_name != current.dispatch_agent_id
+        or owner.slice_id != leaf.name
+        or owner.issue_id != leaf.chainlink_issue_id
+        or owner.prior_invocation_id != current.dispatch_invocation_id
+        or owner.parent_branch != config.branch
+        or owner.branch != current.branch
+    ):
+        return None, "terminal owner identity, issue, or branch conflicts"
+    # Older human-recovery records omitted the invocation generation. Accept
+    # that omission only when it is genuinely absent in the recovery evidence;
+    # the exact generation is then established by the bound host invocation
+    # record below. Dispatch generation remains a separate checkpoint field.
+    recovery_generation_unrecorded = (
+        recovery.invocation_generation == 0 and evidence.get("generation") is None
+    )
+    if (
+        recovery.invocation_generation != owner.generation and not recovery_generation_unrecorded
+    ) or (
+        evidence.get("generation") is not None and evidence.get("generation") != owner.generation
+    ):
+        return None, "terminal owner invocation generation conflicts with recovery evidence"
+    event_proof, event_reason = _terminal_owner_ledger_proof(
+        current, recovery, state, config, store
+    )
+    if event_proof is None:
+        return None, event_reason
+    spawn_event_seq, blocker_event_seq = event_proof
+    # A live retry after host launch is accepted only from this exact durable
+    # action journal and host lineage. Otherwise the current owner must still be
+    # the terminal failed predecessor whose route the operator is changing.
+    resume_entries = EffectJournal(state.run_id, store.run_dir / "action-journal.json").entries_for(
+        "resume_blocked_leaf", leaf.name
+    )
+    if len(resume_entries) > 1:
+        return None, "multiple terminal-owner resume actions require reconciliation"
+    existing_args = resume_entries[0].get("arguments") if resume_entries else None
+    if resume_entries and (
+        not isinstance(existing_args, Mapping)
+        or existing_args.get("recovery_mode") != "terminal_provider_failure"
+    ):
+        return None, "existing resume action belongs to a different recovery contract"
+    for operation in ("file_pr", "resume_pr", "merge_pr", "submit_review"):
+        entries = EffectJournal(state.run_id, store.run_dir / "action-journal.json").entries_for(
+            operation, leaf.name
+        )
+        if any(entry.get("status") != "rejected" for entry in entries):
+            return None, f"existing {operation} effect is unresolved or already published"
+    invocation = owner.invocation_record
+    if invocation.get("invocation_id") == owner.prior_invocation_id:
+        if (
+            invocation.get("status") != "failed"
+            or type(invocation.get("exit_code")) is not int
+            or invocation.get("exit_code") == 0
+            or invocation.get("exit_classification") != "nonzero_exit"
+            or type(invocation.get("ended_at")) not in {int, float}
+            or invocation.get("trigger") != "spawn"
+            or invocation.get("pr_number") is not None
+            or invocation.get("head_sha") is not None
+            or invocation.get("branch") != owner.branch
+            or Path(str(invocation.get("worktree", ""))).resolve() != owner.worktree
+            or invocation.get("slice_id") not in {None, leaf.name}
+            or not _known_terminal_provider_failure(invocation)
+            or owner.runtime != current.agent_type
+            or owner.model != current.model
+        ):
+            return (
+                None,
+                "owner invocation is not the proven terminal provider failure for this assignment",
+            )
+        terminal_digest = _terminal_invocation_digest(invocation)
+    elif isinstance(existing_args, Mapping):
+        terminal_digest = str(existing_args.get("terminal_invocation_digest", ""))
+        if not _is_sha256_text(terminal_digest):
+            return None, "journaled terminal invocation proof is missing or malformed"
+        if (
+            invocation.get("prior_invocation_id") != owner.prior_invocation_id
+            or invocation.get("generation") != owner.generation + 1
+            or invocation.get("trigger") != "resume_blocked"
+            or invocation.get("runtime") != existing_args.get("desired_agent_type")
+            or invocation.get("model") != existing_args.get("desired_model")
+            or invocation.get("branch") != owner.branch
+            or Path(str(invocation.get("worktree", ""))).resolve() != owner.worktree
+        ):
+            return None, "current owner is not the journaled terminal-failure successor"
+    else:
+        return (
+            None,
+            "terminal predecessor evidence is no longer current and no resume intent proves succession",
+        )
+    if config.policy is None:
+        return None, "current worker role policy is unavailable for terminal-owner recovery"
+    try:
+        capabilities = config.capabilities or load_capability()
+        choice = select_agent_type(
+            current,
+            config.role,
+            state.budgets,
+            config.policy,
+            capabilities,
+            config.learned_policy,
+            requested_harness=None,
+        )
+        if choice is None:
+            failure = selection_failure(
+                current,
+                config.role,
+                state.budgets,
+                config.policy,
+                capabilities,
+                requested_harness=None,
+            )
+            return None, f"current role policy cannot select a recovery route: {failure.value}"
+        route = parse_harness_identifier(choice.harness)
+        desired_model = _selected_spawn_model(choice, route, config)
+    except (OSError, ValueError) as error:
+        return None, f"current configured recovery route is unavailable: {type(error).__name__}"
+    prior_runtime = (
+        existing_args.get("prior_runtime") if isinstance(existing_args, Mapping) else owner.runtime
+    )
+    prior_model = (
+        existing_args.get("prior_model") if isinstance(existing_args, Mapping) else owner.model
+    )
+    if (prior_runtime, prior_model) == (route.agent_type, desired_model):
+        return (
+            None,
+            "current configured role route does not authorize replacing the failed provider",
+        )
+    route_digest = _terminal_route_authorization_digest(
+        config, choice.harness, route.agent_type, desired_model, state.plan_manifest.digest
+    )
+    route_authorization = _terminal_route_authorization_record(
+        config,
+        state.plan_manifest.digest,
+        choice.harness,
+        route.agent_type,
+        desired_model,
+        route_digest,
+        terminal_digest,
+        owner,
+        current,
+        spawn_event_seq,
+        blocker_event_seq,
+    )
+    saved_authorization = evidence.get("configured_route_authorization")
+    if saved_authorization is not None and saved_authorization != route_authorization:
+        return (
+            None,
+            "persisted terminal-owner route authorization conflicts with current configuration",
+        )
+    intent_id = blocked_resume_intent_id(owner)
+    if isinstance(existing_args, Mapping):
+        if any(
+            existing_args.get(key) != value
+            for key, value in (
+                ("chainlink_issue_id", leaf.chainlink_issue_id),
+                ("expected_invocation_id", current.dispatch_invocation_id),
+                ("expected_branch", owner.branch),
+                ("expected_worktree", str(owner.worktree)),
+                ("expected_worktree_recorded", owner.worktree_recorded),
+                ("expected_worktree_fingerprint", owner.worktree_fingerprint),
+                ("owner_agent_name", owner.agent_name),
+                ("dispatch_intent_id", intent_id),
+                ("prior_runtime", current.agent_type),
+                ("prior_model", current.model),
+                ("prior_dispatch_intent_id", current.dispatch_intent_id),
+                ("prior_dispatch_generation", current.dispatch_generation),
+                ("accepted_spawn_event_seq", spawn_event_seq),
+                ("blocker_event_seq", blocker_event_seq),
+                ("terminal_invocation_digest", terminal_digest),
+                ("route_authorization_digest", route_digest),
+                ("desired_harness", choice.harness),
+                ("desired_agent_type", route.agent_type),
+                ("desired_model", desired_model),
+                ("configured_role", config.role),
+            )
+        ):
+            return (
+                None,
+                "journaled terminal-owner authorization conflicts with current evidence or configuration",
+            )
+        action_arguments = existing_args
+    else:
+        action_arguments = None
+    resume = _BlockedLeafResumeProof(
+        leaf,
+        current,
+        owner,
+        _terminal_owner_recovery_gate_name(leaf.name),
+        {},
+        intent_id,
+        action_arguments,
+        recovery_mode="terminal_provider_failure",
+        route_reconciliation_source="proven_terminal_provider_failure",
+        desired_harness=choice.harness,
+        desired_agent_type=route.agent_type,
+        desired_model=desired_model,
+        configured_role=config.role,
+        route_authorization_digest=route_digest,
+        accepted_spawn_event_seq=spawn_event_seq,
+        blocker_event_seq=blocker_event_seq,
+    )
+    return (
+        _TerminalOwnerRecoveryProof(
+            resume,
+            str(current.dispatch_intent_id),
+            current.dispatch_generation,
+            current.attempts,
+            str(planned_worktree.resolve()),
+            terminal_digest,
+            route_authorization,
+        ),
+        None,
+    )
+
+
+def _terminal_owner_ledger_proof(
+    current: SliceState,
+    recovery: RecoveryState,
+    state: RunState,
+    config: TLLoopConfig,
+    store: RunStore,
+) -> tuple[tuple[int, int] | None, str | None]:
+    """Correlate accepted spawn and terminal blocker rows by their exact ledger coordinates."""
+    assert config.project_root is not None and config.ledger_run_id is not None
+    try:
+        reader = LedgerReader(
+            Path(config.project_root) / ".exo" / "ledger" / "segments",
+            run_dir=store.run_dir,
+            ledger_run_id=config.ledger_run_id,
+        )
+        rows = reader.read_from(cursor=current.dispatch_ledger_floor)
+    except (LedgerReadError, EnvelopeError, OSError, ValueError):
+        return None, "authoritative terminal-owner ledger evidence is unavailable or malformed"
+    if any(finding.kind is FindingKind.RUN_ID_MISMATCH for finding in rows.findings):
+        return None, "terminal-owner ledger contains a conflicting run identity"
+    spawn_seq = current.dispatch_authoritative_event_seq
+    spawn_rows = [
+        event
+        for event in rows.events
+        if event.event_type == "agent.spawned" and event.run_seq == spawn_seq
+    ]
+    if len(spawn_rows) != 1:
+        return None, "accepted spawn event is missing or ambiguous at its checkpoint sequence"
+    spawn = spawn_rows[0]
+    if (
+        spawn.run_id != config.ledger_run_id
+        or spawn.agent_id != state.run_id
+        or spawn.invocation_id != current.dispatch_invocation_id
+        or spawn.data.get("intent_id") != current.dispatch_intent_id
+        or spawn.data.get("invocation_id") != current.dispatch_invocation_id
+        or spawn.data.get("child_agent") != current.dispatch_agent_id
+        or spawn.data.get("branch") != current.branch
+    ):
+        return (
+            None,
+            "accepted spawn event conflicts with checkpoint owner, invocation, intent, or branch",
+        )
+    if spawn_seq is None:
+        return None, "accepted spawn event has no sequence binding"
+    blocked = [
+        event
+        for event in rows.events
+        if event.event_type == "agent.task_blocked"
+        and event.run_seq is not None
+        and spawn_seq < event.run_seq <= state.events.last_consumed_offset
+        and event.run_id == config.ledger_run_id
+        and event.agent_id == state.run_id
+        and event.task_blocked is not None
+        and event.task_blocked.slice_id == current.id
+        and event.task_blocked.attempt == current.attempts
+        and event.task_blocked.cause is BlockCause.HUMAN_DECISION_REQUIRED
+        and event.task_blocked.scope_attribution == "agent_lifecycle"
+        and event.task_blocked.matched_difficulty_rule == "missing_handoff:nonzero_exit"
+        and event.task_blocked.needs_human is True
+        and event.task_blocked.retryable is True
+        and event.task_blocked.invocation_id is None
+    ]
+    if len(blocked) != 1:
+        return None, "matching post-launch human-blocked event is missing or ambiguous"
+    blocked_event = blocked[0]
+    if (
+        recovery.evidence.get("invocation_id") != current.dispatch_invocation_id
+        or recovery.evidence.get("attempt") != current.attempts
+        or recovery.evidence.get("slice_id") != current.id
+    ):
+        return None, "human recovery binding conflicts with the accepted launch and blocker"
+    return (cast(int, spawn_seq), cast(int, blocked_event.run_seq)), None
+
+
+def _terminal_route_authorization_digest(
+    config: TLLoopConfig,
+    harness: str,
+    agent_type: str,
+    model: str | None,
+    manifest_digest: str,
+) -> str:
+    """Fingerprint the exact role policy and route used for this scoped migration."""
+    if config.policy is None:
+        raise ValueError("terminal route authorization requires a role policy")
+    role = config.policy.roles.get(config.role)
+    if role is None:
+        raise ValueError("terminal route authorization role is missing")
+    payload = {
+        "authorization_source": "accepted_operator_role_configuration",
+        "manifest_digest": manifest_digest,
+        "role": config.role,
+        "policy": {
+            "allow": list(role.allow),
+            "cost_rank": dict(role.cost_rank),
+            "token_budget": role.token_budget,
+            "per_harness_budget": dict(role.per_harness_budget),
+            "escalate_after_attempts": role.escalate_after_attempts,
+            "task_timeout_seconds": role.task_timeout_seconds,
+            "task_timeout_configured": role.task_timeout_configured,
+        },
+        "harness": harness,
+        "agent_type": agent_type,
+        "model": model,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _terminal_route_authorization_record(
+    config: TLLoopConfig,
+    manifest_digest: str,
+    harness: str,
+    agent_type: str,
+    model: str | None,
+    digest: str,
+    terminal_invocation_digest: str,
+    owner: BlockedLeafOwner,
+    current: SliceState,
+    spawn_event_seq: int,
+    blocker_event_seq: int,
+) -> Mapping[str, object]:
+    """Bind operator route consent to this accepted assignment and its evidence."""
+    return {
+        "source": "accepted_operator_role_configuration",
+        "digest": digest,
+        "terminal_invocation_digest": terminal_invocation_digest,
+        "role": config.role,
+        "harness": harness,
+        "agent_type": agent_type,
+        "model": model,
+        "manifest_digest": manifest_digest,
+        "slice_id": current.id,
+        "issue_id": owner.issue_id,
+        "owner_agent_id": owner.agent_name,
+        "prior_invocation_id": owner.prior_invocation_id,
+        "dispatch_intent_id": current.dispatch_intent_id,
+        "dispatch_generation": current.dispatch_generation,
+        "branch": owner.branch,
+        "worktree_fingerprint": owner.worktree_fingerprint,
+        "accepted_spawn_event_seq": spawn_event_seq,
+        "blocker_event_seq": blocker_event_seq,
+    }
+
+
+def _persist_terminal_route_authorization(
+    terminal: _TerminalOwnerRecoveryProof,
+    state: RunState,
+    store: RunStore,
+) -> RunState:
+    """Durably authorize this exact configured route inside the existing human recovery."""
+    current = state.slices.get(terminal.resume.leaf.name)
+    if current is None or current.recovery is None:
+        raise TLLoopError("terminal-owner human recovery disappeared before route authorization")
+    recovery = current.recovery
+    existing = recovery.evidence.get("configured_route_authorization")
+    if existing is not None:
+        if existing != terminal.route_authorization:
+            raise TLLoopError("persisted terminal-owner route authorization changed")
+        return state
+    updated_recovery = replace(
+        recovery,
+        evidence={
+            **dict(recovery.evidence),
+            "configured_route_authorization": dict(terminal.route_authorization),
+        },
+    )
+    updated = replace(current, recovery=updated_recovery)
+    return store.checkpoint(
+        _phase_from_state(state),
+        {**state.slices, terminal.resume.leaf.name: updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        expected_revision=state.revision,
+    )
+
+
+def _known_terminal_provider_failure(invocation: Mapping[str, object]) -> bool:
+    """Recognize only the retained provider's explicit terminal funding refusal."""
+    stderr_tail = invocation.get("stderr_tail")
+    return (
+        invocation.get("exit_reason") == "tmux_target_exited_with_nonzero_code"
+        and isinstance(stderr_tail, str)
+        and "insufficient account funds" in stderr_tail.casefold()
+    )
+
+
+def _terminal_owner_recovery_gate_name(slice_id: str) -> str:
+    return f"tl-terminal-owner-recovery-{slice_id}"
+
+
+def _resume_terminal_owner_failure(
     plan: WorkPlan,
     state: RunState,
     config: TLLoopConfig,
@@ -4681,8 +5246,103 @@ def _resume_approved_blocked_leaf(
     store: RunStore,
     effects_log: list[EffectIntent],
 ) -> RunState:
+    """Reconcile a confirmed launch whose exact host invocation ended in failure."""
+    terminal, reason = _terminal_owner_recovery_proof(plan, state, config, store)
+    if terminal is None:
+        if reason is None:
+            return state
+        leaf = next(
+            (
+                item
+                for item in plan.leaves
+                if (current := state.slices.get(item.name)) is not None
+                and current.status is SliceStatus.SPAWNED
+                and current.recovery is not None
+                and current.recovery.phase is RecoveryPhase.HUMAN_GATE
+            ),
+            None,
+        )
+        if leaf is None:
+            return state
+        return _hold_terminal_owner_recovery(
+            state, leaf, config, effects, store, effects_log, reason
+        )
+    if not config.active or not isinstance(effects, EffectClient):
+        return state
+    try:
+        publication = _call_aggregate_publication_lookup(
+            terminal.resume.leaf.name,
+            config,
+            effects,
+            effects_log,
+            terminal.prior_dispatch_attempt,
+        )
+        live_publication = _decode_aggregate_publication_lookup(
+            terminal.resume.leaf.name,
+            publication,
+            terminal.prior_dispatch_attempt,
+        )
+    except AggregatePublicationRejected as error:
+        return _hold_terminal_owner_recovery(
+            state,
+            terminal.resume.leaf,
+            config,
+            effects,
+            store,
+            effects_log,
+            f"terminal-owner publication state is unresolved: {error.detail}",
+        )
+    if live_publication is not None and terminal.resume.action_arguments is None:
+        return _hold_terminal_owner_recovery(
+            state,
+            terminal.resume.leaf,
+            config,
+            effects,
+            store,
+            effects_log,
+            "terminal-owner recovery found an existing publication; use its exact PR/head continuation",
+        )
+    try:
+        state = _persist_terminal_route_authorization(terminal, state, store)
+    except (OSError, ValueError, TLLoopError) as error:
+        return _hold_terminal_owner_recovery(
+            state,
+            terminal.resume.leaf,
+            config,
+            effects,
+            store,
+            effects_log,
+            f"terminal-owner route authorization could not be checkpointed: {type(error).__name__}",
+        )
+    return _resume_approved_blocked_leaf(
+        plan,
+        state,
+        config,
+        effects,
+        store,
+        effects_log,
+        proof_override=terminal.resume,
+        reprove_terminal=True,
+    )
+
+
+def _resume_approved_blocked_leaf(
+    plan: WorkPlan,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    *,
+    proof_override: _BlockedLeafResumeProof | None = None,
+    reprove_terminal: bool = False,
+) -> RunState:
     """Resume one exactly proved, operator-approved leaf through its owner."""
-    proof, reason = _blocked_leaf_resume_proof(plan, state, config, store)
+    proof, reason = (
+        (proof_override, None)
+        if proof_override is not None
+        else _blocked_leaf_resume_proof(plan, state, config, store)
+    )
     if proof is None:
         if reason is not None:
             return _hold_blocked_leaf_resume(state, config, effects, store, effects_log, reason)
@@ -4691,8 +5351,9 @@ def _resume_approved_blocked_leaf(
         return state
     handoff_error = _prepare_scope_handoff(proof.leaf, state, config, effects, store, effects_log)
     if handoff_error is not None:
-        return _hold_blocked_leaf_resume(
+        return _hold_owner_resume(
             state,
+            proof,
             config,
             effects,
             store,
@@ -4700,10 +5361,20 @@ def _resume_approved_blocked_leaf(
             f"scope handoff before blocked-leaf resume is blocked: {handoff_error}",
         )
     state = store.load()
-    proof, reason = _blocked_leaf_resume_proof(plan, state, config, store)
+    if reprove_terminal:
+        terminal, reason = _terminal_owner_recovery_proof(plan, state, config, store)
+        proof = terminal.resume if terminal is not None else None
+    else:
+        proof, reason = _blocked_leaf_resume_proof(plan, state, config, store)
     if proof is None:
         if reason is not None:
-            return _hold_blocked_leaf_resume(state, config, effects, store, effects_log, reason)
+            return (
+                _hold_owner_resume(
+                    state, proof_override, config, effects, store, effects_log, reason
+                )
+                if proof_override is not None
+                else state
+            )
         return state
     try:
         arguments = _blocked_leaf_resume_action_arguments(proof, state)
@@ -4741,8 +5412,9 @@ def _resume_approved_blocked_leaf(
                 and spawn_requested.success is True
             ):
                 journal.mark_not_dispatched(intent)
-                return _hold_blocked_leaf_resume(
+                return _hold_owner_resume(
                     state,
+                    proof,
                     config,
                     effects,
                     store,
@@ -4760,8 +5432,9 @@ def _resume_approved_blocked_leaf(
                 )
             except Exception as error:  # noqa: BLE001 - journal and safely retry exact owner intent
                 journal.mark_unknown(intent, error)
-                return _hold_blocked_leaf_resume(
+                return _hold_owner_resume(
                     state,
+                    proof,
                     config,
                     effects,
                     store,
@@ -4770,8 +5443,9 @@ def _resume_approved_blocked_leaf(
                 )
             journal.mark_result(intent, result)
         if result.success is not True:
-            return _hold_blocked_leaf_resume(
+            return _hold_owner_resume(
                 state,
+                proof,
                 config,
                 effects,
                 store,
@@ -4780,8 +5454,9 @@ def _resume_approved_blocked_leaf(
             )
         successor = _validated_blocked_resume_result(proof, result)
         if successor is None:
-            return _hold_blocked_leaf_resume(
+            return _hold_owner_resume(
                 state,
+                proof,
                 config,
                 effects,
                 store,
@@ -4794,7 +5469,7 @@ def _resume_approved_blocked_leaf(
             agent_type=runtime,
             model=model,
             requested_harness=proof.current.requested_harness,
-            route_reconciliation_source="proven_preexecution_retry",
+            route_reconciliation_source=proof.route_reconciliation_source,
         )
         accepted = _record_controller_event(
             proof.leaf.name,
@@ -4805,8 +5480,9 @@ def _resume_approved_blocked_leaf(
             effects_log,
         )
         if accepted is None or accepted.success is not True:
-            return _hold_blocked_leaf_resume(
+            return _hold_owner_resume(
                 state,
+                proof,
                 config,
                 effects,
                 store,
@@ -4825,7 +5501,7 @@ def _resume_approved_blocked_leaf(
         ValueError,
         OSError,
     ) as error:
-        return _hold_blocked_leaf_resume(state, config, effects, store, effects_log, str(error))
+        return _hold_owner_resume(state, proof, config, effects, store, effects_log, str(error))
 
 
 def _has_approved_blocked_leaf_resume_gate(plan: WorkPlan, state: RunState) -> bool:
@@ -4854,7 +5530,7 @@ def _blocked_leaf_resume_action_arguments(
 ) -> Mapping[str, object]:
     if proof.action_arguments is not None:
         return proof.action_arguments
-    return {
+    arguments: dict[str, object] = {
         "chainlink_issue_id": proof.owner.issue_id,
         "expected_invocation_id": proof.owner.prior_invocation_id,
         "expected_branch": proof.owner.branch,
@@ -4868,23 +5544,96 @@ def _blocked_leaf_resume_action_arguments(
         "dispatch_intent_id": proof.intent_id,
         "dispatch_attempt": proof.current.attempts + 1,
         "dispatch_started_at": time.time(),
-        "dispatch_generation": proof.owner.generation + 1,
+        "dispatch_generation": (
+            proof.current.dispatch_generation + 1
+            if proof.recovery_mode == "terminal_provider_failure"
+            else proof.owner.generation + 1
+        ),
         "dispatch_ledger_floor": state.events.last_consumed_offset,
         "controller_epoch": state.controller_epoch,
-        "route_reconciliation_source": "proven_preexecution_retry",
+        "route_reconciliation_source": proof.route_reconciliation_source,
         "requested_harness": proof.current.requested_harness,
     }
+    if proof.recovery_mode == "terminal_provider_failure":
+        if (
+            proof.desired_harness is None
+            or proof.desired_agent_type is None
+            or proof.route_authorization_digest is None
+            or proof.accepted_spawn_event_seq is None
+            or proof.blocker_event_seq is None
+        ):
+            raise TLLoopError("terminal-owner resume authorization is incomplete")
+        invocation = proof.owner.invocation_record
+        arguments.update(
+            {
+                "recovery_mode": proof.recovery_mode,
+                "route_authorization_source": "accepted_operator_role_configuration",
+                "configured_role": proof.configured_role,
+                "desired_harness": proof.desired_harness,
+                "desired_agent_type": proof.desired_agent_type,
+                "desired_model": proof.desired_model,
+                "route_authorization_digest": proof.route_authorization_digest,
+                "terminal_invocation_digest": _terminal_invocation_digest(invocation),
+                "prior_runtime": invocation.get("runtime"),
+                "prior_model": invocation.get("model"),
+                "prior_dispatch_intent_id": proof.current.dispatch_intent_id,
+                "prior_dispatch_generation": proof.current.dispatch_generation,
+                "prior_dispatch_attempt": proof.current.attempts,
+                "prior_dispatch_agent_id": proof.current.dispatch_agent_id,
+                "prior_dispatch_invocation_id": proof.current.dispatch_invocation_id,
+                "prior_dispatch_authoritative_event_seq": proof.current.dispatch_authoritative_event_seq,
+                "planned_worktree": proof.current.worktree,
+                "host_worktree": str(proof.owner.worktree),
+                "accepted_spawn_event_seq": proof.accepted_spawn_event_seq,
+                "blocker_event_seq": proof.blocker_event_seq,
+                "manifest_node_id": proof.current.manifest_node_id,
+                "manifest_revision": proof.current.manifest_revision,
+            }
+        )
+    return arguments
+
+
+def _terminal_invocation_digest(invocation: Mapping[str, object]) -> str:
+    fields = (
+        "invocation_id",
+        "generation",
+        "status",
+        "runtime",
+        "model",
+        "effort",
+        "trigger",
+        "branch",
+        "worktree",
+        "slice_id",
+        "pr_number",
+        "head_sha",
+        "ended_at",
+        "exit_code",
+        "exit_reason",
+        "exit_classification",
+        "stderr_tail",
+    )
+    encoded = json.dumps(
+        {key: invocation.get(key) for key in fields}, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _blocked_leaf_dispatch_attempt(
     arguments: Mapping[str, object], current: SliceState
 ) -> DispatchAttempt:
+    route_source = arguments.get("route_reconciliation_source", "proven_preexecution_retry")
+    if (
+        not isinstance(route_source, str)
+        or route_source not in DISPATCH_ROUTE_RECONCILIATION_SOURCES
+    ):
+        raise TLLoopError("blocked-leaf dispatch route reconciliation source is invalid")
     return DispatchAttempt(
         intent_id=cast(str, arguments["dispatch_intent_id"]),
         started_at=float(arguments["dispatch_started_at"]),
         harness="",
         requested_harness=current.requested_harness,
-        route_reconciliation_source="proven_preexecution_retry",
+        route_reconciliation_source=route_source,
         attempt=int(arguments["dispatch_attempt"]),
         controller_epoch=cast(str | None, arguments.get("controller_epoch")),
         dispatch_generation=int(arguments["dispatch_generation"]),
@@ -4938,10 +5687,15 @@ def _validated_blocked_resume_result(
         )
     except BlockedLeafOwnerError:
         return None
+    observed_model = _optional_nonempty_text(identity.get("model"))
+    if proof.recovery_mode == "terminal_provider_failure" and (
+        runtime != proof.desired_agent_type or observed_model != proof.desired_model
+    ):
+        return None
     return (
         invocation_id,
         runtime,
-        _optional_nonempty_text(identity.get("model")),
+        observed_model,
         _optional_nonempty_text(identity.get("effort")),
     )
 
@@ -4971,6 +5725,7 @@ def _checkpoint_blocked_leaf_successor(
         resolved_harness=f"{runtime}/{model}" if model else runtime,
         attempts=attempt.attempt,
         dispatch_uses_current_role_configuration=True,
+        dispatch_route_reconciliation_source=attempt.route_reconciliation_source,
         dispatch_intent_id=proof.intent_id,
         dispatch_started_at=attempt.started_at,
         dispatch_last_boundary="spawn_request_accepted",
@@ -5032,6 +5787,72 @@ def _hold_blocked_leaf_resume(
             effects_log,
         )
     LOGGER.warning("blocked-leaf resume held slice=%s reason=%s", blocked.id, reason)
+    return store.load()
+
+
+def _hold_owner_resume(
+    state: RunState,
+    proof: _BlockedLeafResumeProof,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    reason: str,
+) -> RunState:
+    if proof.recovery_mode == "terminal_provider_failure":
+        return _hold_terminal_owner_recovery(
+            state, proof.leaf, config, effects, store, effects_log, reason
+        )
+    return _hold_blocked_leaf_resume(state, config, effects, store, effects_log, reason)
+
+
+def _hold_terminal_owner_recovery(
+    state: RunState,
+    leaf: LeafTask,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    reason: str,
+) -> RunState:
+    """Persist one scoped diagnostic while retaining the accepted dispatch and human gate."""
+    gate_name = _terminal_owner_recovery_gate_name(leaf.name)
+    gate = next((item for item in state.gates if item.name == gate_name), None)
+    if gate is None:
+        state = store.set_gate(gate_name, GateStatus.PENDING)
+        _record_controller_event(
+            leaf.name,
+            "tl.gate_opened",
+            {
+                "gate_name": gate_name,
+                "run_id": state.run_id,
+                "reason": "terminal_owner_recovery_proof_unresolved",
+            },
+            config,
+            effects,
+            effects_log,
+        )
+    latest = store.load()
+    current = latest.slices.get(leaf.name)
+    if current is None or current.recovery is None:
+        return latest
+    safe_reason = " ".join(reason.split())[:320]
+    evidence = dict(current.recovery.evidence)
+    if evidence.get("terminal_owner_recovery_hold") == safe_reason:
+        return latest
+    evidence["terminal_owner_recovery_hold"] = safe_reason
+    recovery = replace(current.recovery, evidence=evidence)
+    updated = replace(current, recovery=recovery)
+    store.checkpoint(
+        _phase_from_state(latest),
+        {**latest.slices, leaf.name: updated},
+        latest.budgets,
+        latest.events.last_consumed_offset,
+        current_order=latest.current_order,
+        ordered_stages=latest.ordered_stages,
+        integration=latest.integration,
+    )
+    LOGGER.warning("terminal owner recovery held slice=%s reason=%s", leaf.name, safe_reason)
     return store.load()
 
 
@@ -16329,6 +17150,7 @@ def _run_sub_tl_batch(
         if child_store.path.exists():
             child_state = child_store.load()
             child_phase = _child_completion_phase(child_state)
+            retrying_terminal_owner = _terminal_owner_recovery_candidate(task.plan, child_state)
             blocked_leaf_resume_proof = (
                 _approved_blocked_leaf_child_retry_proof(task, child_state, config, store)
                 if child_phase is TLPhase.TLFailed
@@ -16345,6 +17167,7 @@ def _run_sub_tl_batch(
             if (
                 _child_recovery_projection(child_state, store.run_id) is not None
                 and not retrying_approved_blocked_leaf
+                and not retrying_terminal_owner
             ):
                 return task, child_phase, child_state
         effective_config = _ensure_ordered_parent_ready_for_provision(task, config, store)
@@ -16403,11 +17226,15 @@ def _run_live_sub_tl_batch(
     existing: dict[str, tuple[SubTLTask, TLPhase | None, RunState | None]] = {}
     runnable: list[SubTLTask] = []
     blocked_leaf_resume_proofs: dict[str, _BlockedLeafResumeProof] = {}
+    terminal_owner_recovery_tasks: set[str] = set()
     for task in tasks:
         child_store = RunStore(task.name, store.run_dir)
         if child_store.path.exists():
             child_state = child_store.load()
             child_phase = _child_completion_phase(child_state)
+            retrying_terminal_owner = _terminal_owner_recovery_candidate(task.plan, child_state)
+            if retrying_terminal_owner:
+                terminal_owner_recovery_tasks.add(task.name)
             blocked_leaf_resume_proof = (
                 _approved_blocked_leaf_child_retry_proof(task, child_state, config, store)
                 if child_phase is TLPhase.TLFailed
@@ -16422,6 +17249,7 @@ def _run_live_sub_tl_batch(
             if (_child_handoff_ready(child_state, store.run_id) and not retrying_failed_child) or (
                 _child_recovery_projection(child_state, store.run_id) is not None
                 and not retrying_approved_blocked_leaf
+                and not retrying_terminal_owner
             ):
                 existing[task.name] = (task, child_phase, child_state)
                 continue
@@ -16469,6 +17297,7 @@ def _run_live_sub_tl_batch(
             config,
             task=task,
             blocked_leaf_resume_proof=blocked_leaf_resume_proofs.get(task.name),
+            terminal_owner_recovery=task.name in terminal_owner_recovery_tasks,
         )
         phase = (
             _child_completion_phase(child_state) if child_state is not None else TLPhase.TLFailed
@@ -16535,6 +17364,7 @@ def _supervise_live_sub_tl(
     *,
     task: SubTLTask | None = None,
     blocked_leaf_resume_proof: _BlockedLeafResumeProof | None = None,
+    terminal_owner_recovery: bool = False,
 ) -> RunState | None:
     """Supervise a child until it resolves or explicit cancellation is requested."""
     poll_interval = max(config.poll_interval, 0.05)
@@ -16552,10 +17382,10 @@ def _supervise_live_sub_tl(
             child_state = child_store.load()
         except (OSError, ValueError):
             child_state = None
-        if _child_recovery_projection(
-            child_state, getattr(child_store, "run_id", "")
-        ) is not None and not _blocked_leaf_resume_is_pending(
-            child_state, task, blocked_leaf_resume_proof
+        if (
+            _child_recovery_projection(child_state, getattr(child_store, "run_id", "")) is not None
+            and not _blocked_leaf_resume_is_pending(child_state, task, blocked_leaf_resume_proof)
+            and not _terminal_owner_recovery_is_pending(child_state, task, terminal_owner_recovery)
         ):
             return child_state
         process.join(timeout=poll_interval)
@@ -16631,6 +17461,34 @@ def _blocked_leaf_resume_is_pending(
     ):
         return False
     return any(leaf.name == proof.leaf.name for leaf in task.plan.leaves)
+
+
+def _terminal_owner_recovery_is_pending(
+    child_state: RunState | None,
+    task: SubTLTask | None,
+    authorized_candidate: bool,
+) -> bool:
+    """Keep a controller alive only while startup is resolving this exact candidate."""
+    if (
+        not authorized_candidate
+        or child_state is None
+        or task is None
+        or not _terminal_owner_recovery_candidate(task.plan, child_state)
+    ):
+        return False
+    candidate = next(
+        leaf
+        for leaf in task.plan.leaves
+        if (current := child_state.slices.get(leaf.name)) is not None
+        and current.status is SliceStatus.SPAWNED
+        and current.dispatch_last_boundary == "agent.spawned"
+        and current.recovery is not None
+        and current.recovery.phase is RecoveryPhase.HUMAN_GATE
+    )
+    return not any(
+        gate.name == _terminal_owner_recovery_gate_name(candidate.name)
+        for gate in child_state.gates
+    )
 
 
 def _ensure_ordered_parent_ready_for_provision(
@@ -17192,6 +18050,11 @@ def _complete_sub_tl_batch(
                 lifecycle, summary = projection
                 sub_tl_states[task.name] = lifecycle
                 sub_tl_recovery[task.name] = summary
+            elif child_state is not None:
+                # The child resolved its formerly projected human gate during
+                # this startup pass. Remove only that stale parent projection.
+                sub_tl_recovery.pop(task.name, None)
+                sub_tl_states[task.name] = IntegrationLifecycle.RUNNING
             continue
         status = SliceStatus.FAILED if phase is TLPhase.TLFailed else SliceStatus.MERGED
         previous_lifecycle = sub_tl_states.get(task.name, IntegrationLifecycle.RUNNING)
@@ -23116,6 +23979,7 @@ def _prepare_spawn(
                 "dispatch_last_boundary": "dispatch_intended",
                 "dispatch_error": None,
                 "dispatch_error_code": None,
+                "dispatch_route_reconciliation_source": intent.route_reconciliation_source,
                 "dispatch_ledger_floor": intent.ledger_floor,
                 "dispatch_generation": intent.dispatch_generation,
                 "dispatch_next_attempt_at": None,
@@ -23171,6 +24035,11 @@ def _new_dispatch_attempt(state: RunState, name: str, config: TLLoopConfig) -> D
         controller_epoch=state.controller_epoch,
         dispatch_generation=attempt if state.controller_epoch is not None else 0,
         ledger_floor=state.events.last_consumed_offset,
+        route_reconciliation_source=(
+            "proven_preexecution_retry"
+            if current is not None and current.dispatch_uses_current_role_configuration
+            else None
+        ),
     )
 
 

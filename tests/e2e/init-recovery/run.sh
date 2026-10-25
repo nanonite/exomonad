@@ -35,6 +35,10 @@ export EXOMONAD_CODEX_MODEL="${EXOMONAD_CODEX_MODEL:-e2e-unused-model}"
 SESSION="e2e-init-recovery"
 CONTINUATION_SESSION="e2e-init-recovery-continuation"
 AGGREGATE_SESSION="e2e-init-aggregate-recovery"
+CONFIGURED_ROUTE_SOURCE="proven_preexecution_retry"
+if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" ]]; then
+    CONFIGURED_ROUTE_SOURCE="proven_terminal_provider_failure"
+fi
 MOCK_PID=""
 WASM_ARTIFACT_DIR=""
 INITIAL_TMUX="${TMUX:-}"
@@ -44,7 +48,7 @@ AGGREGATE_TMUX_TMPDIR=""
 build_guest_wasm() {
     local role="$1"
     local package="wasm-guest-$role"
-    local build_dir="$WORK_DIR/wasm-build"
+    local build_dir="${E2E_WASM_BUILD_DIR:-$WORK_DIR/wasm-build}"
     mkdir -p "$build_dir" "$WASM_ARTIFACT_DIR"
     (
         cd "$PROJECT_ROOT"
@@ -102,19 +106,19 @@ PY
 }
 
 assert_configured_retry_dispatch_events() {
-    python3 - "$1" <<'PY'
+    python3 - "$1" "${2:-proven_preexecution_retry}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 repository = Path(sys.argv[1])
+source = sys.argv[2]
 required = {
     "tl.dispatch_intended",
     "tl.spawn_requested",
     "tl.spawn_request_accepted",
     "tl.dispatch_confirmed",
 }
-source = "proven_preexecution_retry"
 slice_id = "issue-814-substitution-model-kani"
 ledger = [
     json.loads(line)
@@ -644,6 +648,9 @@ cleanup() {
     if [[ -n "$AGGREGATE_TMUX_TMPDIR" ]]; then
         env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$AGGREGATE_TMUX_TMPDIR" \
             tmux kill-session -t "$AGGREGATE_SESSION" 2>/dev/null
+        case "$AGGREGATE_TMUX_TMPDIR" in
+            /tmp/exo1283-tmux.*) rm -rf -- "$AGGREGATE_TMUX_TMPDIR" ;;
+        esac
     fi
     if [[ -n "$INITIAL_TMUX" ]]; then
         env TMUX="$INITIAL_TMUX" tmux kill-session -t "$SESSION" 2>/dev/null
@@ -994,8 +1001,7 @@ AGG_HOME="$AGG_DIR/home"
 mkdir -p "$AGG_DIR" "$AGG_HOME/.exo" "$(dirname "$AGG_REMOTE")" "$AGG_REPO"
 # The earlier phases use another repository's Git transport. A separate tmux
 # server keeps its inherited GIT_* environment out of the aggregate controller.
-AGGREGATE_TMUX_TMPDIR="$AGG_DIR/tmux"
-mkdir -p "$AGGREGATE_TMUX_TMPDIR"
+AGGREGATE_TMUX_TMPDIR="$(mktemp -d /tmp/exo1283-tmux.XXXXXX)"
 unset TMUX TMUX_PANE
 export TMUX_TMPDIR="$AGGREGATE_TMUX_TMPDIR"
 e2e_log "Phase 8 tmux server isolated to $TMUX_TMPDIR"
@@ -1171,8 +1177,11 @@ export E2E_GIT_REMOTE_DIR="$AGG_REMOTE"
     || e2e_fail "Phase 8 Git transport does not target its isolated remote"
 
 SEED_AGGREGATE_ARGS=()
-if [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
+if [[ "${E2E_BLOCKER_ONLY:-0}" == "1" || "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" ]]; then
     SEED_AGGREGATE_ARGS+=(--active-kani-blocker)
+fi
+if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" ]]; then
+    SEED_AGGREGATE_ARGS+=(--terminal-provider-failure)
 fi
 PYTHONPATH="$PROJECT_ROOT" python3 "$SCRIPT_DIR/seed_aggregate_checkpoint.py" \
     --repo "$AGG_REPO" --mock-url "$AGG_MOCK_URL" --output "$AGG_DIR/seed.json" \
@@ -1198,8 +1207,11 @@ kani_child = json.loads(kani_child_path.read_text(encoding="utf-8"))
 exit_path = kani_child_path.parent / "controller-exit.json"
 assert not exit_path.exists(), "legacy fixture must retain the missing normal-return diagnostic"
 failed_leaf = kani_child["slices"]["issue-814-substitution-model-kani"]
-child_journal = json.loads(
-    (kani_child_path.parent / "action-journal.json").read_text(encoding="utf-8")
+journal_path = kani_child_path.parent / "action-journal.json"
+child_journal = (
+    json.loads(journal_path.read_text(encoding="utf-8"))
+    if journal_path.is_file()
+    else []
 )
 rejected_spawns = [
     entry for entry in child_journal
@@ -1207,31 +1219,41 @@ rejected_spawns = [
     and entry.get("target") == "issue-814-substitution-model-kani"
     and entry.get("status") == "rejected"
 ]
-assert root["fsm"]["phase"] == "tl_failed"
 assert root["current_order"] == 2
 assert architecture["status"] == "merged"
 assert architecture["post_merge"]["phase"] == "complete"
 assert candidate["lifecycle"] == "MERGED"
-assert kani["status"] == "failed"
 assert kani["dispatch_last_boundary"] == "sub_tl_started"
 assert kani["dispatch_intent_id"] and kani["dispatch_authoritative_event_seq"] == 1
 assert kani_child["run_id"] == "kani"
 assert kani_child["parent_run_id"] == "root"
-assert kani_child["fsm"]["phase"] == "tl_failed"
-if seed["active_kani_blocker"]:
-    assert failed_leaf["status"] == "blocked"
-    assert failed_leaf["park_cause"] == "human_decision_required"
+if seed.get("terminal_provider_failure"):
+    assert root["fsm"]["phase"] == "tl_running"
+    assert kani["status"] == "spawned"
+    assert kani_child["fsm"]["phase"] == "tl_running"
+    assert failed_leaf["status"] == "pending"
+    assert failed_leaf.get("dispatch_invocation_id") is None
+    assert not rejected_spawns
+    assert not kani_child["gates"]
 else:
-    assert failed_leaf["status"] == "dispatch_failed"
-    assert failed_leaf["park_cause"] == "dispatch_failed"
-assert failed_leaf["requested_harness"] == "opencode/opencode-go/deepseek-v4.1-flash"
-assert failed_leaf["dispatch_last_boundary"] == "spawn_request_failed"
-assert failed_leaf.get("dispatch_invocation_id") is None
-assert len(rejected_spawns) == 1
-assert rejected_spawns[0]["arguments"]["intent_id"] == failed_leaf["dispatch_intent_id"]
-assert rejected_spawns[0]["result"]["error"] == failed_leaf["dispatch_error"]
-assert any(gate["name"] == "tl-dispatch-failed-issue-814-substitution-model-kani" for gate in kani_child["gates"])
-assert any(gate["name"] == "tl-ordered-child-recovery-kani" for gate in root["gates"])
+    assert journal_path.is_file(), "pre-execution refusal must retain its action journal"
+    assert root["fsm"]["phase"] == "tl_failed"
+    assert kani["status"] == "failed"
+    assert kani_child["fsm"]["phase"] == "tl_failed"
+    if seed["active_kani_blocker"]:
+        assert failed_leaf["status"] == "blocked"
+        assert failed_leaf["park_cause"] == "human_decision_required"
+    else:
+        assert failed_leaf["status"] == "dispatch_failed"
+        assert failed_leaf["park_cause"] == "dispatch_failed"
+    assert failed_leaf["requested_harness"] == "opencode/opencode-go/deepseek-v4.1-flash"
+    assert failed_leaf["dispatch_last_boundary"] == "spawn_request_failed"
+    assert failed_leaf.get("dispatch_invocation_id") is None
+    assert len(rejected_spawns) == 1
+    assert rejected_spawns[0]["arguments"]["intent_id"] == failed_leaf["dispatch_intent_id"]
+    assert rejected_spawns[0]["result"]["error"] == failed_leaf["dispatch_error"]
+    assert any(gate["name"] == "tl-dispatch-failed-issue-814-substitution-model-kani" for gate in kani_child["gates"])
+    assert any(gate["name"] == "tl-ordered-child-recovery-kani" for gate in root["gates"])
 assert Path(kani["worktree"]).is_dir(), "dormant Kani worktree must be retained"
 identity = json.loads((repo / ".exo/agents/kani/identity.json").read_text(encoding="utf-8"))
 invocation = json.loads((repo / ".exo/agents/kani/invocation.json").read_text(encoding="utf-8"))
@@ -1249,7 +1271,10 @@ AGGREGATE_BASE_SHA="$(python3 -c 'import json,sys; print(json.load(open(sys.argv
 AGGREGATE_REMOTE_HEAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["aggregate_remote_head"])' "$AGG_DIR/seed.json")"
 LEAF_PR="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["leaf_pr"])' "$AGG_DIR/seed.json")"
 LEAF_RECEIPT_SHA256="$(python3 -c 'import hashlib,json,sys; d=json.load(open(sys.argv[1])); r=json.load(open(d["child"])); e=r["slices"]["issue-811"]["post_merge"]["evidence"]; print(hashlib.sha256(json.dumps(e,sort_keys=True,separators=(",", ":")).encode()).hexdigest())' "$AGG_DIR/seed.json")"
-REJECTED_KANI_SPAWN_SHA256="$(python3 - "$AGG_REPO/.exo/tl-loop/root/kani/action-journal.json" <<'PY'
+if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" ]]; then
+    REJECTED_KANI_SPAWN_SHA256=""
+else
+    REJECTED_KANI_SPAWN_SHA256="$(python3 - "$AGG_REPO/.exo/tl-loop/root/kani/action-journal.json" <<'PY'
 import hashlib
 import json
 import sys
@@ -1266,6 +1291,7 @@ assert len(rejected) == 1
 print(hashlib.sha256(json.dumps(rejected[0], sort_keys=True, separators=(",", ":")).encode()).hexdigest())
 PY
 )"
+fi
 ARCHITECTURE_INVOCATION_SHA256="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' \
     "$AGG_REPO/.exo/agents/architecture/invocation.json")"
 KANI_IDENTITY_BASELINE="$AGG_DIR/kani-identity-before.json"
@@ -1280,7 +1306,11 @@ AGGREGATE_MERGE_REQUESTS_BEFORE="$(rg -c "pulls/$AGGREGATE_PR/merge" "$AGG_DIR/m
 PULL_PUBLICATIONS_BEFORE="$(count_pull_publications "$AGG_DIR/mock.log")"
 [[ "$PULL_PUBLICATIONS_BEFORE" == "2" ]] \
     || e2e_fail "fixture expected only its leaf and aggregate PR publications, found $PULL_PUBLICATIONS_BEFORE"
-e2e_log "Seeded merged aggregate PR #$AGGREGATE_PR, completed architecture evidence, and a dormant no-PR Kani controller after the #814 dirty-preflight rejection (parent HEAD=$AGGREGATE_REMOTE_HEAD)"
+if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" ]]; then
+    e2e_log "Seeded merged aggregate PR #$AGGREGATE_PR, completed architecture evidence, and a pending Kani leaf for a real accepted-launch terminal-failure setup (parent HEAD=$AGGREGATE_REMOTE_HEAD)"
+else
+    e2e_log "Seeded merged aggregate PR #$AGGREGATE_PR, completed architecture evidence, and a dormant no-PR Kani controller after the #814 dirty-preflight rejection (parent HEAD=$AGGREGATE_REMOTE_HEAD)"
+fi
 
 # The post-checkout hook runs only when the new handoff-proof source worktree
 # is provisioned. It creates a dirty file in the outer root after the tidy
@@ -1498,10 +1528,103 @@ PY
     fi
     sleep 0.1
 done
-[[ -S "$AGG_REPO/.exo/server.sock" ]] || e2e_fail "disposable Phase 8 server did not create its MCP socket"
+if [[ ! -S "$AGG_REPO/.exo/server.sock" ]]; then
+    tmux capture-pane -p -t "$AGGREGATE_SESSION:Server" \
+        > "$AGG_DIR/server-pane-no-socket.log" 2>&1 || true
+    cat "$AGG_DIR/server-pane-no-socket.log"
+    e2e_fail "disposable Phase 8 server did not create its MCP socket"
+fi
 KANI_BLOCKER_EVENT_ID=""
 KANI_BLOCKER_RUN_SEQ=""
-if [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
+if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" ]]; then
+    tmux send-keys -t "$AGGREGATE_SESSION:Server" C-c
+    for _ in $(seq 1 100); do
+        [[ ! -S "$AGG_REPO/.exo/server.sock" ]] && break
+        sleep 0.1
+    done
+    [[ ! -S "$AGG_REPO/.exo/server.sock" ]] \
+        || e2e_fail "Codex server did not release its socket before accepted OpenCode launch"
+    tmux kill-window -t "$AGGREGATE_SESSION:Server" 2>/dev/null || true
+    python3 - "$AGG_REPO/.exo/config.toml" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+assert text.count('worker_effort_level = "xhigh"') == 1
+path.write_text(text.replace('worker_effort_level = "xhigh"', 'worker_effort_level = "high"'), encoding="utf-8")
+PY
+    PHASE8_OPENCODE_SERVER_COMMAND="EXOMONAD_TMUX_SESSION=$AGGREGATE_SESSION EXOMONAD_ROOT_AGENT_TYPE=codex EXOMONAD_SPAWN_AGENT_TYPE=opencode EXOMONAD_WORKER_MODEL=opencode-go/deepseek-v4.1-flash EXOMONAD_WORKER_EFFORT_LEVEL=high EXOMONAD_REVIEWER_AGENT_TYPE=codex EXOMONAD_CODEX_MODEL=gpt-6-luna $EXOMONAD_BIN serve"
+    tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_OPENCODE_SERVER_COMMAND"
+    tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
+    for _ in $(seq 1 100); do
+        if python3 - "$AGG_REPO/.exo/server.sock" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(0.2)
+client.connect(sys.argv[1])
+client.close()
+PY
+        then
+            break
+        fi
+        sleep 0.1
+    done
+    [[ -S "$AGG_REPO/.exo/server.sock" ]] \
+        || e2e_fail "OpenCode server did not create its MCP socket"
+    python3 "$SCRIPT_DIR/configured-owner-resume.py" seed-terminal \
+        --repo "$AGG_REPO" --output "$AGG_DIR/preexisting-opencode-owner.json" \
+        > "$AGG_DIR/preexisting-opencode-owner-seed.json" \
+        || { cat "$AGG_DIR/preexisting-opencode-owner-seed.json"; e2e_fail "failed to seed a real accepted OpenCode launch and terminal provider failure"; }
+    REJECTED_KANI_SPAWN_SHA256="$(python3 - "$AGG_DIR/preexisting-opencode-owner.json" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+record = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(hashlib.sha256(json.dumps(record["accepted_spawn_journal"], sort_keys=True, separators=(",", ":")).encode()).hexdigest())
+PY
+)"
+    tmux send-keys -t "$AGGREGATE_SESSION:Server" C-c
+    for _ in $(seq 1 100); do
+        [[ ! -S "$AGG_REPO/.exo/server.sock" ]] && break
+        sleep 0.1
+    done
+    [[ ! -S "$AGG_REPO/.exo/server.sock" ]] \
+        || e2e_fail "OpenCode server did not release its socket after terminal failure"
+    tmux kill-window -t "$AGGREGATE_SESSION:Server" 2>/dev/null || true
+    python3 - "$AGG_REPO/.exo/config.toml" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+assert text.count('worker_effort_level = "high"') == 1
+path.write_text(text.replace('worker_effort_level = "high"', 'worker_effort_level = "xhigh"'), encoding="utf-8")
+PY
+    tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_SERVER_COMMAND"
+    tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
+    for _ in $(seq 1 100); do
+        if python3 - "$AGG_REPO/.exo/server.sock" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(0.2)
+client.connect(sys.argv[1])
+client.close()
+PY
+        then
+            break
+        fi
+        sleep 0.1
+    done
+    [[ -S "$AGG_REPO/.exo/server.sock" ]] \
+        || e2e_fail "Codex server did not restart after accepted terminal owner setup"
+elif [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
     read -r KANI_BLOCKER_EVENT_ID KANI_BLOCKER_RUN_SEQ < <(emit_active_kani_blocker)
     e2e_log "Emitted active event-shaped blocker $KANI_BLOCKER_EVENT_ID at ledger sequence $KANI_BLOCKER_RUN_SEQ before controller continuation"
 fi
@@ -1524,7 +1647,13 @@ assert_one_live_window Server
 if [[ -n "$KANI_BLOCKER_EVENT_ID" && -n "$KANI_BLOCKER_RUN_SEQ" ]]; then
     assert_active_kani_blocker_replayed "$KANI_BLOCKER_EVENT_ID" "$KANI_BLOCKER_RUN_SEQ"
 fi
-if [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
+if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" ]]; then
+    python3 "$SCRIPT_DIR/configured-owner-resume.py" verify-controller \
+        --repo "$AGG_REPO" --baseline "$AGG_DIR/preexisting-opencode-owner.json" \
+        --output "$AGG_DIR/configured-owner-resume.json" \
+        > "$AGG_DIR/configured-owner-resume.stdout" \
+        || { cat "$AGG_DIR/configured-owner-resume.stdout"; e2e_fail "controller did not recover the accepted terminal OpenCode owner through Codex and reviewer flow"; }
+elif [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
     # Seed the historical owner only after both child and parent projections
     # have durably consumed the blocker. A live owner must not affect routing
     # or acknowledgment of the event that predates it.
@@ -1857,6 +1986,212 @@ PULL_PUBLICATIONS_AFTER_START="$(count_pull_publications "$AGG_DIR/mock.log")"
 (( PULL_PUBLICATIONS_AFTER_START <= PULL_PUBLICATIONS_BEFORE + 2 )) \
     || e2e_fail "first continuation published more than the recovered #814 and post-tidy leaf PRs"
 
+if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" ]]; then
+    TERMINAL_RECOVERY_STATE=""
+    for _ in $(seq 1 1200); do
+        TERMINAL_RECOVERY_STATE="$(python3 - "$AGG_REPO" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root_dir = Path(sys.argv[1]) / ".exo/tl-loop/root"
+try:
+    root = json.loads((root_dir / "run.json").read_text())
+    kani = json.loads((root_dir / "kani/run.json").read_text())
+except (OSError, json.JSONDecodeError):
+    print("waiting checkpoint-unavailable")
+    raise SystemExit(0)
+leaf = kani.get("slices", {}).get("issue-814-substitution-model-kani", {})
+phase = root.get("fsm", {}).get("phase")
+post = leaf.get("post_merge") or {}
+architecture_post = root.get("slices", {}).get("architecture", {}).get("post_merge") or {}
+ready = (
+    phase == "tl_done"
+    and root.get("slices", {}).get("architecture", {}).get("status") == "merged"
+    and architecture_post.get("phase") == "complete"
+    and root.get("slices", {}).get("kani", {}).get("status") == "merged"
+    and leaf.get("status") == "merged"
+    and post.get("phase") == "complete"
+    and not any(
+        node.get("name") == "handoff-proof"
+        for node in (root.get("plan_manifest") or {}).get("nodes", [])
+    )
+    and "handoff-proof" not in root.get("slices", {})
+)
+print("ready" if ready else "waiting", phase, root.get("current_order"), leaf.get("status"), post.get("phase"))
+PY
+        2>/dev/null)" || TERMINAL_RECOVERY_STATE=""
+        [[ "$TERMINAL_RECOVERY_STATE" == "ready "* ]] && break
+        sleep 0.25
+    done
+    [[ "$TERMINAL_RECOVERY_STATE" == "ready "* ]] \
+        || { cat "$AGG_REPO/.exo/tl-loop/root/controller-output.log" 2>/dev/null || true; e2e_fail "terminal-owner recovery did not complete the accepted Kani assignment: '$TERMINAL_RECOVERY_STATE'"; }
+    wait_for_aggregate_tl_terminal "terminal-owner recovery"
+    python3 "$SCRIPT_DIR/configured-owner-resume.py" verify-controller \
+        --repo "$AGG_REPO" --baseline "$AGG_DIR/preexisting-opencode-owner.json" \
+        --output "$AGG_DIR/configured-owner-resume.json" \
+        > "$AGG_DIR/configured-owner-resume-terminal.stdout" \
+        || { cat "$AGG_DIR/configured-owner-resume-terminal.stdout"; e2e_fail "terminal recovery did not retain its final worker, reviewer and publication state"; }
+    TERMINAL_CONTROLLER_EPOCH="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
+    TERMINAL_PANES_BEFORE="$(aggregate_tl_panes)"
+    TERMINAL_EFFECTS_BEFORE="$AGG_DIR/terminal-effects-before-repeat.json"
+    python3 - "$AGG_REPO" "$AGG_DIR/mock.log" "$TERMINAL_EFFECTS_BEFORE" "$LEAF_RECEIPT_SHA256" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+repo, mock_log, output = map(Path, sys.argv[1:4])
+expected_architecture_receipt = sys.argv[4]
+root_dir = repo / ".exo/tl-loop/root"
+root = json.loads((root_dir / "run.json").read_text())
+kani = json.loads((root_dir / "kani/run.json").read_text())
+leaf = kani["slices"]["issue-814-substitution-model-kani"]
+architecture = json.loads((root_dir / "architecture/run.json").read_text())
+architecture_evidence = architecture["slices"]["issue-811"]["post_merge"]["evidence"]
+assert hashlib.sha256(json.dumps(architecture_evidence, sort_keys=True, separators=(",", ":")).encode()).hexdigest() == expected_architecture_receipt
+def digest(path: Path) -> str | None:
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+def journal_digest(path: Path) -> str:
+    rows = json.loads(path.read_text())
+    stable = [row for row in rows if not (
+        row.get("operation") == "emit_controller_event"
+        and row.get("arguments", {}).get("event_type") in {"tl.phase_changed", "tl.recovery_boundary"}
+    )]
+    return hashlib.sha256(json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+remote = {"publications": 0, "merges": 0}
+for line in mock_log.read_text().splitlines():
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    path = str(row.get("path", "")).split("?", 1)[0]
+    if row.get("method") == "POST" and path.endswith("/api/v1/repos/owner/repo/pulls"):
+        remote["publications"] += 1
+    if row.get("method") == "POST" and "/api/v1/repos/owner/repo/pulls/" in path and path.endswith("/merge"):
+        remote["merges"] += 1
+ledger = [
+    json.loads(line)
+    for segment in sorted((repo / ".exo/ledger/segments").glob("segment-*.jsonl"))
+    for line in segment.read_text().splitlines()
+]
+dispatch = [
+    row for row in ledger
+    if row.get("type") in {"tl.dispatch_intended", "tl.spawn_requested", "tl.spawn_request_accepted", "tl.dispatch_confirmed"}
+    and row.get("data", {}).get("slice_id") == "issue-814-substitution-model-kani"
+]
+output.write_text(json.dumps({
+    "root_checkpoint": digest(root_dir / "run.json"),
+    "child_checkpoint": digest(root_dir / "kani/run.json"),
+    "child_journal": journal_digest(root_dir / "kani/action-journal.json"),
+    "owner_invocation": digest(repo / ".exo/agents/issue-814-substitution-model-kani-opencode/invocation.json"),
+    "dispatch_event_ids": [row.get("event_id") for row in dispatch],
+    "dispatch_event_count": len(dispatch),
+    "remote_mutations": remote,
+    "leaf_pr": leaf.get("pr_number"),
+    "leaf_head": (leaf.get("publication") or {}).get("head_sha"),
+    "architecture_receipt": expected_architecture_receipt,
+}, sort_keys=True, indent=2) + "\n")
+PY
+    REPEAT_TERMINAL_STATUS=0
+    HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
+        "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
+        > "$AGG_DIR/init-terminal-repeat.log" 2>&1 || REPEAT_TERMINAL_STATUS=$?
+    assert_init_status "$REPEAT_TERMINAL_STATUS" "$AGG_DIR/init-terminal-repeat.log" \
+        "repeat init --continue after terminal-owner recovery"
+    rg -Fq "server_build=\"$AGGREGATE_BUILD_ID\" controller_build=\"$AGGREGATE_BUILD_ID\"" "$AGG_DIR/init-terminal-repeat.log" \
+        || { cat "$AGG_DIR/init-terminal-repeat.log"; e2e_fail "terminal repeat init used an unexpected runtime artifact"; }
+    [[ "$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)" == "$TERMINAL_CONTROLLER_EPOCH" ]] \
+        || e2e_fail "repeat init restarted the completed terminal-owner controller"
+    TERMINAL_PANES_AFTER="$(aggregate_tl_panes)"
+    TERMINAL_PANE_COUNT_AFTER="$(printf '%s\n' "$TERMINAL_PANES_AFTER" | awk 'NF { count += 1 } END { print count + 0 }')"
+    [[ "$TERMINAL_PANE_COUNT_AFTER" -le 1 ]] \
+        || e2e_fail "terminal-owner repeat init created duplicate TL panes"
+    if [[ -n "$TERMINAL_PANES_AFTER" ]]; then
+        read -r terminal_window_after terminal_pane_after terminal_dead_after <<< "$TERMINAL_PANES_AFTER"
+        [[ "$terminal_dead_after" == "1" ]] \
+            || e2e_fail "terminal-owner repeat init restarted the completed TL"
+        if [[ -n "$TERMINAL_PANES_BEFORE" ]]; then
+            read -r terminal_window_before terminal_pane_before terminal_dead_before <<< "$TERMINAL_PANES_BEFORE"
+            [[ "$terminal_dead_before" == "1" && "$terminal_window_after" == "$terminal_window_before" \
+                && "$terminal_pane_after" == "$terminal_pane_before" ]] \
+                || e2e_fail "terminal-owner repeat init replaced the retained completed TL pane"
+        else
+            e2e_fail "terminal-owner repeat init created an unexpected TL pane"
+        fi
+    fi
+    python3 "$SCRIPT_DIR/configured-owner-resume.py" verify-repeat \
+        --repo "$AGG_REPO" --baseline "$AGG_DIR/configured-owner-resume.json" \
+        > "$AGG_DIR/configured-owner-resume-repeat.stdout" \
+        || { cat "$AGG_DIR/configured-owner-resume-repeat.stdout"; e2e_fail "terminal-owner repeat duplicated or rewrote the successor flow"; }
+    python3 - "$AGG_REPO" "$AGG_DIR/terminal-effects-before-repeat.json" <<'PY' \
+        || e2e_fail "terminal-owner repeat changed accepted checkpoints or dispatch evidence"
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+repo, before_path = map(Path, sys.argv[1:])
+before = json.loads(before_path.read_text())
+root_dir = repo / ".exo/tl-loop/root"
+root = json.loads((root_dir / "run.json").read_text())
+kani = json.loads((root_dir / "kani/run.json").read_text())
+leaf = kani["slices"]["issue-814-substitution-model-kani"]
+def digest(path: Path) -> str | None:
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+ledger = [
+    json.loads(line)
+    for segment in sorted((repo / ".exo/ledger/segments").glob("segment-*.jsonl"))
+    for line in segment.read_text().splitlines()
+]
+dispatch = [
+    row for row in ledger
+    if row.get("type") in {"tl.dispatch_intended", "tl.spawn_requested", "tl.spawn_request_accepted", "tl.dispatch_confirmed"}
+    and row.get("data", {}).get("slice_id") == "issue-814-substitution-model-kani"
+]
+after = {
+    "root_checkpoint": digest(root_dir / "run.json"),
+    "child_checkpoint": digest(root_dir / "kani/run.json"),
+    "child_journal": None,
+    "owner_invocation": digest(repo / ".exo/agents/issue-814-substitution-model-kani-opencode/invocation.json"),
+    "dispatch_event_ids": [row.get("event_id") for row in dispatch],
+    "dispatch_event_count": len(dispatch),
+    "remote_mutations": {"publications": 0, "merges": 0},
+    "leaf_pr": leaf.get("pr_number"),
+    "leaf_head": (leaf.get("publication") or {}).get("head_sha"),
+    "architecture_receipt": before["architecture_receipt"],
+}
+rows = json.loads((root_dir / "kani/action-journal.json").read_text())
+stable = [row for row in rows if not (
+    row.get("operation") == "emit_controller_event"
+    and row.get("arguments", {}).get("event_type") in {"tl.phase_changed", "tl.recovery_boundary"}
+)]
+after["child_journal"] = hashlib.sha256(json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+remote = {"publications": 0, "merges": 0}
+for line in (repo.parent / "mock.log").read_text().splitlines():
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    path = str(row.get("path", "")).split("?", 1)[0]
+    if row.get("method") == "POST" and path.endswith("/api/v1/repos/owner/repo/pulls"):
+        remote["publications"] += 1
+    if row.get("method") == "POST" and "/api/v1/repos/owner/repo/pulls/" in path and path.endswith("/merge"):
+        remote["merges"] += 1
+after["remote_mutations"] = remote
+assert after == before, f"repeat init changed durable or external recovery evidence: {before!r} -> {after!r}"
+assert root.get("fsm", {}).get("phase") == "tl_done"
+assert root.get("slices", {}).get("kani", {}).get("status") == "merged"
+assert leaf.get("status") == "merged" and (leaf.get("post_merge") or {}).get("phase") == "complete"
+assert "handoff-proof" not in root.get("slices", {})
+assert before["dispatch_event_count"] == 4
+PY
+    assert_one_live_window Server
+    assert_one_live_window Watcher
+    e2e_log "PASS: accepted terminal OpenCode owner recovered through the production controller to one Codex successor, exact PR/head, configured reviewer, complete bookkeeping and idempotent repeat init"
+    exit 0
+fi
+
 POST_TIDY_STATE=""
 KANI_BLOCKER_EVENT_ID=""
 KANI_BLOCKER_RUN_SEQ=""
@@ -1943,7 +2278,7 @@ if [[ "$post_tidy_marker" != "ready" || ( "$final_phase" != "tl_running" && "$fi
 fi
 [[ "$(count_pull_publications "$AGG_DIR/mock.log")" == "$((PULL_PUBLICATIONS_BEFORE + 2))" ]] \
     || e2e_fail "expected one recovered #814 publication and one post-tidy leaf publication"
-KANI_LEAF_PR="$(python3 - "$AGG_REPO" "$REJECTED_KANI_SPAWN_SHA256" <<'PY'
+KANI_LEAF_PR="$(python3 - "$AGG_REPO" "$REJECTED_KANI_SPAWN_SHA256" "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" "$AGG_DIR/preexisting-opencode-owner.json" <<'PY'
 import hashlib
 import json
 import sys
@@ -1951,6 +2286,8 @@ from pathlib import Path
 
 repo = Path(sys.argv[1])
 expected_rejected_spawn = sys.argv[2]
+terminal_provider_failure = sys.argv[3] == "1"
+baseline_path = Path(sys.argv[4])
 root_dir = repo / ".exo/tl-loop/root"
 root = json.loads((root_dir / "run.json").read_text())
 child = json.loads((root_dir / "kani/run.json").read_text())
@@ -1991,15 +2328,39 @@ spawns = [
     if entry.get("operation") == "spawn_leaf"
     and entry.get("target") == "issue-814-substitution-model-kani"
 ]
-assert sum(entry.get("status") == "rejected" for entry in spawns) == 1
-assert sum(entry.get("status") == "confirmed" for entry in spawns) == 1
-rejected = next(entry for entry in spawns if entry.get("status") == "rejected")
-accepted = next(entry for entry in spawns if entry.get("status") == "confirmed")
-assert hashlib.sha256(
-    json.dumps(rejected, sort_keys=True, separators=(",", ":")).encode()
-).hexdigest() == expected_rejected_spawn, "original rejected spawn evidence changed"
-assert rejected["arguments"]["intent_id"] != accepted["arguments"]["intent_id"]
-assert accepted["arguments"]["intent_id"] == leaf["dispatch_intent_id"]
+if terminal_provider_failure:
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    assert baseline["historical_dispatch_kind"] == "accepted_terminal_provider_failure"
+    assert sum(entry.get("status") == "rejected" for entry in spawns) == 0
+    assert sum(entry.get("status") == "confirmed" for entry in spawns) == 1
+    accepted = next(entry for entry in spawns if entry.get("status") == "confirmed")
+    accepted_digest = hashlib.sha256(
+        json.dumps(accepted, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert accepted_digest == expected_rejected_spawn
+    assert accepted == baseline["accepted_spawn_journal"], "accepted OpenCode launch journal changed"
+    assert accepted["arguments"]["intent_id"] == baseline["accepted_spawn_journal"]["arguments"]["intent_id"]
+    assert accepted["result"]["result"]["invocation_id"] == baseline["prior_invocation"]["invocation_id"]
+    resume_actions = [
+        entry for entry in journal
+        if entry.get("operation") == "resume_blocked_leaf"
+        and entry.get("target") == "issue-814-substitution-model-kani"
+        and entry.get("status") == "confirmed"
+    ]
+    assert len(resume_actions) == 1
+    assert resume_actions[0]["arguments"]["route_reconciliation_source"] == "proven_terminal_provider_failure"
+    assert resume_actions[0]["arguments"]["dispatch_intent_id"] == leaf["dispatch_intent_id"]
+    assert accepted["arguments"]["intent_id"] != leaf["dispatch_intent_id"]
+else:
+    assert sum(entry.get("status") == "rejected" for entry in spawns) == 1
+    assert sum(entry.get("status") == "confirmed" for entry in spawns) == 1
+    rejected = next(entry for entry in spawns if entry.get("status") == "rejected")
+    accepted = next(entry for entry in spawns if entry.get("status") == "confirmed")
+    assert hashlib.sha256(
+        json.dumps(rejected, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest() == expected_rejected_spawn, "original rejected spawn evidence changed"
+    assert rejected["arguments"]["intent_id"] != accepted["arguments"]["intent_id"]
+    assert accepted["arguments"]["intent_id"] == leaf["dispatch_intent_id"]
 assert leaf["dispatch_invocation_id"]
 events = [
     json.loads(line)
@@ -2032,7 +2393,7 @@ print(leaf["pr_number"])
 PY
 )"
 POST_TIDY_LEAF_PR="$leaf_pr"
-assert_configured_retry_dispatch_events "$AGG_REPO"
+assert_configured_retry_dispatch_events "$AGG_REPO" "$CONFIGURED_ROUTE_SOURCE"
 read -r KANI_CONTROLLER_INVOCATION_ID KANI_CONTROLLER_GENERATION < <(python3 - "$AGG_REPO" <<'PY'
 import json
 import sys
@@ -2478,7 +2839,13 @@ HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" \
     "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
     > "$AGG_DIR/init-repeat.log" 2>&1 || REPEAT_INIT_STATUS=$?
 assert_init_status "$REPEAT_INIT_STATUS" "$AGG_DIR/init-repeat.log" "repeated aggregate init --continue"
-assert_configured_retry_dispatch_events "$AGG_REPO"
+assert_configured_retry_dispatch_events "$AGG_REPO" "$CONFIGURED_ROUTE_SOURCE"
+if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" ]]; then
+    python3 "$SCRIPT_DIR/configured-owner-resume.py" verify-repeat \
+        --repo "$AGG_REPO" --baseline "$AGG_DIR/configured-owner-resume.json" \
+        > "$AGG_DIR/configured-owner-resume-repeat.stdout" \
+        || { cat "$AGG_DIR/configured-owner-resume-repeat.stdout"; e2e_fail "repeat init duplicated terminal-owner successor, PR or reviewer effects"; }
+fi
 rg -Fq "server_build=\"$AGGREGATE_BUILD_ID\" controller_build=\"$AGGREGATE_BUILD_ID\"" "$AGG_DIR/init-repeat.log" \
     || { cat "$AGG_DIR/init-repeat.log"; e2e_fail "repeat init did not attach using the verified binary/archive"; }
 assert_one_live_window Server

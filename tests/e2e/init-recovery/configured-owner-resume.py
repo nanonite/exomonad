@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -71,6 +72,38 @@ def retained_rejected_request(repository: Path) -> dict[str, Any]:
     if len(matches) != 1:
         raise RuntimeError(
             f"expected one immutable original rejected Kani request, found {len(matches)}"
+        )
+    return matches[0]
+
+
+def retained_original_dispatch(
+    repository: Path, baseline: dict[str, Any]
+) -> dict[str, Any]:
+    """Return the exact immutable owner launch record for either fixture shape."""
+    if baseline.get("historical_dispatch_kind") != "accepted_terminal_provider_failure":
+        return retained_rejected_request(repository)
+    expected = baseline.get("accepted_spawn_journal")
+    if not isinstance(expected, dict):
+        raise TypeError(
+            "terminal-provider baseline lacks its accepted spawn journal record"
+        )
+    rows = json.loads(
+        (repository / ".exo/tl-loop/root/kani/action-journal.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    intent_id = expected.get("arguments", {}).get("intent_id")
+    matches = [
+        row
+        for row in rows
+        if row.get("operation") == "spawn_leaf"
+        and row.get("target") == OWNER_SLICE
+        and row.get("status") == "confirmed"
+        and row.get("arguments", {}).get("intent_id") == intent_id
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"expected one accepted historical owner launch, found {len(matches)}"
         )
     return matches[0]
 
@@ -173,6 +206,268 @@ def seed(repository: Path, output: Path) -> None:
     )
 
 
+def seed_terminal_provider_failure(repository: Path, output: Path) -> None:
+    """Create a real accepted OpenCode launch, terminal failure, and blocked event."""
+    from tl_loop.fsm.child import ChildKind, ChildRecord
+    from tl_loop.fsm.scope import TLRunning
+    from tl_loop.loop.driver import EffectIntent
+    from tl_loop.loop.journal import EffectJournal
+    from tl_loop.state.schema import SliceStatus
+    from tl_loop.state.store import RunStore
+
+    transport = TransportClient(project_root=repository, timeout=30)
+    controller = EffectClient(transport, role="tl", name="kani")
+    snapshot = json.loads(
+        (repository / ".exo/tl-loop/plan.snapshot").read_text(encoding="utf-8")
+    )
+    kani_declaration = next(
+        row for row in snapshot["plan"]["sub_tls"] if row["name"] == "kani"
+    )
+    leaf_declaration = next(
+        row for row in kani_declaration["plan"]["leaves"] if row["name"] == OWNER_SLICE
+    )
+    task = leaf_declaration["task"]
+    if leaf_declaration.get("chainlink_issue_id") != BLOCKED_ISSUE_ID:
+        raise RuntimeError(
+            "accepted terminal-failure fixture lacks the typed #814 binding"
+        )
+    intent_id = "e2e-terminal-opencode-814"
+    arguments: dict[str, Any] = {
+        "name": OWNER_SLICE,
+        "task": task,
+        "intent_id": intent_id,
+        "agent_type": "opencode",
+        "model": "opencode-go/deepseek-v4.1-flash",
+        "boundary": leaf_declaration.get("boundary", []),
+        "verify": leaf_declaration.get("verify", []),
+    }
+    spawn_intent = EffectIntent("spawn_leaf", OWNER_SLICE, arguments, True)
+    child_store = RunStore("kani", repository / ".exo/tl-loop/root")
+    journal = EffectJournal("kani", child_store.run_dir / "action-journal.json")
+    journal.append(spawn_intent)
+    spawned = controller.spawn_leaf(
+        name=OWNER_SLICE,
+        task=task,
+        intent_id=intent_id,
+        agent_type="opencode",
+        model="opencode-go/deepseek-v4.1-flash",
+        boundary=leaf_declaration.get("boundary"),
+        verify=leaf_declaration.get("verify"),
+    )
+    journal.mark_result(spawn_intent, spawned)
+    if spawned.success is not True:
+        raise RuntimeError(
+            f"actual OpenCode host launch was refused: {spawned.error!r}"
+        )
+
+    owner_dir, identity = owner_for(repository)
+    original = wait_for_terminal(owner_dir)
+    if (
+        identity.get("agent_type") != "opencode"
+        or identity.get("model") != "opencode-go/deepseek-v4.1-flash"
+        or identity.get("effort") != "high"
+        or identity.get("slice_id") != OWNER_SLICE
+        or identity.get("birth_branch") != original.get("branch")
+        or original.get("runtime") != "opencode"
+        or original.get("model") != "opencode-go/deepseek-v4.1-flash"
+        or original.get("effort") != "high"
+        or original.get("trigger") != "spawn"
+        or original.get("generation") != 1
+        or original.get("status") not in {"failed", "exited"}
+        or type(original.get("exit_code")) is not int
+        or original.get("exit_code") == 0
+        or original.get("exit_classification") != "nonzero_exit"
+        or not isinstance(original.get("ended_at"), (float, int))
+        or "insufficient account funds"
+        not in str(original.get("stderr_tail", "")).casefold()
+        or original.get("pr_number") is not None
+        or original.get("head_sha") is not None
+        or owner_for_issue_id(owner_dir) != BLOCKED_ISSUE_ID
+    ):
+        raise RuntimeError(
+            f"OpenCode invocation did not end in the accepted provider failure: {original!r}"
+        )
+
+    invocation_id = original["invocation_id"]
+    branch = identity["birth_branch"]
+    worktree_recorded = identity["working_dir"]
+    worktree = Path(worktree_recorded)
+    if not worktree.is_absolute():
+        worktree = repository / worktree
+    worktree = worktree.resolve(strict=True)
+    events = canonical_events(repository)
+    runtime_run_id = (repository / ".exo/run_id").read_text(encoding="utf-8").strip()
+    accepted_rows = [
+        row
+        for row in events
+        if row.get("type") == "agent.spawned"
+        and row.get("agent_id") == "kani"
+        and row.get("run_id") == runtime_run_id
+        and row.get("invocation_id") == invocation_id
+        and row.get("data", {}).get("intent_id") == intent_id
+        and row.get("data", {}).get("child_agent") == identity.get("agent_name")
+        and row.get("data", {}).get("branch") == branch
+    ]
+    if len(accepted_rows) != 1:
+        raise RuntimeError(
+            f"accepted OpenCode launch has {len(accepted_rows)} matching authoritative spawn events"
+        )
+    spawn_event = accepted_rows[0]
+    spawn_seq = spawn_event.get("run_seq")
+    if type(spawn_seq) is not int or spawn_seq <= 0:
+        raise RuntimeError("accepted OpenCode spawn event has no durable sequence")
+
+    state = child_store.load()
+    manifest = state.plan_manifest
+    if manifest is None:
+        raise RuntimeError("Kani checkpoint has no accepted child manifest")
+    current = state.slices.get(OWNER_SLICE)
+    if current is None or current.status is not SliceStatus.PENDING:
+        raise RuntimeError(
+            "terminal-failure fixture must begin with an undispatched accepted leaf"
+        )
+    node = next((item for item in manifest.nodes if item.name == OWNER_SLICE), None)
+    if node is None or node.chainlink_issue_id != BLOCKED_ISSUE_ID:
+        raise RuntimeError(
+            "accepted child manifest does not bind the terminal leaf to issue #814"
+        )
+    requested_harness = str(leaf_declaration.get("agent_type", ""))
+    launched = replace(
+        current,
+        status=SliceStatus.SPAWNED,
+        attempts=1,
+        branch=branch,
+        base_ref="main.kani",
+        agent_type="opencode",
+        model="opencode-go/deepseek-v4.1-flash",
+        requested_harness=requested_harness,
+        resolved_harness="opencode/opencode-go/deepseek-v4.1-flash",
+        dispatch_intent_id=intent_id,
+        dispatch_started_at=float(original["started_at"]),
+        dispatch_generation=2,
+        dispatch_ledger_floor=spawn_seq - 1,
+        dispatch_last_boundary="agent.spawned",
+        dispatch_agent_id=identity["agent_name"],
+        dispatch_invocation_id=invocation_id,
+        dispatch_authoritative_event_seq=spawn_seq,
+        chainlink_issue_id=BLOCKED_ISSUE_ID,
+        worktree=str(current.worktree),
+        recovery=None,
+        park_cause=None,
+    )
+    accepted_child = ChildRecord(
+        OWNER_SLICE,
+        ChildKind.LEAF,
+        dispatch_intent_id=intent_id,
+        invocation_id=invocation_id,
+        manifest_node_id=node.node_id,
+        manifest_revision=manifest.manifest_revision,
+    )
+    child_running = TLRunning(
+        current_order=0,
+        pending_by_order={},
+        scope_path=(manifest.scope_id,),
+        plan_digest=manifest.digest,
+        parallel_pending=(accepted_child,),
+    )
+    child_store.checkpoint(
+        child_running,
+        {**state.slices, OWNER_SLICE: launched},
+        state.budgets,
+        spawn_seq,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        plan_manifest=manifest,
+    )
+
+    root_store = RunStore("root", repository / ".exo/tl-loop")
+    root_state = root_store.load()
+    root_store.checkpoint(
+        root_state.recursive_fsm,
+        root_state.slices,
+        root_state.budgets,
+        spawn_seq,
+        current_order=root_state.current_order,
+        ordered_stages=root_state.ordered_stages,
+        integration=root_state.integration,
+        plan_manifest=root_state.plan_manifest,
+    )
+    blocker = controller.emit_controller_event(
+        event_type="agent.task_blocked",
+        payload={
+            "outcome": "blocked",
+            "slice_id": OWNER_SLICE,
+            "cause": "human_decision_required",
+            "scope_attribution": "agent_lifecycle",
+            "needs_human": True,
+            "retryable": True,
+            "recovery_action": "apply the configured worker route to the preserved assignment",
+            "declared_difficulty": "standard",
+            "matched_difficulty_rule": "missing_handoff:nonzero_exit",
+            "attempt": 1,
+        },
+    )
+    if blocker.success is not True or not isinstance(blocker.result, dict):
+        raise RuntimeError(
+            f"production task-blocked event was not recorded: {blocker.error!r}"
+        )
+    blocker_id = blocker.result.get("event_id")
+    blocker_rows = [
+        row for row in canonical_events(repository) if row.get("event_id") == blocker_id
+    ]
+    if len(blocker_rows) != 1 or blocker_rows[0].get("type") != "agent.task_blocked":
+        raise RuntimeError(
+            "post-launch human blocker is not retained in the canonical ledger"
+        )
+    if blocker_rows[0].get("run_seq", 0) <= spawn_seq:
+        raise RuntimeError(
+            "terminal blocker does not follow the accepted OpenCode spawn"
+        )
+
+    history = repository / ".exo/events" / f"{identity['agent_name']}.jsonl"
+    output.write_text(
+        json.dumps(
+            {
+                "historical_dispatch_kind": "accepted_terminal_provider_failure",
+                "owner_agent_name": identity["agent_name"],
+                "owner_dir": str(owner_dir),
+                "prior_invocation": original,
+                "prior_invocation_file_sha256": digest(owner_dir / "invocation.json"),
+                "branch": branch,
+                "worktree": str(worktree),
+                "planned_worktree": current.worktree,
+                "worktree_fingerprint": worktree_fingerprint(worktree),
+                "spawn_event_id": spawn_event["event_id"],
+                "spawn_event_seq": spawn_seq,
+                "accepted_spawn_event": spawn_event,
+                "blocker_event_id": blocker_id,
+                "blocker_event_seq": blocker_rows[0]["run_seq"],
+                "accepted_spawn_journal": journal.entries_for(
+                    "spawn_leaf", OWNER_SLICE
+                )[0],
+                "history_lines": history.read_text(encoding="utf-8").splitlines(),
+            },
+            sort_keys=True,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    print(
+        json.dumps(
+            {"accepted_spawn": invocation_id, "terminal_status": original["status"]}
+        )
+    )
+
+
+def owner_for_issue_id(owner_dir: Path) -> int | None:
+    try:
+        return int((owner_dir / "active_issue").read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
 def wait_for_agent_event(path: Path, expected: str) -> None:
     deadline = time.monotonic() + 45
     while time.monotonic() < deadline:
@@ -187,6 +482,27 @@ def wait_for_agent_event(path: Path, expected: str) -> None:
 def verify_controller(repository: Path, baseline_path: Path, output: Path) -> None:
     """Verify recovery, publication and review came from the continued controller."""
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    if baseline.get("historical_dispatch_kind") == "accepted_terminal_provider_failure":
+        if (
+            baseline.get("prior_invocation", {}).get("status")
+            not in {"failed", "exited"}
+            or "insufficient account funds"
+            not in str(
+                baseline.get("prior_invocation", {}).get("stderr_tail", "")
+            ).casefold()
+        ):
+            raise RuntimeError(
+                "terminal-provider baseline does not retain the exact OpenCode failure"
+            )
+        matching_spawns = [
+            row
+            for row in canonical_events(repository)
+            if row.get("event_id") == baseline.get("spawn_event_id")
+        ]
+        if matching_spawns != [baseline.get("accepted_spawn_event")]:
+            raise RuntimeError(
+                "accepted OpenCode spawn ledger evidence changed after launch"
+            )
     root_dir = repository / ".exo/tl-loop/root"
     child_path = root_dir / "kani/run.json"
     owner_dir = Path(baseline["owner_dir"])
@@ -306,9 +622,12 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
         raise RuntimeError(
             "controller checkpoint does not match the configured same-owner successor"
         )
-    if retained_rejected_request(repository) != baseline["rejected_request"]:
+    expected_original = baseline.get(
+        "accepted_spawn_journal", baseline.get("rejected_request")
+    )
+    if retained_original_dispatch(repository, baseline) != expected_original:
         raise RuntimeError(
-            "controller recovery changed the original rejected OpenCode spawn"
+            "controller recovery changed the original OpenCode dispatch record"
         )
     history = repository / ".exo/events" / f"{baseline['owner_agent_name']}.jsonl"
     history_lines = history.read_text(encoding="utf-8").splitlines()
@@ -357,7 +676,7 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
         raise RuntimeError(
             "parent RunStore lacks its Kani controller invocation projection"
         )
-    original_journal = retained_rejected_request(repository)
+    original_journal = retained_original_dispatch(repository, baseline)
     action_rows = json.loads(
         (root_dir / "kani/action-journal.json").read_text(encoding="utf-8")
     )
@@ -420,9 +739,14 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
         )
 
     record = {
+        "historical_dispatch_kind": baseline.get("historical_dispatch_kind"),
+        "accepted_spawn_journal": baseline.get("accepted_spawn_journal"),
+        "accepted_spawn_event": baseline.get("accepted_spawn_event"),
+        "spawn_event_id": baseline.get("spawn_event_id"),
+        "prior_invocation": baseline["prior_invocation"],
         "owner_agent_name": baseline["owner_agent_name"],
         "prior_invocation_id": prior["invocation_id"],
-        "rejected_request": original_journal,
+        "original_dispatch_journal": original_journal,
         "successor_invocation_id": successor["invocation_id"],
         "branch": baseline["branch"],
         "worktree": baseline["worktree"],
@@ -434,7 +758,7 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
         "reviewer_name": reviewer["agent_name"],
         "reviewer_invocation": reviewer_invocation,
         "reviewer_invocation_event_id": reviewer["event_id"],
-        "successor_invocation_sha256": digest(owner_dir / "invocation.json"),
+        "successor_invocation_generation": successor["generation"],
         "owner_identity_sha256": digest(owner_dir / "identity.json"),
         "owner_history_lines": history_lines,
         "leaf_status": leaf["status"],
@@ -442,6 +766,8 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
         "lifecycle_event_ids": [row.get("event_id") for row in lifecycle],
         "agent_activity": activity,
     }
+    if baseline.get("historical_dispatch_kind") != "accepted_terminal_provider_failure":
+        record["rejected_request"] = original_journal
     output.write_text(
         json.dumps(record, sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
@@ -498,9 +824,30 @@ def canonical_events(repository: Path) -> list[dict[str, Any]]:
 
 def verify_repeat(repository: Path, evidence_path: Path) -> None:
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    retained_launch_event = [
+        row
+        for row in canonical_events(repository)
+        if row.get("event_id") == evidence.get("spawn_event_id")
+    ]
+    if evidence.get(
+        "historical_dispatch_kind"
+    ) == "accepted_terminal_provider_failure" and retained_launch_event != [
+        evidence.get("accepted_spawn_event")
+    ]:
+        raise RuntimeError(
+            "repeat init changed the accepted OpenCode launch ledger row"
+        )
     owner_dir, _ = owner_for(repository)
-    if retained_rejected_request(repository) != evidence["rejected_request"]:
-        raise RuntimeError("repeat init changed the original rejected Kani request")
+    current_invocation = invocation(owner_dir)
+    expected_successor_generation = evidence.get("successor_invocation_generation")
+    if type(expected_successor_generation) is not int:
+        expected_successor_generation = (
+            int(evidence.get("prior_invocation", {}).get("generation", 1)) + 1
+        )
+    if retained_original_dispatch(repository, evidence) != evidence.get(
+        "accepted_spawn_journal", evidence.get("rejected_request")
+    ):
+        raise RuntimeError("repeat init changed the original Kani dispatch record")
     action_rows = json.loads(
         (repository / ".exo/tl-loop/root/kani/action-journal.json").read_text(
             encoding="utf-8"
@@ -556,9 +903,26 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
         raise RuntimeError(
             "repeat init did not retain exactly one configured reviewer action for the same PR head"
         )
-    assert (
-        digest(owner_dir / "invocation.json") == evidence["successor_invocation_sha256"]
-    )
+    if (
+        current_invocation.get("invocation_id") != evidence["successor_invocation_id"]
+        or current_invocation.get("runtime") != evidence["runtime"]
+        or current_invocation.get("model") != evidence["model"]
+        or current_invocation.get("effort") != evidence["effort"]
+        or current_invocation.get("prior_invocation_id")
+        != evidence["prior_invocation_id"]
+        or current_invocation.get("generation") != expected_successor_generation
+        or current_invocation.get("runtime_agent_id") != evidence["owner_agent_name"]
+        or current_invocation.get("slice_id") != OWNER_SLICE
+        or current_invocation.get("branch") != evidence["branch"]
+        or Path(current_invocation.get("worktree", "")).resolve()
+        != Path(evidence["worktree"]).resolve()
+        or current_invocation.get("status") != "exited"
+        or current_invocation.get("exit_code") != 0
+        or current_invocation.get("exit_classification") != "one_shot_complete"
+    ):
+        raise RuntimeError(
+            "repeat init replaced or corrupted the completed configured successor invocation"
+        )
     history = repository / ".exo/events" / f"{evidence['owner_agent_name']}.jsonl"
     history_lines = history.read_text(encoding="utf-8").splitlines()
     prior_history = evidence["owner_history_lines"]
@@ -678,7 +1042,10 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("seed", "verify-controller", "verify-repeat"))
+    parser.add_argument(
+        "mode",
+        choices=("seed", "seed-terminal", "verify-controller", "verify-repeat"),
+    )
     parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--output", type=Path)
@@ -687,6 +1054,10 @@ def main() -> None:
         if arguments.output is None:
             parser.error("seed requires --output")
         seed(arguments.repo, arguments.output)
+    elif arguments.mode == "seed-terminal":
+        if arguments.output is None:
+            parser.error("seed-terminal requires --output")
+        seed_terminal_provider_failure(arguments.repo, arguments.output)
     elif arguments.mode == "verify-controller":
         if arguments.baseline is None or arguments.output is None:
             parser.error("verify-controller requires --baseline and --output")

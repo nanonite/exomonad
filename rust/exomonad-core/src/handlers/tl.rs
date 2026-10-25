@@ -60,7 +60,10 @@ fn valid_field_value(event_type: &str, key: &str, value: &Value) -> bool {
         return false;
     };
     if key == "route_reconciliation_source" {
-        return value.as_str() == Some("proven_preexecution_retry");
+        return matches!(
+            value.as_str(),
+            Some("proven_preexecution_retry") | Some("proven_terminal_provider_failure")
+        );
     }
     if value.is_null() {
         return true;
@@ -335,7 +338,7 @@ mod tests {
                 .emit_event(
                     EmitEventRequest {
                         event_type: event_type.to_string(),
-                        payload: r#"{"slice_id":"leaf-a","intent_id":"intent-1","boundary":"dispatch_intended","started_at":1,"attempt":2,"route_reconciliation_source":"proven_preexecution_retry"}"#
+                    payload: r#"{"slice_id":"leaf-a","intent_id":"intent-1","boundary":"dispatch_intended","started_at":1,"attempt":2,"route_reconciliation_source":"proven_preexecution_retry"}"#
                             .as_bytes()
                             .to_vec(),
                     },
@@ -357,6 +360,25 @@ mod tests {
                 "proven_preexecution_retry"
             );
         }
+
+        handler
+            .emit_event(
+                EmitEventRequest {
+                    event_type: "tl.dispatch_intended".to_string(),
+                    payload: r#"{"slice_id":"leaf-terminal","route_reconciliation_source":"proven_terminal_provider_failure"}"#
+                        .as_bytes()
+                        .to_vec(),
+                },
+                &context(),
+            )
+            .await
+            .unwrap();
+        let retained = event_log.ledger().read_events().unwrap();
+        assert!(retained.iter().any(|record| {
+            record.event.event_type == "tl.dispatch_intended"
+                && record.event.data["route_reconciliation_source"]
+                    == "proven_terminal_provider_failure"
+        }));
     }
 
     #[tokio::test]
