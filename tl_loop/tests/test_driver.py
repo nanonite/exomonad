@@ -19835,9 +19835,11 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
     assert transport.resume_calls == 1
 
 
+@pytest.mark.parametrize("legacy_adoption_audit", [False, True])
 def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpoint_crash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    legacy_adoption_audit: bool,
 ) -> None:
     plan, config, store, owner_dir, owner_name, prior_invocation_id = (
         _seed_terminal_provider_failure_leaf(tmp_path)
@@ -20002,11 +20004,106 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
     assert lineage_reason is not None
     invocation_path.write_bytes(successor_invocation)
 
+    legacy_adoption_entry = None
+    if legacy_adoption_audit:
+        legacy_proof, legacy_reason = driver_module._terminal_owner_recovery_proof(
+            plan, store.load(), config, store
+        )
+        assert legacy_proof is not None and legacy_reason is None
+        legacy_authorization = dict(legacy_proof.successor_adoption_authorization)
+        legacy_authorization.pop("authorization_version")
+        legacy_authorization.pop("predecessor_generation")
+        legacy_authorization["successor_generation"] = owner.generation
+        latest = store.load()
+        current = latest.slices[leaf.name]
+        evidence = dict(current.recovery.evidence)
+        evidence["confirmed_successor_adoption_authorization"] = legacy_authorization
+        legacy_recovery = replace(current.recovery, evidence=evidence)
+        store.checkpoint(
+            driver_module._phase_from_state(latest),
+            {**latest.slices, leaf.name: replace(current, recovery=legacy_recovery)},
+            latest.budgets,
+            latest.events.last_consumed_offset,
+            current_order=latest.current_order,
+            ordered_stages=latest.ordered_stages,
+            integration=latest.integration,
+            expected_revision=latest.revision,
+        )
+        legacy_intent = EffectIntent(
+            "authorize_terminal_owner_successor_adoption",
+            leaf.name,
+            legacy_authorization,
+            True,
+        )
+        journal.append(legacy_intent)
+        legacy_digest = hashlib.sha256(
+            json.dumps(legacy_authorization, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        journal.mark_result(
+            legacy_intent,
+            ToolResult.from_raw(
+                {"success": True, "result": {"authorization_sha256": legacy_digest}}
+            ),
+        )
+        legacy_adoption_entry = journal.existing(legacy_intent)
+
+    adoption_proof, adoption_reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert adoption_proof is not None and adoption_reason is None
+    persisted_adoption_state = driver_module._persist_terminal_route_authorization(
+        adoption_proof, store.load(), store
+    )
+    adoption_checkpoint = persisted_adoption_state.slices[leaf.name].recovery.evidence[
+        "confirmed_successor_adoption_authorization"
+    ]
+    persisted_successor = json.loads((owner_dir / "invocation.json").read_text(encoding="utf-8"))
+    assert adoption_checkpoint["authorization_version"] == 2
+    assert adoption_checkpoint["prior_invocation_id"] == prior_invocation_id
+    assert adoption_checkpoint["successor_invocation_id"] == successor_id
+    assert adoption_checkpoint["predecessor_generation"] == owner.generation
+    assert adoption_checkpoint["successor_generation"] == persisted_successor["generation"]
+    assert adoption_checkpoint["successor_generation"] == owner.generation + 1
+    assert adoption_checkpoint["dispatch_generation"] == interrupted.dispatch_generation
+    if legacy_adoption_audit:
+        assert adoption_checkpoint["correction_reason"] == (
+            "legacy_successor_generation_recorded_as_predecessor"
+        )
+        assert (
+            adoption_checkpoint["supersedes_legacy_authorization_sha256"]
+            == hashlib.sha256(
+                json.dumps(
+                    legacy_adoption_entry["arguments"], sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        adoption_evidence = persisted_adoption_state.slices[leaf.name].recovery.evidence
+        assert adoption_evidence["confirmed_successor_adoption_authorization_history"] == [
+            legacy_adoption_entry["arguments"]
+        ]
+    authorization_digest = hashlib.sha256(
+        json.dumps(adoption_checkpoint, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    staged_adoption_entries = journal.entries_for(
+        "authorize_terminal_owner_successor_adoption", leaf.name
+    )
+    expected_adoption_entry_count = 2 if legacy_adoption_audit else 1
+    assert len(staged_adoption_entries) == expected_adoption_entry_count
+    staged_adoption_entry = next(
+        entry
+        for entry in staged_adoption_entries
+        if entry["arguments"].get("authorization_version") == 2
+    )
+    assert staged_adoption_entry["arguments"] == adoption_checkpoint
+    assert journal.replay(staged_adoption_entry).result == {
+        "authorization_sha256": authorization_digest
+    }
+
     monkeypatch.setattr(RunStore, "checkpoint", original_checkpoint)
     replay_transport = RecordingTransport()
     replayed = driver_module._resume_terminal_owner_failure(
         plan,
-        approved,
+        persisted_adoption_state,
         config,
         EffectClient(replay_transport),
         store,
@@ -20018,6 +20115,9 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
     assert recovered.branch == owner.branch and recovered.worktree == str(owner.worktree)
     assert recovered.status is SliceStatus.DISPATCH_UNCONFIRMED
     assert recovered.recovery is None
+    final_checkpoint_slice = store.load().slices[leaf.name]
+    assert final_checkpoint_slice.dispatch_invocation_id == successor_id
+    assert final_checkpoint_slice.dispatch_generation == interrupted.dispatch_generation + 1
     assert not any(tool_name == "resume_blocked_leaf" for tool_name, _ in replay_transport.calls)
     assert len(journal.entries_for("resume_blocked_leaf", leaf.name)) == 1
     assert (
@@ -20034,8 +20134,12 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
         is GateStatus.REJECTED
     )
     adoption_entries = journal.entries_for("authorize_terminal_owner_successor_adoption", leaf.name)
-    assert len(adoption_entries) == 1 and adoption_entries[0]["status"] == "confirmed"
-    adoption = adoption_entries[0]["arguments"]
+    assert len(adoption_entries) == expected_adoption_entry_count
+    adoption_entry = next(
+        entry for entry in adoption_entries if entry["arguments"].get("authorization_version") == 2
+    )
+    assert adoption_entry["status"] == "confirmed"
+    adoption = adoption_entry["arguments"]
     assert isinstance(adoption, Mapping)
     assert adoption["resume_action_key"] == journal_entry[0]["key"]
     assert (
@@ -20048,6 +20152,13 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
     )
     assert adoption["prior_invocation_id"] == prior_invocation_id
     assert adoption["successor_invocation_id"] == successor_id
+    persisted_successor = json.loads((owner_dir / "invocation.json").read_text(encoding="utf-8"))
+    assert adoption["authorization_version"] == 2
+    assert adoption["predecessor_generation"] == owner.generation
+    assert adoption["successor_generation"] == persisted_successor["generation"]
+    assert adoption["successor_generation"] == owner.generation + 1
+    assert adoption["dispatch_generation"] == interrupted.dispatch_generation
+    assert recovered.dispatch_generation == interrupted.dispatch_generation + 1
     assert adoption["owner_agent_id"] == owner_name
     assert adoption["slice_id"] == leaf.name and adoption["issue_id"] == 814
     assert adoption["branch"] == owner.branch
@@ -20065,6 +20176,24 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
             )
         ).hexdigest()
     )
+    if legacy_adoption_audit:
+        assert legacy_adoption_entry in adoption_entries
+        assert (
+            next(
+                entry
+                for entry in adoption_entries
+                if entry["arguments"].get("authorization_version") is None
+            )
+            == legacy_adoption_entry
+        )
+        assert (
+            adoption["supersedes_legacy_authorization_sha256"]
+            == hashlib.sha256(
+                json.dumps(
+                    legacy_adoption_entry["arguments"], sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+        )
     assert resume_calls == 1
 
     repeated = driver_module._resume_terminal_owner_failure(
@@ -20083,5 +20212,5 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
                 "authorize_terminal_owner_successor_adoption", leaf.name
             )
         )
-        == 1
+        == expected_adoption_entry_count
     )

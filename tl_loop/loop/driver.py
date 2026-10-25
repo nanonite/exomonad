@@ -5389,6 +5389,121 @@ def _saved_terminal_launch_authorization_matches(
     return saved.get("digest") == expected_digest
 
 
+_LEGACY_SUCCESSOR_ADOPTION_KEYS = frozenset(
+    {
+        "source",
+        "recovery_gate_authorization",
+        "resume_action_key",
+        "resume_dispatch_intent_id",
+        "accepted_dispatch_intent_id",
+        "prior_invocation_id",
+        "successor_invocation_id",
+        "successor_generation",
+        "owner_agent_id",
+        "slice_id",
+        "issue_id",
+        "manifest_digest",
+        "route_authorization_digest",
+        "runtime",
+        "model",
+        "effort",
+        "branch",
+        "parent_branch",
+        "worktree",
+        "worktree_fingerprint",
+        "dispatch_generation",
+        "accepted_spawn_event_seq",
+        "blocker_event_seq",
+        "confirmed_result_sha256",
+    }
+)
+
+
+def _legacy_adoption_generation_matches(
+    previous: object,
+    candidate: Mapping[str, object],
+) -> bool:
+    if not isinstance(previous, Mapping) or set(previous) != _LEGACY_SUCCESSOR_ADOPTION_KEYS:
+        return False
+    predecessor_generation = candidate.get("predecessor_generation")
+    successor_generation = candidate.get("successor_generation")
+    return (
+        type(predecessor_generation) is int
+        and type(successor_generation) is int
+        and type(previous.get("successor_generation")) is int
+        and successor_generation == predecessor_generation + 1
+        and previous.get("successor_generation") == predecessor_generation
+        and all(
+            previous[key] == candidate.get(key)
+            for key in _LEGACY_SUCCESSOR_ADOPTION_KEYS - {"successor_generation"}
+        )
+    )
+
+
+def _legacy_adoption_correction_reference(
+    current: SliceState,
+    candidate: Mapping[str, object],
+) -> tuple[str | None, str | None]:
+    if current.recovery is None:
+        return None, None
+    evidence = current.recovery.evidence
+    history = evidence.get("confirmed_successor_adoption_authorization_history", [])
+    if not isinstance(history, list):
+        return None, "confirmed-successor adoption history is malformed"
+    records = [evidence.get("confirmed_successor_adoption_authorization"), *history]
+    matching = [
+        record for record in records if _legacy_adoption_generation_matches(record, candidate)
+    ]
+    digests = {
+        hashlib.sha256(
+            json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        for record in matching
+        if isinstance(record, Mapping)
+    }
+    if len(digests) > 1:
+        return None, "multiple legacy adoption records conflict with the persisted successor"
+    reference = next(iter(digests), None)
+    saved = evidence.get("confirmed_successor_adoption_authorization")
+    if isinstance(saved, Mapping) and (
+        "supersedes_legacy_authorization_sha256" in saved or "correction_reason" in saved
+    ):
+        expected = dict(candidate)
+        expected.update(
+            {
+                "correction_reason": "legacy_successor_generation_recorded_as_predecessor",
+                "supersedes_legacy_authorization_sha256": reference,
+            }
+        )
+        if reference is None or dict(saved) != expected:
+            return None, "persisted successor adoption correction provenance conflicts"
+    return reference, None
+
+
+def _valid_legacy_adoption_correction(
+    previous: object,
+    candidate: Mapping[str, object],
+) -> bool:
+    if not isinstance(previous, Mapping):
+        return False
+    correction = {
+        "correction_reason": "legacy_successor_generation_recorded_as_predecessor",
+        "supersedes_legacy_authorization_sha256": hashlib.sha256(
+            json.dumps(previous, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
+    without_correction = {
+        key: value
+        for key, value in candidate.items()
+        if key not in {"correction_reason", "supersedes_legacy_authorization_sha256"}
+    }
+    return (
+        candidate.get("authorization_version") == 2
+        and all(candidate.get(key) == value for key, value in correction.items())
+        and _legacy_adoption_generation_matches(previous, without_correction)
+    )
+
+
 def _confirmed_successor_adoption_authorization(
     entry: Mapping[str, object],
     current: SliceState,
@@ -5403,6 +5518,23 @@ def _confirmed_successor_adoption_authorization(
     arguments = entry.get("arguments")
     result = entry.get("result")
     approval = gate_authorization
+    persisted = owner.invocation_record
+    successor_generation = persisted.get("generation")
+    persisted_worktree = persisted.get("worktree")
+    if (
+        type(successor_generation) is not int
+        or successor_generation != owner.generation + 1
+        or persisted.get("invocation_id") != successor[0]
+        or persisted.get("prior_invocation_id") != owner.prior_invocation_id
+        or persisted.get("trigger") != "resume_blocked"
+        or persisted.get("branch") != owner.branch
+        or not isinstance(persisted_worktree, str)
+        or Path(persisted_worktree).resolve() != owner.worktree
+        or persisted.get("runtime") != successor[1]
+        or _optional_nonempty_text(persisted.get("model")) != successor[2]
+        or _optional_nonempty_text(persisted.get("effort")) != successor[3]
+    ):
+        return None, "validated persisted successor invocation has conflicting lineage"
     if (
         entry.get("status") != "confirmed"
         or not isinstance(entry.get("key"), str)
@@ -5424,35 +5556,47 @@ def _confirmed_successor_adoption_authorization(
     result_digest = hashlib.sha256(
         json.dumps(result, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-    return (
-        {
-            "source": "explicit_gate_approval_to_adopt_confirmed_successor",
-            "recovery_gate_authorization": dict(approval),
-            "resume_action_key": entry["key"],
-            "resume_dispatch_intent_id": arguments["dispatch_intent_id"],
-            "accepted_dispatch_intent_id": current.dispatch_intent_id,
-            "prior_invocation_id": owner.prior_invocation_id,
-            "successor_invocation_id": successor[0],
-            "successor_generation": owner.generation,
-            "owner_agent_id": owner.agent_name,
-            "slice_id": current.id,
-            "issue_id": owner.issue_id,
-            "manifest_digest": manifest_digest,
-            "route_authorization_digest": launch_authorization.get("digest"),
-            "runtime": successor[1],
-            "model": successor[2],
-            "effort": successor[3],
-            "branch": owner.branch,
-            "parent_branch": owner.parent_branch,
-            "worktree": str(owner.worktree),
-            "worktree_fingerprint": owner.worktree_fingerprint,
-            "dispatch_generation": current.dispatch_generation,
-            "accepted_spawn_event_seq": spawn_event_seq,
-            "blocker_event_seq": blocker_event_seq,
-            "confirmed_result_sha256": result_digest,
-        },
-        None,
+    authorization: dict[str, object] = {
+        "source": "explicit_gate_approval_to_adopt_confirmed_successor",
+        "authorization_version": 2,
+        "recovery_gate_authorization": dict(approval),
+        "resume_action_key": entry["key"],
+        "resume_dispatch_intent_id": arguments["dispatch_intent_id"],
+        "accepted_dispatch_intent_id": current.dispatch_intent_id,
+        "prior_invocation_id": owner.prior_invocation_id,
+        "predecessor_generation": owner.generation,
+        "successor_invocation_id": successor[0],
+        "successor_generation": successor_generation,
+        "owner_agent_id": owner.agent_name,
+        "slice_id": current.id,
+        "issue_id": owner.issue_id,
+        "manifest_digest": manifest_digest,
+        "route_authorization_digest": launch_authorization.get("digest"),
+        "runtime": successor[1],
+        "model": successor[2],
+        "effort": successor[3],
+        "branch": owner.branch,
+        "parent_branch": owner.parent_branch,
+        "worktree": str(owner.worktree),
+        "worktree_fingerprint": owner.worktree_fingerprint,
+        "dispatch_generation": current.dispatch_generation,
+        "accepted_spawn_event_seq": spawn_event_seq,
+        "blocker_event_seq": blocker_event_seq,
+        "confirmed_result_sha256": result_digest,
+    }
+    correction_reference, correction_error = _legacy_adoption_correction_reference(
+        current, authorization
     )
+    if correction_error is not None:
+        return None, correction_error
+    if correction_reference is not None:
+        authorization.update(
+            {
+                "correction_reason": "legacy_successor_generation_recorded_as_predecessor",
+                "supersedes_legacy_authorization_sha256": correction_reference,
+            }
+        )
+    return authorization, None
 
 
 def _terminal_route_authorization_digest(
@@ -5579,8 +5723,10 @@ def _persist_terminal_route_authorization(
     if adoption is not None:
         existing_adoption = evidence.get("confirmed_successor_adoption_authorization")
         if existing_adoption != adoption:
-            if existing_adoption is not None and not _fresh_terminal_gate_reauthorization(
-                existing_adoption, adoption
+            if (
+                existing_adoption is not None
+                and not _fresh_terminal_gate_reauthorization(existing_adoption, adoption)
+                and not _valid_legacy_adoption_correction(existing_adoption, adoption)
             ):
                 raise TLLoopError("persisted confirmed-successor adoption approval changed")
             history = evidence.get("confirmed_successor_adoption_authorization_history", [])
