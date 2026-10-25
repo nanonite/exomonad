@@ -19071,6 +19071,9 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
     successor_id = "codex-terminal-failure-successor"
     gate_name = driver_module._terminal_owner_recovery_gate_name(plan.leaves[0].name)
     store.set_gate(gate_name, GateStatus.PENDING)
+    legacy_proof_gate_name = f"tl-blocked-leaf-resume-proof-{plan.leaves[0].name}"
+    store.set_gate(legacy_proof_gate_name, GateStatus.PENDING)
+    store.answer_gate(legacy_proof_gate_name, GateStatus.REJECTED)
     owner = driver_module.resolve_dormant_owner_for_slice(
         config.project_root,
         slice_id=plan.leaves[0].name,
@@ -19184,6 +19187,10 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
     assert resumed.recovery is None
     assert (
         next(gate for gate in store.load().gates if gate.name == gate_name).status
+        is GateStatus.REJECTED
+    )
+    assert (
+        next(gate for gate in store.load().gates if gate.name == legacy_proof_gate_name).status
         is GateStatus.REJECTED
     )
     assert resumed.pr_number is None and resumed.publication is None
@@ -19944,11 +19951,62 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
         interrupted.recovery is not None and interrupted.recovery.phase is RecoveryPhase.HUMAN_GATE
     )
 
+    confirmed_before_rejection = json.dumps(journal_entry[0], sort_keys=True, separators=(",", ":"))
+    recovery_gate_name = driver_module._terminal_owner_recovery_gate_name(leaf.name)
+    proof_gate_name = f"tl-blocked-leaf-resume-proof-{leaf.name}"
+    store.set_gate(recovery_gate_name, GateStatus.PENDING)
+    rejected = store.answer_gate(recovery_gate_name, GateStatus.REJECTED)
+    store.set_gate(proof_gate_name, GateStatus.PENDING)
+    rejected = store.answer_gate(proof_gate_name, GateStatus.REJECTED)
+
+    rejected_transport = RecordingTransport()
+    held = driver_module._resume_terminal_owner_failure(
+        plan,
+        rejected,
+        config,
+        EffectClient(rejected_transport),
+        store,
+        journal,
+    )
+    assert held.slices[leaf.name].dispatch_invocation_id == prior_invocation_id
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in rejected_transport.calls)
+    assert all(
+        next(gate for gate in held.gates if gate.name == name).status is GateStatus.REJECTED
+        for name in (recovery_gate_name, proof_gate_name)
+    )
+    assert (
+        json.dumps(
+            journal.entries_for("resume_blocked_leaf", leaf.name)[0],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        == confirmed_before_rejection
+    )
+
+    approved = store.answer_gate(recovery_gate_name, GateStatus.APPROVED)
+    changed_route = replace(config, worker_effort_level="high")
+    changed_route_proof, changed_route_reason = driver_module._terminal_owner_recovery_proof(
+        plan, approved, changed_route, store
+    )
+    assert changed_route_proof is None
+    assert "original route authorization" in str(changed_route_reason)
+    invocation_path = owner_dir / "invocation.json"
+    successor_invocation = invocation_path.read_bytes()
+    changed_invocation = json.loads(successor_invocation)
+    changed_invocation["prior_invocation_id"] = "foreign-predecessor"
+    invocation_path.write_text(json.dumps(changed_invocation), encoding="utf-8")
+    conflicting_lineage, lineage_reason = driver_module._terminal_owner_recovery_proof(
+        plan, approved, config, store
+    )
+    assert conflicting_lineage is None
+    assert lineage_reason is not None
+    invocation_path.write_bytes(successor_invocation)
+
     monkeypatch.setattr(RunStore, "checkpoint", original_checkpoint)
     replay_transport = RecordingTransport()
     replayed = driver_module._resume_terminal_owner_failure(
         plan,
-        store.load(),
+        approved,
         config,
         EffectClient(replay_transport),
         store,
@@ -19962,7 +20020,52 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
     assert recovered.recovery is None
     assert not any(tool_name == "resume_blocked_leaf" for tool_name, _ in replay_transport.calls)
     assert len(journal.entries_for("resume_blocked_leaf", leaf.name)) == 1
+    assert (
+        json.dumps(
+            journal.entries_for("resume_blocked_leaf", leaf.name)[0],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        == confirmed_before_rejection
+    )
     assert len(journal.entries_for("spawn_leaf", leaf.name)) == 1
+    assert (
+        next(gate for gate in store.load().gates if gate.name == proof_gate_name).status
+        is GateStatus.REJECTED
+    )
+    adoption_entries = journal.entries_for("authorize_terminal_owner_successor_adoption", leaf.name)
+    assert len(adoption_entries) == 1 and adoption_entries[0]["status"] == "confirmed"
+    adoption = adoption_entries[0]["arguments"]
+    assert isinstance(adoption, Mapping)
+    assert adoption["resume_action_key"] == journal_entry[0]["key"]
+    assert (
+        adoption["resume_dispatch_intent_id"] == journal_entry[0]["arguments"]["dispatch_intent_id"]
+    )
+    assert adoption["accepted_dispatch_intent_id"] == interrupted.dispatch_intent_id
+    assert (
+        adoption["route_authorization_digest"]
+        == journal_entry[0]["arguments"]["route_authorization_digest"]
+    )
+    assert adoption["prior_invocation_id"] == prior_invocation_id
+    assert adoption["successor_invocation_id"] == successor_id
+    assert adoption["owner_agent_id"] == owner_name
+    assert adoption["slice_id"] == leaf.name and adoption["issue_id"] == 814
+    assert adoption["branch"] == owner.branch
+    assert adoption["parent_branch"] == owner.parent_branch
+    assert adoption["worktree"] == str(owner.worktree)
+    assert adoption["worktree_fingerprint"] == owner.worktree_fingerprint
+    assert adoption["runtime"] == "codex"
+    assert adoption["model"] == "gpt-6-luna" and adoption["effort"] == "xhigh"
+    assert adoption["recovery_gate_authorization"]["status"] == GateStatus.APPROVED.value
+    assert (
+        adoption["confirmed_result_sha256"]
+        == hashlib.sha256(
+            json.dumps(journal_entry[0]["result"], sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+    )
+    assert resume_calls == 1
 
     repeated = driver_module._resume_terminal_owner_failure(
         plan,
@@ -19974,3 +20077,11 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
     )
     assert repeated.slices[leaf.name] == recovered
     assert not any(tool_name == "resume_blocked_leaf" for tool_name, _ in replay_transport.calls)
+    assert (
+        len(
+            EffectJournal(store.run_id, store.run_dir / "action-journal.json").entries_for(
+                "authorize_terminal_owner_successor_adoption", leaf.name
+            )
+        )
+        == 1
+    )

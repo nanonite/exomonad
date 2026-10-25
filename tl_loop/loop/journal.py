@@ -37,6 +37,7 @@ MUTATING_OPERATIONS = frozenset(
         "root_branch_finalize",
         "resume_pr",
         "resume_blocked_leaf",
+        "authorize_terminal_owner_successor_adoption",
         "cleanup_reviewer_leaf",
         "close_reviewer_window",
         "cleanup_orphan",
