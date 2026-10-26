@@ -286,6 +286,7 @@ def seed_terminal_provider_failure(
         "agent_name": owner_name,
         "slug": OWNER_SLICE,
         "slice_id": OWNER_SLICE,
+        "display_name": f"OpenCode {OWNER_SLICE}",
         "agent_type": "opencode",
         "model": "opencode-go/deepseek-v4.1-flash",
         "effort": "high",
