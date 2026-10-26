@@ -175,11 +175,19 @@ def heartbeat_once(
     parked: list[str] = []
     progress = False
 
-    for slice_state in active:
+    for observed_slice in active:
+        observed_row = worker_rows.get(observed_slice.id)
+        current = store.load()
+        slice_state = current.slices.get(observed_slice.id)
+        if not _observation_still_current(observed_slice, slice_state, observed_row):
+            if active_work is not None:
+                active_work.stop(observed_slice.id)
+            continue
+        assert slice_state is not None
         current, recovery_event, recovery_progress = _reconcile_recovery(
-            store.load(),
+            current,
             slice_state,
-            worker_rows.get(slice_state.id),
+            observed_row,
             now=current_time,
             store=store,
             effects=effects,
@@ -252,7 +260,13 @@ def heartbeat_once(
                     )
                 )
             continue
-        slice_state = current.slices[slice_state.id]
+        current = store.load()
+        slice_state = current.slices.get(observed_slice.id)
+        if not _observation_still_current(observed_slice, slice_state, observed_row):
+            if active_work is not None:
+                active_work.stop(observed_slice.id)
+            continue
+        assert slice_state is not None
         if row is None:
             if active_work is not None:
                 active_work.stop(slice_state.id)
@@ -374,6 +388,13 @@ def heartbeat_once(
                 active_work_elapsed = active_work.elapsed(slice_state.id)
             else:
                 active_work.stop(slice_state.id)
+        current = store.load()
+        slice_state = current.slices.get(observed_slice.id)
+        if not _observation_still_current(observed_slice, slice_state, observed_row):
+            if active_work is not None:
+                active_work.stop(observed_slice.id)
+            continue
+        assert slice_state is not None
         budget_event = _enforce_task_budget(
             current=store.load(),
             slice_state=slice_state,
@@ -395,13 +416,20 @@ def heartbeat_once(
                 raise HeartbeatError(
                     f"dead slice {slice_state.id!r} requires an active effect client to park"
                 )
+            current = store.load()
+            latest_slice = current.slices.get(observed_slice.id)
+            if not _observation_still_current(observed_slice, latest_slice, observed_row):
+                if active_work is not None:
+                    active_work.stop(observed_slice.id)
+                continue
+            assert latest_slice is not None
             park(
-                slice_state,
+                latest_slice,
                 ParkCause.STALL_DETECTED,
                 store=store,
                 issue_creator=effects,
-                ledger=state.budgets,
-                audit=_stall_detection_audit(current, slice_state, row),
+                ledger=current.budgets,
+                audit=_stall_detection_audit(current, latest_slice, row),
             )
             parked.append(slice_state.id)
             progress = True
@@ -1033,6 +1061,46 @@ def _active_slices(state: RunState) -> tuple[SliceState, ...]:
         for slice_state in state.slices.values()
         if slice_state.status in active_statuses
     )
+
+
+def _observation_still_current(
+    observed: SliceState,
+    current: SliceState | None,
+    row: JsonMapping | None,
+) -> bool:
+    """Accept a pane row only for the active dispatch identity it observed."""
+    if current is None or current.status not in _active_statuses():
+        return False
+    identity_fields = (
+        "dispatch_intent_id",
+        "dispatch_agent_id",
+        "dispatch_invocation_id",
+        "dispatch_generation",
+        "attempts",
+        "branch",
+        "worktree",
+    )
+    if any(getattr(observed, field) != getattr(current, field) for field in identity_fields):
+        return False
+    if row is None:
+        return True
+    invocation_id = _text(row, "invocation_id") or _text(row, "invocationId")
+    if (
+        invocation_id is not None
+        and current.dispatch_invocation_id is not None
+        and invocation_id != current.dispatch_invocation_id
+    ):
+        return False
+    agent_id = _text(row, "agent_id") or _text(row, "agentId")
+    if (
+        agent_id is not None
+        and current.dispatch_agent_id is not None
+        and agent_id != current.dispatch_agent_id
+    ):
+        return False
+    runtime_name = _text(row, "name")
+    expected_name = observed.dispatch_agent_id or observed.id
+    return runtime_name is None or runtime_name == expected_name
 
 
 def _poll_workers(

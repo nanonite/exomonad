@@ -25,6 +25,7 @@ from tl_loop.loop.heartbeat import (
     heartbeat_once,
 )
 from tl_loop.loop.work_clock import ActiveWorkClock
+from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.schema import (
     ActionKind,
     ActionPhase,
@@ -495,6 +496,203 @@ def test_nested_recovery_hold_checkpoint_reassesses_concurrent_owner_changes(
             assert outer.reconciliation["nested_recovery_hold"]["reason_code"] == (
                 "checkpoint_missing"
             )
+
+
+def test_full_heartbeat_preserves_operator_abandon_during_nested_hold_clear(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale pane observation cannot overwrite an abandon winning hold clearance."""
+    _plan, config, store, _outer_store, inner_store = _seed_deep_nested_recovery_run(tmp_path)
+    inner_store.path.unlink()
+    state = _activate_nested_parent(store, store.load())
+    first = heartbeat_once(
+        state,
+        store,
+        EffectClient(HeartbeatTransport(pane_alive=True)),
+        HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
+        now=100.0,
+        project_root=config.project_root,
+    )
+    assert "nested_recovery_hold" in first.state.slices["outer"].reconciliation
+
+    latest = store.load()
+    integration = replace(
+        latest.integration,
+        sub_tl_states={**latest.integration.sub_tl_states, "outer": IntegrationLifecycle.RUNNING},
+        sub_tl_recovery={},
+    )
+    state = store.checkpoint(
+        latest.recursive_fsm or latest.fsm,
+        latest.slices,
+        latest.budgets,
+        latest.events.last_consumed_offset,
+        ordered_stages=latest.ordered_stages,
+        integration=integration,
+        plan_manifest=latest.plan_manifest,
+    )
+    root_journal = store.run_dir / "action-journal.json"
+    heartbeat_transport = HeartbeatTransport(pane_alive=False)
+    effects = EffectClient(heartbeat_transport)
+    original_checkpoint = RunStore.checkpoint
+    abandoned = False
+    journal_after_abandon: bytes | None = None
+
+    class AbandonTransport:
+        def call_tool(self, role, name, tool_name, arguments):
+            del role, name, tool_name, arguments
+            return cast(JsonObject, {"success": True, "result": {}})
+
+    def interleaved_checkpoint(checkpoint_store, fsm, slices, budgets, offset, **kwargs):
+        nonlocal abandoned, journal_after_abandon
+        target = slices.get("outer")
+        persisted = (
+            store.load().slices["outer"] if checkpoint_store.run_id == store.run_id else None
+        )
+        if (
+            not abandoned
+            and checkpoint_store.run_id == store.run_id
+            and target is not None
+            and persisted is not None
+            and "nested_recovery_hold" in (persisted.reconciliation or {})
+            and "nested_recovery_hold" not in (target.reconciliation or {})
+        ):
+            abandoned = True
+            result = abandon_slice(
+                store.root_dir.parent.parent,
+                store.run_id,
+                "outer",
+                effects=EffectClient(AbandonTransport()),
+            )
+            assert result["status"] == "abandoned"
+            journal_after_abandon = root_journal.read_bytes()
+        return original_checkpoint(checkpoint_store, fsm, slices, budgets, offset, **kwargs)
+
+    monkeypatch.setattr(RunStore, "checkpoint", interleaved_checkpoint)
+    result = heartbeat_once(
+        state,
+        store,
+        effects,
+        HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
+        now=110.0,
+        project_root=config.project_root,
+    )
+
+    latest = store.load()
+    outer = latest.slices["outer"]
+    assert abandoned
+    assert outer.status is SliceStatus.PARKED
+    assert outer.park_cause is ParkCause.ATTEMPT_ABANDONED
+    assert outer.park_audit["reason"] == "operator_requested"
+    assert result.state.revision == latest.revision
+    assert result.parked_slice_ids == ()
+    assert not any(event.kind == "worker.dead" for event in result.events)
+    assert root_journal.read_bytes() == journal_after_abandon
+    assert not any(
+        name in {"chainlink_issue_create", "emit_controller_event", "cleanup"}
+        for name, _ in heartbeat_transport.calls
+    )
+    assert not any(name in {"spawn_leaf", "spawn_worker"} for name, _ in heartbeat_transport.calls)
+
+    repeated = heartbeat_once(
+        result.state,
+        store,
+        effects,
+        HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
+        now=120.0,
+        project_root=config.project_root,
+    )
+    persisted = store.load().slices["outer"]
+    assert persisted.status is SliceStatus.PARKED
+    assert persisted.park_cause is ParkCause.ATTEMPT_ABANDONED
+    assert repeated.parked_slice_ids == ()
+    assert not any(event.kind == "worker.dead" for event in repeated.events)
+    assert root_journal.read_bytes() == journal_after_abandon
+
+
+def test_full_heartbeat_defers_predecessor_pane_observation_after_invocation_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A predecessor's dead-pane row cannot stall a newly bound invocation."""
+    _plan, config, store, _outer_store, inner_store = _seed_deep_nested_recovery_run(tmp_path)
+    inner_store.path.unlink()
+    state = _activate_nested_parent(store, store.load())
+    first = heartbeat_once(
+        state,
+        store,
+        EffectClient(HeartbeatTransport(pane_alive=True)),
+        HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
+        now=100.0,
+        project_root=config.project_root,
+    )
+    assert "nested_recovery_hold" in first.state.slices["outer"].reconciliation
+
+    latest = store.load()
+    integration = replace(
+        latest.integration,
+        sub_tl_states={**latest.integration.sub_tl_states, "outer": IntegrationLifecycle.RUNNING},
+        sub_tl_recovery={},
+    )
+    state = store.checkpoint(
+        latest.recursive_fsm or latest.fsm,
+        latest.slices,
+        latest.budgets,
+        latest.events.last_consumed_offset,
+        ordered_stages=latest.ordered_stages,
+        integration=integration,
+        plan_manifest=latest.plan_manifest,
+    )
+    predecessor = state.slices["outer"].dispatch_invocation_id
+    assert predecessor is not None
+    concurrent_store = RunStore(store.run_id, store.root_dir)
+    transport = HeartbeatTransport(pane_alive=False, worker_invocation_id=predecessor)
+    original_checkpoint = RunStore.checkpoint
+    rebound = False
+
+    def interleaved_checkpoint(checkpoint_store, fsm, slices, budgets, offset, **kwargs):
+        nonlocal rebound
+        target = slices.get("outer")
+        persisted = (
+            store.load().slices["outer"] if checkpoint_store.run_id == store.run_id else None
+        )
+        clearing_hold = (
+            checkpoint_store.run_id == store.run_id
+            and target is not None
+            and persisted is not None
+            and "nested_recovery_hold" in (persisted.reconciliation or {})
+            and "nested_recovery_hold" not in (target.reconciliation or {})
+        )
+        if clearing_hold and not rebound:
+            rebound = True
+            driver_module._checkpoint_ordered_sub_tl_invocation(
+                concurrent_store, "outer", "newer-outer-invocation"
+            )
+        return original_checkpoint(checkpoint_store, fsm, slices, budgets, offset, **kwargs)
+
+    monkeypatch.setattr(RunStore, "checkpoint", interleaved_checkpoint)
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
+        now=110.0,
+        project_root=config.project_root,
+    )
+
+    latest = store.load()
+    outer = latest.slices["outer"]
+    assert rebound
+    assert outer.status is SliceStatus.SPAWNED
+    assert outer.dispatch_invocation_id == "newer-outer-invocation"
+    assert outer.park_cause is None
+    assert result.parked_slice_ids == ()
+    assert not any(event.kind == "worker.dead" for event in result.events)
+    assert not any(
+        name in {"chainlink_issue_create", "emit_controller_event", "cleanup"}
+        for name, _ in transport.calls
+    )
+    assert not any(name in {"spawn_leaf", "spawn_worker"} for name, _ in transport.calls)
 
 
 def _activate_nested_parent(store: RunStore, state):
