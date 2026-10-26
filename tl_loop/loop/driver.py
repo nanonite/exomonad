@@ -2463,7 +2463,7 @@ def _reconcile_fresh_continue_stalls(
         changed,
         state.budgets,
         state.events.last_consumed_offset,
-        current_order=current_order,
+        current_order=(current_order if type(current_order) is int and current_order > 0 else None),
         ordered_stages=state.ordered_stages,
         integration=state.integration,
         plan_manifest=state.plan_manifest,

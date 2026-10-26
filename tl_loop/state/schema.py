@@ -682,9 +682,11 @@ RECONCILIATION_KEYS = frozenset(
         "ancestry_proof",
         "aggregate_post_merge_hold",
         "aggregate_publication_resolution",
+        "nested_recovery_hold",
     }
 )
 AGGREGATE_POST_MERGE_HOLD_KEYS = frozenset({"reason_code", "pr_number"})
+NESTED_RECOVERY_HOLD_KEYS = frozenset({"reason_code", "reason", "parent_run_id", "parent_slice_id"})
 AGGREGATE_PUBLICATION_RESOLUTION_KEYS = frozenset(
     {"resolution", "pr_number", "head_sha", "merge_journal_id"}
 )
@@ -1936,6 +1938,22 @@ def _reconciliation(value: object, path: str, errors: list[tuple[str, str]]) -> 
                     resolution_value,
                     key,
                     f"{path}.reconciliation.aggregate_publication_resolution",
+                    errors,
+                )
+    nested_hold = reconciliation.get("nested_recovery_hold")
+    if nested_hold is not None:
+        nested_value = _object(
+            nested_hold,
+            f"{path}.reconciliation.nested_recovery_hold",
+            NESTED_RECOVERY_HOLD_KEYS,
+            errors,
+        )
+        if nested_value is not None:
+            for key in NESTED_RECOVERY_HOLD_KEYS:
+                _non_empty_string(
+                    nested_value,
+                    key,
+                    f"{path}.reconciliation.nested_recovery_hold",
                     errors,
                 )
 

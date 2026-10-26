@@ -20546,3 +20546,558 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
         )
         == expected_adoption_entry_count
     )
+
+
+def test_continue_reconciles_nested_parallel_leaf_stall_with_canonical_zero_order(
+    tmp_path: Path,
+) -> None:
+    """A direct leaf keeps parallel order zero when its old stall is cleared."""
+    plan, config, store, *_ = _seed_terminal_provider_failure_leaf(tmp_path)
+    config = replace(config, active=False, keep_alive_on_waiting=False)
+    before = store.load()
+    original_order = before.current_order
+    leaf_id = plan.leaves[0].name
+    current = before.slices[leaf_id]
+    parked = replace(
+        current,
+        status=SliceStatus.PARKED,
+        park_cause=ParkCause.STALL_DETECTED,
+        park_audit={"attempts": 1, "reason": "pane_alive=false"},
+        recovery=None,
+        action=None,
+    )
+    original_intent = parked.dispatch_intent_id
+    original_invocation = parked.dispatch_invocation_id
+    original_attempts = parked.attempts
+    store.checkpoint(
+        before.recursive_fsm,
+        {**before.slices, leaf_id: parked},
+        before.budgets,
+        before.events.last_consumed_offset,
+        plan_manifest=before.plan_manifest,
+    )
+
+    result = run_tl_loop(
+        config.run_id,
+        plan,
+        SyntheticQueue([]),
+        ReadOnlyEffectClient(RecordingTransport()),
+        config=config,
+        root_dir=config.root_dir,
+    )
+
+    reconciled = store.load()
+    leaf = reconciled.slices[leaf_id]
+    assert leaf.status is SliceStatus.SPAWNED
+    assert leaf.park_cause is None
+    assert leaf.recovery is None and leaf.action is None
+    assert leaf.attempts == original_attempts
+    assert leaf.dispatch_intent_id == original_intent
+    assert leaf.dispatch_invocation_id == original_invocation
+    assert reconciled.current_order == original_order
+    assert reconciled.ordered_stages == ()
+    assert isinstance(reconciled.recursive_fsm, RecursiveTLRunning)
+    assert reconciled.recursive_fsm.current_order == 0
+    assert leaf.park_audit is not None
+    assert leaf.park_audit["reason"] == "pane_alive=false"
+    assert leaf.park_audit["superseded_by_epoch"] == reconciled.controller_epoch
+    assert result.final_state.slices[leaf_id].dispatch_invocation_id == original_invocation
+
+    repeat = run_tl_loop(
+        config.run_id,
+        plan,
+        SyntheticQueue([]),
+        ReadOnlyEffectClient(RecordingTransport()),
+        config=config,
+        root_dir=config.root_dir,
+    )
+    assert repeat.final_state.slices[leaf_id] == leaf
+
+
+def test_continue_reconciles_root_parallel_leaf_stall_without_inventing_order(
+    tmp_path: Path,
+) -> None:
+    """Root-owned parallel recovery keeps order zero and accepted evidence."""
+    base_plan, base_config, *_ = _seed_terminal_provider_failure_leaf(tmp_path)
+    plan = WorkPlan(leaves=base_plan.leaves)
+    root_dir = base_config.project_root / ".exo" / "tl-loop"
+    config = replace(
+        base_config,
+        run_id="direct-root",
+        root_dir=root_dir,
+        parent_run_id=None,
+        parent_branch=None,
+        parent_agent_id=None,
+        branch="main",
+        worktree=base_config.project_root,
+        depth=0,
+        declared_manifest=None,
+        active=False,
+        keep_alive_on_waiting=False,
+    )
+    manifest = driver_module._candidate_manifest(plan, config.run_id, config)
+    slices = driver_module._initial_slices(plan, config, root_dir, config.run_id)
+    create(
+        config.run_id,
+        {
+            "owner_branch": config.branch,
+            "owner_worktree": str(config.worktree),
+            "depth": 0,
+            "plan_manifest": manifest.to_document(),
+            "slices": slices,
+        },
+        root_dir=root_dir,
+    )
+    store = RunStore(config.run_id, root_dir)
+    store.set_plan_manifest(manifest)
+    before = store.load()
+    original_order = before.current_order
+    leaf_id = plan.leaves[0].name
+    declared = next(node for node in manifest.nodes if node.name == leaf_id)
+    original = before.slices[leaf_id]
+    parked = replace(
+        original,
+        status=SliceStatus.PARKED,
+        park_cause=ParkCause.STALL_DETECTED,
+        park_audit={"attempts": 1, "reason": "pane_alive=false"},
+        attempts=3,
+        dispatch_agent_id="accepted-root-leaf-owner",
+        dispatch_invocation_id="accepted-root-leaf-invocation",
+        dispatch_intent_id="accepted-root-leaf-intent",
+        dispatch_authoritative_event_seq=17,
+        dispatch_last_boundary=driver_module.DISPATCH_CONFIRMED_BOUNDARY,
+        dispatch_generation=1,
+        manifest_node_id=declared.node_id,
+    )
+    store.checkpoint(
+        RecursiveTLRunning(
+            current_order=0,
+            pending_by_order={},
+            parallel_pending=(
+                ChildRecord(
+                    leaf_id,
+                    ChildKind.LEAF,
+                    dispatch_intent_id=parked.dispatch_intent_id,
+                    invocation_id=parked.dispatch_invocation_id,
+                    manifest_node_id=declared.node_id,
+                    manifest_revision=manifest.manifest_revision,
+                ),
+            ),
+            scope_path=(manifest.scope_id,),
+            plan_digest=manifest.digest,
+        ),
+        {**before.slices, leaf_id: parked},
+        before.budgets,
+        before.events.last_consumed_offset,
+        plan_manifest=manifest,
+    )
+
+    transport = RecordingTransport()
+    first = run_tl_loop(
+        config.run_id,
+        plan,
+        SyntheticQueue([]),
+        ReadOnlyEffectClient(transport),
+        config=config,
+        root_dir=root_dir,
+    )
+    recovered = store.load()
+    leaf = recovered.slices[leaf_id]
+    assert leaf.status is SliceStatus.SPAWNED
+    assert leaf.attempts == parked.attempts
+    assert leaf.dispatch_intent_id == parked.dispatch_intent_id
+    assert leaf.dispatch_invocation_id == parked.dispatch_invocation_id
+    assert leaf.park_audit == {
+        "attempts": 1,
+        "reason": "pane_alive=false",
+        "superseded_by_epoch": recovered.controller_epoch,
+        "supersession_reason": "fresh_continue_reconciles_invocation_local_stall",
+    }
+    assert recovered.current_order == original_order
+    assert recovered.ordered_stages == ()
+    assert isinstance(recovered.recursive_fsm, RecursiveTLRunning)
+    assert recovered.recursive_fsm.current_order == 0
+    assert first.final_state.slices[leaf_id].dispatch_invocation_id == parked.dispatch_invocation_id
+    assert not any(name in {"spawn_leaf", "spawn_worker"} for name, _ in transport.calls)
+
+    repeated = run_tl_loop(
+        config.run_id,
+        plan,
+        SyntheticQueue([]),
+        ReadOnlyEffectClient(RecordingTransport()),
+        config=config,
+        root_dir=root_dir,
+    )
+    assert repeated.final_state.slices[leaf_id] == leaf
+
+
+@pytest.mark.parametrize("conflict", (None, "inner_parent"))
+@pytest.mark.parametrize("root_failed", (False, True))
+def test_depth_three_recovery_checkpoint_path_is_verified_during_continue_and_heartbeat(
+    tmp_path: Path,
+    conflict: str | None,
+    root_failed: bool,
+) -> None:
+    """Startup and heartbeat resolve root/outer/inner/leaf through accepted scopes."""
+    plan, config, root_store, outer_store, inner_store = _seed_deep_nested_recovery_run(
+        tmp_path, conflict=conflict
+    )
+    root_state = root_store.load()
+    if root_failed:
+        root_store.checkpoint(
+            RecursiveTLFailed("historical invocation-local parent stall"),
+            root_state.slices,
+            root_state.budgets,
+            root_state.events.last_consumed_offset,
+            current_order=1,
+            ordered_stages=root_state.ordered_stages,
+            integration=root_state.integration,
+            plan_manifest=root_state.plan_manifest,
+        )
+        root_state = root_store.load()
+    root_slice = root_state.slices["outer"]
+    if conflict == "inner_parent":
+        proof, reason = driver_module.verified_nested_recovery_wait(
+            root_state, root_slice, root_store
+        )
+        assert not proof
+        assert "identity conflicts" in reason
+        held = driver_module._reconcile_fresh_continue_stalls(
+            plan,
+            root_state,
+            config,
+            root_store,
+            prior_terminal_reason=(
+                "historical invocation-local parent stall" if root_failed else None
+            ),
+        )
+        assert held.slices["outer"].status is SliceStatus.PARKED
+        assert held.slices["outer"].park_audit == root_slice.park_audit
+        if root_failed:
+            assert isinstance(held.recursive_fsm, RecursiveTLRunning)
+        return
+
+    proof, reason = driver_module.verified_nested_recovery_wait(root_state, root_slice, root_store)
+    assert proof, reason
+
+    continued = driver_module._reconcile_fresh_continue_stalls(
+        plan,
+        root_state,
+        config,
+        root_store,
+        prior_terminal_reason=("historical invocation-local parent stall" if root_failed else None),
+    )
+    reconciled = root_store.load()
+    assert reconciled.slices["outer"].status is SliceStatus.SPAWNED
+    assert reconciled.slices["outer"].park_cause is None
+    assert reconciled.current_order == 1
+    assert reconciled.slices["later"].status is SliceStatus.PENDING
+    assert reconciled.integration.sub_tl_recovery["outer"].child_path == (
+        "root",
+        "outer",
+        "inner",
+        "leaf-a",
+    )
+    assert not isinstance(reconciled.recursive_fsm, RecursiveTLFailed)
+    assert isinstance(reconciled.recursive_fsm, RecursiveTLRunning)
+    assert continued.slices["outer"].dispatch_invocation_id == "root-outer-invocation"
+
+    class DeadControllerTransport(RecordingTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            if tool_name == "poll_workers":
+                self.calls.append((tool_name, arguments))
+                return {
+                    "success": True,
+                    "result": {
+                        "workers": [
+                            {"name": "root", "pane_alive": False, "lifecycle_status": "ACTIVE"}
+                        ],
+                        "missing_agents": [],
+                    },
+                }
+            return super().call_tool(role, name, tool_name, arguments)
+
+    heartbeat = driver_module.heartbeat_once(
+        reconciled,
+        root_store,
+        EffectClient(DeadControllerTransport()),
+        driver_module.HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
+        now=100.0,
+        project_root=config.project_root,
+    )
+    assert heartbeat.state.slices["outer"].status is SliceStatus.SPAWNED
+    assert heartbeat.state.slices["outer"].park_cause is None
+    assert heartbeat.parked_slice_ids == ()
+    assert inner_store.load().slices["leaf-a"].recovery is not None
+    assert outer_store.load().integration.sub_tl_recovery["inner"].child_path == (
+        "outer",
+        "inner",
+        "leaf-a",
+    )
+
+
+def _seed_deep_nested_recovery_run(
+    tmp_path: Path,
+    *,
+    conflict: str | None = None,
+) -> tuple[WorkPlan, TLLoopConfig, RunStore, RunStore, RunStore]:
+    """Persist owned root/outer/inner scopes and a human-gated leaf receipt."""
+    project = tmp_path / "repository"
+    project.mkdir(parents=True, exist_ok=True)
+    root_dir = tmp_path / ".exo" / "tl-loop"
+    identity = RepositoryIdentity("https://forge.example.test/deep/repository.git")
+    leaf_plan = WorkPlan.from_mapping(
+        {"leaves": [{"name": "leaf-a", "task": "deep recovery", "chainlink_issue_id": None}]}
+    )
+    outer_plan = WorkPlan(sub_tls=(SubTLTask("inner", leaf_plan, order=1),))
+    plan = WorkPlan(
+        sub_tls=(SubTLTask("outer", outer_plan, order=1), SubTLTask("later", WorkPlan(), order=2))
+    )
+    root_config = TLLoopConfig(
+        active=False,
+        run_id="root",
+        root_dir=root_dir,
+        project_root=project,
+        worktree=project,
+        branch="main",
+        repository_identity=identity,
+        session_mode="continue",
+        keep_alive_on_waiting=False,
+    )
+    root_manifest = driver_module._manifest_for_plan(plan, "root", root_config)
+    root_slices = _initial_slices(plan, root_config, root_dir, "root")
+    root_store = RunStore("root", root_dir)
+    create(
+        "root",
+        {
+            "owner_branch": "main",
+            "owner_worktree": str(project),
+            "repository_identity": identity.to_document(),
+            "plan_manifest": root_manifest.to_document(),
+            "slices": root_slices,
+        },
+        root_dir=root_dir,
+    )
+    root_store.set_plan_manifest(root_manifest, slices=root_slices)
+    stages = tuple(
+        driver_module.OrderedStageState(stage.order, stage.sub_tls) for stage in plan.ordered_stages
+    )
+    root_state = root_store.set_ordered_state(1, stages, root_store.load().integration)
+
+    outer_task = plan.sub_tls[0]
+    outer_node = next(node for node in root_manifest.nodes if node.name == "outer")
+    outer_manifest = root_manifest.child_manifests[outer_node.node_id]
+    outer_worktree = Path(root_state.slices["outer"].worktree or project / "outer")
+    outer_config = replace(
+        root_config,
+        run_id="outer",
+        root_dir=root_store.run_dir,
+        branch=outer_node.owned_branch,
+        worktree=outer_worktree,
+        parent_run_id="root",
+        parent_branch="main",
+        parent_agent_id="root",
+        depth=1,
+        declared_manifest=outer_manifest,
+    )
+    outer_slices = _initial_slices(outer_task.plan, outer_config, root_store.run_dir, "outer")
+    outer_store = RunStore("outer", root_store.run_dir)
+    create(
+        "outer",
+        {
+            "owner_branch": outer_node.owned_branch,
+            "owner_worktree": str(outer_worktree),
+            "parent_run_id": "root",
+            "parent_branch": "main",
+            "parent_agent_id": "root",
+            "depth": 1,
+            "repository_identity": identity.to_document(),
+            "plan_manifest": outer_manifest.to_document(),
+            "slices": outer_slices,
+        },
+        root_dir=root_store.run_dir,
+    )
+    outer_store.set_plan_manifest(outer_manifest, slices=outer_slices)
+    outer_stages = tuple(
+        driver_module.OrderedStageState(stage.order, stage.sub_tls)
+        for stage in outer_task.plan.ordered_stages
+    )
+    outer_state = outer_store.set_ordered_state(1, outer_stages, outer_store.load().integration)
+
+    inner_task = outer_task.plan.sub_tls[0]
+    inner_node = next(node for node in outer_manifest.nodes if node.name == "inner")
+    inner_manifest = outer_manifest.child_manifests[inner_node.node_id]
+    inner_worktree = Path(outer_state.slices["inner"].worktree or outer_worktree / "inner")
+    inner_config = replace(
+        outer_config,
+        run_id="inner",
+        root_dir=outer_store.run_dir,
+        branch=inner_node.owned_branch,
+        worktree=inner_worktree,
+        parent_run_id="outer",
+        parent_branch=outer_node.owned_branch,
+        parent_agent_id="outer",
+        depth=2,
+        declared_manifest=inner_manifest,
+    )
+    inner_slices = _initial_slices(inner_task.plan, inner_config, outer_store.run_dir, "inner")
+    inner_store = RunStore("inner", outer_store.run_dir)
+    create(
+        "inner",
+        {
+            "owner_branch": inner_node.owned_branch,
+            "owner_worktree": str(inner_worktree),
+            "parent_run_id": "foreign-parent" if conflict == "inner_parent" else "outer",
+            "parent_branch": outer_node.owned_branch,
+            "parent_agent_id": "outer",
+            "depth": 2,
+            "repository_identity": identity.to_document(),
+            "plan_manifest": inner_manifest.to_document(),
+            "slices": inner_slices,
+        },
+        root_dir=outer_store.run_dir,
+    )
+    inner_store.set_plan_manifest(inner_manifest, slices=inner_slices)
+    inner_state = inner_store.load()
+    current_leaf = inner_state.slices["leaf-a"]
+    leaf_invocation = "deep-leaf-invocation"
+    leaf_owner = "deep-leaf-owner"
+    recovery = driver_module.transition_recovery(
+        begin_recovery(
+            cause="human_decision_required",
+            owner_run_id="inner",
+            slice_attempt=1,
+            owner_agent_id=leaf_owner,
+            invocation_generation=1,
+            plan_revision=inner_state.revision,
+            evidence={
+                "slice_id": "leaf-a",
+                "attempt": 1,
+                "invocation_id": leaf_invocation,
+                "generation": 1,
+            },
+            next_action="open_human_gate",
+        ),
+        RecoveryPhase.HUMAN_GATE,
+        next_action="open_human_gate",
+    )
+    leaf = replace(
+        current_leaf,
+        status=SliceStatus.SPAWNED,
+        attempts=1,
+        dispatch_intent_id="deep-leaf-intent",
+        dispatch_agent_id=leaf_owner,
+        dispatch_invocation_id=leaf_invocation,
+        dispatch_generation=1,
+        dispatch_authoritative_event_seq=108015,
+        dispatch_last_boundary="agent.spawned",
+        recovery=recovery,
+    )
+    leaf_node = next(node for node in inner_manifest.nodes if node.name == "leaf-a")
+    inner_store.checkpoint(
+        RecursiveTLRunning(
+            current_order=0,
+            pending_by_order={},
+            parallel_pending=(
+                ChildRecord(
+                    "leaf-a",
+                    ChildKind.LEAF,
+                    manifest_node_id=leaf_node.node_id,
+                    manifest_revision=inner_manifest.manifest_revision,
+                ),
+            ),
+            scope_path=(inner_manifest.scope_id,),
+            plan_digest=inner_manifest.digest,
+        ),
+        {**inner_state.slices, "leaf-a": leaf},
+        inner_state.budgets,
+        108015,
+        plan_manifest=inner_manifest,
+    )
+
+    inner_projection = driver_module._child_recovery_projection(inner_store.load(), "outer")
+    assert inner_projection is not None
+    _inner_lifecycle, inner_summary = inner_projection
+    outer_slice = replace(
+        outer_state.slices["inner"],
+        status=SliceStatus.SPAWNED,
+        attempts=1,
+        dispatch_intent_id="outer-inner-intent",
+        dispatch_agent_id="outer",
+        dispatch_invocation_id="outer-inner-invocation",
+        dispatch_generation=1,
+        dispatch_authoritative_event_seq=1,
+        dispatch_last_boundary="sub_tl_started",
+    )
+    outer_integration = replace(
+        outer_state.integration,
+        sub_tl_states={"inner": SubTLLifecycle.HUMAN_GATE},
+        sub_tl_recovery={"inner": inner_summary},
+    )
+    outer_state = outer_store.checkpoint(
+        outer_state.recursive_fsm or outer_state.fsm,
+        {**outer_state.slices, "inner": outer_slice},
+        outer_state.budgets,
+        outer_state.events.last_consumed_offset,
+        current_order=1,
+        ordered_stages=outer_stages,
+        integration=outer_integration,
+        plan_manifest=outer_manifest,
+    )
+
+    outer_projection = driver_module._child_recovery_projection(outer_state, "root")
+    assert outer_projection is not None
+    _outer_lifecycle, outer_summary = outer_projection
+    root_outer = replace(
+        root_state.slices["outer"],
+        status=SliceStatus.PARKED,
+        attempts=1,
+        dispatch_intent_id="root-outer-intent",
+        dispatch_agent_id="root",
+        dispatch_invocation_id="root-outer-invocation",
+        dispatch_generation=1,
+        dispatch_authoritative_event_seq=1,
+        dispatch_last_boundary="sub_tl_started",
+        park_cause=ParkCause.STALL_DETECTED,
+        park_audit={"attempts": 1, "reason": "pane_alive=false"},
+    )
+    root_integration = replace(
+        root_state.integration,
+        sub_tl_states={"outer": SubTLLifecycle.HUMAN_GATE, "later": IntegrationLifecycle.RUNNING},
+        sub_tl_recovery={"outer": outer_summary},
+    )
+    root_nodes = {node.name: node for node in root_manifest.nodes}
+    root_phase = RecursiveTLRunning(
+        current_order=1,
+        pending_by_order={
+            1: (
+                ChildRecord(
+                    "outer",
+                    ChildKind.SUB_TL,
+                    manifest_node_id=root_nodes["outer"].node_id,
+                    manifest_revision=root_manifest.manifest_revision,
+                ),
+            ),
+            2: (
+                ChildRecord(
+                    "later",
+                    ChildKind.SUB_TL,
+                    manifest_node_id=root_nodes["later"].node_id,
+                    manifest_revision=root_manifest.manifest_revision,
+                ),
+            ),
+        },
+        scope_path=(root_manifest.scope_id,),
+        plan_digest=root_manifest.digest,
+    )
+    root_store.checkpoint(
+        root_phase,
+        {**root_state.slices, "outer": root_outer},
+        root_state.budgets,
+        root_state.events.last_consumed_offset,
+        current_order=1,
+        ordered_stages=stages,
+        integration=root_integration,
+        plan_manifest=root_manifest,
+    )
+    return plan, root_config, root_store, outer_store, inner_store

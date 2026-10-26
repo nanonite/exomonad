@@ -28,12 +28,14 @@ from tl_loop.state.schema import (
     ActionPhase,
     ActionState,
     DeadlineLedger,
+    GateStatus,
     ParkCause,
     RunState,
     SliceStatus,
 )
 from tl_loop.state.store import RunStore
 from tl_loop.tests.checkpoint_fixtures import create
+from tl_loop.tests.test_driver import _seed_deep_nested_recovery_run
 
 
 class _MutableClock:
@@ -230,6 +232,102 @@ def test_silently_dead_worker_is_parked(tmp_path: Path) -> None:
         "emit_controller_event",
         "emit_controller_event",
     ]
+
+
+@pytest.mark.parametrize("proof_failure", ("missing", "corrupt", "conflicting", "stale_summary"))
+def test_dead_nested_controller_is_held_when_declared_recovery_proof_is_unavailable(
+    tmp_path: Path,
+    proof_failure: str,
+) -> None:
+    """An asserted nested recovery cannot degrade into a generic parent stall."""
+    conflict = "inner_parent" if proof_failure == "conflicting" else None
+    _plan, config, store, _outer_store, inner_store = _seed_deep_nested_recovery_run(
+        tmp_path, conflict=conflict
+    )
+    state = store.load()
+    parent_slice = replace(
+        state.slices["outer"],
+        status=SliceStatus.SPAWNED,
+        park_cause=None,
+        park_audit=None,
+    )
+    integration = state.integration
+    if proof_failure == "missing":
+        inner_store.path.unlink()
+    elif proof_failure == "corrupt":
+        inner_store.path.write_text("{not-json", encoding="utf-8")
+    elif proof_failure == "stale_summary":
+        summary = integration.sub_tl_recovery["outer"]
+        integration = replace(
+            integration,
+            sub_tl_recovery={"outer": replace(summary, next_probe_at=123.0)},
+        )
+    state = store.checkpoint(
+        state.recursive_fsm or state.fsm,
+        {**state.slices, "outer": parent_slice},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=1,
+        ordered_stages=state.ordered_stages,
+        integration=integration,
+    )
+    manual_gate = "manual-nested-recovery-review"
+    state = store.set_gate(manual_gate, GateStatus.PENDING)
+    active_work = ActiveWorkClock(_MutableClock(100.0))
+    active_work.mark_active("outer")
+    transport = HeartbeatTransport(pane_alive=False)
+    effects = EffectClient(transport)
+
+    result = heartbeat_once(
+        state,
+        store,
+        effects,
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=1.0),
+        now=10.0,
+        project_root=config.project_root,
+        active_work=active_work,
+    )
+
+    held = result.state.slices["outer"]
+    assert held.status is SliceStatus.SPAWNED
+    assert held.park_cause is None
+    assert result.parked_slice_ids == ()
+    assert active_work.snapshot() == {}
+    assert held.reconciliation is not None
+    expected_reason = {
+        "missing": "checkpoint_missing",
+        "corrupt": "checkpoint_unavailable",
+        "conflicting": "child_identity_conflict",
+        "stale_summary": "summary_conflict",
+    }[proof_failure]
+    assert held.reconciliation["nested_recovery_hold"]["reason_code"] == expected_reason
+    held_events = [event for event in result.events if event.kind == "nested_recovery.proof_held"]
+    assert len(held_events) == 1
+    assert held_events[0].payload["reason_code"] == expected_reason
+    assert not any(name == "chainlink_issue_create" for name, _ in transport.calls)
+    assert (
+        next(gate for gate in result.state.gates if gate.name == manual_gate).status
+        is GateStatus.PENDING
+    )
+    assert "worker.dead" not in [event.kind for event in result.events]
+
+    repeated = heartbeat_once(
+        result.state,
+        store,
+        EffectClient(HeartbeatTransport(pane_alive=False)),
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=1.0),
+        now=20.0,
+        project_root=config.project_root,
+    )
+    assert repeated.state.slices["outer"].status is SliceStatus.SPAWNED
+    assert repeated.state.slices["outer"].park_cause is None
+    assert repeated.parked_slice_ids == ()
+    assert not any(event.kind == "worker.dead" for event in repeated.events)
+    assert (
+        repeated.state.slices["outer"].reconciliation["nested_recovery_hold"]
+        == held.reconciliation["nested_recovery_hold"]
+    )
+    assert not any(event.kind == "nested_recovery.proof_held" for event in repeated.events)
 
 
 def test_silent_live_worker_stall_is_observational(tmp_path: Path) -> None:

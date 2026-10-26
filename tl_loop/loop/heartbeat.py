@@ -19,7 +19,10 @@ from tl_loop.events.types import BlockCause
 from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState, begin_recovery, transition_recovery
 from tl_loop.loop.escalate import park
 from tl_loop.loop.journal import EffectJournal
-from tl_loop.loop.nested_recovery import verified_nested_recovery_wait
+from tl_loop.loop.nested_recovery import (
+    NestedRecoveryAssessment,
+    assess_nested_recovery_wait,
+)
 from tl_loop.loop.observability import emit_controller_event
 from tl_loop.loop.observation import WatcherObservation
 from tl_loop.loop.reconcile import (
@@ -197,21 +200,40 @@ def heartbeat_once(
             # A retired lifecycle row is not proof of a worker handoff. Route it
             # through the terminal-invocation evidence path before deciding it is stale.
             row = None
-        nested_wait, _nested_reason = verified_nested_recovery_wait(
-            current, current.slices[slice_state.id], store
-        )
-        if nested_wait:
+        slice_state = current.slices[slice_state.id]
+        nested = assess_nested_recovery_wait(current, slice_state, store)
+        if nested.asserted:
+            current, hold_changed = _reconcile_nested_recovery_hold(
+                current, slice_state, nested, store
+            )
             if active_work is not None:
                 active_work.stop(slice_state.id)
-            events.append(
-                _event(
-                    "nested_recovery.wait",
-                    "child_checkpoint",
-                    slice_state.id,
-                    {"lifecycle": current.integration.sub_tl_states[slice_state.id].value},
+            if nested.verified:
+                events.append(
+                    _event(
+                        "nested_recovery.wait",
+                        "child_checkpoint",
+                        slice_state.id,
+                        {"lifecycle": current.integration.sub_tl_states[slice_state.id].value},
+                    )
                 )
-            )
+            elif hold_changed:
+                events.append(
+                    _event(
+                        "nested_recovery.proof_held",
+                        "child_checkpoint",
+                        slice_state.id,
+                        {
+                            "reason_code": nested.reason_code,
+                            "reason": nested.reason,
+                            "parent_run_id": current.run_id,
+                            "parent_slice_id": slice_state.id,
+                        },
+                    )
+                )
             continue
+        current = _reconcile_nested_recovery_hold(current, slice_state, nested, store)[0]
+        slice_state = current.slices[slice_state.id]
         if row is None:
             if active_work is not None:
                 active_work.stop(slice_state.id)
@@ -375,8 +397,7 @@ def heartbeat_once(
 
     current = store.load()
     for slice_state in _active_slices(current):
-        nested_wait, _nested_reason = verified_nested_recovery_wait(current, slice_state, store)
-        if nested_wait:
+        if assess_nested_recovery_wait(current, slice_state, store).asserted:
             continue
         pr_number = slice_state.pr_number
         resolved_pr_number = pr_number is None
@@ -817,11 +838,61 @@ def _stop_ineligible_work_clocks(
     """Forget timers for slices no longer eligible before any early return."""
     for slice_id in active_work.snapshot():
         slice_state = state.slices.get(slice_id)
-        nested_wait = (
-            slice_state is not None and verified_nested_recovery_wait(state, slice_state, store)[0]
+        nested_asserted = (
+            slice_state is not None
+            and assess_nested_recovery_wait(state, slice_state, store).asserted
         )
-        if slice_state is None or nested_wait or not _slice_is_active_work(slice_state):
+        if slice_state is None or nested_asserted or not _slice_is_active_work(slice_state):
             active_work.stop(slice_id)
+
+
+def _reconcile_nested_recovery_hold(
+    state: RunState,
+    slice_state: SliceState,
+    assessment: NestedRecoveryAssessment,
+    store: RunStore,
+) -> tuple[RunState, bool]:
+    """Persist or clear only the scoped diagnostic for nested recovery proof."""
+    reconciliation = dict(slice_state.reconciliation or {})
+    existing = reconciliation.get("nested_recovery_hold")
+    if assessment.asserted and not assessment.verified:
+        expected = {
+            "reason_code": assessment.reason_code,
+            "reason": assessment.reason,
+            "parent_run_id": state.run_id,
+            "parent_slice_id": slice_state.id,
+        }
+        if existing == expected:
+            return state, False
+        if not reconciliation:
+            reconciliation.update(
+                {
+                    "confirmed_stage": "nested_recovery_wait",
+                    "authoritative_evidence": [],
+                    "missing_evidence": [],
+                    "conflicts": [],
+                    "next_action": "restore the declared child recovery evidence",
+                }
+            )
+        reconciliation["nested_recovery_hold"] = expected
+    elif existing is not None:
+        reconciliation.pop("nested_recovery_hold", None)
+    else:
+        return state, False
+    updated_slice = replace(
+        slice_state,
+        reconciliation=reconciliation or None,
+    )
+    updated_state = store.checkpoint(
+        state.recursive_fsm or state.fsm,
+        {**state.slices, slice_state.id: updated_slice},
+        state.budgets,
+        state.events.last_consumed_offset,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        plan_manifest=state.plan_manifest,
+    )
+    return updated_state, True
 
 
 def _worker_activity_identity(
