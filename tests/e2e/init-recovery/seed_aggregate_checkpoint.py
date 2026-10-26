@@ -205,6 +205,7 @@ def seed_child_scope(
     from tl_loop.loop.driver import (
         TLLoopConfig,
         _bind_initial_slices,
+        _child_controller_name,
         _initial_slices,
     )
     from tl_loop.state.schema import (
@@ -233,7 +234,7 @@ def seed_child_scope(
         project_root=repository,
         parent_branch="main",
         parent_run_id="root",
-        parent_agent_id="root",
+        parent_agent_id=_child_controller_name(architecture_task),
         depth=1,
         repository_identity=repository_identity,
         agent_id="architecture",
@@ -253,7 +254,7 @@ def seed_child_scope(
             "owner_worktree": str(architecture_worktree),
             "parent_branch": "main",
             "parent_run_id": "root",
-            "parent_agent_id": "root",
+            "parent_agent_id": _child_controller_name(architecture_task),
             "depth": 1,
         },
         root_dir=root_store.run_dir,
@@ -613,7 +614,7 @@ def seed_root(
         worktree=kani_worktree,
         parent_branch="main",
         parent_run_id="root",
-        parent_agent_id="root",
+        parent_agent_id=_child_controller_name(kani_task),
         agent_id=_child_controller_name(kani_task),
         depth=1,
         declared_manifest=kani_manifest,
@@ -628,7 +629,7 @@ def seed_root(
             "owner_worktree": kani_worktree,
             "parent_branch": "main",
             "parent_run_id": "root",
-            "parent_agent_id": "root",
+            "parent_agent_id": _child_controller_name(kani_task),
             "depth": 1,
         },
         root_dir=root_store.run_dir,

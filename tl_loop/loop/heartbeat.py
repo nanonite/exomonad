@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import subprocess
@@ -18,6 +19,7 @@ from tl_loop.events.types import BlockCause
 from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState, begin_recovery, transition_recovery
 from tl_loop.loop.escalate import park
 from tl_loop.loop.journal import EffectJournal
+from tl_loop.loop.nested_recovery import verified_nested_recovery_wait
 from tl_loop.loop.observability import emit_controller_event
 from tl_loop.loop.observation import WatcherObservation
 from tl_loop.loop.reconcile import (
@@ -135,7 +137,7 @@ def heartbeat_once(
     deadline from historical timestamps.
     """
     if active_work is not None:
-        _stop_ineligible_work_clocks(state, active_work)
+        _stop_ineligible_work_clocks(state, active_work, store)
     current_time = time.time() if now is None else now
     if not heartbeat_due(state.goals, current_time, config.interval_seconds):
         return HeartbeatResult(False, False, state, (), ())
@@ -195,6 +197,21 @@ def heartbeat_once(
             # A retired lifecycle row is not proof of a worker handoff. Route it
             # through the terminal-invocation evidence path before deciding it is stale.
             row = None
+        nested_wait, _nested_reason = verified_nested_recovery_wait(
+            current, current.slices[slice_state.id], store
+        )
+        if nested_wait:
+            if active_work is not None:
+                active_work.stop(slice_state.id)
+            events.append(
+                _event(
+                    "nested_recovery.wait",
+                    "child_checkpoint",
+                    slice_state.id,
+                    {"lifecycle": current.integration.sub_tl_states[slice_state.id].value},
+                )
+            )
+            continue
         if row is None:
             if active_work is not None:
                 active_work.stop(slice_state.id)
@@ -343,6 +360,7 @@ def heartbeat_once(
                 store=store,
                 issue_creator=effects,
                 ledger=state.budgets,
+                audit=_stall_detection_audit(current, slice_state, row),
             )
             parked.append(slice_state.id)
             progress = True
@@ -357,6 +375,9 @@ def heartbeat_once(
 
     current = store.load()
     for slice_state in _active_slices(current):
+        nested_wait, _nested_reason = verified_nested_recovery_wait(current, slice_state, store)
+        if nested_wait:
+            continue
         pr_number = slice_state.pr_number
         resolved_pr_number = pr_number is None
         if pr_number is None:
@@ -788,11 +809,18 @@ def _slice_is_active_work(slice_state: SliceState) -> bool:
     return not (slice_state.action is not None and slice_state.action.kind is ActionKind.MERGE)
 
 
-def _stop_ineligible_work_clocks(state: RunState, active_work: ActiveWorkClock) -> None:
+def _stop_ineligible_work_clocks(
+    state: RunState,
+    active_work: ActiveWorkClock,
+    store: RunStore,
+) -> None:
     """Forget timers for slices no longer eligible before any early return."""
     for slice_id in active_work.snapshot():
         slice_state = state.slices.get(slice_id)
-        if slice_state is None or not _slice_is_active_work(slice_state):
+        nested_wait = (
+            slice_state is not None and verified_nested_recovery_wait(state, slice_state, store)[0]
+        )
+        if slice_state is None or nested_wait or not _slice_is_active_work(slice_state):
             active_work.stop(slice_id)
 
 
@@ -812,6 +840,24 @@ def _worker_activity_identity(
         invocation_id,
         generation,
     )
+
+
+def _stall_detection_audit(
+    state: RunState,
+    slice_state: SliceState,
+    row: Mapping[str, object],
+) -> dict[str, object]:
+    """Bind a new live stall observation to its controller and dispatch epoch."""
+    encoded = json.dumps(
+        _worker_activity_identity(slice_state, row),
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("ascii")
+    return {
+        "controller_epoch": state.controller_epoch,
+        "activity_identity_sha256": hashlib.sha256(encoded).hexdigest(),
+        "reason": "pane_alive_false_during_current_invocation",
+    }
 
 
 def _active_slices(state: RunState) -> tuple[SliceState, ...]:

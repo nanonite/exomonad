@@ -49,6 +49,10 @@ _AUDIT_FIELDS = frozenset(
         "action_key",
         "action",
         "target_id",
+        "controller_epoch",
+        "activity_identity_sha256",
+        "superseded_by_epoch",
+        "supersession_reason",
     }
 )
 _BLOCKED_AUDIT_FIELDS = frozenset(
@@ -113,9 +117,7 @@ class IssueCreator(Protocol):
     ) -> ToolResult:
         """Create one issue through the effect boundary."""
 
-    def chainlink_issue_list(
-        self, *, labels: Sequence[str], status: str
-    ) -> ToolResult:
+    def chainlink_issue_list(self, *, labels: Sequence[str], status: str) -> ToolResult:
         """List open and closed issues for retry reconciliation."""
 
 
@@ -233,9 +235,7 @@ def park(
     # which attempt or publication created an issue, so a recorded legacy id is
     # never auto-bound: it fails closed with the binding instructions.
     publication = getattr(slice, "publication", None)
-    bound_head = (
-        getattr(publication, "head_sha", None) if publication is not None else None
-    )
+    bound_head = getattr(publication, "head_sha", None) if publication is not None else None
     pr_number = slice.pr_number
     legacy_binding_id: int | None = None
     if store is not None:
@@ -596,9 +596,7 @@ def _escalation_intent_path(store: RunStore, key: str) -> Path:
     return Path(store.run_dir) / "escalations" / f"intent-{_intent_digest(key)}.json"
 
 
-def _pre_389_escalation_key(
-    run_id: str, slice_id: str, attempt: int, cause: ParkCause
-) -> str:
+def _pre_389_escalation_key(run_id: str, slice_id: str, attempt: int, cause: ParkCause) -> str:
     """The exact pre-389 key format, reconstructed from commit f80df647."""
     return f"task-escalation:{run_id}:{slice_id}:{attempt}:{cause.value}"
 
@@ -612,12 +610,9 @@ def _legacy_escalation_intent_path(
     return Path(store.run_dir) / "escalations" / f"{safe}.json"
 
 
-def _legacy_binding_path(
-    store: RunStore, slice_id: str, cause: ParkCause, attempt: int
-) -> Path:
+def _legacy_binding_path(store: RunStore, slice_id: str, cause: ParkCause, attempt: int) -> Path:
     safe = "".join(
-        ch if ch.isalnum() or ch in "-_." else "_"
-        for ch in f"{slice_id}:{cause.value}:{attempt}"
+        ch if ch.isalnum() or ch in "-_." else "_" for ch in f"{slice_id}:{cause.value}:{attempt}"
     )
     return Path(store.run_dir) / "escalations" / f"legacy-{safe}.json"
 
@@ -763,9 +758,7 @@ def _run_token(store: RunStore) -> str:
             if path.exists():
                 return _read_run_token(path)
             token = os.urandom(8).hex()
-            temporary = path.with_name(
-                f"{path.name}.{os.getpid()}.{os.urandom(4).hex()}.tmp"
-            )
+            temporary = path.with_name(f"{path.name}.{os.getpid()}.{os.urandom(4).hex()}.tmp")
             try:
                 with open(temporary, "w", encoding="utf-8") as handle:
                     handle.write(token)
@@ -786,17 +779,13 @@ def _run_token(store: RunStore) -> str:
                     pass
             return token
         except OSError as error:
-            raise EscalationError(
-                f"could not publish run token at {path}: {error}"
-            ) from error
+            raise EscalationError(f"could not publish run token at {path}: {error}") from error
         finally:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
 @contextmanager
-def _escalation_locks(
-    store: RunStore, run_id: str, slice_id: str, attempt: int, cause: ParkCause
-):
+def _escalation_locks(store: RunStore, run_id: str, slice_id: str, attempt: int, cause: ParkCause):
     """Serialize one escalation across both the pre-389 and digest lock files.
 
     A pre-389 invocation holds only the historical lock, so a new invocation
@@ -812,9 +801,7 @@ def _escalation_locks(
     with open(legacy_path.with_suffix(".lock"), "w", encoding="utf-8") as legacy_handle:
         fcntl.flock(legacy_handle.fileno(), fcntl.LOCK_EX)
         try:
-            with open(
-                digest_path.with_suffix(".lock"), "w", encoding="utf-8"
-            ) as digest_handle:
+            with open(digest_path.with_suffix(".lock"), "w", encoding="utf-8") as digest_handle:
                 fcntl.flock(digest_handle.fileno(), fcntl.LOCK_EX)
                 try:
                     yield digest_path, legacy_path
@@ -835,15 +822,11 @@ def _read_intent(path: Path) -> dict[str, object] | None:
     except FileNotFoundError:
         return None
     except OSError as error:
-        raise EscalationError(
-            f"escalation intent is unreadable at {path}: {error}"
-        ) from error
+        raise EscalationError(f"escalation intent is unreadable at {path}: {error}") from error
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as error:
-        raise EscalationError(
-            f"escalation intent is malformed at {path}: {error}"
-        ) from error
+        raise EscalationError(f"escalation intent is malformed at {path}: {error}") from error
     if not isinstance(value, dict):
         raise EscalationError(f"escalation intent at {path} is not an object")
     return value
@@ -878,8 +861,7 @@ def _list_needs_human_issues(creator: object) -> list[object]:
         ) from error
     if result.success is not True:
         raise IssueLookupUnavailable(
-            result.error
-            or "chainlink issue list failed; refusing to create a possible duplicate"
+            result.error or "chainlink issue list failed; refusing to create a possible duplicate"
         )
     payload = result.result
     if isinstance(payload, list):
@@ -995,9 +977,10 @@ def _create_issue(
     if store is not None:
         run_id = store.run_id
         title = f"{base_title} [run {_run_token(store)}]"
-        with _escalation_locks(
-            store, run_id, slice.id, attempt, cause
-        ) as (intent_path, legacy_intent_path):
+        with _escalation_locks(store, run_id, slice.id, attempt, cause) as (
+            intent_path,
+            legacy_intent_path,
+        ):
             return _create_issue_locked(
                 creator,
                 slice,
@@ -1046,9 +1029,7 @@ def _create_issue_locked(
     # cause a pre-digest intent to be skipped, or the mixed-version upgrade
     # state could duplicate an issue.
     digest_intent = _read_intent(intent_path) if intent_path is not None else None
-    legacy_intent = (
-        _read_intent(legacy_intent_path) if legacy_intent_path is not None else None
-    )
+    legacy_intent = _read_intent(legacy_intent_path) if legacy_intent_path is not None else None
     # An intent whose title differs from the expected title must never authorize
     # reuse, reconciliation, migration, or creation.
     if digest_intent is not None and not _intent_title_matches(digest_intent, title):
@@ -1087,9 +1068,7 @@ def _create_issue_locked(
                 "to reuse or create an issue"
             )
         if digest_intent is not None and not (
-            _intent_identity_matches(
-                digest_intent, run_id, slice.id, attempt, cause
-            )
+            _intent_identity_matches(digest_intent, run_id, slice.id, attempt, cause)
             and _intent_provenance_matches(digest_intent, pr_number, head_sha)
         ):
             raise EscalationError(
@@ -1138,9 +1117,7 @@ def _create_issue_locked(
     if intent_path is not None:
         matched = _find_run_scoped_issue(creator, title)
         if matched is not None:
-            if intent is not None and _intent_provenance_matches(
-                intent, pr_number, head_sha
-            ):
+            if intent is not None and _intent_provenance_matches(intent, pr_number, head_sha):
                 _write_escalation_intent(
                     intent_path,
                     run_id=run_id,

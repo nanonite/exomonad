@@ -668,6 +668,10 @@ RECONCILIATION_KEYS = frozenset(
         "confirmed_stage",
         "authoritative_evidence",
         "missing_evidence",
+        "controller_epoch",
+        "activity_identity_sha256",
+        "superseded_by_epoch",
+        "supersession_reason",
         "conflicts",
         "next_action",
         "merge_base_sha",
@@ -732,6 +736,10 @@ PARK_AUDIT_KEYS = frozenset(
         "target_id",
         "error",
         "error_kind",
+        "controller_epoch",
+        "activity_identity_sha256",
+        "superseded_by_epoch",
+        "supersession_reason",
         "publication_attempt",
         "publication_approval_consumed",
         "missing_evidence",
@@ -1843,6 +1851,10 @@ def _park_audit(value: object, path: str, errors: list[tuple[str, str]]) -> None
         "target_id",
         "error",
         "error_kind",
+        "controller_epoch",
+        "activity_identity_sha256",
+        "superseded_by_epoch",
+        "supersession_reason",
     ):
         if key in audit:
             _nullable_string(audit, key, f"{path}.park_audit", errors)

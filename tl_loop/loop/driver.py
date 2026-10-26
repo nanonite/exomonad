@@ -172,6 +172,7 @@ from tl_loop.loop.heartbeat import (
     pr_terminal_cause,
 )
 from tl_loop.loop.integration_lineage import GitLineageError, verify_aggregate_lineage
+from tl_loop.loop.nested_recovery import verified_nested_recovery_wait
 from tl_loop.loop.observability import emit_controller_event
 from tl_loop.loop.recovery_policy import policy_for_cause
 from tl_loop.loop.review import (
@@ -2015,31 +2016,13 @@ def run_tl_loop(
     effects_log.extend(identity_effects)
     state = _reconcile_legacy_parked_lanes(state, store, effects_log)
     state = _initialize_ordered_runtime(work_plan, state, store)
-    if continued_failed_root_reason is not None:
-        previous_phase = _phase_from_state(state)
-        try:
-            state = _reopen_ordered_scope(state, work_plan, store, None)
-        except OrderedCompletionEvidenceError as error:
-            state = _hold_ordered_completion_evidence(
-                state, error, selected, effects, store, effects_log
-            )
-            return TLRunResult(
-                state,
-                tuple(effects_log),
-                (),
-                (),
-                (),
-                {"ordered_completion_recovery": str(error)},
-                _journal_entries(effects_log),
-            )
-        _emit_phase_change(
-            run_id,
-            previous_phase,
-            _phase_from_state(state),
-            selected,
-            effects,
-            effects_log,
-        )
+    state = _reconcile_fresh_continue_stalls(
+        work_plan,
+        state,
+        selected,
+        store,
+        prior_terminal_reason=continued_failed_root_reason,
+    )
     try:
         return _run_loop(
             run_id,
@@ -2441,6 +2424,154 @@ def _continued_failed_root_reason(state: RunState | None, config: TLLoopConfig) 
     if isinstance(phase, (TLFailed, RecursiveTLFailed)):
         return phase.reason
     return None
+
+
+def _reconcile_fresh_continue_stalls(
+    plan: WorkPlan,
+    state: RunState,
+    config: TLLoopConfig,
+    store: RunStore,
+    *,
+    prior_terminal_reason: str | None,
+) -> RunState:
+    """Replace only proven prior-invocation stall projections before replay."""
+    if config.session_mode != "continue" or state.plan_manifest is None:
+        return state
+    changed = dict(state.slices)
+    changed_any = False
+    for slice_id, current in state.slices.items():
+        if (
+            current.status is not SliceStatus.PARKED
+            or current.park_cause is not ParkCause.STALL_DETECTED
+        ):
+            continue
+        updated = _fresh_stall_slice_projection(plan, state, current, config, store)
+        if updated is not None and updated != current:
+            changed[slice_id] = updated
+            changed_any = True
+    phase = _phase_from_state(state)
+    if prior_terminal_reason is not None and state.plan_manifest.role == "root":
+        phase = _fresh_ordered_running_projection(state, plan, prior_terminal_reason)
+        changed_any = changed_any or phase is not None
+    if not changed_any:
+        return state
+    if phase is None:
+        phase = _phase_from_state(state)
+    current_order = getattr(phase, "current_order", state.current_order)
+    return store.checkpoint(
+        phase,
+        changed,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        plan_manifest=state.plan_manifest,
+    )
+
+
+def _fresh_stall_slice_projection(
+    plan: WorkPlan,
+    state: RunState,
+    current: SliceState,
+    config: TLLoopConfig,
+    store: RunStore,
+) -> SliceState | None:
+    """Reset one stall only when durable ownership can be reconciled safely."""
+    if current.recovery is not None or current.action is not None:
+        return None
+    manifest = state.plan_manifest
+    if manifest is None:
+        return None
+    nodes = [node for node in manifest.nodes if node.name == current.id]
+    if len(nodes) != 1 or current.manifest_node_id != nodes[0].node_id:
+        return None
+    node = nodes[0]
+    if node.kind == "sub_tl":
+        task = next((item for item in plan.sub_tls if item.name == current.id), None)
+        if task is None:
+            return None
+        verified, _reason = verified_nested_recovery_wait(state, current, store)
+        if not verified:
+            return None
+    elif node.kind in {"leaf", "worker"}:
+        if not _accepted_direct_stall_dispatch(state, current, node):
+            return None
+        if _direct_stall_has_decision_gate(state, current.id):
+            return None
+    else:
+        return None
+    audit = dict(current.park_audit or {})
+    audit.update(
+        {
+            "superseded_by_epoch": state.controller_epoch,
+            "supersession_reason": "fresh_continue_reconciles_invocation_local_stall",
+        }
+    )
+    updated = slice_transition(current, SliceStatusChanged(SliceStatus.SPAWNED))
+    return replace(updated, park_cause=None, park_audit=audit)
+
+
+def _accepted_direct_stall_dispatch(
+    state: RunState,
+    current: SliceState,
+    node: ManifestNode,
+) -> bool:
+    """Require a confirmed owner before startup reconciles a parked worker."""
+    return (
+        node.kind in {"leaf", "worker"}
+        and current.dispatch_agent_id is not None
+        and current.dispatch_invocation_id is not None
+        and current.dispatch_intent_id is not None
+        and current.dispatch_authoritative_event_seq is not None
+        and current.dispatch_last_boundary == DISPATCH_CONFIRMED_BOUNDARY
+        and current.manifest_node_id == node.node_id
+        and state.plan_manifest is not None
+        and current.dispatch_generation >= 0
+    )
+
+
+def _direct_stall_has_decision_gate(state: RunState, slice_id: str) -> bool:
+    """Keep a scoped pending or rejected operator decision authoritative."""
+    token = f"{slice_id}"
+    return any(
+        gate.status in {GateStatus.PENDING, GateStatus.REJECTED} and token in gate.name
+        for gate in state.gates
+    )
+
+
+def _fresh_ordered_running_projection(
+    state: RunState,
+    plan: WorkPlan,
+    prior_reason: str,
+) -> RecursiveTLRunning | None:
+    """Remove a saved root failure label while retaining its durable evidence."""
+    if not plan.sub_tls or state.plan_manifest is None:
+        return None
+    planning = _canonical_planning_from_manifest(state.plan_manifest, state.slices)
+    groups = dict(planning.ordered_children)
+    current_order = state.current_order or (min(groups) if groups else 0)
+    records = groups.get(current_order)
+    if not records:
+        return None
+    reason_digest = hashlib.sha256(prior_reason.encode("utf-8")).hexdigest()
+    return RecursiveTLRunning(
+        current_order=current_order,
+        pending_by_order={
+            order: group for order, group in groups.items() if order >= current_order
+        },
+        scope_path=planning.scope_path,
+        plan_digest=planning.plan_digest,
+        dispatch_intents={
+            name: slice_state.dispatch_intent_id
+            for name, slice_state in state.slices.items()
+            if slice_state.dispatch_intent_id is not None
+        },
+        evidence={
+            "prior_terminal_verdict_sha256": reason_digest,
+            "replay_epoch": state.controller_epoch or "legacy-no-epoch",
+        },
+    )
 
 
 def _ordered_terminal_recovery_decision(
@@ -4113,6 +4244,11 @@ def _reconcile_continued_root_failure(
         return state
     if not plan.sub_tls:
         return state
+    completed_error = _completed_ordered_sub_tl_evidence_error(state, plan, store)
+    if completed_error is not None:
+        return _hold_ordered_completion_evidence(
+            state, completed_error, config, effects, store, effects_log
+        )
     stage = next(
         (stage for stage in plan.ordered_stages if stage.order == state.current_order),
         None,
@@ -4125,6 +4261,13 @@ def _reconcile_continued_root_failure(
         if state.slices.get(name) is not None and state.slices[name].status is SliceStatus.FAILED
     ]
     if not failed:
+        if any(
+            (current := state.slices.get(name)) is not None
+            and current.status is SliceStatus.PARKED
+            and current.park_cause is ParkCause.STALL_DETECTED
+            for name in stage.sub_tls
+        ):
+            return state
         return _clear_superseded_ambiguous_recovery_gate(
             state,
             stage.sub_tls,
@@ -4164,6 +4307,40 @@ def _reconcile_continued_root_failure(
         )
     except OrderedCompletionEvidenceError as error:
         return _hold_ordered_completion_evidence(state, error, config, effects, store, effects_log)
+
+
+def _completed_ordered_sub_tl_evidence_error(
+    state: RunState,
+    plan: WorkPlan,
+    store: RunStore,
+) -> OrderedCompletionEvidenceError | None:
+    """Revalidate merged declarations before a fresh root verdict enables work."""
+    manifest = state.plan_manifest
+    if manifest is None or manifest.role != "root":
+        return None
+    planning = _canonical_planning_from_manifest(manifest, state.slices)
+    records = (
+        *planning.parallel_children,
+        *(record for _, group in planning.ordered_children for record in group),
+    )
+    tasks_by_name = {task.name: task for task in plan.sub_tls}
+    for record in records:
+        if record.kind is not ChildKind.SUB_TL:
+            continue
+        current = state.slices.get(record.child_id)
+        if current is None or current.status is not SliceStatus.MERGED:
+            continue
+        try:
+            _ordered_sub_tl_completion_state(
+                state,
+                record,
+                tasks_by_name.get(record.child_id),
+                current,
+                store,
+            )
+        except OrderedCompletionEvidenceError as error:
+            return error
+    return None
 
 
 def _hold_ordered_completion_evidence(
@@ -4239,11 +4416,6 @@ def _clear_superseded_ambiguous_recovery_gate(
         None,
     )
     if gate is None:
-        return state
-    if any(
-        state.slices.get(member) is not None and state.slices[member].status is SliceStatus.FAILED
-        for member in stage_members
-    ):
         return state
     state = store.clear_gate(gate.name)
     previous_failure_sha256 = hashlib.sha256(previous_failure_reason.encode("utf-8")).hexdigest()
@@ -4336,6 +4508,22 @@ def _terminal_recovery_diagnostics(
     if not isinstance(phase, (TLFailed, RecursiveTLFailed)):
         return result
     result["ordered_recovery"] = phase.reason
+    if (
+        phase.reason.startswith("ordered recovery child '")
+        and "completion proof is unresolved:" in phase.reason
+    ):
+        result["ordered_completion_recovery"] = phase.reason
+        gate = next(
+            (
+                gate
+                for gate in state.gates
+                if gate.name.startswith("tl-ordered-completion-evidence-")
+            ),
+            None,
+        )
+        if gate is not None:
+            result["completion_evidence_gate"] = gate.name
+            result["completion_evidence_gate_status"] = gate.status.value
     gate = next(
         (gate for gate in state.gates if gate.name.startswith(ORDERED_RECOVERY_GATE_PREFIX)),
         None,
@@ -17403,6 +17591,27 @@ def _run_sub_tls(
             for task, current in zip(stage_tasks, stage_states)
         ):
             return state
+        unresolved_stall = next(
+            (
+                (task, current)
+                for task, current in zip(stage_tasks, stage_states)
+                if current is not None
+                and current.status is SliceStatus.PARKED
+                and current.park_cause is ParkCause.STALL_DETECTED
+            ),
+            None,
+        )
+        if unresolved_stall is not None:
+            stalled_task, stalled_slice = unresolved_stall
+            _verified, proof_reason = verified_nested_recovery_wait(state, stalled_slice, store)
+            return _fail_recursive_parent(
+                state,
+                config,
+                effects,
+                store,
+                effects_log,
+                f"prior stall for {stalled_task.name!r} remains unresolved: {proof_reason}",
+            )
         if any(
             current.status is SliceStatus.FAILED
             or (

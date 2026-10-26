@@ -206,8 +206,13 @@ def seed(repository: Path, output: Path) -> None:
     )
 
 
-def seed_terminal_provider_failure(repository: Path, output: Path) -> None:
-    """Create a real accepted OpenCode launch, terminal failure, and blocked event."""
+def seed_terminal_provider_failure(
+    repository: Path,
+    output: Path,
+    *,
+    seed_parent_stall: bool = False,
+) -> None:
+    """Create an accepted historical launch and optionally its saved parent stall."""
     from tl_loop.fsm.child import ChildKind, ChildRecord
     from tl_loop.fsm.scope import TLRunning
     from tl_loop.loop.driver import EffectIntent
@@ -426,39 +431,195 @@ def seed_terminal_provider_failure(repository: Path, output: Path) -> None:
         )
 
     history = repository / ".exo/events" / f"{identity['agent_name']}.jsonl"
+    evidence: dict[str, Any] = {
+        "historical_dispatch_kind": "accepted_terminal_provider_failure",
+        "owner_agent_name": identity["agent_name"],
+        "owner_dir": str(owner_dir),
+        "prior_invocation": original,
+        "prior_invocation_file_sha256": digest(owner_dir / "invocation.json"),
+        "branch": branch,
+        "worktree": str(worktree),
+        "planned_worktree": current.worktree,
+        "worktree_fingerprint": worktree_fingerprint(worktree),
+        "spawn_event_id": spawn_event["event_id"],
+        "spawn_event_seq": spawn_seq,
+        "accepted_spawn_event": spawn_event,
+        "blocker_event_id": blocker_id,
+        "blocker_event_seq": blocker_rows[0]["run_seq"],
+        "accepted_spawn_journal": journal.entries_for("spawn_leaf", OWNER_SLICE)[0],
+        "history_lines": history.read_text(encoding="utf-8").splitlines(),
+    }
+    if seed_parent_stall:
+        evidence.update(_seed_historical_parent_stall(repository, blocker_rows[0]))
     output.write_text(
-        json.dumps(
-            {
-                "historical_dispatch_kind": "accepted_terminal_provider_failure",
-                "owner_agent_name": identity["agent_name"],
-                "owner_dir": str(owner_dir),
-                "prior_invocation": original,
-                "prior_invocation_file_sha256": digest(owner_dir / "invocation.json"),
-                "branch": branch,
-                "worktree": str(worktree),
-                "planned_worktree": current.worktree,
-                "worktree_fingerprint": worktree_fingerprint(worktree),
-                "spawn_event_id": spawn_event["event_id"],
-                "spawn_event_seq": spawn_seq,
-                "accepted_spawn_event": spawn_event,
-                "blocker_event_id": blocker_id,
-                "blocker_event_seq": blocker_rows[0]["run_seq"],
-                "accepted_spawn_journal": journal.entries_for(
-                    "spawn_leaf", OWNER_SLICE
-                )[0],
-                "history_lines": history.read_text(encoding="utf-8").splitlines(),
-            },
-            sort_keys=True,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
+        json.dumps(evidence, sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
     print(
         json.dumps(
             {"accepted_spawn": invocation_id, "terminal_status": original["status"]}
         )
     )
+
+
+def _seed_historical_parent_stall(
+    repository: Path,
+    blocker_row: dict[str, Any],
+) -> dict[str, Any]:
+    """Retain the old root stall after its accepted child entered human recovery."""
+    from tl_loop.events.envelope import project
+    from tl_loop.fsm.recovery import RecoveryPhase, begin_recovery, transition_recovery
+    from tl_loop.fsm.scope import TLFailed
+    from tl_loop.loop.driver import _child_recovery_projection
+    from tl_loop.ordered import SubTLLifecycle
+    from tl_loop.state.schema import ParkCause, SliceStatus
+    from tl_loop.state.store import RunStore
+
+    child_store = RunStore("kani", repository / ".exo/tl-loop/root")
+    child = child_store.load()
+    leaf = child.slices.get(OWNER_SLICE)
+    if (
+        leaf is None
+        or leaf.dispatch_invocation_id is None
+        or leaf.dispatch_agent_id is None
+    ):
+        raise RuntimeError(
+            "historical stall fixture lacks accepted child invocation identity"
+        )
+    event = project(blocker_row)
+    blocked = event.task_blocked
+    if blocked is None or event.run_seq is None:
+        raise RuntimeError("historical blocker fixture has no typed blocked payload")
+    audit = dict(event.data)
+    audit.update(
+        {
+            "slice_id": OWNER_SLICE,
+            "attempt": blocked.attempt,
+            "invocation_id": leaf.dispatch_invocation_id,
+            "scope_attribution": blocked.scope_attribution,
+            "matched_difficulty_rule": blocked.matched_difficulty_rule,
+            "outcome": "blocked",
+            "needs_human": blocked.needs_human,
+            "retryable": blocked.retryable,
+        }
+    )
+    recovery = begin_recovery(
+        cause=blocked.cause.value,
+        owner_run_id=child.run_id,
+        slice_attempt=blocked.attempt,
+        owner_agent_id=leaf.dispatch_agent_id,
+        invocation_generation=0,
+        plan_revision=child.revision,
+        evidence=audit,
+        next_action="open_human_gate",
+    )
+    recovery = transition_recovery(
+        recovery,
+        RecoveryPhase.HUMAN_GATE,
+        next_action="open_human_gate",
+        evidence=audit,
+    )
+    child = child_store.checkpoint(
+        child.fsm,
+        {**child.slices, OWNER_SLICE: replace(leaf, recovery=recovery)},
+        child.budgets,
+        event.run_seq,
+        current_order=child.current_order,
+        ordered_stages=child.ordered_stages,
+        integration=child.integration,
+        plan_manifest=child.plan_manifest,
+    )
+    projection = _child_recovery_projection(child, "root")
+    if projection is None:
+        raise RuntimeError("child human recovery did not produce a parent projection")
+    lifecycle, summary = projection
+    if lifecycle is not SubTLLifecycle.HUMAN_GATE:
+        raise RuntimeError(
+            "terminal provider fixture did not reach a human-gated child state"
+        )
+
+    root_store = RunStore("root", repository / ".exo/tl-loop")
+    root = root_store.load()
+    kani = root.slices.get("kani")
+    if kani is None or kani.dispatch_last_boundary != "sub_tl_started":
+        raise RuntimeError(
+            "historical parent stall fixture lacks accepted Kani dispatch"
+        )
+    parked = replace(
+        kani,
+        status=SliceStatus.PARKED,
+        park_cause=ParkCause.STALL_DETECTED,
+        park_audit={"attempts": 1, "reason": "pane_alive=false"},
+    )
+    integration = replace(
+        root.integration,
+        sub_tl_states={**root.integration.sub_tl_states, "kani": lifecycle},
+        sub_tl_recovery={**root.integration.sub_tl_recovery, "kani": summary},
+    )
+    phase = TLFailed("heartbeat parked the root while its Kani child awaited recovery")
+    root = root_store.checkpoint(
+        phase,
+        {**root.slices, "kani": parked},
+        root.budgets,
+        event.run_seq,
+        current_order=root.current_order,
+        ordered_stages=root.ordered_stages,
+        integration=integration,
+        plan_manifest=root.plan_manifest,
+    )
+    root_controller = EffectClient(
+        TransportClient(project_root=repository, timeout=30), role="tl", name="root"
+    )
+    stall_event = root_controller.emit_controller_event(
+        event_type="tl.slice_parked",
+        payload={"slice_id": "kani", "park_cause": "stall_detected", "attempts": 1},
+    )
+    if stall_event.success is not True or not isinstance(stall_event.result, dict):
+        raise RuntimeError(
+            f"historical parent stall event was not retained: {stall_event.error!r}"
+        )
+    event_id = stall_event.result.get("event_id")
+    rows = [
+        row for row in canonical_events(repository) if row.get("event_id") == event_id
+    ]
+    if len(rows) != 1 or rows[0].get("type") != "tl.slice_parked":
+        raise RuntimeError("historical parent stall is missing from canonical ledger")
+    refreshed = root_store.load()
+    current_audit = refreshed.slices["kani"].park_audit or {}
+    stall_row = rows[0]
+    stall_data = stall_row.get("data")
+    if (
+        refreshed.run_id != "root"
+        or refreshed.current_order != 2
+        or refreshed.fsm.phase.value != "tl_failed"
+        or refreshed.slices["kani"].status is not SliceStatus.PARKED
+        or refreshed.slices["kani"].park_cause is not ParkCause.STALL_DETECTED
+        or current_audit.get("controller_epoch") is not None
+        or current_audit.get("reason") != "pane_alive=false"
+        or not isinstance(stall_data, dict)
+        or stall_data.get("slice_id") != "kani"
+        or stall_data.get("park_cause") != ParkCause.STALL_DETECTED.value
+        or stall_row.get("run_seq", 0) <= event.run_seq
+        or refreshed.integration.sub_tl_recovery.get("kani") != summary
+    ):
+        raise RuntimeError(
+            "historical root stall checkpoint does not match the accepted fixture"
+        )
+    return {
+        "historical_parent_stall_event_id": event_id,
+        "historical_parent_stall_event_seq": rows[0].get("run_seq"),
+        "historical_parent_stall_event": stall_row,
+        "historical_parent_stall_audit": dict(current_audit),
+        "historical_parent_stall_controller_epoch": refreshed.controller_epoch,
+        "historical_parent_stall_phase": refreshed.fsm.phase.value,
+        "historical_parent_recovery_summary": {
+            "owner_run_id": summary.owner_run_id,
+            "child_path": list(summary.child_path),
+            "slice_id": summary.slice_id,
+            "cause": summary.cause,
+            "recovery_round": summary.recovery_round,
+            "next_probe_at": summary.next_probe_at,
+        },
+    }
 
 
 def owner_for_issue_id(owner_dir: Path) -> int | None:
@@ -502,6 +663,34 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
         if matching_spawns != [baseline.get("accepted_spawn_event")]:
             raise RuntimeError(
                 "accepted OpenCode spawn ledger evidence changed after launch"
+            )
+    if baseline.get("historical_parent_stall_event_id") is not None:
+        stall_event_id = baseline["historical_parent_stall_event_id"]
+        stall_rows = [
+            row
+            for row in canonical_events(repository)
+            if row.get("event_id") == stall_event_id
+        ]
+        if stall_rows != [baseline.get("historical_parent_stall_event")]:
+            raise RuntimeError("controller changed the historical parent stall event")
+        root_checkpoint = json.loads(
+            (repository / ".exo/tl-loop/root/run.json").read_text(encoding="utf-8")
+        )
+        kani_projection = root_checkpoint.get("slices", {}).get("kani", {})
+        stall_audit = kani_projection.get("park_audit") or {}
+        if (
+            kani_projection.get("status") == "parked"
+            or kani_projection.get("park_cause") is not None
+            or stall_audit.get("reason") != "pane_alive=false"
+            or stall_audit.get("supersession_reason")
+            != "fresh_continue_reconciles_invocation_local_stall"
+            or stall_audit.get("superseded_by_epoch")
+            != root_checkpoint.get("controller_epoch")
+            or root_checkpoint.get("events", {}).get("last_consumed_offset", 0)
+            < baseline.get("historical_parent_stall_event_seq", 0)
+        ):
+            raise RuntimeError(
+                "continued root did not supersede only the prior Kani stall projection"
             )
     root_dir = repository / ".exo/tl-loop/root"
     child_path = root_dir / "kani/run.json"
@@ -766,6 +955,29 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
         "lifecycle_event_ids": [row.get("event_id") for row in lifecycle],
         "agent_activity": activity,
     }
+    if baseline.get("historical_parent_stall_event_id") is not None:
+        record.update(
+            {
+                "historical_parent_stall_event_id": baseline[
+                    "historical_parent_stall_event_id"
+                ],
+                "historical_parent_stall_event_seq": baseline[
+                    "historical_parent_stall_event_seq"
+                ],
+                "historical_parent_stall_event": baseline[
+                    "historical_parent_stall_event"
+                ],
+                "historical_parent_stall_audit": baseline[
+                    "historical_parent_stall_audit"
+                ],
+                "historical_parent_stall_controller_epoch": baseline[
+                    "historical_parent_stall_controller_epoch"
+                ],
+                "historical_parent_stall_superseded_by_epoch": stall_audit[
+                    "superseded_by_epoch"
+                ],
+            }
+        )
     if baseline.get("historical_dispatch_kind") != "accepted_terminal_provider_failure":
         record["rejected_request"] = original_journal
     output.write_text(
@@ -837,6 +1049,35 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
         raise RuntimeError(
             "repeat init changed the accepted OpenCode launch ledger row"
         )
+    if evidence.get("historical_parent_stall_event_id") is not None:
+        stall_event_id = evidence["historical_parent_stall_event_id"]
+        stall_rows = [
+            row
+            for row in canonical_events(repository)
+            if row.get("event_id") == stall_event_id
+        ]
+        root_checkpoint = json.loads(
+            (repository / ".exo/tl-loop/root/run.json").read_text(encoding="utf-8")
+        )
+        kani_projection = root_checkpoint.get("slices", {}).get("kani", {})
+        expected_stall_audit = dict(evidence.get("historical_parent_stall_audit") or {})
+        expected_stall_audit.update(
+            {
+                "superseded_by_epoch": evidence.get(
+                    "historical_parent_stall_superseded_by_epoch"
+                ),
+                "supersession_reason": "fresh_continue_reconciles_invocation_local_stall",
+            }
+        )
+        if (
+            stall_rows != [evidence.get("historical_parent_stall_event")]
+            or kani_projection.get("status") == "parked"
+            or kani_projection.get("park_cause") is not None
+            or kani_projection.get("park_audit") != expected_stall_audit
+        ):
+            raise RuntimeError(
+                "repeat continuation changed the stall reconciliation evidence"
+            )
     owner_dir, _ = owner_for(repository)
     current_invocation = invocation(owner_dir)
     expected_successor_generation = evidence.get("successor_invocation_generation")
@@ -1049,6 +1290,7 @@ def main() -> None:
     parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--historical-parent-stall", action="store_true")
     arguments = parser.parse_args()
     if arguments.mode == "seed":
         if arguments.output is None:
@@ -1057,7 +1299,11 @@ def main() -> None:
     elif arguments.mode == "seed-terminal":
         if arguments.output is None:
             parser.error("seed-terminal requires --output")
-        seed_terminal_provider_failure(arguments.repo, arguments.output)
+        seed_terminal_provider_failure(
+            arguments.repo,
+            arguments.output,
+            seed_parent_stall=arguments.historical_parent_stall,
+        )
     elif arguments.mode == "verify-controller":
         if arguments.baseline is None or arguments.output is None:
             parser.error("verify-controller requires --baseline and --output")

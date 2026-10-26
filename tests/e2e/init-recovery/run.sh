@@ -39,6 +39,10 @@ CONFIGURED_ROUTE_SOURCE="proven_preexecution_retry"
 if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" ]]; then
     CONFIGURED_ROUTE_SOURCE="proven_terminal_provider_failure"
 fi
+if [[ "${E2E_HISTORICAL_PARENT_STALL:-0}" == "1" && "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" != "1" ]]; then
+    printf 'E2E_HISTORICAL_PARENT_STALL requires E2E_TERMINAL_PROVIDER_FAILURE=1\n' >&2
+    exit 2
+fi
 MOCK_PID=""
 WASM_ARTIFACT_DIR=""
 INITIAL_TMUX="${TMUX:-}"
@@ -1574,8 +1578,13 @@ PY
     done
     [[ -S "$AGG_REPO/.exo/server.sock" ]] \
         || e2e_fail "OpenCode server did not create its MCP socket"
+    TERMINAL_SEED_ARGS=()
+    if [[ "${E2E_HISTORICAL_PARENT_STALL:-0}" == "1" ]]; then
+        TERMINAL_SEED_ARGS+=(--historical-parent-stall)
+    fi
     python3 "$SCRIPT_DIR/configured-owner-resume.py" seed-terminal \
         --repo "$AGG_REPO" --output "$AGG_DIR/preexisting-opencode-owner.json" \
+        "${TERMINAL_SEED_ARGS[@]}" \
         > "$AGG_DIR/preexisting-opencode-owner-seed.json" \
         || { cat "$AGG_DIR/preexisting-opencode-owner-seed.json"; e2e_fail "failed to seed a real accepted OpenCode launch and terminal provider failure"; }
     REJECTED_KANI_SPAWN_SHA256="$(python3 - "$AGG_DIR/preexisting-opencode-owner.json" <<'PY'

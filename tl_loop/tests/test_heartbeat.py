@@ -218,6 +218,9 @@ def test_silently_dead_worker_is_parked(tmp_path: Path) -> None:
     parked = result.state.slices["slice-a"]
     assert parked.status is SliceStatus.PARKED
     assert parked.park_cause is ParkCause.STALL_DETECTED
+    assert parked.park_audit is not None
+    assert parked.park_audit["reason"] == "pane_alive_false_during_current_invocation"
+    assert parked.park_audit["activity_identity_sha256"]
     assert result.parked_slice_ids == ("slice-a",)
     assert [event.kind for event in result.events] == ["worker.dead"]
     assert [name for name, _ in transport.calls] == [

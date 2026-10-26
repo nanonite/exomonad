@@ -10787,15 +10787,9 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
         "ordered-e2e-run",
         RunStore("ordered-e2e-run", replayed_root).run_dir / "action-journal.json",
     )
-    assert any(
-        entry.get("operation") == "emit_controller_event"
-        and isinstance(entry.get("arguments"), Mapping)
-        and entry["arguments"].get("event_type") == "tl.phase_changed"
-        and isinstance(entry["arguments"].get("payload"), Mapping)
-        and entry["arguments"]["payload"].get("from_phase") == "tl_failed"
-        and entry["arguments"]["payload"].get("to_phase") == "tl_waiting"
-        for entry in recovery_journal.snapshot()
-    )
+    # Fresh continuation removes the prior terminal verdict before catch-up;
+    # the immutable failure event remains historical evidence, so recovery does
+    # not fabricate a phase transition from that old verdict.
     superseded_boundaries = [
         cast(Mapping[str, Any], entry["arguments"]["payload"])
         for entry in recovery_journal.snapshot()
@@ -10818,6 +10812,12 @@ def test_recursive_ordered_lifecycle_integrates_sequential_children_without_root
     restart_deadline = threading.Timer(10, restart_cancel.set)
     restart_deadline.start()
     try:
+        print(
+            "pre_resume_root",
+            RunStore("ordered-e2e-run", replayed_root).load().recursive_fsm,
+            RunStore("ordered-e2e-run", replayed_root).load().current_order,
+            RunStore("ordered-e2e-run", replayed_root).load().slices,
+        )
         resumed = run_tl_loop(
             "ordered-e2e-run",
             plan,
@@ -19605,6 +19605,338 @@ def test_parent_schedules_terminal_provider_failure_before_human_gate_projection
         ].digest
     )
     assert len(outcome) == 1 and outcome[0][2] is not None
+
+
+@pytest.mark.parametrize("saved_root_phase", ("running", "failed"))
+@pytest.mark.parametrize("proof_conflict", (None, "parent_branch"))
+def test_continue_reconciles_historical_parent_stall_before_nested_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    saved_root_phase: str,
+    proof_conflict: str | None,
+) -> None:
+    """A prior parent stall cannot hide a child's durable terminal recovery."""
+    kani_plan, child_config, child_store, _owner_dir, _owner, _invocation = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    project = Path(child_config.project_root)
+    root_dir = Path(child_config.root_dir).parent
+    architecture_name = "substitution-model-architecture-stage"
+    kani_name = child_store.run_id
+    later_name = "substitution-model-examples-stage"
+    plan = WorkPlan(
+        sub_tls=(
+            SubTLTask(
+                architecture_name,
+                WorkPlan(),
+                order=1,
+                integration=IntegrationContract(aggregate_pr_required=False),
+            ),
+            SubTLTask(kani_name, kani_plan, order=2),
+            SubTLTask(
+                later_name,
+                WorkPlan(),
+                order=3,
+                integration=IntegrationContract(aggregate_pr_required=False),
+            ),
+        )
+    )
+    root_config = replace(
+        child_config,
+        run_id="root",
+        root_dir=root_dir,
+        branch="main",
+        worktree=project,
+        parent_run_id=None,
+        parent_branch=None,
+        parent_agent_id=None,
+        depth=0,
+        declared_manifest=None,
+        active=True,
+        session_mode="continue",
+        keep_alive_on_waiting=False,
+    )
+    manifest = driver_module._candidate_manifest(plan, "root", root_config)
+    root_slices = _initial_slices(plan, root_config, root_dir, "root")
+    root_store = RunStore("root", root_dir)
+    create(
+        "root",
+        {
+            "owner_branch": "main",
+            "owner_worktree": str(project),
+            "repository_identity": root_config.repository_identity.to_document(),
+            "plan_manifest": manifest.to_document(),
+            "slices": root_slices,
+        },
+        root_dir=root_dir,
+    )
+    root_store.set_plan_manifest(manifest)
+    stages = tuple(
+        driver_module.OrderedStageState(stage.order, stage.sub_tls) for stage in plan.ordered_stages
+    )
+    initial = root_store.set_ordered_state(2, stages, root_store.load().integration)
+    kani_node = next(node for node in manifest.nodes if node.name == kani_name)
+    architecture = replace(
+        initial.slices[architecture_name],
+        status=SliceStatus.MERGED,
+        post_merge=PostMergeState(
+            PostMergePhase.NOT_REQUIRED,
+            {"child_id": architecture_name, "aggregate_pr_required": "false"},
+        ),
+    )
+    kani = replace(
+        initial.slices[kani_name],
+        status=SliceStatus.PARKED,
+        attempts=1,
+        dispatch_intent_id="accepted-kani-controller-intent",
+        dispatch_generation=1,
+        dispatch_started_at=1792900000.0,
+        dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
+        dispatch_agent_id=kani_name,
+        dispatch_invocation_id="accepted-kani-controller-invocation",
+        dispatch_authoritative_event_seq=108014,
+        branch=(
+            "main.unrelated"
+            if proof_conflict == "parent_branch"
+            else initial.slices[kani_name].branch
+        ),
+        park_cause=ParkCause.STALL_DETECTED,
+        park_audit={"attempts": 1, "reason": "pane_alive=false"},
+    )
+    child_projection = driver_module._child_recovery_projection(child_store.load(), "root")
+    assert child_projection is not None
+    child_lifecycle, child_summary = child_projection
+    integration = replace(
+        initial.integration,
+        sub_tl_states={
+            architecture_name: IntegrationLifecycle.MERGED,
+            kani_name: child_lifecycle,
+            later_name: IntegrationLifecycle.RUNNING,
+        },
+        sub_tl_recovery={kani_name: child_summary},
+    )
+    phase = RecursiveTLRunning(
+        current_order=2,
+        pending_by_order={
+            2: (
+                ChildRecord(
+                    kani_name,
+                    ChildKind.SUB_TL,
+                    manifest_node_id=kani_node.node_id,
+                    manifest_revision=manifest.manifest_revision,
+                ),
+            )
+        },
+        scope_path=(manifest.scope_id,),
+        plan_digest=manifest.digest,
+    )
+    saved_phase = (
+        phase
+        if saved_root_phase == "running"
+        else RecursiveTLFailed(
+            "previous root invocation failed before nested child recovery",
+            scope_path=(manifest.scope_id,),
+        )
+    )
+    root_store.checkpoint(
+        saved_phase,
+        {
+            **initial.slices,
+            architecture_name: architecture,
+            kani_name: kani,
+            later_name: replace(initial.slices[later_name], status=SliceStatus.PENDING),
+        },
+        initial.budgets,
+        108045,
+        current_order=2,
+        ordered_stages=stages,
+        integration=integration,
+        plan_manifest=manifest,
+    )
+    terminal_gate = driver_module._terminal_owner_recovery_gate_name(kani_plan.leaves[0].name)
+    child_store.set_gate(terminal_gate, GateStatus.PENDING)
+    child_store.answer_gate(terminal_gate, GateStatus.REJECTED)
+    root_store.set_gate("operator-preserved-unrelated-hold", GateStatus.PENDING)
+    root_store.answer_gate("operator-preserved-unrelated-hold", GateStatus.REJECTED)
+    ambiguous_gate = driver_module._ordered_recovery_gate_name(None)
+    if saved_root_phase == "failed" or proof_conflict is not None:
+        root_store.set_gate(ambiguous_gate, GateStatus.PENDING)
+    if saved_root_phase == "failed":
+        assert driver_module._continued_failed_root_reason(root_store.load(), root_config)
+    assert (
+        manifest.child_manifests[kani_node.node_id].digest
+        == child_store.load().plan_manifest.digest
+    )
+    calls: list[str] = []
+
+    def resume_child(spec: Mapping[str, object], config: TLLoopConfig, budgets: BudgetLedger):
+        del config, budgets
+        assert spec["run_id"] == kani_name
+        calls.append(kani_name)
+        child = child_store.load()
+        # The controller has reached the existing human recovery wait. Its
+        # durable child recovery remains unchanged while the parent observes it.
+        return SimpleNamespace(
+            final_state=SimpleNamespace(
+                run_id=child.run_id,
+                revision=child.revision,
+                slices=child.slices,
+                fsm=SimpleNamespace(phase=TLPhase.TLRunning),
+                recursive_fsm=None,
+                integration=child.integration,
+                plan_manifest=child.plan_manifest,
+            )
+        )
+
+    monkeypatch.setattr(driver_module, "tl_run", resume_child)
+
+    class FixtureRepositoryTransport(RecordingTransport):
+        def call_tool(self, role: str, name: str, tool_name: str, arguments: JsonObject):
+            if tool_name == "repository_identity":
+                self.calls.append((tool_name, arguments))
+                return {
+                    "success": True,
+                    "result": {"remote_url": root_config.repository_identity.remote_url},
+                }
+            return super().call_tool(role, name, tool_name, arguments)
+
+    result = run_tl_loop(
+        "root",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(FixtureRepositoryTransport()),
+        config=root_config,
+        root_dir=root_dir,
+    )
+
+    parent = root_store.load()
+    if proof_conflict is not None:
+        assert calls == []
+        assert parent.slices[kani_name].status is SliceStatus.PARKED
+        assert parent.slices[kani_name].park_cause is ParkCause.STALL_DETECTED
+        assert isinstance(parent.recursive_fsm, RecursiveTLFailed)
+        assert "prior stall" in parent.recursive_fsm.reason
+        assert "branch or worktree conflicts" in parent.recursive_fsm.reason
+        assert parent.slices[later_name].status is SliceStatus.PENDING
+        assert (
+            next(
+                gate
+                for gate in root_store.load().gates
+                if gate.name == "operator-preserved-unrelated-hold"
+            ).status
+            is GateStatus.REJECTED
+        )
+        assert any(gate.name == ambiguous_gate for gate in root_store.load().gates)
+        assert (
+            next(gate for gate in child_store.load().gates if gate.name == terminal_gate).status
+            is GateStatus.REJECTED
+        )
+        return
+
+    assert calls == [kani_name]
+    assert parent.current_order == 2
+    assert parent.slices[kani_name].status is SliceStatus.SPAWNED, (
+        parent.recursive_fsm,
+        parent.integration,
+        result.diagnostics,
+    )
+    assert parent.slices[kani_name].park_cause is None
+    assert parent.integration.sub_tl_recovery[kani_name] == child_summary
+    assert parent.slices[architecture_name].post_merge == architecture.post_merge
+    assert parent.slices[later_name].status is SliceStatus.PENDING
+    assert not (
+        isinstance(parent.recursive_fsm, RecursiveTLFailed)
+        and parent.recursive_fsm.reason == "recursive child is not recoverable"
+    )
+    assert (
+        result.final_state.slices[kani_name].dispatch_invocation_id == kani.dispatch_invocation_id
+    )
+    assert parent.slices[kani_name].park_audit is not None
+    assert parent.slices[kani_name].park_audit["reason"] == "pane_alive=false"
+    assert parent.slices[kani_name].park_audit["superseded_by_epoch"] == parent.controller_epoch
+    assert (
+        next(
+            gate
+            for gate in root_store.load().gates
+            if gate.name == "operator-preserved-unrelated-hold"
+        ).status
+        is GateStatus.REJECTED
+    )
+    if saved_root_phase == "failed":
+        assert not any(gate.name == ambiguous_gate for gate in root_store.load().gates)
+    assert (
+        next(gate for gate in child_store.load().gates if gate.name == terminal_gate).status
+        is GateStatus.REJECTED
+    )
+    first_stall_audit = dict(parent.slices[kani_name].park_audit or {})
+    repeat_transport = FixtureRepositoryTransport()
+    repeated = run_tl_loop(
+        "root",
+        plan,
+        SyntheticQueue([]),
+        EffectClient(repeat_transport),
+        config=root_config,
+        root_dir=root_dir,
+    )
+    repeated_parent = root_store.load()
+    assert calls == [kani_name, kani_name]
+    assert repeated_parent.slices[kani_name].status is SliceStatus.SPAWNED
+    assert repeated_parent.slices[kani_name].dispatch_invocation_id == kani.dispatch_invocation_id
+    assert repeated_parent.slices[kani_name].park_audit == first_stall_audit
+    assert repeated_parent.integration.sub_tl_recovery[kani_name] == child_summary
+    assert repeated_parent.slices[later_name].status is SliceStatus.PENDING
+    assert not any(
+        name in {"spawn_sub_tl", "spawn_leaf", "resume_blocked_leaf", "post_merge_parent_sync"}
+        for name, _ in repeat_transport.calls
+    )
+    assert repeated.final_state.slices[kani_name].dispatch_invocation_id == (
+        kani.dispatch_invocation_id
+    )
+
+    class DeadNestedPaneTransport(FixtureRepositoryTransport):
+        def call_tool(self, role: str, name: str, tool_name: str, arguments: JsonObject):
+            if tool_name == "poll_workers":
+                self.calls.append((tool_name, arguments))
+                return {
+                    "success": True,
+                    "result": {
+                        "workers": [
+                            {"name": kani_name, "pane_alive": False, "lifecycle_status": "ACTIVE"}
+                        ],
+                        "missing_agents": [],
+                    },
+                }
+            if tool_name == "resolve_live_pr_for_slice":
+                self.calls.append((tool_name, arguments))
+                return {
+                    "success": True,
+                    "result": {
+                        "slice_id": kani_name,
+                        "resolution": "never_published",
+                        "pr_number": None,
+                    },
+                }
+            return super().call_tool(role, name, tool_name, arguments)
+
+    clock_reads: list[int] = []
+
+    def work_clock() -> float:
+        clock_reads.append(1)
+        return float(len(clock_reads))
+
+    nested_heartbeat = driver_module.heartbeat_once(
+        parent,
+        root_store,
+        EffectClient(DeadNestedPaneTransport()),
+        driver_module.HeartbeatConfig(interval_seconds=0.001, stall_threshold_seconds=1.0),
+        now=time.time() + 10,
+        project_root=project,
+        active_work=driver_module.ActiveWorkClock(work_clock),
+    )
+    assert nested_heartbeat.state.slices[kani_name].status is SliceStatus.SPAWNED
+    assert nested_heartbeat.parked_slice_ids == ()
+    assert "worker.dead" not in {event.kind for event in nested_heartbeat.events}
+    assert clock_reads == []
 
 
 @pytest.mark.parametrize(
