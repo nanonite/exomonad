@@ -10,8 +10,10 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -212,10 +214,11 @@ def seed_terminal_provider_failure(
     *,
     seed_parent_stall: bool = False,
 ) -> None:
-    """Create an accepted historical launch and optionally its saved parent stall."""
+    """Seed historical OpenCode records without launching that provider."""
+    from tl_loop.client.effects import ToolResult
     from tl_loop.fsm.child import ChildKind, ChildRecord
     from tl_loop.fsm.scope import TLRunning
-    from tl_loop.loop.driver import EffectIntent
+    from tl_loop.loop.driver import EffectIntent, derive_child_branch
     from tl_loop.loop.journal import EffectJournal
     from tl_loop.state.schema import SliceStatus
     from tl_loop.state.store import RunStore
@@ -237,6 +240,84 @@ def seed_terminal_provider_failure(
             "accepted terminal-failure fixture lacks the typed #814 binding"
         )
     intent_id = "e2e-terminal-opencode-814"
+    owner_name = f"{OWNER_SLICE}-opencode"
+    parent_branch = "main.kani"
+    branch = derive_child_branch(parent_branch, owner_name)
+    worktree = repository / ".exo" / "worktrees" / owner_name
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            branch,
+            str(worktree),
+            parent_branch,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    owner_dir = repository / ".exo" / "agents" / owner_name
+    owner_dir.mkdir(parents=True, exist_ok=False)
+    (owner_dir / "active_issue").write_text(f"{BLOCKED_ISSUE_ID}\n", encoding="utf-8")
+    identity = {
+        "agent_name": owner_name,
+        "slug": OWNER_SLICE,
+        "slice_id": OWNER_SLICE,
+        "agent_type": "opencode",
+        "model": "opencode-go/deepseek-v4.1-flash",
+        "effort": "high",
+        "birth_branch": branch,
+        "parent_branch": parent_branch,
+        "working_dir": str(worktree),
+        "topology": "worktree_per_agent",
+        "ledger_owned": False,
+    }
+    (owner_dir / "identity.json").write_text(
+        json.dumps(identity, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    invocation_id = "e2e-historical-opencode-invocation"
+    started_at = int(time.time()) - 30
+    ended_at = started_at + 5
+    original: dict[str, Any] = {
+        "invocation_id": invocation_id,
+        "generation": 1,
+        "status": "failed",
+        "runtime": "opencode",
+        "model": "opencode-go/deepseek-v4.1-flash",
+        "effort": "high",
+        "trigger": "spawn",
+        "branch": branch,
+        "worktree": str(worktree),
+        "runtime_agent_id": owner_name,
+        "slice_id": OWNER_SLICE,
+        "pr_number": None,
+        "head_sha": None,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "exit_code": 42,
+        "exit_reason": "tmux_target_exited_with_nonzero_code",
+        "exit_classification": "nonzero_exit",
+        "stderr_tail": "Insufficient account funds",
+        "prior_invocation_id": None,
+        "recovery_round": 0,
+        "authorization_source": None,
+        "mode": "interactive",
+        "routing": {"window_id": "@999999"},
+    }
+    (owner_dir / "invocation.json").write_text(
+        json.dumps(original, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    (owner_dir / "dispatch_intent").write_text(intent_id + "\n", encoding="utf-8")
+    (owner_dir / "routing.json").write_text(
+        json.dumps({"window_id": "@999999"}, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
     arguments: dict[str, Any] = {
         "name": OWNER_SLICE,
         "task": task,
@@ -250,61 +331,211 @@ def seed_terminal_provider_failure(
     child_store = RunStore("kani", repository / ".exo/tl-loop/root")
     journal = EffectJournal("kani", child_store.run_dir / "action-journal.json")
     journal.append(spawn_intent)
-    spawned = controller.spawn_leaf(
-        name=OWNER_SLICE,
-        task=task,
-        intent_id=intent_id,
-        agent_type="opencode",
-        model="opencode-go/deepseek-v4.1-flash",
-        boundary=leaf_declaration.get("boundary"),
-        verify=leaf_declaration.get("verify"),
+    journal.mark_result(
+        spawn_intent,
+        ToolResult.from_raw(
+            {
+                "success": True,
+                "result": {
+                    "agent_id": owner_name,
+                    "invocation_id": invocation_id,
+                    "branch_name": branch,
+                    "worktree_path": str(worktree),
+                },
+            }
+        ),
     )
-    journal.mark_result(spawn_intent, spawned)
-    if spawned.success is not True:
-        raise RuntimeError(
-            f"actual OpenCode host launch was refused: {spawned.error!r}"
-        )
-
-    owner_dir, identity = owner_for(repository)
-    original = wait_for_terminal(owner_dir)
-    if (
-        identity.get("agent_type") != "opencode"
-        or identity.get("model") != "opencode-go/deepseek-v4.1-flash"
-        or identity.get("effort") != "high"
-        or identity.get("slice_id") != OWNER_SLICE
-        or identity.get("birth_branch") != original.get("branch")
-        or original.get("runtime") != "opencode"
-        or original.get("model") != "opencode-go/deepseek-v4.1-flash"
-        or original.get("effort") != "high"
-        or original.get("trigger") != "spawn"
-        or original.get("generation") != 1
-        or original.get("status") not in {"failed", "exited"}
-        or type(original.get("exit_code")) is not int
-        or original.get("exit_code") == 0
-        or original.get("exit_classification") != "nonzero_exit"
-        or not isinstance(original.get("ended_at"), (float, int))
-        or "insufficient account funds"
-        not in str(original.get("stderr_tail", "")).casefold()
-        or original.get("pr_number") is not None
-        or original.get("head_sha") is not None
-        or owner_for_issue_id(owner_dir) != BLOCKED_ISSUE_ID
-    ):
-        raise RuntimeError(
-            f"OpenCode invocation did not end in the accepted provider failure: {original!r}"
-        )
-
-    invocation_id = original["invocation_id"]
-    branch = identity["birth_branch"]
-    worktree_recorded = identity["working_dir"]
-    worktree = Path(worktree_recorded)
-    if not worktree.is_absolute():
-        worktree = repository / worktree
-    worktree = worktree.resolve(strict=True)
     events = canonical_events(repository)
     runtime_run_id = (repository / ".exo/run_id").read_text(encoding="utf-8").strip()
+    session_id = next(
+        (row.get("session_id") for row in reversed(events) if row.get("session_id")),
+        None,
+    )
+    first_sequence = (
+        max(
+            (sequence for row in events if type(sequence := row.get("run_seq")) is int),
+            default=0,
+        )
+        + 1
+    )
+    spawn_seq = first_sequence + 1
+    timestamps = [started_at, started_at + 1, ended_at]
+    event_ids = [str(uuid4()) for _ in range(3)]
+    owner_data = {
+        "batch_id": None,
+        "branch": branch,
+        "channel": None,
+        "delivery_vs_authoritative": "metadata_only",
+        "generation": 1,
+        "harness": "exomonad",
+        "head_sha": None,
+        "invocation_id": invocation_id,
+        "issue_number": BLOCKED_ISSUE_ID,
+        "item_id": None,
+        "outcome": "started",
+        "pr_number": None,
+        "provider": "opencode",
+        "queue_class": None,
+        "queue_seq": None,
+        "role": "dev",
+        "rollout_mode": "enabled",
+        "run_id": None,
+        "runtime": "opencode",
+        "runtime_agent_id": owner_name,
+        "session_id": None,
+        "slice_id": OWNER_SLICE,
+        "source": "lifecycle",
+        "source_agent": None,
+        "status": "running",
+        "stderr_tail": None,
+        "trigger": "spawn",
+        "worktree": str(worktree),
+    }
+    spawn_event = {
+        "schema_version": 1,
+        "id": event_ids[1],
+        "event_id": event_ids[1],
+        "event_time": datetime.fromtimestamp(timestamps[1], timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z"),
+        "observed_at": datetime.fromtimestamp(timestamps[1], timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z"),
+        "run_seq": spawn_seq,
+        "type": "agent.spawned",
+        "agent_id": "kani",
+        "run_id": runtime_run_id,
+        "invocation_id": invocation_id,
+        "generation": None,
+        "lifecycle_state": "emitted",
+        "source": "rust",
+        "session_id": session_id,
+        "data": {
+            "agent_type": "OpenCode",
+            "branch": branch,
+            "child_agent": owner_name,
+            "effort": "high",
+            "intent_id": intent_id,
+            "invocation_id": invocation_id,
+            "model": "opencode-go/deepseek-v4.1-flash",
+            "spawn_type": "leaf_subtree",
+            "topology": "worktreeperagent",
+        },
+    }
+    ledger_rows = []
+    for index, (event_type, outcome, status) in enumerate(
+        (
+            ("agent.invocation.started", "started", "running"),
+            ("agent.spawned", "spawned", None),
+            ("agent.invocation.finished", "finished", "failed"),
+        )
+    ):
+        if index == 1:
+            ledger_rows.append(spawn_event)
+            continue
+        event_time = (
+            datetime.fromtimestamp(timestamps[index], timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+        row_data = {
+            **owner_data,
+            "exit_classification": "nonzero_exit" if status == "failed" else None,
+            "exit_code": 42 if status == "failed" else None,
+            "exit_reason": "tmux_target_exited_with_nonzero_code"
+            if status == "failed"
+            else None,
+            "outcome": outcome,
+            "status": status,
+            "stderr_tail": "Insufficient account funds" if status == "failed" else None,
+        }
+        event_id = event_ids[index]
+        ledger_rows.append(
+            {
+                "schema_version": 1,
+                "id": event_id,
+                "event_id": event_id,
+                "event_time": event_time,
+                "observed_at": event_time,
+                "run_seq": first_sequence + index,
+                "type": event_type,
+                "agent_id": owner_name,
+                "run_id": runtime_run_id,
+                "invocation_id": invocation_id,
+                "generation": 1,
+                "lifecycle_state": "emitted",
+                "harness": "exomonad",
+                "provider": "opencode",
+                "runtime": "opencode",
+                "role": "dev",
+                "source": "lifecycle",
+                "session_id": session_id,
+                "data": row_data,
+            }
+        )
+    segment_dir = repository / ".exo/ledger/segments"
+    segment_dir.mkdir(parents=True, exist_ok=True)
+    existing_segments = tuple(segment_dir.glob("segment-*.jsonl"))
+    segment_index = (
+        max(
+            (int(path.stem.removeprefix("segment-")) for path in existing_segments),
+            default=0,
+        )
+        + 1
+    )
+    segment_path = segment_dir / f"segment-{segment_index:012}.jsonl"
+    segment_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in ledger_rows),
+        encoding="utf-8",
+    )
+    history = repository / ".exo/events" / f"{owner_name}.jsonl"
+    history.parent.mkdir(parents=True, exist_ok=True)
+    history_rows = []
+    for index, (event_type, status, outcome) in enumerate(
+        (
+            ("agent.invocation.started", "running", "started"),
+            ("agent.invocation.finished", "failed", "finished"),
+        )
+    ):
+        event_id = str(uuid4())
+        data = {
+            **owner_data,
+            "exit_classification": "nonzero_exit" if status == "failed" else None,
+            "exit_code": 42 if status == "failed" else None,
+            "exit_reason": "tmux_target_exited_with_nonzero_code"
+            if status == "failed"
+            else None,
+            "outcome": outcome,
+            "status": status,
+            "stderr_tail": "Insufficient account funds" if status == "failed" else None,
+        }
+        history_rows.append(
+            {
+                "agent_id": owner_name,
+                "data": data,
+                "id": event_id,
+                "ts": datetime.fromtimestamp(timestamps[index * 2], timezone.utc)
+                .isoformat(timespec="milliseconds")
+                .replace("+00:00", "Z"),
+                "type": event_type,
+            }
+        )
+    history.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in history_rows),
+        encoding="utf-8",
+    )
+    worktree = worktree.resolve(strict=True)
+    identity["working_dir"] = str(worktree)
+    original["worktree"] = str(worktree)
+    (owner_dir / "identity.json").write_text(
+        json.dumps(identity, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    (owner_dir / "invocation.json").write_text(
+        json.dumps(original, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
     accepted_rows = [
         row
-        for row in events
+        for row in canonical_events(repository)
         if row.get("type") == "agent.spawned"
         and row.get("agent_id") == "kani"
         and row.get("run_id") == runtime_run_id
@@ -321,6 +552,10 @@ def seed_terminal_provider_failure(
     spawn_seq = spawn_event.get("run_seq")
     if type(spawn_seq) is not int or spawn_seq <= 0:
         raise RuntimeError("accepted OpenCode spawn event has no durable sequence")
+
+    controller = EffectClient(
+        TransportClient(project_root=repository, timeout=30), role="tl", name="kani"
+    )
 
     state = child_store.load()
     manifest = state.plan_manifest
@@ -825,6 +1060,20 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
             "controller recovery rewrote historical OpenCode lifecycle records"
         )
     activity = event_counts(agent_log)
+    historical = baseline.get("prior_invocation")
+    if (
+        not isinstance(historical, dict)
+        or historical.get("runtime") != "opencode"
+        or historical.get("status") != "failed"
+        or historical.get("exit_classification") != "nonzero_exit"
+        or "insufficient account funds"
+        not in str(historical.get("stderr_tail", "")).casefold()
+    ):
+        raise RuntimeError("historical OpenCode failure fixture is incomplete")
+    if activity.get("historical_opencode_owner_failed", 0):
+        raise RuntimeError(
+            "the harness launched an OpenCode process instead of using history"
+        )
     for event in (
         "recovery_worker_started",
         "recovery_worker_filed_pr",
@@ -1269,7 +1518,12 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
         == 1
     )
     activity = event_counts(Path(os.environ["E2E_AGENT_LOG"]))
-    assert activity.get("historical_opencode_owner_failed") == 1
+    historical = evidence.get("prior_invocation")
+    assert isinstance(historical, dict)
+    assert historical.get("runtime") == "opencode"
+    assert historical.get("status") == "failed"
+    assert historical.get("exit_classification") == "nonzero_exit"
+    assert activity.get("historical_opencode_owner_failed", 0) == 0
     assert activity.get("recovery_worker_started") == 1
     assert activity.get("recovery_worker_filed_pr") == 1
     assert activity.get("recovery_worker_notified_parent") == 1

@@ -1205,8 +1205,12 @@ root = json.loads((root_dir / "run.json").read_text(encoding="utf-8"))
 architecture = root["slices"]["architecture"]
 kani = root["slices"]["kani"]
 candidate = root["integration"]["candidates"]["architecture"]
+root_identity = json.loads((repo / ".exo/agents/root/identity.json").read_text(encoding="utf-8"))
+architecture_child_path = root_dir / "architecture/run.json"
 kani_child_path = root_dir / "kani/run.json"
+assert architecture_child_path.is_file(), "completed architecture child checkpoint is missing"
 assert kani_child_path.is_file(), "failed Kani child checkpoint is missing"
+architecture_child = json.loads(architecture_child_path.read_text(encoding="utf-8"))
 kani_child = json.loads(kani_child_path.read_text(encoding="utf-8"))
 exit_path = kani_child_path.parent / "controller-exit.json"
 assert not exit_path.exists(), "legacy fixture must retain the missing normal-return diagnostic"
@@ -1227,10 +1231,17 @@ assert root["current_order"] == 2
 assert architecture["status"] == "merged"
 assert architecture["post_merge"]["phase"] == "complete"
 assert candidate["lifecycle"] == "MERGED"
+assert architecture_child["parent_agent_id"] == root_identity["agent_name"] == "root"
+assert architecture_child["run_id"] == "architecture"
+assert root["slices"]["architecture"]["dispatch_agent_id"] == "architecture"
+assert root["slices"]["architecture"]["dispatch_agent_id"] != architecture_child["parent_agent_id"]
 assert kani["dispatch_last_boundary"] == "sub_tl_started"
 assert kani["dispatch_intent_id"] and kani["dispatch_authoritative_event_seq"] == 1
 assert kani_child["run_id"] == "kani"
 assert kani_child["parent_run_id"] == "root"
+assert kani_child["parent_agent_id"] == root_identity["agent_name"] == "root"
+assert kani["dispatch_agent_id"] == "kani"
+assert kani["dispatch_agent_id"] != kani_child["parent_agent_id"]
 if seed.get("terminal_provider_failure"):
     assert root["fsm"]["phase"] == "tl_running"
     assert kani["status"] == "spawned"
@@ -1329,7 +1340,9 @@ AGENT_EVENT_LOG="$AGG_DIR/agent-events.jsonl"
 FAKE_CODEX_BIN="$AGG_DIR/fake-bin"
 mkdir -p "$FAKE_CODEX_BIN"
 install -m 0755 "$SCRIPT_DIR/fake-codex.sh" "$FAKE_CODEX_BIN/codex"
-install -m 0755 "$SCRIPT_DIR/fake-codex.sh" "$FAKE_CODEX_BIN/opencode"
+if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" != "1" ]]; then
+    install -m 0755 "$SCRIPT_DIR/fake-codex.sh" "$FAKE_CODEX_BIN/opencode"
+fi
 export PATH="$FAKE_CODEX_BIN:$PATH"
 export E2E_AGENT_LOG="$AGENT_EVENT_LOG"
 export E2E_SOURCE_WORKTREE="$HANDOFF_WORKTREE"
@@ -1541,43 +1554,6 @@ fi
 KANI_BLOCKER_EVENT_ID=""
 KANI_BLOCKER_RUN_SEQ=""
 if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" ]]; then
-    tmux send-keys -t "$AGGREGATE_SESSION:Server" C-c
-    for _ in $(seq 1 100); do
-        [[ ! -S "$AGG_REPO/.exo/server.sock" ]] && break
-        sleep 0.1
-    done
-    [[ ! -S "$AGG_REPO/.exo/server.sock" ]] \
-        || e2e_fail "Codex server did not release its socket before accepted OpenCode launch"
-    tmux kill-window -t "$AGGREGATE_SESSION:Server" 2>/dev/null || true
-    python3 - "$AGG_REPO/.exo/config.toml" <<'PY'
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-text = path.read_text(encoding="utf-8")
-assert text.count('worker_effort_level = "xhigh"') == 1
-path.write_text(text.replace('worker_effort_level = "xhigh"', 'worker_effort_level = "high"'), encoding="utf-8")
-PY
-    PHASE8_OPENCODE_SERVER_COMMAND="EXOMONAD_TMUX_SESSION=$AGGREGATE_SESSION EXOMONAD_ROOT_AGENT_TYPE=codex EXOMONAD_SPAWN_AGENT_TYPE=opencode EXOMONAD_WORKER_MODEL=opencode-go/deepseek-v4.1-flash EXOMONAD_WORKER_EFFORT_LEVEL=high EXOMONAD_REVIEWER_AGENT_TYPE=codex EXOMONAD_CODEX_MODEL=gpt-6-luna $EXOMONAD_BIN serve"
-    tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_OPENCODE_SERVER_COMMAND"
-    tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
-    for _ in $(seq 1 100); do
-        if python3 - "$AGG_REPO/.exo/server.sock" <<'PY' >/dev/null 2>&1
-import socket
-import sys
-
-client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-client.settimeout(0.2)
-client.connect(sys.argv[1])
-client.close()
-PY
-        then
-            break
-        fi
-        sleep 0.1
-    done
-    [[ -S "$AGG_REPO/.exo/server.sock" ]] \
-        || e2e_fail "OpenCode server did not create its MCP socket"
     TERMINAL_SEED_ARGS=()
     if [[ "${E2E_HISTORICAL_PARENT_STALL:-0}" == "1" ]]; then
         TERMINAL_SEED_ARGS+=(--historical-parent-stall)
@@ -1586,8 +1562,10 @@ PY
         --repo "$AGG_REPO" --output "$AGG_DIR/preexisting-opencode-owner.json" \
         "${TERMINAL_SEED_ARGS[@]}" \
         > "$AGG_DIR/preexisting-opencode-owner-seed.json" \
-        || { cat "$AGG_DIR/preexisting-opencode-owner-seed.json"; e2e_fail "failed to seed a real accepted OpenCode launch and terminal provider failure"; }
-    REJECTED_KANI_SPAWN_SHA256="$(python3 - "$AGG_DIR/preexisting-opencode-owner.json" <<'PY'
+        || { cat "$AGG_DIR/preexisting-opencode-owner-seed.json"; e2e_fail "failed to seed historical accepted OpenCode records and terminal provider failure"; }
+    [[ ! -e "$FAKE_CODEX_BIN/opencode" ]] \
+        || e2e_fail "terminal-provider acceptance must not install an OpenCode executable"
+    REJECTED_KANI_SPAWN_SHA256="$(python3 - "$AGG_DIR/preexisting-opencode-owner.json" <<'PY2'
 import hashlib
 import json
 import sys
@@ -1595,44 +1573,8 @@ from pathlib import Path
 
 record = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 print(hashlib.sha256(json.dumps(record["accepted_spawn_journal"], sort_keys=True, separators=(",", ":")).encode()).hexdigest())
-PY
+PY2
 )"
-    tmux send-keys -t "$AGGREGATE_SESSION:Server" C-c
-    for _ in $(seq 1 100); do
-        [[ ! -S "$AGG_REPO/.exo/server.sock" ]] && break
-        sleep 0.1
-    done
-    [[ ! -S "$AGG_REPO/.exo/server.sock" ]] \
-        || e2e_fail "OpenCode server did not release its socket after terminal failure"
-    tmux kill-window -t "$AGGREGATE_SESSION:Server" 2>/dev/null || true
-    python3 - "$AGG_REPO/.exo/config.toml" <<'PY'
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-text = path.read_text(encoding="utf-8")
-assert text.count('worker_effort_level = "high"') == 1
-path.write_text(text.replace('worker_effort_level = "high"', 'worker_effort_level = "xhigh"'), encoding="utf-8")
-PY
-    tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_SERVER_COMMAND"
-    tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
-    for _ in $(seq 1 100); do
-        if python3 - "$AGG_REPO/.exo/server.sock" <<'PY' >/dev/null 2>&1
-import socket
-import sys
-
-client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-client.settimeout(0.2)
-client.connect(sys.argv[1])
-client.close()
-PY
-        then
-            break
-        fi
-        sleep 0.1
-    done
-    [[ -S "$AGG_REPO/.exo/server.sock" ]] \
-        || e2e_fail "Codex server did not restart after accepted terminal owner setup"
 elif [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
     read -r KANI_BLOCKER_EVENT_ID KANI_BLOCKER_RUN_SEQ < <(emit_active_kani_blocker)
     e2e_log "Emitted active event-shaped blocker $KANI_BLOCKER_EVENT_ID at ledger sequence $KANI_BLOCKER_RUN_SEQ before controller continuation"

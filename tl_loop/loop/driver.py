@@ -2522,7 +2522,13 @@ def _fresh_stall_slice_projection(
         task = next((item for item in plan.sub_tls if item.name == current.id), None)
         if task is None:
             return None
-        verified, _reason = verified_nested_recovery_wait(state, current, store)
+        verified, _reason = verified_nested_recovery_wait(
+            state,
+            current,
+            store,
+            parent_controller_agent_id=config.agent_id or config.run_id,
+            project_root=config.project_root,
+        )
         if not verified:
             return None
     elif node.kind in {"leaf", "worker"}:
@@ -2951,7 +2957,7 @@ def _ordered_child_config(
         worktree=worktree,
         parent_run_id=config.run_id,
         parent_branch=parent_branch,
-        parent_agent_id=_child_controller_name(task),
+        parent_agent_id=config.agent_id or config.run_id,
         depth=config.depth + 1,
         ordered_recovery=True,
     )
@@ -7285,6 +7291,7 @@ def _run_loop(
                     config.heartbeat,
                     project_root=config.project_root,
                     active_work=active_work_clock,
+                    controller_agent_id=config.agent_id or config.run_id,
                     review_replay=lambda replay_state, replay_slice, replay_watcher, replay_config=config: (
                         _replay_watcher_review_if_needed(
                             plan,
@@ -17634,7 +17641,13 @@ def _run_sub_tls(
         )
         if unresolved_stall is not None:
             stalled_task, stalled_slice = unresolved_stall
-            _verified, proof_reason = verified_nested_recovery_wait(state, stalled_slice, store)
+            _verified, proof_reason = verified_nested_recovery_wait(
+                state,
+                stalled_slice,
+                store,
+                parent_controller_agent_id=config.agent_id or config.run_id,
+                project_root=config.project_root,
+            )
             return _fail_recursive_parent(
                 state,
                 config,

@@ -132,6 +132,7 @@ def heartbeat_once(
     project_root: Path | str,
     review_replay: ReviewReplay | None = None,
     active_work: ActiveWorkClock | None = None,
+    controller_agent_id: str | None = None,
 ) -> HeartbeatResult:
     """Poll liveness and reconcile one idle wave through the durable store.
 
@@ -141,7 +142,13 @@ def heartbeat_once(
     deadline from historical timestamps.
     """
     if active_work is not None:
-        _stop_ineligible_work_clocks(state, active_work, store)
+        _stop_ineligible_work_clocks(
+            state,
+            active_work,
+            store,
+            controller_agent_id=controller_agent_id,
+            project_root=project_root,
+        )
     current_time = time.time() if now is None else now
     if not heartbeat_due(state.goals, current_time, config.interval_seconds):
         return HeartbeatResult(False, False, state, (), ())
@@ -210,9 +217,20 @@ def heartbeat_once(
             # through the terminal-invocation evidence path before deciding it is stale.
             row = None
         slice_state = current.slices[slice_state.id]
-        nested = assess_nested_recovery_wait(current, slice_state, store)
+        nested = assess_nested_recovery_wait(
+            current,
+            slice_state,
+            store,
+            parent_controller_agent_id=controller_agent_id,
+            project_root=project_root,
+        )
         if nested.asserted:
-            current, nested, hold_changed = _reconcile_nested_recovery_hold(slice_state.id, store)
+            current, nested, hold_changed = _reconcile_nested_recovery_hold(
+                slice_state.id,
+                store,
+                controller_agent_id=controller_agent_id,
+                project_root=project_root,
+            )
             slice_state = current.slices.get(slice_state.id, slice_state)
             if active_work is not None:
                 active_work.stop(slice_state.id)
@@ -240,7 +258,12 @@ def heartbeat_once(
                     )
                 )
             continue
-        current, nested, _hold_changed = _reconcile_nested_recovery_hold(slice_state.id, store)
+        current, nested, _hold_changed = _reconcile_nested_recovery_hold(
+            slice_state.id,
+            store,
+            controller_agent_id=controller_agent_id,
+            project_root=project_root,
+        )
         slice_state = current.slices.get(slice_state.id, slice_state)
         if nested.asserted:
             if active_work is not None:
@@ -444,7 +467,13 @@ def heartbeat_once(
 
     current = store.load()
     for slice_state in _active_slices(current):
-        if assess_nested_recovery_wait(current, slice_state, store).asserted:
+        if assess_nested_recovery_wait(
+            current,
+            slice_state,
+            store,
+            parent_controller_agent_id=controller_agent_id,
+            project_root=project_root,
+        ).asserted:
             continue
         pr_number = slice_state.pr_number
         resolved_pr_number = pr_number is None
@@ -881,13 +910,22 @@ def _stop_ineligible_work_clocks(
     state: RunState,
     active_work: ActiveWorkClock,
     store: RunStore,
+    *,
+    controller_agent_id: str | None,
+    project_root: Path | str,
 ) -> None:
     """Forget timers for slices no longer eligible before any early return."""
     for slice_id in active_work.snapshot():
         slice_state = state.slices.get(slice_id)
         nested_asserted = (
             slice_state is not None
-            and assess_nested_recovery_wait(state, slice_state, store).asserted
+            and assess_nested_recovery_wait(
+                state,
+                slice_state,
+                store,
+                parent_controller_agent_id=controller_agent_id,
+                project_root=project_root,
+            ).asserted
         )
         if slice_state is None or nested_asserted or not _slice_is_active_work(slice_state):
             active_work.stop(slice_id)
@@ -896,6 +934,9 @@ def _stop_ineligible_work_clocks(
 def _reconcile_nested_recovery_hold(
     slice_id: str,
     store: RunStore,
+    *,
+    controller_agent_id: str | None,
+    project_root: Path | str,
 ) -> tuple[RunState, NestedRecoveryAssessment, bool]:
     """Persist only a current scoped proof hold using bounded revision retries."""
     for _attempt in range(MAX_NESTED_HOLD_CHECKPOINT_ATTEMPTS):
@@ -912,7 +953,13 @@ def _reconcile_nested_recovery_hold(
                 ),
                 False,
             )
-        assessment = assess_nested_recovery_wait(current, slice_state, store)
+        assessment = assess_nested_recovery_wait(
+            current,
+            slice_state,
+            store,
+            parent_controller_agent_id=controller_agent_id,
+            project_root=project_root,
+        )
         if not _nested_hold_update_allowed(slice_state):
             return current, assessment, False
         updated_slice = _nested_hold_projection(current, slice_state, assessment)
@@ -944,7 +991,13 @@ def _reconcile_nested_recovery_hold(
                 ),
                 True,
             )
-        latest_assessment = assess_nested_recovery_wait(latest, latest_slice, store)
+        latest_assessment = assess_nested_recovery_wait(
+            latest,
+            latest_slice,
+            store,
+            parent_controller_agent_id=controller_agent_id,
+            project_root=project_root,
+        )
         if latest.revision != updated_state.revision or latest_assessment != assessment:
             continue
         return latest, latest_assessment, True
@@ -961,7 +1014,17 @@ def _reconcile_nested_recovery_hold(
             ),
             False,
         )
-    return current, assess_nested_recovery_wait(current, slice_state, store), False
+    return (
+        current,
+        assess_nested_recovery_wait(
+            current,
+            slice_state,
+            store,
+            parent_controller_agent_id=controller_agent_id,
+            project_root=project_root,
+        ),
+        False,
+    )
 
 
 def _nested_hold_update_allowed(slice_state: SliceState) -> bool:

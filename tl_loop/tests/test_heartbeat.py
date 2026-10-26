@@ -288,6 +288,7 @@ def test_dead_nested_controller_is_held_when_declared_recovery_proof_is_unavaila
         HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=1.0),
         now=10.0,
         project_root=config.project_root,
+        controller_agent_id=config.agent_id or config.run_id,
         active_work=active_work,
     )
 
@@ -321,6 +322,7 @@ def test_dead_nested_controller_is_held_when_declared_recovery_proof_is_unavaila
         HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=1.0),
         now=20.0,
         project_root=config.project_root,
+        controller_agent_id=config.agent_id or config.run_id,
     )
     assert repeated.state.slices["outer"].status is SliceStatus.SPAWNED
     assert repeated.state.slices["outer"].park_cause is None
@@ -360,6 +362,7 @@ def test_nested_recovery_hold_checkpoint_reassesses_concurrent_owner_changes(
             HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
             now=100.0,
             project_root=config.project_root,
+            controller_agent_id=config.agent_id or config.run_id,
         )
         assert "nested_recovery_hold" in held.state.slices["outer"].reconciliation
         inner_store.path.write_bytes(inner_bytes)
@@ -437,6 +440,7 @@ def test_nested_recovery_hold_checkpoint_reassesses_concurrent_owner_changes(
         HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
         now=110.0,
         project_root=config.project_root,
+        controller_agent_id=config.agent_id or config.run_id,
     )
 
     assert raced
@@ -483,7 +487,9 @@ def test_nested_recovery_hold_checkpoint_reassesses_concurrent_owner_changes(
         ) == before_root_journal
     assert not any(name in {"spawn_leaf", "spawn_worker"} for name, _ in transport.calls)
     if hold_operation == "create" and concurrent_operation == "invocation":
-        assert outer.reconciliation["nested_recovery_hold"]["reason_code"] == "checkpoint_missing"
+        assert outer.reconciliation["nested_recovery_hold"]["reason_code"] == (
+            "child_dispatch_registration_conflict"
+        )
     if hold_operation == "clear" and concurrent_operation == "abandon":
         assert outer.reconciliation["nested_recovery_hold"]["reason_code"] == "checkpoint_missing"
     if concurrent_operation == "proof_change":
@@ -513,6 +519,7 @@ def test_full_heartbeat_preserves_operator_abandon_during_nested_hold_clear(
         HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
         now=100.0,
         project_root=config.project_root,
+        controller_agent_id=config.agent_id or config.run_id,
     )
     assert "nested_recovery_hold" in first.state.slices["outer"].reconciliation
 
@@ -576,6 +583,7 @@ def test_full_heartbeat_preserves_operator_abandon_during_nested_hold_clear(
         HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
         now=110.0,
         project_root=config.project_root,
+        controller_agent_id=config.agent_id or config.run_id,
     )
 
     latest = store.load()
@@ -601,6 +609,7 @@ def test_full_heartbeat_preserves_operator_abandon_during_nested_hold_clear(
         HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
         now=120.0,
         project_root=config.project_root,
+        controller_agent_id=config.agent_id or config.run_id,
     )
     persisted = store.load().slices["outer"]
     assert persisted.status is SliceStatus.PARKED
@@ -625,6 +634,7 @@ def test_full_heartbeat_defers_predecessor_pane_observation_after_invocation_cha
         HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
         now=100.0,
         project_root=config.project_root,
+        controller_agent_id=config.agent_id or config.run_id,
     )
     assert "nested_recovery_hold" in first.state.slices["outer"].reconciliation
 
@@ -678,6 +688,7 @@ def test_full_heartbeat_defers_predecessor_pane_observation_after_invocation_cha
         HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
         now=110.0,
         project_root=config.project_root,
+        controller_agent_id=config.agent_id or config.run_id,
     )
 
     latest = store.load()
@@ -757,6 +768,7 @@ def test_nested_hold_conflict_retries_are_bounded_and_return_latest_checkpoint(
         HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
         now=100.0,
         project_root=config.project_root,
+        controller_agent_id=config.agent_id or config.run_id,
     )
 
     latest = store.load()

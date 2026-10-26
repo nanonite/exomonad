@@ -18674,6 +18674,7 @@ def _seed_terminal_provider_failure_leaf(
     prior_runtime: str = "opencode",
     prior_model: str = "opencode-go/deepseek-v4.1-flash",
     prior_effort: str = "high",
+    controller_invocation_id: str = "accepted-kani-controller-invocation",
 ) -> tuple[WorkPlan, TLLoopConfig, RunStore, Path, str, str]:
     """Build the retained accepted-launch / terminal-provider-failure shape."""
     run_id = "substitution-model-kani-stage"
@@ -18737,6 +18738,7 @@ def _seed_terminal_provider_failure_leaf(
         catalog=catalog,
         requested_model="gpt-6-luna",
         worker_effort_level="xhigh",
+        agent_id="root",
         max_events=1,
         poll_interval=0.001,
         keep_alive_on_waiting=False,
@@ -18766,7 +18768,7 @@ def _seed_terminal_provider_failure_leaf(
             "owner_worktree": str(controller_worktree),
             "parent_run_id": "root",
             "parent_branch": "main",
-            "parent_agent_id": run_id,
+            "parent_agent_id": config.parent_agent_id,
             "depth": 1,
             "ledger_run_id": ledger_run_id,
             "plan_manifest": manifest.to_document(),
@@ -19055,6 +19057,14 @@ def _seed_terminal_provider_failure_leaf(
     (ledger / "segment-000000108015.jsonl").write_text(
         "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
         encoding="utf-8",
+    )
+    _write_controller_registration(
+        project,
+        run_id,
+        controller_invocation_id,
+        run_id,
+        config.branch,
+        str(controller_worktree),
     )
     assert planned_worktree != owner_worktree
     return plan, config, store, owner_dir, owner_name, invocation_id
@@ -19618,7 +19628,10 @@ def test_continue_reconciles_historical_parent_stall_before_nested_recovery(
 ) -> None:
     """A prior parent stall cannot hide a child's durable terminal recovery."""
     kani_plan, child_config, child_store, _owner_dir, _owner, _invocation = (
-        _seed_terminal_provider_failure_leaf(tmp_path)
+        _seed_terminal_provider_failure_leaf(
+            tmp_path,
+            controller_invocation_id="37defeed-df70-42d3-b51d-0b63d4a4ef1e",
+        )
     )
     project = Path(child_config.project_root)
     root_dir = Path(child_config.root_dir).parent
@@ -19689,13 +19702,13 @@ def test_continue_reconciles_historical_parent_stall_before_nested_recovery(
         initial.slices[kani_name],
         status=SliceStatus.PARKED,
         attempts=1,
-        dispatch_intent_id="accepted-kani-controller-intent",
+        dispatch_intent_id="43ecde13b888132ed8af5206c7609f65",
         dispatch_generation=1,
         dispatch_started_at=1792900000.0,
         dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
         dispatch_agent_id=kani_name,
-        dispatch_invocation_id="accepted-kani-controller-invocation",
-        dispatch_authoritative_event_seq=108014,
+        dispatch_invocation_id="37defeed-df70-42d3-b51d-0b63d4a4ef1e",
+        dispatch_authoritative_event_seq=84185,
         branch=(
             "main.unrelated"
             if proof_conflict == "parent_branch"
@@ -19704,6 +19717,14 @@ def test_continue_reconciles_historical_parent_stall_before_nested_recovery(
         park_cause=ParkCause.STALL_DETECTED,
         park_audit={"attempts": 1, "reason": "pane_alive=false"},
     )
+    assert root_config.agent_id == "root"
+    assert child_store.load().parent_agent_id == "root"
+    assert kani_name == "substitution-model-kani-stage"
+    assert kani.dispatch_agent_id == kani_name
+    assert kani.dispatch_intent_id == "43ecde13b888132ed8af5206c7609f65"
+    assert kani.dispatch_invocation_id == "37defeed-df70-42d3-b51d-0b63d4a4ef1e"
+    assert kani.dispatch_authoritative_event_seq == 84185
+    assert kani.dispatch_last_boundary == "sub_tl_started"
     child_projection = driver_module._child_recovery_projection(child_store.load(), "root")
     assert child_projection is not None
     child_lifecycle, child_summary = child_projection
@@ -20732,7 +20753,10 @@ def test_continue_reconciles_root_parallel_leaf_stall_without_inventing_order(
     assert repeated.final_state.slices[leaf_id] == leaf
 
 
-@pytest.mark.parametrize("conflict", (None, "inner_parent"))
+@pytest.mark.parametrize(
+    "conflict",
+    (None, "inner_parent", "outer_parent_agent", "inner_parent_agent", "outer_dispatch"),
+)
 @pytest.mark.parametrize("root_failed", (False, True))
 def test_depth_three_recovery_checkpoint_path_is_verified_during_continue_and_heartbeat(
     tmp_path: Path,
@@ -20757,12 +20781,23 @@ def test_depth_three_recovery_checkpoint_path_is_verified_during_continue_and_he
         )
         root_state = root_store.load()
     root_slice = root_state.slices["outer"]
-    if conflict == "inner_parent":
+    if conflict is not None:
         proof, reason = driver_module.verified_nested_recovery_wait(
-            root_state, root_slice, root_store
+            root_state,
+            root_slice,
+            root_store,
+            parent_controller_agent_id=config.agent_id or config.run_id,
+            project_root=config.project_root,
         )
         assert not proof
-        assert "identity conflicts" in reason
+        if conflict == "inner_parent":
+            assert "parent run identity conflicts" in reason
+        elif conflict in {"outer_parent_agent", "inner_parent_agent"}:
+            assert "parent controller identity" in reason
+        elif conflict == "outer_dispatch":
+            assert "registered child controller" in reason
+        else:
+            assert "branch or worktree conflicts" in reason
         held = driver_module._reconcile_fresh_continue_stalls(
             plan,
             root_state,
@@ -20778,7 +20813,13 @@ def test_depth_three_recovery_checkpoint_path_is_verified_during_continue_and_he
             assert isinstance(held.recursive_fsm, RecursiveTLRunning)
         return
 
-    proof, reason = driver_module.verified_nested_recovery_wait(root_state, root_slice, root_store)
+    proof, reason = driver_module.verified_nested_recovery_wait(
+        root_state,
+        root_slice,
+        root_store,
+        parent_controller_agent_id=config.agent_id or config.run_id,
+        project_root=config.project_root,
+    )
     assert proof, reason
 
     continued = driver_module._reconcile_fresh_continue_stalls(
@@ -20825,6 +20866,7 @@ def test_depth_three_recovery_checkpoint_path_is_verified_during_continue_and_he
         driver_module.HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
         now=100.0,
         project_root=config.project_root,
+        controller_agent_id=config.agent_id or config.run_id,
     )
     assert heartbeat.state.slices["outer"].status is SliceStatus.SPAWNED
     assert heartbeat.state.slices["outer"].park_cause is None
@@ -20835,6 +20877,53 @@ def test_depth_three_recovery_checkpoint_path_is_verified_during_continue_and_he
         "inner",
         "leaf-a",
     )
+
+
+def test_nested_recovery_binds_parent_and_child_controller_identities_separately(
+    tmp_path: Path,
+) -> None:
+    """Run names and controller names remain distinct through recursive proof."""
+    _plan, config, root_store, outer_store, inner_store = _seed_deep_nested_recovery_run(
+        tmp_path,
+        distinct_child_agents=True,
+    )
+    root_state = root_store.load()
+    root_slice = root_state.slices["outer"]
+
+    verified, reason = driver_module.verified_nested_recovery_wait(
+        root_state,
+        root_slice,
+        root_store,
+        parent_controller_agent_id=config.agent_id or config.run_id,
+        project_root=config.project_root,
+    )
+
+    outer_state = outer_store.load()
+    inner_state = inner_store.load()
+    assert root_state.run_id == "root" and config.agent_id == "root-controller"
+    assert root_slice.dispatch_agent_id == "outer-controller"
+    assert outer_state.run_id == "outer" and outer_state.parent_agent_id == "root-controller"
+    assert outer_state.slices["inner"].dispatch_agent_id == "inner-controller"
+    assert inner_state.run_id == "inner" and inner_state.parent_agent_id == "outer-controller"
+    assert verified, reason
+
+
+def test_nested_recovery_rejects_conflicting_parent_manifest_binding(tmp_path: Path) -> None:
+    """The supplied parent slice must point to its accepted declaration node."""
+    _plan, config, root_store, *_ = _seed_deep_nested_recovery_run(tmp_path)
+    state = root_store.load()
+    conflicted = replace(state.slices["outer"], manifest_node_id="root/sub_tl/other")
+
+    verified, reason = driver_module.verified_nested_recovery_wait(
+        state,
+        conflicted,
+        root_store,
+        parent_controller_agent_id=config.agent_id or config.run_id,
+        project_root=config.project_root,
+    )
+
+    assert not verified
+    assert "manifest binding" in reason
 
 
 @pytest.mark.parametrize("concurrent_change", ("invocation", "abandon"))
@@ -21017,6 +21106,7 @@ def _seed_deep_nested_recovery_run(
     tmp_path: Path,
     *,
     conflict: str | None = None,
+    distinct_child_agents: bool = False,
 ) -> tuple[WorkPlan, TLLoopConfig, RunStore, RunStore, RunStore]:
     """Persist owned root/outer/inner scopes and a human-gated leaf receipt."""
     project = tmp_path / "repository"
@@ -21026,10 +21116,21 @@ def _seed_deep_nested_recovery_run(
     leaf_plan = WorkPlan.from_mapping(
         {"leaves": [{"name": "leaf-a", "task": "deep recovery", "chainlink_issue_id": None}]}
     )
-    outer_plan = WorkPlan(sub_tls=(SubTLTask("inner", leaf_plan, order=1),))
+    inner_task = SubTLTask(
+        "inner",
+        leaf_plan,
+        agent_id="inner-controller" if distinct_child_agents else None,
+        order=1,
+    )
+    outer_plan = WorkPlan(sub_tls=(inner_task,))
     plan = WorkPlan(
         sub_tls=(
-            SubTLTask("outer", outer_plan, agent_id="root", order=1),
+            SubTLTask(
+                "outer",
+                outer_plan,
+                agent_id="outer-controller" if distinct_child_agents else None,
+                order=1,
+            ),
             SubTLTask("later", WorkPlan(), order=2),
         )
     )
@@ -21043,6 +21144,7 @@ def _seed_deep_nested_recovery_run(
         repository_identity=identity,
         session_mode="continue",
         keep_alive_on_waiting=False,
+        agent_id="root-controller",
     )
     root_manifest = driver_module._manifest_for_plan(plan, "root", root_config)
     root_slices = _initial_slices(plan, root_config, root_dir, "root")
@@ -21068,17 +21170,14 @@ def _seed_deep_nested_recovery_run(
     outer_node = next(node for node in root_manifest.nodes if node.name == "outer")
     outer_manifest = root_manifest.child_manifests[outer_node.node_id]
     outer_worktree = Path(root_state.slices["outer"].worktree or project / "outer")
-    outer_config = replace(
+    outer_config = driver_module._child_config(
         root_config,
-        run_id="outer",
-        root_dir=root_store.run_dir,
-        branch=outer_node.owned_branch,
-        worktree=outer_worktree,
-        parent_run_id="root",
-        parent_branch="main",
-        parent_agent_id="outer",
-        depth=1,
-        declared_manifest=outer_manifest,
+        outer_task,
+        SyntheticQueue([]),
+        EffectClient(RecordingTransport()),
+        root_store,
+        outer_node.owned_branch,
+        str(outer_worktree),
     )
     outer_slices = _initial_slices(outer_task.plan, outer_config, root_store.run_dir, "outer")
     outer_store = RunStore("outer", root_store.run_dir)
@@ -21089,7 +21188,11 @@ def _seed_deep_nested_recovery_run(
             "owner_worktree": str(outer_worktree),
             "parent_run_id": outer_config.parent_run_id,
             "parent_branch": outer_config.parent_branch,
-            "parent_agent_id": outer_config.parent_agent_id,
+            "parent_agent_id": (
+                "foreign-parent"
+                if conflict == "outer_parent_agent"
+                else outer_config.parent_agent_id
+            ),
             "depth": 1,
             "repository_identity": identity.to_document(),
             "plan_manifest": outer_manifest.to_document(),
@@ -21104,21 +21207,17 @@ def _seed_deep_nested_recovery_run(
     )
     outer_state = outer_store.set_ordered_state(1, outer_stages, outer_store.load().integration)
 
-    inner_task = outer_task.plan.sub_tls[0]
     inner_node = next(node for node in outer_manifest.nodes if node.name == "inner")
     inner_manifest = outer_manifest.child_manifests[inner_node.node_id]
     inner_worktree = Path(outer_state.slices["inner"].worktree or outer_worktree / "inner")
-    inner_config = replace(
+    inner_config = driver_module._child_config(
         outer_config,
-        run_id="inner",
-        root_dir=outer_store.run_dir,
-        branch=inner_node.owned_branch,
-        worktree=inner_worktree,
-        parent_run_id="outer",
-        parent_branch=outer_node.owned_branch,
-        parent_agent_id="inner",
-        depth=2,
-        declared_manifest=inner_manifest,
+        inner_task,
+        SyntheticQueue([]),
+        EffectClient(RecordingTransport()),
+        outer_store,
+        inner_node.owned_branch,
+        str(inner_worktree),
     )
     inner_slices = _initial_slices(inner_task.plan, inner_config, outer_store.run_dir, "inner")
     inner_store = RunStore("inner", outer_store.run_dir)
@@ -21131,7 +21230,11 @@ def _seed_deep_nested_recovery_run(
             if conflict == "inner_parent"
             else inner_config.parent_run_id,
             "parent_branch": inner_config.parent_branch,
-            "parent_agent_id": inner_config.parent_agent_id,
+            "parent_agent_id": (
+                "foreign-parent"
+                if conflict == "inner_parent_agent"
+                else inner_config.parent_agent_id
+            ),
             "depth": 2,
             "repository_identity": identity.to_document(),
             "plan_manifest": inner_manifest.to_document(),
@@ -21206,11 +21309,27 @@ def _seed_deep_nested_recovery_run(
         branch=inner_node.owned_branch,
         attempts=1,
         dispatch_intent_id="outer-inner-intent",
-        dispatch_agent_id="inner",
+        dispatch_agent_id=inner_config.agent_id or inner_config.run_id,
         dispatch_invocation_id="outer-inner-invocation",
         dispatch_generation=1,
         dispatch_authoritative_event_seq=1,
         dispatch_last_boundary="sub_tl_started",
+    )
+    _write_controller_registration(
+        project,
+        outer_config.agent_id or outer_config.run_id,
+        "root-outer-invocation",
+        outer_config.run_id,
+        outer_config.branch,
+        str(outer_worktree),
+    )
+    _write_controller_registration(
+        project,
+        inner_config.agent_id or inner_config.run_id,
+        "outer-inner-invocation",
+        inner_config.run_id,
+        inner_config.branch,
+        str(inner_worktree),
     )
     outer_integration = replace(
         outer_state.integration,
@@ -21238,11 +21357,16 @@ def _seed_deep_nested_recovery_run(
         branch=root_nodes["outer"].owned_branch,
         attempts=1,
         dispatch_intent_id="root-outer-intent",
-        dispatch_agent_id="outer",
+        dispatch_agent_id=(
+            inner_config.agent_id or inner_config.run_id
+            if conflict == "outer_dispatch"
+            else outer_config.agent_id or outer_config.run_id
+        ),
         dispatch_invocation_id="root-outer-invocation",
         dispatch_generation=1,
         dispatch_authoritative_event_seq=1,
         dispatch_last_boundary="sub_tl_started",
+        manifest_node_id=root_nodes["outer"].node_id,
         park_cause=ParkCause.STALL_DETECTED,
         park_audit={"attempts": 1, "reason": "pane_alive=false"},
     )
@@ -21285,3 +21409,40 @@ def _seed_deep_nested_recovery_run(
         plan_manifest=root_manifest,
     )
     return plan, root_config, root_store, outer_store, inner_store
+
+
+def _write_controller_registration(
+    project: Path,
+    agent_id: str,
+    invocation_id: str,
+    slice_id: str,
+    branch: str,
+    worktree: str,
+) -> None:
+    """Persist the same owner coordinates the production host records."""
+    owner_dir = project / ".exo" / "agents" / agent_id
+    owner_dir.mkdir(parents=True, exist_ok=True)
+    (owner_dir / "identity.json").write_text(
+        json.dumps(
+            {
+                "agent_name": agent_id,
+                "slug": slice_id,
+                "slice_id": slice_id,
+                "birth_branch": branch,
+                "working_dir": worktree,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (owner_dir / "invocation.json").write_text(
+        json.dumps(
+            {
+                "invocation_id": invocation_id,
+                "runtime_agent_id": agent_id,
+                "slice_id": slice_id,
+                "branch": branch,
+                "worktree": worktree,
+            }
+        ),
+        encoding="utf-8",
+    )
