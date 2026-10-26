@@ -410,6 +410,7 @@ RECOVERY_CONSISTENCY_GATE_NAME = "tl-recovery-consistency"
 ORDERED_RECOVERY_GATE_PREFIX = "tl-ordered-child-recovery-"
 MAX_CONVERGENCE_STEPS = 8
 MAX_ORDERED_INVOCATION_CHECKPOINT_ATTEMPTS = 8
+MAX_FRESH_STALL_RESET_CHECKPOINT_ATTEMPTS = 3
 # A per-call fairness cap on _drain_direct_scope_convergence, not a
 # correctness bound: that function raises the moment a step makes no
 # progress, so exhausting this many *progressing* steps in one call just
@@ -2434,40 +2435,70 @@ def _reconcile_fresh_continue_stalls(
     *,
     prior_terminal_reason: str | None,
 ) -> RunState:
-    """Replace only proven prior-invocation stall projections before replay."""
+    """Replace proven old stalls with revision-checked, freshly assessed state."""
     if config.session_mode != "continue" or state.plan_manifest is None:
         return state
-    changed = dict(state.slices)
-    changed_any = False
-    for slice_id, current in state.slices.items():
+    for _attempt in range(MAX_FRESH_STALL_RESET_CHECKPOINT_ATTEMPTS):
+        current = store.load()
+        if current.plan_manifest != state.plan_manifest:
+            return current
+        changed = dict(current.slices)
+        changed_any = False
+        for slice_id, current_slice in current.slices.items():
+            observed_slice = state.slices.get(slice_id)
+            if (
+                not _fresh_stall_snapshot_unchanged(observed_slice, current_slice)
+                or current_slice.status is not SliceStatus.PARKED
+                or current_slice.park_cause is not ParkCause.STALL_DETECTED
+            ):
+                continue
+            updated = _fresh_stall_slice_projection(plan, current, current_slice, config, store)
+            if updated is not None and updated != current_slice:
+                changed[slice_id] = updated
+                changed_any = True
+        phase = _phase_from_state(current)
         if (
-            current.status is not SliceStatus.PARKED
-            or current.park_cause is not ParkCause.STALL_DETECTED
+            prior_terminal_reason is not None
+            and current.plan_manifest.role == "root"
+            and _phase_matches_prior_failure(phase, prior_terminal_reason)
         ):
+            phase = _fresh_ordered_running_projection(current, plan, prior_terminal_reason)
+            changed_any = changed_any or phase is not None
+        if not changed_any:
+            return current
+        if phase is None:
+            phase = _phase_from_state(current)
+        current_order = getattr(phase, "current_order", current.current_order)
+        try:
+            return store.checkpoint(
+                phase,
+                changed,
+                current.budgets,
+                current.events.last_consumed_offset,
+                current_order=(
+                    current_order if type(current_order) is int and current_order > 0 else None
+                ),
+                ordered_stages=current.ordered_stages,
+                integration=current.integration,
+                plan_manifest=current.plan_manifest,
+                expected_revision=current.revision,
+            )
+        except CheckpointConflict:
             continue
-        updated = _fresh_stall_slice_projection(plan, state, current, config, store)
-        if updated is not None and updated != current:
-            changed[slice_id] = updated
-            changed_any = True
-    phase = _phase_from_state(state)
-    if prior_terminal_reason is not None and state.plan_manifest.role == "root":
-        phase = _fresh_ordered_running_projection(state, plan, prior_terminal_reason)
-        changed_any = changed_any or phase is not None
-    if not changed_any:
-        return state
-    if phase is None:
-        phase = _phase_from_state(state)
-    current_order = getattr(phase, "current_order", state.current_order)
-    return store.checkpoint(
-        phase,
-        changed,
-        state.budgets,
-        state.events.last_consumed_offset,
-        current_order=(current_order if type(current_order) is int and current_order > 0 else None),
-        ordered_stages=state.ordered_stages,
-        integration=state.integration,
-        plan_manifest=state.plan_manifest,
-    )
+    return store.load()
+
+
+def _fresh_stall_snapshot_unchanged(
+    observed: SliceState | None,
+    current: SliceState,
+) -> bool:
+    """Require the exact authorized slice snapshot before superseding its stall."""
+    return observed is not None and observed == current
+
+
+def _phase_matches_prior_failure(phase: object, reason: str) -> bool:
+    """Reconcile only the exact failure verdict captured before this continue."""
+    return isinstance(phase, (TLFailed, RecursiveTLFailed)) and phase.reason == reason
 
 
 def _fresh_stall_slice_projection(

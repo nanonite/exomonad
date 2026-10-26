@@ -10,10 +10,12 @@ from typing import cast
 
 import pytest
 
+import tl_loop.loop.driver as driver_module
 from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.transport import JsonObject
 from tl_loop.events.types import BlockCause
 from tl_loop.fsm.recovery import begin_recovery
+from tl_loop.loop.abandon import abandon_slice
 from tl_loop.loop.heartbeat import (
     HeartbeatConfig,
     HeartbeatError,
@@ -328,6 +330,246 @@ def test_dead_nested_controller_is_held_when_declared_recovery_proof_is_unavaila
         == held.reconciliation["nested_recovery_hold"]
     )
     assert not any(event.kind == "nested_recovery.proof_held" for event in repeated.events)
+
+
+@pytest.mark.parametrize("hold_operation", ("create", "clear"))
+@pytest.mark.parametrize("concurrent_operation", ("invocation", "abandon", "proof_change"))
+def test_nested_recovery_hold_checkpoint_reassesses_concurrent_owner_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hold_operation: str,
+    concurrent_operation: str,
+) -> None:
+    """Hold writes preserve a winner from invocation binding or operator abandon."""
+    _plan, config, store, _outer_store, inner_store = _seed_deep_nested_recovery_run(tmp_path)
+    seeded_child = inner_store.load()
+    seeded_leaf = seeded_child.slices["leaf-a"]
+    inner_bytes = inner_store.path.read_bytes()
+    inner_store.path.unlink()
+    state = store.load()
+    state = _activate_nested_parent(store, state)
+    state = store.set_gate("unrelated-rejected-gate", GateStatus.REJECTED)
+    effects = EffectClient(HeartbeatTransport(pane_alive=False))
+
+    if hold_operation == "clear":
+        held = heartbeat_once(
+            state,
+            store,
+            effects,
+            HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
+            now=100.0,
+            project_root=config.project_root,
+        )
+        assert "nested_recovery_hold" in held.state.slices["outer"].reconciliation
+        inner_store.path.write_bytes(inner_bytes)
+        state = store.load()
+
+    before_outer = state.slices["outer"]
+    before_later = state.slices["later"]
+    before_budgets = state.budgets
+    before_leaf = seeded_leaf
+    inner_journal_path = inner_store.run_dir / "action-journal.json"
+    before_inner_journal = inner_journal_path.read_bytes() if inner_journal_path.exists() else None
+    root_journal_path = store.run_dir / "action-journal.json"
+    before_root_journal = root_journal_path.read_bytes() if root_journal_path.exists() else None
+
+    transport = HeartbeatTransport(pane_alive=False)
+    effects = EffectClient(transport)
+    concurrent_store = RunStore(store.run_id, store.root_dir)
+    raced = False
+    root_journal_after_concurrent = None
+    original_checkpoint = RunStore.checkpoint
+
+    def interleaved_checkpoint(
+        checkpoint_store: RunStore,
+        fsm,
+        slices,
+        budgets,
+        offset,
+        **kwargs,
+    ):
+        nonlocal raced, root_journal_after_concurrent
+        target = slices.get("outer")
+        persisted = (
+            store.load().slices["outer"] if checkpoint_store.run_id == store.run_id else None
+        )
+        target_has_hold = (
+            target is not None
+            and target.reconciliation is not None
+            and "nested_recovery_hold" in target.reconciliation
+        )
+        persisted_has_hold = (
+            persisted is not None
+            and persisted.reconciliation is not None
+            and "nested_recovery_hold" in persisted.reconciliation
+        )
+        hold_write = checkpoint_store.run_id == store.run_id and (
+            (hold_operation == "create" and target_has_hold and not persisted_has_hold)
+            or (hold_operation == "clear" and persisted_has_hold and not target_has_hold)
+        )
+        if hold_write and not raced:
+            raced = True
+            if concurrent_operation == "invocation":
+                driver_module._checkpoint_ordered_sub_tl_invocation(
+                    concurrent_store, "outer", "confirmed-concurrent-invocation"
+                )
+            elif concurrent_operation == "abandon":
+                abandoned = abandon_slice(
+                    config.project_root.parent,
+                    store.run_id,
+                    "outer",
+                    effects=EffectClient(HeartbeatTransport()),
+                )
+                assert abandoned["status"] == "abandoned"
+                root_journal_after_concurrent = root_journal_path.read_bytes()
+            elif hold_operation == "create":
+                inner_store.path.write_bytes(inner_bytes)
+            else:
+                inner_store.path.unlink()
+        return original_checkpoint(checkpoint_store, fsm, slices, budgets, offset, **kwargs)
+
+    monkeypatch.setattr(RunStore, "checkpoint", interleaved_checkpoint)
+    result = heartbeat_once(
+        state,
+        store,
+        effects,
+        HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
+        now=110.0,
+        project_root=config.project_root,
+    )
+
+    assert raced
+    latest = store.load()
+    outer = latest.slices["outer"]
+    if concurrent_operation == "invocation":
+        assert outer.dispatch_invocation_id == "confirmed-concurrent-invocation"
+        record = next(
+            record
+            for records in latest.recursive_fsm.pending_by_order.values()
+            for record in records
+            if record.child_id == "outer"
+        )
+        assert record.invocation_id == "confirmed-concurrent-invocation"
+    elif concurrent_operation == "abandon":
+        assert outer.status is SliceStatus.PARKED
+        assert outer.park_cause is ParkCause.ATTEMPT_ABANDONED
+        assert outer.park_audit["reason"] == "operator_requested"
+    assert result.state.revision == latest.revision
+    assert latest.budgets == before_budgets
+    assert latest.slices["later"] == before_later
+    assert (
+        next(gate for gate in latest.gates if gate.name == "unrelated-rejected-gate").status
+        is GateStatus.REJECTED
+    )
+    assert latest.slices["outer"].attempts == before_outer.attempts
+    assert latest.slices["outer"].recovery == before_outer.recovery
+    child_expected_present = (
+        hold_operation == "clear" and concurrent_operation != "proof_change"
+    ) or (hold_operation == "create" and concurrent_operation == "proof_change")
+    assert inner_store.path.exists() is child_expected_present
+    if child_expected_present:
+        assert inner_store.path.read_bytes() == inner_bytes
+        assert inner_store.load().slices["leaf-a"] == before_leaf
+    assert (
+        inner_journal_path.read_bytes() if inner_journal_path.exists() else None
+    ) == before_inner_journal
+    if concurrent_operation == "abandon":
+        assert root_journal_after_concurrent is not None
+        assert root_journal_path.read_bytes() == root_journal_after_concurrent
+    else:
+        assert (
+            root_journal_path.read_bytes() if root_journal_path.exists() else None
+        ) == before_root_journal
+    assert not any(name in {"spawn_leaf", "spawn_worker"} for name, _ in transport.calls)
+    if hold_operation == "create" and concurrent_operation == "invocation":
+        assert outer.reconciliation["nested_recovery_hold"]["reason_code"] == "checkpoint_missing"
+    if hold_operation == "clear" and concurrent_operation == "abandon":
+        assert outer.reconciliation["nested_recovery_hold"]["reason_code"] == "checkpoint_missing"
+    if concurrent_operation == "proof_change":
+        if hold_operation == "create":
+            assert (
+                outer.reconciliation is None or "nested_recovery_hold" not in outer.reconciliation
+            )
+            assert any(event.kind == "nested_recovery.wait" for event in result.events)
+        else:
+            assert outer.reconciliation["nested_recovery_hold"]["reason_code"] == (
+                "checkpoint_missing"
+            )
+
+
+def _activate_nested_parent(store: RunStore, state):
+    """Make the retained child scope eligible for the production heartbeat pass."""
+    active = replace(
+        state.slices["outer"],
+        status=SliceStatus.SPAWNED,
+        park_cause=None,
+        park_audit=None,
+    )
+    return store.checkpoint(
+        state.recursive_fsm or state.fsm,
+        {**state.slices, "outer": active},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+
+def test_nested_hold_conflict_retries_are_bounded_and_return_latest_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated concurrent revisions do not cause stale writes or unbounded retries."""
+    _plan, config, store, _outer_store, inner_store = _seed_deep_nested_recovery_run(tmp_path)
+    inner_store.path.unlink()
+    state = _activate_nested_parent(store, store.load())
+    transport = HeartbeatTransport(pane_alive=False)
+    concurrent_store = RunStore(store.run_id, store.root_dir)
+    checkpoints = 0
+    original_checkpoint = RunStore.checkpoint
+
+    def keep_conflicting(
+        checkpoint_store: RunStore,
+        fsm,
+        slices,
+        budgets,
+        offset,
+        **kwargs,
+    ):
+        nonlocal checkpoints
+        target = slices.get("outer")
+        persisted_reconciliation = store.load().slices["outer"].reconciliation or {}
+        if (
+            checkpoint_store.run_id == store.run_id
+            and target is not None
+            and target.reconciliation is not None
+            and "nested_recovery_hold" in target.reconciliation
+            and "nested_recovery_hold" not in persisted_reconciliation
+        ):
+            checkpoints += 1
+            concurrent_store.set_gate(f"concurrent-revision-{checkpoints}", GateStatus.PENDING)
+        return original_checkpoint(checkpoint_store, fsm, slices, budgets, offset, **kwargs)
+
+    monkeypatch.setattr(RunStore, "checkpoint", keep_conflicting)
+    result = heartbeat_once(
+        state,
+        store,
+        EffectClient(transport),
+        HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
+        now=100.0,
+        project_root=config.project_root,
+    )
+
+    latest = store.load()
+    assert checkpoints == 3
+    assert result.state.revision == latest.revision
+    assert latest.slices["outer"].status is SliceStatus.SPAWNED
+    assert latest.slices["outer"].park_cause is None
+    assert latest.slices["outer"].reconciliation is None
+    assert len([gate for gate in latest.gates if gate.name.startswith("concurrent-revision-")]) == 3
+    assert any(event.kind == "nested_recovery.proof_held" for event in result.events)
+    assert not any(name in {"spawn_leaf", "spawn_worker"} for name, _ in transport.calls)
 
 
 def test_silent_live_worker_stall_is_observational(tmp_path: Path) -> None:

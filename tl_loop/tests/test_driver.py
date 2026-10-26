@@ -35,6 +35,7 @@ from tl_loop.fsm.scope import TLAllMerged as RecursiveTLAllMerged
 from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
 from tl_loop.fsm.scope import TLPRFiled as RecursiveTLPRFiled
 from tl_loop.fsm.scope import TLRunning as RecursiveTLRunning
+from tl_loop.loop.abandon import abandon_slice
 from tl_loop.loop.convergence import ConvergenceInvariantError, ConvergenceTracker
 from tl_loop.loop.driver import (
     AGGREGATE_PUBLICATION_GATE_PREFIX,
@@ -20836,6 +20837,182 @@ def test_depth_three_recovery_checkpoint_path_is_verified_during_continue_and_he
     )
 
 
+@pytest.mark.parametrize("concurrent_change", ("invocation", "abandon"))
+def test_fresh_continue_stall_reset_reassesses_concurrent_checkpoint_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    concurrent_change: str,
+) -> None:
+    """A stale reset cannot replace newer invocation evidence or operator abandon."""
+    plan, config, store, _outer_store, _inner_store = _seed_deep_nested_recovery_run(tmp_path)
+    state = store.set_gate("unrelated-rejected-gate", GateStatus.REJECTED)
+    original_outer = state.slices["outer"]
+    original_later = state.slices["later"]
+    original_budgets = state.budgets
+    root_journal_path = store.run_dir / "action-journal.json"
+    original_root_journal = root_journal_path.read_bytes() if root_journal_path.exists() else None
+    concurrent_store = RunStore(store.run_id, store.root_dir)
+    raced = False
+    root_journal_after_concurrent = None
+    original_checkpoint = RunStore.checkpoint
+
+    def interleaved_checkpoint(
+        checkpoint_store: RunStore,
+        fsm,
+        slices,
+        budgets,
+        offset,
+        **kwargs,
+    ):
+        nonlocal raced, root_journal_after_concurrent
+        candidate = slices.get("outer")
+        reset_candidate = (
+            checkpoint_store.run_id == store.run_id
+            and candidate is not None
+            and candidate.status is SliceStatus.SPAWNED
+            and candidate.park_cause is None
+            and candidate.park_audit is not None
+            and candidate.park_audit.get("supersession_reason")
+            == "fresh_continue_reconciles_invocation_local_stall"
+        )
+        if reset_candidate and not raced:
+            raced = True
+            if concurrent_change == "invocation":
+                _checkpoint_ordered_sub_tl_invocation(
+                    concurrent_store, "outer", "concurrent-confirmed-invocation"
+                )
+            else:
+                concurrent = concurrent_store.load()
+                reset = driver_module._reconcile_fresh_continue_stalls(
+                    plan,
+                    concurrent,
+                    config,
+                    concurrent_store,
+                    prior_terminal_reason=None,
+                )
+                assert reset.slices["outer"].status is SliceStatus.SPAWNED
+                abandoned = abandon_slice(
+                    config.project_root.parent,
+                    "root",
+                    "outer",
+                    effects=EffectClient(RecordingTransport()),
+                )
+                assert abandoned["status"] == "abandoned"
+                root_journal_after_concurrent = root_journal_path.read_bytes()
+        return original_checkpoint(checkpoint_store, fsm, slices, budgets, offset, **kwargs)
+
+    monkeypatch.setattr(RunStore, "checkpoint", interleaved_checkpoint)
+    result = driver_module._reconcile_fresh_continue_stalls(
+        plan,
+        state,
+        config,
+        store,
+        prior_terminal_reason=None,
+    )
+    latest = store.load()
+
+    assert raced
+    assert result.revision == latest.revision
+    assert latest.budgets == original_budgets
+    assert latest.slices["later"] == original_later
+    assert latest.slices["outer"].attempts == original_outer.attempts
+    assert (
+        next(gate for gate in latest.gates if gate.name == "unrelated-rejected-gate").status
+        is GateStatus.REJECTED
+    )
+    if concurrent_change == "invocation":
+        outer = latest.slices["outer"]
+        assert outer.status is SliceStatus.PARKED
+        assert outer.park_cause is ParkCause.STALL_DETECTED
+        assert outer.dispatch_intent_id == original_outer.dispatch_intent_id
+        assert outer.dispatch_invocation_id == "concurrent-confirmed-invocation"
+        assert outer.dispatch_agent_id == original_outer.dispatch_agent_id
+        assert outer.dispatch_generation == original_outer.dispatch_generation
+        record = next(
+            record
+            for records in latest.recursive_fsm.pending_by_order.values()
+            for record in records
+            if record.child_id == "outer"
+        )
+        assert record.invocation_id == "concurrent-confirmed-invocation"
+    else:
+        outer = latest.slices["outer"]
+        assert outer.status is SliceStatus.PARKED
+        assert outer.park_cause is ParkCause.ATTEMPT_ABANDONED
+        assert outer.park_audit["reason"] == "operator_requested"
+        assert outer.dispatch_intent_id == original_outer.dispatch_intent_id
+        assert outer.dispatch_agent_id == original_outer.dispatch_agent_id
+        assert outer.dispatch_invocation_id == original_outer.dispatch_invocation_id
+        assert outer.dispatch_generation == original_outer.dispatch_generation
+    if concurrent_change == "abandon":
+        assert root_journal_after_concurrent is not None
+        assert root_journal_path.read_bytes() == root_journal_after_concurrent
+    else:
+        assert (
+            root_journal_path.read_bytes() if root_journal_path.exists() else None
+        ) == original_root_journal
+
+
+@pytest.mark.parametrize("root_failed", (False, True))
+def test_depth_three_nested_recovery_replays_through_full_tl_startup(
+    tmp_path: Path,
+    root_failed: bool,
+) -> None:
+    """Full continue startup reaches depth-three proof without redispatching work."""
+    plan, config, root_store, _outer_store, inner_store = _seed_deep_nested_recovery_run(tmp_path)
+    config = replace(config, active=False, keep_alive_on_waiting=False)
+    before_root = root_store.load()
+    if root_failed:
+        root_store.checkpoint(
+            RecursiveTLFailed("historical invocation-local root stall"),
+            before_root.slices,
+            before_root.budgets,
+            before_root.events.last_consumed_offset,
+            current_order=1,
+            ordered_stages=before_root.ordered_stages,
+            integration=before_root.integration,
+            plan_manifest=before_root.plan_manifest,
+        )
+    before_leaf = inner_store.load().slices["leaf-a"]
+    transport = RecordingTransport()
+
+    result = run_tl_loop(
+        "root",
+        plan,
+        SyntheticQueue([]),
+        ReadOnlyEffectClient(transport),
+        config=config,
+        root_dir=config.root_dir,
+    )
+
+    first = root_store.load()
+    assert first.slices["outer"].status is SliceStatus.SPAWNED
+    assert first.slices["outer"].park_cause is None
+    assert first.slices["later"].status is SliceStatus.PENDING
+    assert isinstance(first.recursive_fsm, RecursiveTLRunning)
+    assert first.recursive_fsm.current_order == 1
+    assert first.integration.sub_tl_recovery["outer"].child_path == (
+        "root",
+        "outer",
+        "inner",
+        "leaf-a",
+    )
+    assert inner_store.load().slices["leaf-a"] == before_leaf
+    assert result.final_state.slices["outer"].dispatch_invocation_id == ("root-outer-invocation")
+    assert not any(name in {"spawn_leaf", "spawn_worker"} for name, _ in transport.calls)
+
+    repeated = run_tl_loop(
+        "root",
+        plan,
+        SyntheticQueue([]),
+        ReadOnlyEffectClient(RecordingTransport()),
+        config=config,
+        root_dir=config.root_dir,
+    )
+    assert repeated.final_state.slices["outer"] == first.slices["outer"]
+    assert repeated.final_state.slices["later"] == first.slices["later"]
+
+
 def _seed_deep_nested_recovery_run(
     tmp_path: Path,
     *,
@@ -20851,7 +21028,10 @@ def _seed_deep_nested_recovery_run(
     )
     outer_plan = WorkPlan(sub_tls=(SubTLTask("inner", leaf_plan, order=1),))
     plan = WorkPlan(
-        sub_tls=(SubTLTask("outer", outer_plan, order=1), SubTLTask("later", WorkPlan(), order=2))
+        sub_tls=(
+            SubTLTask("outer", outer_plan, agent_id="root", order=1),
+            SubTLTask("later", WorkPlan(), order=2),
+        )
     )
     root_config = TLLoopConfig(
         active=False,
@@ -20896,7 +21076,7 @@ def _seed_deep_nested_recovery_run(
         worktree=outer_worktree,
         parent_run_id="root",
         parent_branch="main",
-        parent_agent_id="root",
+        parent_agent_id="outer",
         depth=1,
         declared_manifest=outer_manifest,
     )
@@ -20907,9 +21087,9 @@ def _seed_deep_nested_recovery_run(
         {
             "owner_branch": outer_node.owned_branch,
             "owner_worktree": str(outer_worktree),
-            "parent_run_id": "root",
-            "parent_branch": "main",
-            "parent_agent_id": "root",
+            "parent_run_id": outer_config.parent_run_id,
+            "parent_branch": outer_config.parent_branch,
+            "parent_agent_id": outer_config.parent_agent_id,
             "depth": 1,
             "repository_identity": identity.to_document(),
             "plan_manifest": outer_manifest.to_document(),
@@ -20936,7 +21116,7 @@ def _seed_deep_nested_recovery_run(
         worktree=inner_worktree,
         parent_run_id="outer",
         parent_branch=outer_node.owned_branch,
-        parent_agent_id="outer",
+        parent_agent_id="inner",
         depth=2,
         declared_manifest=inner_manifest,
     )
@@ -20947,9 +21127,11 @@ def _seed_deep_nested_recovery_run(
         {
             "owner_branch": inner_node.owned_branch,
             "owner_worktree": str(inner_worktree),
-            "parent_run_id": "foreign-parent" if conflict == "inner_parent" else "outer",
-            "parent_branch": outer_node.owned_branch,
-            "parent_agent_id": "outer",
+            "parent_run_id": "foreign-parent"
+            if conflict == "inner_parent"
+            else inner_config.parent_run_id,
+            "parent_branch": inner_config.parent_branch,
+            "parent_agent_id": inner_config.parent_agent_id,
             "depth": 2,
             "repository_identity": identity.to_document(),
             "plan_manifest": inner_manifest.to_document(),
@@ -21021,9 +21203,10 @@ def _seed_deep_nested_recovery_run(
     outer_slice = replace(
         outer_state.slices["inner"],
         status=SliceStatus.SPAWNED,
+        branch=inner_node.owned_branch,
         attempts=1,
         dispatch_intent_id="outer-inner-intent",
-        dispatch_agent_id="outer",
+        dispatch_agent_id="inner",
         dispatch_invocation_id="outer-inner-invocation",
         dispatch_generation=1,
         dispatch_authoritative_event_seq=1,
@@ -21048,12 +21231,14 @@ def _seed_deep_nested_recovery_run(
     outer_projection = driver_module._child_recovery_projection(outer_state, "root")
     assert outer_projection is not None
     _outer_lifecycle, outer_summary = outer_projection
+    root_nodes = {node.name: node for node in root_manifest.nodes}
     root_outer = replace(
         root_state.slices["outer"],
         status=SliceStatus.PARKED,
+        branch=root_nodes["outer"].owned_branch,
         attempts=1,
         dispatch_intent_id="root-outer-intent",
-        dispatch_agent_id="root",
+        dispatch_agent_id="outer",
         dispatch_invocation_id="root-outer-invocation",
         dispatch_generation=1,
         dispatch_authoritative_event_seq=1,
@@ -21066,7 +21251,6 @@ def _seed_deep_nested_recovery_run(
         sub_tl_states={"outer": SubTLLifecycle.HUMAN_GATE, "later": IntegrationLifecycle.RUNNING},
         sub_tl_recovery={"outer": outer_summary},
     )
-    root_nodes = {node.name: node for node in root_manifest.nodes}
     root_phase = RecursiveTLRunning(
         current_order=1,
         pending_by_order={

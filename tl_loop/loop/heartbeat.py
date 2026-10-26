@@ -51,12 +51,13 @@ from tl_loop.state.schema import (
 )
 from tl_loop.state.serialization import dumps as dumps_json
 from tl_loop.state.slice_transition import HeadChanged, slice_transition
-from tl_loop.state.store import RunStore
+from tl_loop.state.store import CheckpointConflict, RunStore
 
 JsonMapping: TypeAlias = Mapping[str, object]
 LiveEffects: TypeAlias = EffectClient | ReadOnlyEffectClient
 ReviewReplay: TypeAlias = Callable[[RunState, SliceState, WatcherObservation], RunState]
 LOGGER = logging.getLogger(__name__)
+MAX_NESTED_HOLD_CHECKPOINT_ATTEMPTS = 3
 
 
 class HeartbeatError(RuntimeError):
@@ -203,9 +204,8 @@ def heartbeat_once(
         slice_state = current.slices[slice_state.id]
         nested = assess_nested_recovery_wait(current, slice_state, store)
         if nested.asserted:
-            current, hold_changed = _reconcile_nested_recovery_hold(
-                current, slice_state, nested, store
-            )
+            current, nested, hold_changed = _reconcile_nested_recovery_hold(slice_state.id, store)
+            slice_state = current.slices.get(slice_state.id, slice_state)
             if active_work is not None:
                 active_work.stop(slice_state.id)
             if nested.verified:
@@ -217,7 +217,7 @@ def heartbeat_once(
                         {"lifecycle": current.integration.sub_tl_states[slice_state.id].value},
                     )
                 )
-            elif hold_changed:
+            elif hold_changed or not _nested_hold_matches(slice_state, current, nested):
                 events.append(
                     _event(
                         "nested_recovery.proof_held",
@@ -232,7 +232,26 @@ def heartbeat_once(
                     )
                 )
             continue
-        current = _reconcile_nested_recovery_hold(current, slice_state, nested, store)[0]
+        current, nested, _hold_changed = _reconcile_nested_recovery_hold(slice_state.id, store)
+        slice_state = current.slices.get(slice_state.id, slice_state)
+        if nested.asserted:
+            if active_work is not None:
+                active_work.stop(slice_state.id)
+            if not nested.verified:
+                events.append(
+                    _event(
+                        "nested_recovery.proof_held",
+                        "child_checkpoint",
+                        slice_state.id,
+                        {
+                            "reason_code": nested.reason_code,
+                            "reason": nested.reason,
+                            "parent_run_id": current.run_id,
+                            "parent_slice_id": slice_state.id,
+                        },
+                    )
+                )
+            continue
         slice_state = current.slices[slice_state.id]
         if row is None:
             if active_work is not None:
@@ -847,12 +866,86 @@ def _stop_ineligible_work_clocks(
 
 
 def _reconcile_nested_recovery_hold(
+    slice_id: str,
+    store: RunStore,
+) -> tuple[RunState, NestedRecoveryAssessment, bool]:
+    """Persist only a current scoped proof hold using bounded revision retries."""
+    for _attempt in range(MAX_NESTED_HOLD_CHECKPOINT_ATTEMPTS):
+        current = store.load()
+        slice_state = current.slices.get(slice_id)
+        if slice_state is None:
+            return (
+                current,
+                NestedRecoveryAssessment(
+                    False,
+                    False,
+                    "slice_missing",
+                    "parent slice disappeared during proof reconciliation",
+                ),
+                False,
+            )
+        assessment = assess_nested_recovery_wait(current, slice_state, store)
+        if not _nested_hold_update_allowed(slice_state):
+            return current, assessment, False
+        updated_slice = _nested_hold_projection(current, slice_state, assessment)
+        if updated_slice == slice_state:
+            return current, assessment, False
+        try:
+            updated_state = store.checkpoint(
+                current.recursive_fsm or current.fsm,
+                {**current.slices, slice_id: updated_slice},
+                current.budgets,
+                current.events.last_consumed_offset,
+                ordered_stages=current.ordered_stages,
+                integration=current.integration,
+                plan_manifest=current.plan_manifest,
+                expected_revision=current.revision,
+            )
+        except CheckpointConflict:
+            continue
+        latest = store.load()
+        latest_slice = latest.slices.get(slice_id)
+        if latest_slice is None:
+            return (
+                latest,
+                NestedRecoveryAssessment(
+                    False,
+                    False,
+                    "slice_missing",
+                    "parent slice disappeared during proof reconciliation",
+                ),
+                True,
+            )
+        latest_assessment = assess_nested_recovery_wait(latest, latest_slice, store)
+        if latest.revision != updated_state.revision or latest_assessment != assessment:
+            continue
+        return latest, latest_assessment, True
+    current = store.load()
+    slice_state = current.slices.get(slice_id)
+    if slice_state is None:
+        return (
+            current,
+            NestedRecoveryAssessment(
+                False,
+                False,
+                "slice_missing",
+                "parent slice disappeared during proof reconciliation",
+            ),
+            False,
+        )
+    return current, assess_nested_recovery_wait(current, slice_state, store), False
+
+
+def _nested_hold_update_allowed(slice_state: SliceState) -> bool:
+    """Do not edit diagnostics on work an operator or reducer has parked."""
+    return slice_state.status in _active_statuses()
+
+
+def _nested_hold_projection(
     state: RunState,
     slice_state: SliceState,
     assessment: NestedRecoveryAssessment,
-    store: RunStore,
-) -> tuple[RunState, bool]:
-    """Persist or clear only the scoped diagnostic for nested recovery proof."""
+) -> SliceState:
     reconciliation = dict(slice_state.reconciliation or {})
     existing = reconciliation.get("nested_recovery_hold")
     if assessment.asserted and not assessment.verified:
@@ -863,7 +956,7 @@ def _reconcile_nested_recovery_hold(
             "parent_slice_id": slice_state.id,
         }
         if existing == expected:
-            return state, False
+            return slice_state
         if not reconciliation:
             reconciliation.update(
                 {
@@ -878,21 +971,19 @@ def _reconcile_nested_recovery_hold(
     elif existing is not None:
         reconciliation.pop("nested_recovery_hold", None)
     else:
-        return state, False
-    updated_slice = replace(
-        slice_state,
-        reconciliation=reconciliation or None,
-    )
-    updated_state = store.checkpoint(
-        state.recursive_fsm or state.fsm,
-        {**state.slices, slice_state.id: updated_slice},
-        state.budgets,
-        state.events.last_consumed_offset,
-        ordered_stages=state.ordered_stages,
-        integration=state.integration,
-        plan_manifest=state.plan_manifest,
-    )
-    return updated_state, True
+        return slice_state
+    return replace(slice_state, reconciliation=reconciliation or None)
+
+
+def _nested_hold_matches(
+    slice_state: SliceState,
+    state: RunState,
+    assessment: NestedRecoveryAssessment,
+) -> bool:
+    """Check whether the latest checkpoint already carries this proof hold."""
+    if not assessment.asserted or assessment.verified:
+        return True
+    return _nested_hold_projection(state, slice_state, assessment) == slice_state
 
 
 def _worker_activity_identity(

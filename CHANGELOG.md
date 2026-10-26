@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Reset invocation-local stall parks before replaying continued plans (#1284)
 - Fix dormant subTL controller continuation without a published PR (#1281)
 - Fix recovery of historical spawn refusals with missing error kinds (#1280)
 - Fix continuation preserving completed subTL receipts during ordered recovery (#1266)
