@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -36,6 +37,23 @@ def worktree_fingerprint(worktree: Path) -> str:
         capture_output=True,
     ).stdout
     return "sha256:" + hashlib.sha256(status).hexdigest()
+
+
+def advance_seeded_ledger_sequence(
+    repository: Path, rows: list[dict[str, Any]]
+) -> None:
+    """Keep the append allocator beyond the synthetic historical rows."""
+    ledger = repository / ".exo/ledger"
+    sequence_path = ledger / "run_seq"
+    lock_path = ledger / "run_seq.lock"
+    highest_seeded = max(int(row["run_seq"]) for row in rows)
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        current = int(sequence_path.read_text(encoding="utf-8").strip() or "0")
+        if current < highest_seeded:
+            temporary = ledger / f".run-seq-fixture-{uuid4().hex}.tmp"
+            temporary.write_text(f"{highest_seeded}\n", encoding="utf-8")
+            os.replace(temporary, sequence_path)
 
 
 def owner_for(repository: Path) -> tuple[Path, dict[str, Any]]:
@@ -488,6 +506,7 @@ def seed_terminal_provider_failure(
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in ledger_rows),
         encoding="utf-8",
     )
+    advance_seeded_ledger_sequence(repository, ledger_rows)
     history = repository / ".exo/events" / f"{owner_name}.jsonl"
     history.parent.mkdir(parents=True, exist_ok=True)
     history_rows = []
