@@ -1563,6 +1563,36 @@ if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" ]]; then
         "${TERMINAL_SEED_ARGS[@]}" \
         > "$AGG_DIR/preexisting-opencode-owner-seed.json" \
         || { cat "$AGG_DIR/preexisting-opencode-owner-seed.json"; e2e_fail "failed to seed historical accepted OpenCode records and terminal provider failure"; }
+    # The fixture writes a historical owner after the server's startup scan.
+    # Restart only the disposable server so its in-memory resolver loads that
+    # persisted identity before the production controller attempts recovery.
+    tmux send-keys -t "$AGGREGATE_SESSION:Server" C-c
+    for _ in $(seq 1 100); do
+        [[ ! -S "$AGG_REPO/.exo/server.sock" ]] && break
+        sleep 0.1
+    done
+    [[ ! -S "$AGG_REPO/.exo/server.sock" ]] \
+        || e2e_fail "Phase 8 server did not release its socket before loading the seeded owner"
+    tmux kill-window -t "$AGGREGATE_SESSION:Server" 2>/dev/null || true
+    tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_SERVER_COMMAND"
+    tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
+    for _ in $(seq 1 100); do
+        if python3 - "$AGG_REPO/.exo/server.sock" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(0.2)
+client.connect(sys.argv[1])
+client.close()
+PY
+        then
+            break
+        fi
+        sleep 0.1
+    done
+    [[ -S "$AGG_REPO/.exo/server.sock" ]] \
+        || e2e_fail "Phase 8 server did not reload the seeded historical owner"
     [[ ! -e "$FAKE_CODEX_BIN/opencode" ]] \
         || e2e_fail "terminal-provider acceptance must not install an OpenCode executable"
     REJECTED_KANI_SPAWN_SHA256="$(python3 - "$AGG_DIR/preexisting-opencode-owner.json" <<'PY2'
