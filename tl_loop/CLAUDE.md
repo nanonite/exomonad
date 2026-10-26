@@ -332,14 +332,19 @@ slice is not active work forgets its start, so the next active interval is
 bounded on its own. Historical timestamps and the `deadline_ledger` remain
 audit facts and are not rewritten to make a deadline pass.
 
-Dead panes remain authoritative process failures and use the existing M5.3 park
-path with stall_detected, including needs-human issue creation and dependent
-blocking. A live pane with no progress only emits a wave.stalled observation;
-elapsed time does not park or fail the slice. The controller remains active
-until an authoritative event, explicit cancellation, or an unrecoverable
-integrity error resolves it. Repeated heartbeats must be safe to run because
-terminal slices are no longer polled and unchanged PR observations produce no
-new synthetic event.
+A dead pane for proven active work during the current invocation uses the
+existing M5.3 park path with `stall_detected`, including needs-human issue
+creation and dependent blocking. On `--continue`, a saved stall park is prior
+invocation evidence: supersede only its current projection after accepted
+manifest/owner proof, retaining the park event, audit, identities, budgets, and
+receipts. A nested parent pane's death alone is not active work when its child
+checkpoint proves a human-recovery wait; missing or conflicting child proof
+stays parked with a scoped hold. A live pane with no progress only emits a
+wave.stalled observation; elapsed time does not park or fail the slice. The
+controller remains active until an authoritative event, explicit cancellation,
+or an unrecoverable integrity error resolves it. Repeated heartbeats must be
+safe to run because terminal slices are no longer polled and unchanged PR
+observations produce no new synthetic event.
 
 Classifications must not depend on a default being spelled out. A watcher
 snapshot answers in protobuf, where a boolean or string with no value simply

@@ -1079,6 +1079,18 @@ producer awaiting parent aggregate integration is never timed, so aggregate
 integration cannot be expired by a worker budget. Historical timestamps and the
 `deadline_ledger` remain audit facts and are not rewritten.
 
+A saved `PARKED/STALL_DETECTED` status is an outcome of the previous controller
+invocation, not a current timeout verdict. On `--continue`, the controller may
+supersede that projection only after accepted-manifest and owner evidence prove
+the scope is reconcilable; a nested parent stall additionally requires the
+child checkpoint to prove its current recovery wait. The old park audit, event,
+escalation identity, dispatch and invocation bindings, receipts, retry counts,
+and token charges remain durable. Missing or conflicting proof leaves the
+scope parked with a scoped hold. Other park causes, manual/rejected gates, and
+unresolved effects are not reset. This state reconciliation happens once at
+invocation startup; repeated heartbeats within an invocation still enforce
+the current active-work budget.
+
 #### Ordered-child recovery gates
 
 A terminal ordered child whose controller stopped before authoritative
@@ -1566,12 +1578,13 @@ the only operator mutation; do not manually mark a stage merged.
 | `review_rounds_exhausted` | Review-round ceiling reached and the `roles.tl` judgment escalated, or `roles.tl.escalate_after_attempts` guides were already spent | Human reads the PR and answers the named gate |
 | `review_stuck` | The `roles.tl` review-stuck judgment failed (backend error, unusable guide, exhausted budget) or a repair dispatch failed | Read the PR and the slice's `dispatch_error`; fix `roles.tl` or the plan and resume |
 | `harness_switch_requested` | The configured harness could not proceed | Approve explicitly; set `EXOMONAD_ALLOW_HARNESS_SWITCH=1` |
-| `stall_detected` | Dead pane or no progress past the heartbeat threshold | Investigate the worker |
+| `stall_detected` | An active-work pane disappeared during this invocation | Continue revalidates the accepted owner and scope; only proven stale stall projections are superseded |
 | `task_budget_exceeded` | A declared wall-clock slice ceiling elapsed | Use the authenticated per-slice reset only after inspecting the parked task; it restarts that task clock and adjusts its token reservation without changing global ceilings |
 
 The controller does not retry past a ceiling, coax a model into continuing, or
 pick a different harness on its own. Every one of these becomes a durable,
-named, auditable gate.
+named, auditable gate. A dead parent pane alone is not a stall verdict for a
+nested child whose checkpoint proves it is waiting on human recovery.
 
 ### Long-running waves
 
