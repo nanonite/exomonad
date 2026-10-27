@@ -125,6 +125,22 @@ pub struct WindowInfo {
     pub pane_id: PaneId,
 }
 
+/// Exact server and pane coordinates from one tmux listing observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxPaneSnapshot {
+    pub session_name: String,
+    pub window_id: WindowId,
+    pub pane_id: PaneId,
+    pub pid: u32,
+    pub dead: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TmuxServerIdentity {
+    pub pid: u32,
+    pub start_ticks: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowStartupStatus {
     Ready,
@@ -336,6 +352,52 @@ fn server_unavailable(stderr: &str) -> bool {
     stderr.to_ascii_lowercase().contains("no server running")
 }
 
+fn parse_pane_snapshot(line: &str) -> Result<TmuxPaneSnapshot> {
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() != 5 {
+        anyhow::bail!("tmux returned a malformed pane snapshot row");
+    }
+    let window_id =
+        WindowId::parse(fields[1]).context("tmux returned a malformed pane window ID")?;
+    let pane_id = PaneId::parse(fields[2]).context("tmux returned a malformed pane ID")?;
+    let pid = fields[3]
+        .parse::<u32>()
+        .context("tmux returned a malformed pane PID")?;
+    let dead = match fields[4] {
+        "0" => false,
+        "1" => true,
+        _ => anyhow::bail!("tmux returned a malformed pane-dead flag"),
+    };
+    if fields[0].is_empty() || pid == 0 {
+        anyhow::bail!("tmux returned incomplete pane ownership evidence");
+    }
+    Ok(TmuxPaneSnapshot {
+        session_name: fields[0].to_owned(),
+        window_id,
+        pane_id,
+        pid,
+        dead,
+    })
+}
+
+async fn process_start_ticks(pid: u32) -> Result<u64> {
+    let path = format!("/proc/{pid}/stat");
+    let stat = tokio::fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("inspect tmux process identity for PID {pid}"))?;
+    let fields = stat
+        .rsplit_once(')')
+        .context("process stat is malformed")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    fields
+        .get(19)
+        .context("process stat lacks its start-time field")?
+        .parse()
+        .context("process start-time field is malformed")
+}
+
 fn tmux_command() -> Command {
     let mut command = Command::new("tmux");
     if let Ok(socket) = env::var("EXOMONAD_TMUX_SOCKET") {
@@ -461,6 +523,77 @@ impl TmuxIpc {
             .await
             .context("Failed to run tmux has-session")?;
         Ok(status.success())
+    }
+
+    /// Read the selected tmux server PID and process-start identity.
+    pub async fn server_identity(&self) -> Result<TmuxServerIdentity> {
+        let output = tmux_command()
+            .args(["display-message", "-p", "#{pid}"])
+            .output()
+            .await
+            .context("Failed to inspect tmux server identity")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "tmux server identity is unavailable: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let pid = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u32>()
+            .context("tmux returned a malformed server PID")?;
+        let start_ticks = process_start_ticks(pid).await?;
+        Ok(TmuxServerIdentity { pid, start_ticks })
+    }
+
+    /// Inspect one exact pane within this server and session. A missing target
+    /// is represented as `None`; unavailable or malformed inspection is an
+    /// error and therefore cannot authorize cleanup.
+    pub async fn pane_snapshot(
+        &self,
+        expected_session: &str,
+        expected_window: &WindowId,
+        expected_pane: &PaneId,
+    ) -> Result<Option<TmuxPaneSnapshot>> {
+        if expected_session != self.session_name {
+            anyhow::bail!("controller pane session does not match the configured tmux session");
+        }
+        let output = tmux_command()
+            .args([
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}\t#{window_id}\t#{pane_id}\t#{pane_pid}\t#{pane_dead}",
+            ])
+            .output()
+            .await
+            .context("Failed to inspect tmux pane snapshot")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if session_missing(&stderr) {
+                return Ok(None);
+            }
+            if server_unavailable(&stderr) {
+                anyhow::bail!("tmux server is unavailable: {}", stderr.trim());
+            }
+            anyhow::bail!("tmux pane inspection failed: {}", stderr.trim());
+        }
+        let rows = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(parse_pane_snapshot)
+            .collect::<Result<Vec<_>>>()?;
+        let mut matching = rows.into_iter().filter(|pane| {
+            pane.session_name == expected_session
+                && pane.window_id == *expected_window
+                && pane.pane_id == *expected_pane
+        });
+        let Some(snapshot) = matching.next() else {
+            return Ok(None);
+        };
+        if matching.next().is_some() {
+            anyhow::bail!("tmux returned duplicate rows for the exact controller pane");
+        }
+        Ok(Some(snapshot))
     }
 
     /// Read the process id of a window's pane from the selected tmux server.
@@ -947,6 +1080,23 @@ impl TmuxIpc {
             );
         }
         info!(pane = %pane_id, "Killed tmux pane");
+        Ok(())
+    }
+
+    /// Send the standard interrupt key to one session-qualified pane.
+    pub async fn send_interrupt_to_pane(&self, pane_id: &PaneId) -> Result<()> {
+        let target = qualify_tmux_target(&self.session_name, pane_id.as_str());
+        let output = tmux_command()
+            .args(["send-keys", "-t", &target, "C-c"])
+            .output()
+            .await
+            .context("Failed to request graceful controller pane interruption")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "tmux could not interrupt the verified controller pane: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
         Ok(())
     }
 
@@ -1504,6 +1654,26 @@ mod tests {
             "no server running on /tmp/tmux-1000/default"
         ));
         assert!(!session_missing("usage: tmux list-windows"));
+    }
+
+    #[test]
+    fn controller_pane_snapshot_parser_requires_complete_exact_coordinates() {
+        let snapshot = parse_pane_snapshot("workspace\t@7\t%9\t1234\t1").unwrap();
+        assert_eq!(snapshot.session_name, "workspace");
+        assert_eq!(snapshot.window_id.as_str(), "@7");
+        assert_eq!(snapshot.pane_id.as_str(), "%9");
+        assert_eq!(snapshot.pid, 1234);
+        assert!(snapshot.dead);
+
+        for malformed in [
+            "workspace\t@7\t%9\t1234",
+            "\t@7\t%9\t1234\t0",
+            "workspace\tbad\t%9\t1234\t0",
+            "workspace\t@7\t%9\t0\t0",
+            "workspace\t@7\t%9\t1234\tdead",
+        ] {
+            assert!(parse_pane_snapshot(malformed).is_err(), "{malformed:?}");
+        }
     }
 
     #[tokio::test]

@@ -1604,6 +1604,9 @@ impl<
         cwd: &Path,
         full_command: &str,
     ) -> Result<super::tmux_ipc::WindowId> {
+        let _dispatch = self
+            .acquire_dispatch_permit("start an agent in a tmux window")
+            .await?;
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let tmux = self.tmux()?;
         let window_name = name.to_string();
@@ -1799,6 +1802,9 @@ impl<
         claude_flags: Option<&ClaudeSpawnFlags>,
         model_override: Option<&str>,
     ) -> Result<super::tmux_ipc::PaneId> {
+        let _dispatch = self
+            .acquire_dispatch_permit("start a worker in a tmux pane")
+            .await?;
         info!(name, cwd = %cwd.display(), agent_type = ?agent_type, parent = ?parent_window_name, "Creating tmux pane");
 
         // Write prompt to file to avoid shell quoting issues

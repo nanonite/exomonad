@@ -1055,6 +1055,70 @@ pub(crate) async fn finish_invocation_for_missing_target(
     Ok(finished)
 }
 
+/// Retire one controller invocation after its exact shared control pane has
+/// stopped. Invocation routes may name the shared window while worker panes
+/// remain in it, so window-level liveness alone is insufficient evidence.
+pub(crate) async fn finish_invocation_after_controller_pane_stopped(
+    agent_dir: &Path,
+    expected: &InvocationRecord,
+    target: &super::ControllerPaneOwnership,
+    tmux: &crate::services::tmux_ipc::TmuxIpc,
+) -> Result<InvocationRecord> {
+    let _guard = mutation_lock().lock().await;
+    let current = read_locked(agent_dir)
+        .await?
+        .context("controller invocation disappeared during workspace shutdown")?;
+    if current.invocation_id != expected.invocation_id
+        || current.generation != expected.generation
+        || !current.routing.same_delivery_target(&expected.routing)
+    {
+        anyhow::bail!("controller invocation changed during workspace shutdown");
+    }
+    if !current.is_live() {
+        return Ok(current);
+    }
+    if current.routing.window_id.as_ref() != Some(&target.window_id)
+        || current.routing.pane_id.is_some()
+    {
+        anyhow::bail!("controller invocation no longer uses the accepted shared TL route");
+    }
+    let server = tmux.server_identity().await?;
+    if server.pid != target.tmux_server_pid || server.start_ticks != target.tmux_server_start_ticks
+    {
+        anyhow::bail!("tmux server identity changed during workspace shutdown");
+    }
+    if let Some(pane) = tmux
+        .pane_snapshot(&target.tmux_session, &target.window_id, &target.pane_id)
+        .await?
+    {
+        if !pane.dead {
+            anyhow::bail!(
+                "shared controller pane is still active during interruption checkpointing"
+            );
+        }
+    }
+    let finished = finish_locked(
+        agent_dir,
+        &current.invocation_id,
+        InvocationStatus::Killed,
+        None,
+        InvocationExitContext {
+            reason: Some("workspace control-plane shutdown".to_string()),
+            classification: Some("workspace_control_plane_shutdown".to_string()),
+            stderr_tail: None,
+        },
+    )
+    .await?;
+    let InvocationFinishResult::Finished(finished) = finished else {
+        anyhow::bail!("controller invocation was not durably retired after pane shutdown");
+    };
+    tokio::fs::write(agent_dir.join("exited_at"), unix_timestamp().to_string()).await?;
+    if let Ok(routing) = RoutingInfo::read_from_dir(agent_dir).await {
+        routing.without_ownership().write_to_dir(agent_dir).await?;
+    }
+    Ok(finished)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

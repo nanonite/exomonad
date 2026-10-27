@@ -51,6 +51,14 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tracing::warn;
 
+fn shutdown_endpoint_path(workspace_control_plane: bool) -> &'static str {
+    if workspace_control_plane {
+        "/shutdown/workspace"
+    } else {
+        "/shutdown"
+    }
+}
+
 // ============================================================================
 // CLI Types
 // ============================================================================
@@ -288,8 +296,12 @@ enum Commands {
     /// Reload WASM plugins (clears plugin cache, next call loads fresh from disk)
     Reload,
 
-    /// Gracefully shut down the running server
-    Shutdown,
+    /// Gracefully shut down the running server; this does not stop agent panes.
+    Shutdown {
+        /// Also stop the verified root/shared-TL controller pane. Independent worker panes are preserved.
+        #[arg(long)]
+        workspace: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -694,7 +706,7 @@ async fn main() -> Result<()> {
             return models::run(harness, provider).await;
         }
 
-        Commands::Shutdown => {
+        Commands::Shutdown { workspace } => {
             let socket = uds_client::find_server_socket().context("Cannot find server socket.")?;
             println!("Socket: {}", socket.display());
 
@@ -728,18 +740,25 @@ async fn main() -> Result<()> {
 
             let client = uds_client::ServerClient::new(socket);
             println!("Connecting...");
-            match client
-                .post_json::<serde_json::Value, serde_json::Value>(
-                    "/shutdown",
-                    &serde_json::json!({}),
-                )
+            let path = shutdown_endpoint_path(workspace);
+            let response = client
+                .post_json::<serde_json::Value, serde_json::Value>(path, &serde_json::json!({}))
                 .await
-            {
-                Ok(resp) => println!("Server acknowledged shutdown: {}", resp),
-                Err(e) => eprintln!("Shutdown request failed: {}", e),
-            }
+                .with_context(|| format!("Shutdown request failed for {path}"))?;
+            println!("Shutdown acknowledged: {}", response);
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shutdown_endpoint_path;
+
+    #[test]
+    fn shutdown_defaults_to_server_only_and_workspace_mode_is_explicit() {
+        assert_eq!(shutdown_endpoint_path(false), "/shutdown");
+        assert_eq!(shutdown_endpoint_path(true), "/shutdown/workspace");
+    }
 }

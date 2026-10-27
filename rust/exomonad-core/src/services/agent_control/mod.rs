@@ -7,6 +7,7 @@
 
 mod cleanup;
 pub mod codex_lifecycle;
+mod controller_lifecycle;
 mod internal;
 pub mod invocation;
 mod spawn;
@@ -17,6 +18,11 @@ pub use codex_lifecycle::{
     release_captured_codex_trust, release_captured_codex_trusts, release_codex_agent_trust,
     CapturedCodexTrust, CodexAgentSpec, CodexTrustRelease, CodexTrustReleaseBatch,
     ProvisionedCodexAgent, RetainedProjectTrust,
+};
+pub use controller_lifecycle::{
+    persist_controller_ownership, read_controller_ownership, ControllerPaneOwnership,
+    WorkspaceShutdownIntent, WorkspaceShutdownPhase, WorkspaceShutdownResult,
+    ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH, WORKSPACE_SHUTDOWN_RELATIVE_PATH,
 };
 pub use invocation::{
     finish_invocation, finish_invocation_and_tombstone,
@@ -1595,6 +1601,14 @@ impl<
                 .map_err(|_| anyhow!("test invocation registration pause was closed"))?;
             permit.forget();
         }
+        let _dispatch = if reuse_live_invocation {
+            Some(
+                self.acquire_dispatch_permit("register an ordered sub-TL controller invocation")
+                    .await?,
+            )
+        } else {
+            None
+        };
         let adoption_identity = identity.as_ref().map(|record| {
             (
                 record.birth_branch.to_string(),

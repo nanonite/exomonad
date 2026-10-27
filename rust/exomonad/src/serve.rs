@@ -1724,9 +1724,49 @@ pub async fn reload(State(state): State<AppState>) -> impl IntoResponse {
 pub async fn shutdown_endpoint(
     State(signal): State<Arc<tokio::sync::Notify>>,
 ) -> impl IntoResponse {
-    info!("Shutdown requested via /shutdown endpoint");
+    info!("Server-only shutdown requested via /shutdown endpoint");
     signal.notify_waiters();
-    Json(serde_json::json!({"status": "ok"}))
+    Json(serde_json::json!({"status": "ok", "mode": "server_only"}))
+}
+
+#[derive(Clone)]
+struct WorkspaceShutdownEndpointState {
+    app: AppState,
+    signal: Arc<tokio::sync::Notify>,
+}
+
+async fn workspace_shutdown_endpoint(
+    State(state): State<WorkspaceShutdownEndpointState>,
+) -> Response {
+    match state
+        .app
+        .agent_control
+        .shutdown_workspace_control_plane()
+        .await
+    {
+        Ok(result) => {
+            info!(operation_id = %result.operation_id, "Workspace controller shutdown completed");
+            state.signal.notify_waiters();
+            Json(serde_json::json!({
+                "status": result.status,
+                "mode": "workspace_control_plane",
+                "result": result,
+            }))
+            .into_response()
+        }
+        Err(error) => {
+            warn!(error = %error, "Workspace controller shutdown is blocked");
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "status": "blocked",
+                    "mode": "workspace_control_plane",
+                    "error": error.to_string(),
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn shutdown_signal_future(signal: Arc<tokio::sync::Notify>, listener_name: &'static str) {
@@ -2280,6 +2320,13 @@ Run `exomonad recompile` first to build it.",
             "/shutdown",
             post(shutdown_endpoint).with_state(shutdown_signal.clone()),
         )
+        .route(
+            "/shutdown/workspace",
+            post(workspace_shutdown_endpoint).with_state(WorkspaceShutdownEndpointState {
+                app: app_state.clone(),
+                signal: shutdown_signal.clone(),
+            }),
+        )
         .with_state(app_state)
         .layer(cors)
         .layer(TraceLayer::new_for_http());
@@ -2356,6 +2403,27 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(project.path().join(".exo")).unwrap();
         project
+    }
+
+    #[tokio::test]
+    async fn shutdown_endpoint_only_requests_server_shutdown() {
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let notified = signal.notified();
+        tokio::pin!(notified);
+        let response = shutdown_endpoint(State(signal.clone()))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["mode"], "server_only");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
