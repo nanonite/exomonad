@@ -1757,6 +1757,15 @@ elif [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
 fi
 
 if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" && "${E2E_BLOCKER_ONLY:-0}" != "1" ]]; then
+    # Keep an unrelated selected pane alive while the disposable Server exits.
+    # The workspace shutdown targets only the recorded root controller pane;
+    # this pane keeps the tmux session available for the server-only restart
+    # and ensures selected-pane routing cannot stand in for controller identity.
+    tmux new-window -d -t "$AGGREGATE_SESSION" -n RecoveryKeeper "exec sleep 600"
+    tmux select-window -t "$AGGREGATE_SESSION:RecoveryKeeper"
+    RECOVERY_KEEPER_PANE="$(tmux display-message -p -t "$AGGREGATE_SESSION:RecoveryKeeper" '#{pane_id}')"
+    [[ -n "$RECOVERY_KEEPER_PANE" ]] \
+        || e2e_fail "could not establish the unrelated selected recovery pane"
     (
         cd "$AGG_REPO"
         HOME="$AGG_HOME" "$EXOMONAD_BIN" shutdown --workspace
@@ -1782,6 +1791,9 @@ PY
     done
     [[ ! -S "$AGG_REPO/.exo/server.sock" ]] \
         || e2e_fail "explicit workspace shutdown did not retire the disposable Server socket"
+    assert_one_live_window RecoveryKeeper
+    [[ "$(tmux display-message -p -t "$AGGREGATE_SESSION" '#{window_name}')" == "RecoveryKeeper" ]] \
+        || e2e_fail "workspace shutdown changed the selected unrelated pane"
     tmux kill-window -t "$AGGREGATE_SESSION:Server" 2>/dev/null || true
     tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_SERVER_COMMAND"
     tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
@@ -1802,6 +1814,9 @@ PY
     done
     [[ -S "$AGG_REPO/.exo/server.sock" ]] \
         || { tmux capture-pane -p -t "$AGGREGATE_SESSION:Server" > "$AGG_DIR/server-pane-no-socket.log" 2>&1 || true; cat "$AGG_DIR/server-pane-no-socket.log"; e2e_fail "Server did not restart after the completed workspace shutdown"; }
+    assert_one_live_window RecoveryKeeper
+    [[ "$(tmux display-message -p -t "$AGGREGATE_SESSION" '#{window_name}')" == "RecoveryKeeper" ]] \
+        || e2e_fail "server restart changed the selected unrelated pane"
     e2e_log "Completed explicit workspace shutdown and server-only restart before init continuation"
 fi
 
