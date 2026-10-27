@@ -1,8 +1,5 @@
 use crate::domain::RoutingInfo;
-use crate::services::agent_control::{
-    finish_invocation_and_tombstone, read_invocation, InvocationFinishResult, InvocationRecord,
-    InvocationStatus,
-};
+use crate::services::agent_control::{read_invocation, InvocationRecord, InvocationStatus};
 use crate::services::agent_resources::{
     dispose_agent_resources, dispose_exited_reviewer_resources,
 };
@@ -375,30 +372,32 @@ async fn observe_session_durations(
             .map(|s| s.trim().to_string());
         let liveness = match tmux_session {
             Some(session) => {
-                verify_routing_liveness(&routing, invocation.as_ref(), &slug, session).await
+                verify_routing_liveness(&agent_dir, &routing, invocation.as_ref(), &slug, session)
+                    .await
             }
             None => RoutingLiveness::Unverifiable(
                 "tmux routing cannot be verified without a session".to_string(),
             ),
         };
         if liveness == RoutingLiveness::Dead {
-            match finish_invocation_and_tombstone(
-                &agent_dir,
-                &routing,
-                InvocationStatus::Exited,
-                None,
-            )
-            .await
-            {
-                Ok(InvocationFinishResult::IgnoredStale) => {
-                    warn!(agent = %slug, "Preserved newer invocation after verified exit")
+            if let (Some(expected), Some(session)) = (invocation.as_ref(), tmux_session) {
+                let tmux = crate::services::tmux_ipc::TmuxIpc::new(session);
+                if let Err(error) = crate::services::agent_control::invocation::finish_invocation_for_missing_target(
+                    &agent_dir,
+                    expected,
+                    &tmux,
+                    InvocationStatus::Exited,
+                    "managed delivery target was verified absent",
+                    "managed_target_missing_during_reconciliation",
+                )
+                .await
+                {
+                    warn!(
+                        agent = %slug,
+                        %error,
+                        "Failed to finish verified-dead invocation; preserving routing"
+                    );
                 }
-                Ok(InvocationFinishResult::Finished(_)) | Ok(InvocationFinishResult::Missing) => {}
-                Err(error) => warn!(
-                    agent = %slug,
-                    %error,
-                    "Failed to finish verified-dead invocation; preserving routing"
-                ),
             }
             info!(
                 agent = %slug,
@@ -438,6 +437,7 @@ fn duration_threshold_reached(age_secs: u64, limit_secs: u64) -> bool {
 }
 
 async fn verify_routing_liveness(
+    agent_dir: &Path,
     routing: &RoutingInfo,
     invocation: Option<&InvocationRecord>,
     slug: &str,
@@ -474,31 +474,39 @@ async fn verify_routing_liveness(
     }
 
     let tmux = crate::services::tmux_ipc::TmuxIpc::new(session);
-    match tmux.routing_owner(routing).await {
-        Ok(Some(owner))
-            if owner.agent_id == slug
-                && owner.invocation_id == invocation.invocation_id
-                && owner.generation == invocation.generation => {}
-        Ok(Some(owner)) => {
-            return RoutingLiveness::Unverifiable(format!(
-                "tmux ownership mismatch: expected agent={slug} invocation={} generation={}, observed agent={} invocation={} generation={}",
-                invocation.invocation_id,
-                invocation.generation,
-                owner.agent_id,
-                owner.invocation_id,
-                owner.generation
-            ));
-        }
-        Ok(None) => {
-            return RoutingLiveness::Unverifiable(
-                "tmux target has no complete ownership proof".to_string(),
-            );
-        }
-        Err(error) => return RoutingLiveness::Unverifiable(error.to_string()),
-    }
     match crate::services::tmux_ipc::routing_target_alive(routing, &tmux).await {
-        Ok(true) => RoutingLiveness::Live,
-        Ok(false) => RoutingLiveness::Dead,
+        Ok(false) => return RoutingLiveness::Dead,
+        Err(error) => return RoutingLiveness::Unverifiable(error.to_string()),
+        Ok(true) => {}
+    }
+    match tmux.routing_owner_state(routing).await {
+        Ok(crate::services::tmux_ipc::RoutingOwnerState::Owned(owner)) => {
+            match crate::services::agent_control::invocation::routing_owner_matches_invocation_or_parent(
+                agent_dir,
+                invocation,
+                &owner,
+                &invocation.routing,
+            )
+            .await
+            {
+                Ok(true) => RoutingLiveness::Live,
+                Ok(false) => RoutingLiveness::Unverifiable(format!(
+                    "tmux ownership mismatch: expected agent={slug} invocation={} generation={}, observed agent={} invocation={} generation={}",
+                    invocation.invocation_id,
+                    invocation.generation,
+                    owner.agent_id,
+                    owner.invocation_id,
+                    owner.generation
+                )),
+                Err(error) => RoutingLiveness::Unverifiable(error.to_string()),
+            }
+        }
+        Ok(crate::services::tmux_ipc::RoutingOwnerState::Unowned) => {
+            RoutingLiveness::Unverifiable("tmux target has no complete ownership proof".to_string())
+        }
+        Ok(crate::services::tmux_ipc::RoutingOwnerState::Partial) => {
+            RoutingLiveness::Unverifiable("tmux target has partial ownership evidence".to_string())
+        }
         Err(error) => RoutingLiveness::Unverifiable(error.to_string()),
     }
 }
@@ -641,6 +649,95 @@ async fn kill_agent_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::process::Command as StdCommand;
+
+    struct OrphanTmuxServer {
+        socket: String,
+        session: String,
+        previous_socket: Option<OsString>,
+    }
+
+    impl OrphanTmuxServer {
+        fn new() -> Self {
+            let socket = format!("exo-orphan-recovery-{}", uuid::Uuid::new_v4());
+            let session = format!("exo-orphan-recovery-{}", uuid::Uuid::new_v4());
+            let previous_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
+            std::env::set_var("EXOMONAD_TMUX_SOCKET", &socket);
+            let status = Self::command(&socket)
+                .args([
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &session,
+                    "-n",
+                    "owned-target",
+                    "sh",
+                    "-c",
+                    "sleep 300",
+                ])
+                .status()
+                .expect("start isolated orphan test tmux server");
+            assert!(status.success(), "isolated tmux session starts");
+            Self {
+                socket,
+                session,
+                previous_socket,
+            }
+        }
+
+        fn command(socket: &str) -> StdCommand {
+            let mut command = StdCommand::new("tmux");
+            command.args(["-L", socket]);
+            command
+        }
+
+        fn window_id(&self) -> crate::services::tmux_ipc::WindowId {
+            let output = Self::command(&self.socket)
+                .args(["list-windows", "-t", &self.session, "-F", "#{window_id}"])
+                .output()
+                .expect("list isolated windows");
+            assert!(output.status.success());
+            crate::services::tmux_ipc::WindowId::parse(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .expect("isolated session has a window"),
+            )
+            .unwrap()
+        }
+
+        fn keep_session_alive(&self) {
+            let status = Self::command(&self.socket)
+                .args(["new-window", "-d", "-t", &self.session, "sleep", "300"])
+                .status()
+                .expect("create a second isolated window");
+            assert!(status.success());
+        }
+
+        fn kill_window(&self, window: &crate::services::tmux_ipc::WindowId) {
+            let status = Self::command(&self.socket)
+                .args(["kill-window", "-t", window.as_str()])
+                .status()
+                .expect("remove isolated target window");
+            assert!(status.success());
+        }
+
+        fn kill_server(&self) {
+            let _ = Self::command(&self.socket).arg("kill-server").status();
+        }
+    }
+
+    impl Drop for OrphanTmuxServer {
+        fn drop(&mut self) {
+            let _ = Self::command(&self.socket).arg("kill-server").status();
+            if let Some(previous) = self.previous_socket.take() {
+                std::env::set_var("EXOMONAD_TMUX_SOCKET", previous);
+            } else {
+                std::env::remove_var("EXOMONAD_TMUX_SOCKET");
+            }
+        }
+    }
 
     #[test]
     fn recent_activity_prevents_timeout_from_old_spawn_age() {
@@ -764,5 +861,65 @@ mod tests {
             .expect_err("missing routing should not be treated as live");
 
         assert!(error.to_string().contains("routing.json is unavailable"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn absent_owned_target_is_proven_dead_before_tmux_owner_lookup() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let server = OrphanTmuxServer::new();
+        let target = server.window_id();
+        server.keep_session_alive();
+        let agent_dir = temp_dir.path().join(".exo/agents/ordered-child");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        let plain_routing = RoutingInfo::window(target.clone());
+        let invocation = crate::services::agent_control::start_invocation_with_provenance(
+            &agent_dir,
+            crate::services::AgentType::Codex,
+            crate::services::agent_control::InvocationTrigger::Spawn,
+            plain_routing.clone(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let tmux = crate::services::tmux_ipc::TmuxIpc::new(&server.session);
+        tmux.set_routing_owner(
+            &plain_routing,
+            "ordered-child",
+            &invocation.invocation_id,
+            invocation.generation,
+        )
+        .await
+        .unwrap();
+        let owned_routing = RoutingInfo::read_from_dir(&agent_dir).await.unwrap();
+        server.kill_window(&target);
+
+        assert_eq!(
+            verify_routing_liveness(
+                &agent_dir,
+                &owned_routing,
+                Some(&invocation),
+                "ordered-child",
+                &server.session,
+            )
+            .await,
+            RoutingLiveness::Dead,
+            "missing targets are decided from the scope listing before querying target options"
+        );
+        server.kill_server();
+        assert!(matches!(
+            verify_routing_liveness(
+                &agent_dir,
+                &owned_routing,
+                Some(&invocation),
+                "ordered-child",
+                &server.session,
+            )
+            .await,
+            RoutingLiveness::Unverifiable(_)
+        ));
     }
 }

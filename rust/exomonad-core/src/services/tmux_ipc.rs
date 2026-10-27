@@ -329,8 +329,11 @@ fn normalize_for_capture(text: &str) -> String {
 }
 
 fn session_missing(stderr: &str) -> bool {
-    let stderr = stderr.to_ascii_lowercase();
-    stderr.contains("can't find session") || stderr.contains("no server running")
+    stderr.to_ascii_lowercase().contains("can't find session")
+}
+
+fn server_unavailable(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("no server running")
 }
 
 fn tmux_command() -> Command {
@@ -1303,6 +1306,9 @@ impl TmuxIpc {
                 );
                 return Ok(false);
             }
+            if server_unavailable(&stderr) {
+                anyhow::bail!("tmux server is unavailable: {}", stderr.trim());
+            }
             warn!(
                 session = %self.session_name,
                 window = %window_id,
@@ -1382,6 +1388,9 @@ impl TmuxIpc {
                 );
                 return Ok(false);
             }
+            if server_unavailable(&stderr) {
+                anyhow::bail!("tmux server is unavailable: {}", stderr.trim());
+            }
             warn!(
                 session = %self.session_name,
                 pane = %pane_id,
@@ -1425,6 +1434,9 @@ impl TmuxIpc {
                     "tmux process probe found no session"
                 );
                 return Ok(false);
+            }
+            if server_unavailable(&stderr) {
+                anyhow::bail!("tmux server is unavailable: {}", stderr.trim());
             }
             warn!(
                 session = %self.session_name,
@@ -1485,7 +1497,10 @@ mod tests {
     #[test]
     fn test_session_missing_accepts_expected_tmux_errors_only() {
         assert!(session_missing("can't find session: workspace"));
-        assert!(session_missing(
+        assert!(!session_missing(
+            "no server running on /tmp/tmux-1000/default"
+        ));
+        assert!(server_unavailable(
             "no server running on /tmp/tmux-1000/default"
         ));
         assert!(!session_missing("usage: tmux list-windows"));

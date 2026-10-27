@@ -455,7 +455,7 @@ impl<
         }
 
         let agent_dir = project_dir.join(".exo/agents").join(agent_name.as_str());
-        let prior_invocation = read_invocation(&agent_dir).await.map_err(|_| {
+        let mut prior_invocation = read_invocation(&agent_dir).await.map_err(|_| {
             ordered_provision_failure(
                 super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
                 "the prior controller invocation is malformed or unreadable; reconcile it before provisioning",
@@ -496,14 +496,6 @@ impl<
                 "publication history is unavailable; ordered controller continuation is blocked",
             )
         })?;
-        let invocation_plan = ordered_invocation_plan(
-            prior_invocation.as_ref(),
-            &record,
-            &publications,
-            pr_number,
-            head_sha.as_deref(),
-        )?;
-
         let existing_identity = self.agent_resolver().get(&agent_name).await;
         if prior_invocation.is_some() && existing_identity.as_ref() != Some(&record) {
             return Err(ordered_provision_failure(
@@ -554,15 +546,10 @@ impl<
                 "no unique current TL delivery target is available for ordered controller provisioning",
             )
         })?;
-        if let Some(prior) = prior_invocation.as_ref().filter(|record| record.is_live()) {
-            if !prior.routing.same_delivery_target(&routing) {
-                return Err(ordered_provision_failure(
-                    super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
-                    "the live controller is bound to a different delivery target and will not be replaced",
-                ));
-            }
-        }
-        if let Some(prior) = prior_invocation.as_ref() {
+        if let Some(prior) = prior_invocation
+            .as_ref()
+            .filter(|invocation| invocation.is_live())
+        {
             if routing_path.exists() {
                 let persisted_routing = RoutingInfo::read_from_dir(&agent_dir).await.map_err(|_| {
                     ordered_provision_failure(
@@ -584,19 +571,168 @@ impl<
                         "routing ownership conflicts with the prior controller invocation",
                     ));
                 }
-                if prior.is_live() && !persisted_routing.same_delivery_target(&routing) {
+                if !persisted_routing.same_delivery_target(&prior.routing) {
                     return Err(ordered_provision_failure(
-                        super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
-                        "the live controller routing differs from the current TL target",
+                        super::OrderedSubTLProvisionFailureKind::OwnershipConflict,
+                        "the live controller checkpoint conflicts with its durable routing target",
                     ));
                 }
-            } else if prior.is_live() {
+            } else {
                 return Err(ordered_provision_failure(
                     super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
-                    "the live controller routing record is missing; reconcile it before provisioning",
+                    "the live controller routing record is missing; liveness cannot be proven",
                 ));
             }
+
+            #[cfg(test)]
+            let synthetic_route = self.ordered_sub_tl_routing_override.is_some();
+            #[cfg(not(test))]
+            let synthetic_route = false;
+            let tmux = if synthetic_route {
+                None
+            } else {
+                Some(self.tmux().map_err(|_| {
+                    ordered_provision_failure(
+                        super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                        "tmux liveness inspection is unavailable; controller replacement is blocked",
+                    )
+                })?)
+            };
+            let target_alive = match tmux.as_ref() {
+                Some(tmux) => {
+                    let current_target_alive =
+                        crate::services::tmux_ipc::routing_target_alive(&routing, tmux)
+                            .await
+                            .map_err(|_| {
+                                ordered_provision_failure(
+                                    super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                                    "the current TL delivery target could not be inspected",
+                                )
+                            })?;
+                    if !current_target_alive {
+                        return Err(ordered_provision_failure(
+                            super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                            "the current TL delivery target disappeared during provisioning",
+                        ));
+                    }
+                    match tmux.routing_owner_state(&routing).await.map_err(|_| {
+                        ordered_provision_failure(
+                            super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                            "the current TL delivery target ownership could not be inspected",
+                        )
+                    })? {
+                        super::super::tmux_ipc::RoutingOwnerState::Unowned
+                            if prior.routing.same_delivery_target(&routing) =>
+                        {
+                            return Err(ordered_provision_failure(
+                                super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                                "the matching live target has no ownership proof; target reuse cannot be distinguished",
+                            ));
+                        }
+                        super::super::tmux_ipc::RoutingOwnerState::Unowned => {}
+                        super::super::tmux_ipc::RoutingOwnerState::Partial => {
+                            return Err(ordered_provision_failure(
+                                super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                                "the current TL delivery target has incomplete ownership evidence",
+                            ));
+                        }
+                        super::super::tmux_ipc::RoutingOwnerState::Owned(owner) => {
+                            let owner_is_scoped =
+                                invocation::routing_owner_matches_invocation_or_parent(
+                                    &agent_dir,
+                                    prior,
+                                    &owner,
+                                    &routing,
+                                )
+                                .await
+                                .map_err(|_| {
+                                    ordered_provision_failure(
+                                        super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                                        "the current TL target owner relationship could not be verified",
+                                    )
+                                })?;
+                            if !owner_is_scoped {
+                                return Err(ordered_provision_failure(
+                                    super::OrderedSubTLProvisionFailureKind::OwnershipConflict,
+                                    "tmux target ownership conflicts with the accepted parent or controller",
+                                ));
+                            }
+                        }
+                    }
+                    crate::services::tmux_ipc::routing_target_alive(&prior.routing, tmux)
+                        .await
+                        .map_err(|_| {
+                            ordered_provision_failure(
+                                super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                                "the recorded controller target could not be inspected; replacement is blocked",
+                            )
+                        })?
+                }
+                None => true,
+            };
+            if target_alive {
+                if !prior.routing.same_delivery_target(&routing) {
+                    return Err(ordered_provision_failure(
+                        super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                        "the live controller is bound to a different delivery target and will not be replaced",
+                    ));
+                }
+            } else {
+                let tmux = tmux.as_ref().ok_or_else(|| {
+                    ordered_provision_failure(
+                        super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                        "tmux target loss cannot be confirmed for a synthetic routing observation",
+                    )
+                })?;
+                let finished = invocation::finish_invocation_for_missing_target(
+                    &agent_dir,
+                    prior,
+                    tmux,
+                    InvocationStatus::Killed,
+                    "controller delivery target was absent during reprovisioning",
+                    "controller_target_missing_on_reprovision",
+                )
+                .await
+                .map_err(|_| {
+                    ordered_provision_failure(
+                        super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                        "the absent-target observation no longer matches the durable controller invocation; retry reconciliation",
+                    )
+                })?;
+                prior_invocation = Some(finished);
+            }
+        } else if let Some(prior) = prior_invocation.as_ref() {
+            if routing_path.exists() {
+                let persisted_routing = RoutingInfo::read_from_dir(&agent_dir).await.map_err(|_| {
+                    ordered_provision_failure(
+                        super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                        "the prior controller routing record is unreadable; reconcile it before provisioning",
+                    )
+                })?;
+                let has_owner_fields = persisted_routing.owner_agent_id.is_some()
+                    || persisted_routing.owner_invocation_id.is_some()
+                    || persisted_routing.owner_generation.is_some();
+                let owned_by_prior = persisted_routing.has_ownership_proof()
+                    && persisted_routing.owner_agent_id.as_deref() == Some(agent_name.as_str())
+                    && persisted_routing.owner_invocation_id.as_deref()
+                        == Some(prior.invocation_id.as_str())
+                    && persisted_routing.owner_generation == Some(prior.generation);
+                if has_owner_fields && !owned_by_prior {
+                    return Err(ordered_provision_failure(
+                        super::OrderedSubTLProvisionFailureKind::OwnershipConflict,
+                        "routing ownership conflicts with the prior controller invocation",
+                    ));
+                }
+            }
         }
+
+        let invocation_plan = ordered_invocation_plan(
+            prior_invocation.as_ref(),
+            &record,
+            &publications,
+            pr_number,
+            head_sha.as_deref(),
+        )?;
 
         self.agent_resolver()
             .ensure_ordered_sub_tl_identity(record.clone())
@@ -2804,12 +2940,62 @@ mod tests {
                 .expect("tmux returns a valid window ID")
         }
 
+        fn window_id_for_session(&self) -> super::super::tmux_ipc::WindowId {
+            let output = Self::command(&self.socket)
+                .args(["list-windows", "-t", &self.session, "-F", "#{window_id}"])
+                .output()
+                .expect("list isolated session windows");
+            assert!(output.status.success(), "isolated session lists windows");
+            super::super::tmux_ipc::WindowId::parse(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .expect("isolated session has a window"),
+            )
+            .expect("tmux returns a valid window ID")
+        }
+
         fn kill_target(&self, target: &super::super::tmux_ipc::WindowId) {
             let status = Self::command(&self.socket)
                 .args(["kill-window", "-t", target.as_str()])
                 .status()
                 .expect("kill isolated target window");
             assert!(status.success(), "isolated target window exits");
+        }
+
+        fn kill_server(&self) {
+            let _ = Self::command(&self.socket).arg("kill-server").status();
+        }
+
+        fn rename_window(&self, window: &super::super::tmux_ipc::WindowId, name: &str) {
+            let status = Self::command(&self.socket)
+                .args(["rename-window", "-t", window.as_str(), name])
+                .status()
+                .expect("rename isolated tmux window");
+            assert!(status.success(), "isolated window rename succeeds");
+        }
+
+        fn restart_session_with_tl(&self) -> super::super::tmux_ipc::WindowId {
+            let output = Self::command(&self.socket)
+                .args([
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &self.session,
+                    "-n",
+                    "TL",
+                    "-P",
+                    "-F",
+                    "#{window_id}",
+                    "sh",
+                    "-c",
+                    "sleep 300",
+                ])
+                .output()
+                .expect("restart isolated tmux session");
+            assert!(output.status.success(), "replacement session starts");
+            super::super::tmux_ipc::WindowId::parse(String::from_utf8_lossy(&output.stdout).trim())
+                .expect("replacement session returns a TL window ID")
         }
     }
 
@@ -2838,6 +3024,19 @@ mod tests {
         AgentControlService::new(Arc::new(services))
             .with_tmux_session(session.to_string())
             .with_ordered_sub_tl_routing_for_test(routing)
+    }
+
+    async fn ordered_service_using_tmux_route(
+        project_dir: &Path,
+        session: &str,
+    ) -> AgentControlService<crate::services::Services> {
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.to_path_buf();
+        services.git_wt = Arc::new(crate::services::git_worktree::GitWorktreeService::new(
+            project_dir.to_path_buf(),
+        ));
+        services.agent_resolver = Arc::new(AgentResolver::load(project_dir.to_path_buf()).await);
+        AgentControlService::new(Arc::new(services)).with_tmux_session(session.to_string())
     }
 
     fn invocation_start_count(project_dir: &Path, agent_id: &str, invocation_id: &str) -> usize {
@@ -3051,7 +3250,10 @@ mod tests {
                 .provision_ordered_sub_tl(record.clone())
                 .await
                 .expect_err("a live foreign tmux owner cannot be adopted");
-        assert!(format!("{foreign_error:#}").contains("tmux target ownership conflicts"));
+        assert!(
+            format!("{foreign_error:#}").contains("tmux target ownership conflicts"),
+            "{foreign_error:#}"
+        );
         assert_eq!(
             std::fs::read(agent_dir.join("routing.json")).unwrap(),
             route_before_foreign_owner,
@@ -3285,6 +3487,434 @@ mod tests {
         assert!(
             exit_evidence_preserved && tombstone_evidence_preserved,
             "exit marker evidence preserved={exit_evidence_preserved}; terminal tombstone evidence preserved={tombstone_evidence_preserved}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordered_sub_tl_replaces_running_invocation_after_its_real_tmux_target_disappears() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        let run_git = |args: &[&str], directory: &std::path::Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"], &project_dir);
+        run_git(
+            &["config", "user.email", "test@example.invalid"],
+            &project_dir,
+        );
+        run_git(&["config", "user.name", "Test"], &project_dir);
+        std::fs::write(project_dir.join("seed"), "seed\n").unwrap();
+        run_git(&["add", "seed"], &project_dir);
+        run_git(&["commit", "-q", "-m", "seed"], &project_dir);
+
+        let record = AgentIdentityRecord {
+            agent_name: AgentName::try_from_str("ordered-child").unwrap(),
+            slug: Slug::try_from_str("ordered-child").unwrap(),
+            agent_type: AgentType::Codex,
+            birth_branch: BirthBranch::try_from_str("main.ordered-child").unwrap(),
+            parent_branch: BirthBranch::try_from_str("main").unwrap(),
+            working_dir: project_dir.join(".exo/worktrees/ordered-child"),
+            display_name: "🤖 ordered-child".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
+            ledger_owned: true,
+            slice_id: Some("ordered-child".to_string()),
+        };
+        let tmux = OrderedTestTmux::new();
+        let old_target = tmux.new_target("TL");
+        let old_routing = RoutingInfo::window(old_target.clone());
+        let agent_dir = project_dir.join(".exo/agents/ordered-child");
+        let first_id = ordered_service_using_tmux_route(&project_dir, &tmux.session)
+            .await
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .expect("initial controller is provisioned on the real TL window");
+
+        let monitor_pause = Arc::new(super::super::InvocationRegistrationPause {
+            reached: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        super::super::pause_monitor_before_exit_marker_read(
+            &agent_dir,
+            &first_id,
+            monitor_pause.clone(),
+        );
+        tmux.kill_target(&old_target);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            monitor_pause.reached.notified(),
+        )
+        .await
+        .expect("the old delivery target disappears while its durable invocation remains live");
+        let interrupted = read_invocation(&agent_dir)
+            .await
+            .unwrap()
+            .expect("the old invocation remains persisted");
+        assert!(interrupted.is_live());
+        assert_eq!(interrupted.invocation_id, first_id);
+        assert_eq!(interrupted.routing.window_id, old_routing.window_id);
+
+        let new_target = tmux.new_target("TL");
+        assert_ne!(new_target, old_target);
+        let service_a = ordered_service_using_tmux_route(&project_dir, &tmux.session).await;
+        let service_b = ordered_service_using_tmux_route(&project_dir, &tmux.session).await;
+        let (retry_a, retry_b) = tokio::join!(
+            service_a.provision_ordered_sub_tl(record.clone()),
+            service_b.provision_ordered_sub_tl(record.clone()),
+        );
+        monitor_pause.release.add_permits(1);
+        let successor_id = retry_a
+            .as_ref()
+            .ok()
+            .or_else(|| retry_b.as_ref().ok())
+            .cloned()
+            .expect("one of two concurrent retries registers the controller restart");
+        if let (Ok(first), Ok(second)) = (&retry_a, &retry_b) {
+            assert_eq!(
+                first, second,
+                "both services adopt the single winning restart"
+            );
+        }
+        for result in [&retry_a, &retry_b] {
+            if let Err(error) = result {
+                assert!(
+                    matches!(
+                        error.downcast_ref::<super::OrderedSubTLProvisionFailure>(),
+                        Some(super::OrderedSubTLProvisionFailure {
+                            kind: super::OrderedSubTLProvisionFailureKind::LifecycleBlocked
+                                | super::OrderedSubTLProvisionFailureKind::OwnershipConflict,
+                            ..
+                        })
+                    ),
+                    "concurrent stale evidence is held with a typed lifecycle outcome: {error:#}"
+                );
+            }
+        }
+        let successor = read_invocation(&agent_dir)
+            .await
+            .unwrap()
+            .expect("the replacement controller invocation is durable");
+        assert_ne!(successor_id, first_id);
+        assert_eq!(successor.invocation_id, successor_id);
+        assert_eq!(successor.status, InvocationStatus::Running);
+        assert_eq!(successor.generation, interrupted.generation + 1);
+        assert_eq!(successor.trigger, InvocationTrigger::ControllerRestart);
+        assert_eq!(
+            successor.prior_invocation_id.as_deref(),
+            Some(first_id.as_str())
+        );
+        assert_eq!(successor.routing.window_id.as_ref(), Some(&new_target));
+        assert_eq!(successor.runtime_agent_id.as_deref(), Some("ordered-child"));
+        assert_eq!(successor.slice_id.as_deref(), Some("ordered-child"));
+        assert_eq!(successor.branch.as_deref(), Some("main.ordered-child"));
+        assert_eq!(
+            successor.worktree.as_deref(),
+            Some(record.working_dir.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            invocation_start_count(&project_dir, "ordered-child", &first_id),
+            1
+        );
+        assert_eq!(
+            invocation_start_count(&project_dir, "ordered-child", &successor_id),
+            1
+        );
+        assert_eq!(
+            ordered_service_using_tmux_route(&project_dir, &tmux.session)
+                .await
+                .provision_ordered_sub_tl(record.clone())
+                .await
+                .unwrap(),
+            successor_id,
+            "a retry after a concurrent stale-state refusal converges on the winner"
+        );
+        let lifecycle = crate::services::EventLog::open(project_dir.join(".exo/events"))
+            .unwrap()
+            .ledger()
+            .read_events()
+            .unwrap();
+        assert_eq!(
+            lifecycle
+                .iter()
+                .filter(|event| {
+                    event.event.event_type == "agent.invocation.finished"
+                        && event.event.agent_id.as_deref() == Some("ordered-child")
+                        && event.event.invocation_id.as_deref() == Some(first_id.as_str())
+                })
+                .count(),
+            1,
+            "the predecessor outcome remains in the lifecycle ledger"
+        );
+
+        tmux.kill_server();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while super::super::invocation_monitor_registered(&agent_dir, &successor_id) {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the monitor stops after bounded unavailable-server observations");
+        assert!(
+            read_invocation(&agent_dir)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_live(),
+            "server loss is not fabricated into a terminal process outcome"
+        );
+        let recreated_target = tmux.restart_session_with_tl();
+        assert_ne!(
+            successor.routing.window_id.as_ref(),
+            Some(&recreated_target),
+            "fresh server target identity differs from the lost target"
+        );
+        let recovered_again = ordered_service_using_tmux_route(&project_dir, &tmux.session)
+            .await
+            .provision_ordered_sub_tl(record.clone())
+            .await;
+        let recovered_again = recovered_again
+            .expect("a fully lost session permits one evidence-backed controller restart");
+        let final_invocation = read_invocation(&agent_dir)
+            .await
+            .unwrap()
+            .expect("the second replacement remains registered");
+        assert_eq!(final_invocation.invocation_id, recovered_again);
+        assert_eq!(final_invocation.generation, successor.generation + 1);
+        assert_eq!(
+            final_invocation.trigger,
+            InvocationTrigger::ControllerRestart
+        );
+        assert_eq!(
+            final_invocation.prior_invocation_id.as_deref(),
+            Some(successor_id.as_str())
+        );
+        assert_eq!(
+            final_invocation.routing.window_id.as_ref(),
+            Some(&recreated_target)
+        );
+        assert_eq!(
+            invocation_start_count(&project_dir, "ordered-child", &recovered_again),
+            1
+        );
+        assert_eq!(
+            ordered_service_using_tmux_route(&project_dir, &tmux.session)
+                .await
+                .provision_ordered_sub_tl(record)
+                .await
+                .unwrap(),
+            recovered_again,
+            "continuation after recovery reuses the new live controller"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordered_sub_tl_reuses_a_parent_owned_shared_tl_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        let run_git = |args: &[&str], directory: &std::path::Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"], &project_dir);
+        run_git(
+            &["config", "user.email", "test@example.invalid"],
+            &project_dir,
+        );
+        run_git(&["config", "user.name", "Test"], &project_dir);
+        std::fs::write(project_dir.join("seed"), "seed\n").unwrap();
+        run_git(&["add", "seed"], &project_dir);
+        run_git(&["commit", "-q", "-m", "seed"], &project_dir);
+
+        let root_dir = project_dir.join(".exo/agents/root");
+        std::fs::create_dir_all(&root_dir).unwrap();
+        let root_identity = AgentIdentityRecord {
+            agent_name: AgentName::try_from_str("root").unwrap(),
+            slug: Slug::try_from_str("root").unwrap(),
+            agent_type: AgentType::Codex,
+            birth_branch: BirthBranch::try_from_str("main").unwrap(),
+            parent_branch: BirthBranch::try_from_str("main").unwrap(),
+            working_dir: project_dir.clone(),
+            display_name: "root".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
+            ledger_owned: true,
+            slice_id: Some("root".to_string()),
+        };
+        std::fs::write(
+            root_dir.join("identity.json"),
+            serde_json::to_vec_pretty(&root_identity).unwrap(),
+        )
+        .unwrap();
+
+        let tmux = OrderedTestTmux::new();
+        let target = tmux.new_target("TL");
+        let routing = RoutingInfo::window(target.clone());
+        let root_invocation = invocation::start_invocation_with_provenance(
+            &root_dir,
+            AgentType::Codex,
+            InvocationTrigger::Spawn,
+            routing.clone(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let tmux_ipc = super::super::tmux_ipc::TmuxIpc::new(&tmux.session);
+        tmux_ipc
+            .set_routing_owner(
+                &routing,
+                "root",
+                &root_invocation.invocation_id,
+                root_invocation.generation,
+            )
+            .await
+            .unwrap();
+
+        let child = AgentIdentityRecord {
+            agent_name: AgentName::try_from_str("ordered-child").unwrap(),
+            slug: Slug::try_from_str("ordered-child").unwrap(),
+            agent_type: AgentType::Codex,
+            birth_branch: BirthBranch::try_from_str("main.ordered-child").unwrap(),
+            parent_branch: BirthBranch::try_from_str("main").unwrap(),
+            working_dir: project_dir.join(".exo/worktrees/ordered-child"),
+            display_name: "🤖 ordered-child".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
+            ledger_owned: true,
+            slice_id: Some("ordered-child".to_string()),
+        };
+        let first_id = ordered_service_using_tmux_route(&project_dir, &tmux.session)
+            .await
+            .provision_ordered_sub_tl(child.clone())
+            .await
+            .expect("the child can share its declared parent TL delivery window");
+        let repeated_id = ordered_service_using_tmux_route(&project_dir, &tmux.session)
+            .await
+            .provision_ordered_sub_tl(child.clone())
+            .await
+            .expect("the parent-owned window remains a valid shared delivery target");
+        assert_eq!(first_id, repeated_id);
+        let owner = tmux_ipc.routing_owner_state(&routing).await.unwrap();
+        assert!(
+            matches!(owner, super::super::tmux_ipc::RoutingOwnerState::Owned(ref owner)
+            if owner.agent_id == "root"
+                && owner.invocation_id == root_invocation.invocation_id
+                && owner.generation == root_invocation.generation)
+        );
+
+        let mut conflicting_parent = root_identity;
+        conflicting_parent.birth_branch = BirthBranch::try_from_str("main.other-parent").unwrap();
+        std::fs::write(
+            root_dir.join("identity.json"),
+            serde_json::to_vec_pretty(&conflicting_parent).unwrap(),
+        )
+        .unwrap();
+        let error = ordered_service_using_tmux_route(&project_dir, &tmux.session)
+            .await
+            .provision_ordered_sub_tl(child)
+            .await
+            .expect_err("a shared pane owned by an unrelated parent must remain blocked");
+        assert_eq!(
+            error
+                .downcast_ref::<super::OrderedSubTLProvisionFailure>()
+                .unwrap()
+                .code(),
+            "ordered_sub_tl_ownership_conflict"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordered_sub_tl_holds_when_a_new_server_reuses_the_old_window_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        let run_git = |args: &[&str], directory: &std::path::Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(directory)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"], &project_dir);
+        run_git(
+            &["config", "user.email", "test@example.invalid"],
+            &project_dir,
+        );
+        run_git(&["config", "user.name", "Test"], &project_dir);
+        std::fs::write(project_dir.join("seed"), "seed\n").unwrap();
+        run_git(&["add", "seed"], &project_dir);
+        run_git(&["commit", "-q", "-m", "seed"], &project_dir);
+
+        let tmux = OrderedTestTmux::new();
+        let old_target = tmux.window_id_for_session();
+        tmux.rename_window(&old_target, "TL");
+        let record = AgentIdentityRecord {
+            agent_name: AgentName::try_from_str("ordered-reuse").unwrap(),
+            slug: Slug::try_from_str("ordered-reuse").unwrap(),
+            agent_type: AgentType::Codex,
+            birth_branch: BirthBranch::try_from_str("main.ordered-reuse").unwrap(),
+            parent_branch: BirthBranch::try_from_str("main").unwrap(),
+            working_dir: project_dir.join(".exo/worktrees/ordered-reuse"),
+            display_name: "🤖 ordered-reuse".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
+            ledger_owned: true,
+            slice_id: Some("ordered-reuse".to_string()),
+        };
+        let agent_dir = project_dir.join(".exo/agents/ordered-reuse");
+        let first_id = ordered_service_using_tmux_route(&project_dir, &tmux.session)
+            .await
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .unwrap();
+        let invocation_before = std::fs::read(agent_dir.join("invocation.json")).unwrap();
+        let routing_before = std::fs::read(agent_dir.join("routing.json")).unwrap();
+
+        tmux.kill_server();
+        let reused_target = tmux.restart_session_with_tl();
+        assert_eq!(reused_target, old_target);
+        let error = ordered_service_using_tmux_route(&project_dir, &tmux.session)
+            .await
+            .provision_ordered_sub_tl(record)
+            .await
+            .expect_err("a same-ID pane from a replacement server is not the old target proof");
+        assert_eq!(
+            error
+                .downcast_ref::<super::OrderedSubTLProvisionFailure>()
+                .unwrap()
+                .code(),
+            "ordered_sub_tl_lifecycle_blocked"
+        );
+        assert!(format!("{error:#}").contains("target reuse cannot be distinguished"));
+        assert_eq!(
+            std::fs::read(agent_dir.join("invocation.json")).unwrap(),
+            invocation_before
+        );
+        assert_eq!(
+            std::fs::read(agent_dir.join("routing.json")).unwrap(),
+            routing_before
+        );
+        assert_eq!(
+            invocation_start_count(&project_dir, "ordered-reuse", &first_id),
+            1
         );
     }
 

@@ -389,8 +389,17 @@ pub(crate) async fn reconcile_live_invocation_startup(
                     if owner.agent_id == agent_id
                         && owner.invocation_id == current.invocation_id
                         && owner.generation == current.generation => {}
-                crate::services::tmux_ipc::RoutingOwnerState::Owned(_) => {
-                    anyhow::bail!("tmux target ownership conflicts with the live invocation");
+                crate::services::tmux_ipc::RoutingOwnerState::Owned(owner) => {
+                    if !routing_owner_matches_invocation_or_parent(
+                        agent_dir,
+                        &current,
+                        &owner,
+                        &current.routing,
+                    )
+                    .await?
+                    {
+                        anyhow::bail!("tmux target ownership conflicts with the live invocation or its declared parent");
+                    }
                 }
                 crate::services::tmux_ipc::RoutingOwnerState::Partial => {
                     anyhow::bail!("tmux target has partial ownership evidence");
@@ -416,6 +425,58 @@ fn agent_id_from_dir(agent_dir: &Path) -> Result<&str> {
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .context("agent directory has no usable identity for routing ownership")
+}
+
+pub(crate) async fn routing_owner_matches_invocation_or_parent(
+    agent_dir: &Path,
+    invocation: &InvocationRecord,
+    owner: &crate::services::tmux_ipc::TmuxOwnership,
+    delivery_target: &RoutingInfo,
+) -> Result<bool> {
+    let child_id = agent_id_from_dir(agent_dir)?;
+    if owner.agent_id == child_id {
+        return Ok(owner.invocation_id == invocation.invocation_id
+            && owner.generation == invocation.generation
+            && invocation.routing.same_delivery_target(delivery_target));
+    }
+    let child_identity_path = agent_dir.join("identity.json");
+    let child_identity: crate::services::agent_resolver::AgentIdentityRecord =
+        serde_json::from_slice(&tokio::fs::read(&child_identity_path).await?)?;
+    if child_identity.agent_name.as_str() != child_id
+        || child_identity.birth_branch.as_str() != invocation.branch.as_deref().unwrap_or_default()
+    {
+        return Ok(false);
+    }
+    let Ok(parent_name) = crate::domain::AgentName::try_from_str(&owner.agent_id) else {
+        return Ok(false);
+    };
+    let parent_dir = agent_dir
+        .parent()
+        .context("agent directory has no registry parent")?
+        .join(parent_name.as_str());
+    let parent_identity_path = parent_dir.join("identity.json");
+    let parent_identity_bytes = match tokio::fs::read(&parent_identity_path).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let parent_identity: crate::services::agent_resolver::AgentIdentityRecord =
+        serde_json::from_slice(&parent_identity_bytes)?;
+    if parent_identity.agent_name != parent_name
+        || !parent_identity.ledger_owned
+        || parent_identity.birth_branch != child_identity.parent_branch
+    {
+        return Ok(false);
+    }
+    let Some(parent_invocation) = read_locked(&parent_dir).await? else {
+        return Ok(false);
+    };
+    Ok(parent_invocation.is_live()
+        && parent_invocation.invocation_id == owner.invocation_id
+        && parent_invocation.generation == owner.generation
+        && parent_invocation
+            .routing
+            .same_delivery_target(delivery_target))
 }
 
 async fn require_expected_live_invocation(
@@ -927,6 +988,71 @@ pub async fn finish_invocation_and_tombstone_with_context(
         routing.without_ownership().write_to_dir(agent_dir).await?;
     }
     Ok(result)
+}
+
+/// Finish an invocation only after its recorded delivery target was
+/// positively observed absent. The exact checkpoint and routing owner are
+/// revalidated under the invocation mutation lock so a concurrent successor
+/// cannot be mistaken for the interrupted invocation.
+pub(crate) async fn finish_invocation_for_missing_target(
+    agent_dir: &Path,
+    expected: &InvocationRecord,
+    tmux: &crate::services::tmux_ipc::TmuxIpc,
+    status: InvocationStatus,
+    reason: &str,
+    classification: &str,
+) -> Result<InvocationRecord> {
+    let _guard = mutation_lock().lock().await;
+    let current = read_locked(agent_dir)
+        .await?
+        .context("controller invocation disappeared during liveness reconciliation")?;
+    if current != *expected || !current.is_live() {
+        anyhow::bail!("controller invocation changed during liveness reconciliation");
+    }
+    if current.routing.window_id.is_none() && current.routing.pane_id.is_none() {
+        anyhow::bail!("live controller has no stable delivery target to reconcile");
+    }
+    let persisted_routing = RoutingInfo::read_from_dir(agent_dir).await?;
+    if !persisted_routing.same_delivery_target(&current.routing) {
+        anyhow::bail!("controller routing changed during liveness reconciliation");
+    }
+    if crate::services::tmux_ipc::routing_target_alive(&current.routing, tmux).await? {
+        anyhow::bail!("recorded delivery target became live during liveness reconciliation");
+    }
+    let owner_fields = persisted_routing.owner_agent_id.is_some()
+        || persisted_routing.owner_invocation_id.is_some()
+        || persisted_routing.owner_generation.is_some();
+    if owner_fields {
+        let owner_matches = persisted_routing.has_ownership_proof()
+            && persisted_routing.owner_agent_id.as_deref() == Some(agent_id_from_dir(agent_dir)?)
+            && persisted_routing.owner_invocation_id.as_deref()
+                == Some(current.invocation_id.as_str())
+            && persisted_routing.owner_generation == Some(current.generation);
+        if !owner_matches {
+            anyhow::bail!("controller routing ownership conflicts with the interrupted invocation");
+        }
+    }
+    let finished = finish_locked(
+        agent_dir,
+        &current.invocation_id,
+        status,
+        None,
+        InvocationExitContext {
+            reason: Some(reason.to_owned()),
+            classification: Some(classification.to_owned()),
+            stderr_tail: None,
+        },
+    )
+    .await?;
+    let InvocationFinishResult::Finished(finished) = finished else {
+        anyhow::bail!("controller invocation could not be retired after target loss");
+    };
+    tokio::fs::write(agent_dir.join("exited_at"), unix_timestamp().to_string()).await?;
+    persisted_routing
+        .without_ownership()
+        .write_to_dir(agent_dir)
+        .await?;
+    Ok(finished)
 }
 
 #[cfg(test)]
