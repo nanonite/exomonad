@@ -20,10 +20,14 @@ use uuid::Uuid;
 
 pub const ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH: &str =
     ".exo/tl-loop/root/controller-target.json";
+pub const ROOT_CONTROLLER_PENDING_OWNERSHIP_RELATIVE_PATH: &str =
+    ".exo/tl-loop/root/controller-target.pending.json";
 pub const WORKSPACE_SHUTDOWN_RELATIVE_PATH: &str =
     ".exo/controller-lifecycle/workspace-shutdown.json";
 const WORKSPACE_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 const WORKSPACE_SHUTDOWN_POLL: Duration = Duration::from_millis(50);
+const ORDERED_CONTROLLER_REGISTRATION_DECISION: &str =
+    "register an ordered sub-TL controller invocation";
 
 /// Exact root controller pane ownership captured by `init` after startup.
 /// Numeric tmux IDs are accepted only with the server, process, run and epoch
@@ -40,6 +44,52 @@ pub struct ControllerPaneOwnership {
     pub pane_start_ticks: u64,
     pub tmux_server_pid: u32,
     pub tmux_server_start_ticks: u64,
+}
+
+/// Exact tmux and process identity before a controller has written its root
+/// RunStore. This is a startup handoff record, not an active shutdown owner.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControllerPaneTarget {
+    pub schema_version: u32,
+    pub controller_epoch: String,
+    pub tmux_session: String,
+    pub window_id: WindowId,
+    pub pane_id: PaneId,
+    pub pane_pid: u32,
+    pub pane_start_ticks: u64,
+    pub tmux_server_pid: u32,
+    pub tmux_server_start_ticks: u64,
+}
+
+impl ControllerPaneTarget {
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != 1
+            || self.controller_epoch.trim().is_empty()
+            || self.tmux_session.trim().is_empty()
+            || self.pane_pid == 0
+            || self.pane_start_ticks == 0
+            || self.tmux_server_pid == 0
+            || self.tmux_server_start_ticks == 0
+        {
+            anyhow::bail!("root controller startup target is incomplete or unsupported");
+        }
+        Ok(())
+    }
+
+    pub fn with_run_id(&self, run_id: impl Into<String>) -> ControllerPaneOwnership {
+        ControllerPaneOwnership {
+            schema_version: self.schema_version,
+            controller_epoch: self.controller_epoch.clone(),
+            run_id: run_id.into(),
+            tmux_session: self.tmux_session.clone(),
+            window_id: self.window_id.clone(),
+            pane_id: self.pane_id.clone(),
+            pane_pid: self.pane_pid,
+            pane_start_ticks: self.pane_start_ticks,
+            tmux_server_pid: self.tmux_server_pid,
+            tmux_server_start_ticks: self.tmux_server_start_ticks,
+        }
+    }
 }
 
 impl ControllerPaneOwnership {
@@ -101,6 +151,10 @@ pub fn controller_ownership_path(project_dir: &Path) -> PathBuf {
     project_dir.join(ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH)
 }
 
+pub fn pending_controller_ownership_path(project_dir: &Path) -> PathBuf {
+    project_dir.join(ROOT_CONTROLLER_PENDING_OWNERSHIP_RELATIVE_PATH)
+}
+
 pub fn workspace_shutdown_path(project_dir: &Path) -> PathBuf {
     project_dir.join(WORKSPACE_SHUTDOWN_RELATIVE_PATH)
 }
@@ -114,6 +168,160 @@ pub async fn read_controller_ownership(project_dir: &Path) -> Result<ControllerP
         .with_context(|| format!("parse root controller ownership {}", path.display()))?;
     ownership.validate()?;
     Ok(ownership)
+}
+
+/// Read the exact target init is preparing, preferring a durable pending
+/// handoff over the previous completed controller target.
+pub async fn read_controller_target_for_routing(
+    project_dir: &Path,
+) -> Result<ControllerPaneOwnership> {
+    let pending_path = pending_controller_ownership_path(project_dir);
+    match tokio::fs::read(&pending_path).await {
+        Ok(bytes) => {
+            let target: ControllerPaneOwnership =
+                serde_json::from_slice(&bytes).with_context(|| {
+                    format!(
+                        "parse pending root controller target {}",
+                        pending_path.display()
+                    )
+                })?;
+            target.validate()?;
+            Ok(target)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            read_controller_ownership(project_dir).await
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "read pending root controller target {}",
+                pending_path.display()
+            )
+        }),
+    }
+}
+
+/// Capture target coordinates only from the window/pane IDs returned by the
+/// creating tmux operation. A title or pane position is never an identity.
+pub async fn capture_controller_ownership(
+    tmux: &crate::services::tmux_ipc::TmuxIpc,
+    controller_epoch: &str,
+    run_id: &str,
+    window_id: WindowId,
+    pane_id: PaneId,
+) -> Result<ControllerPaneOwnership> {
+    let target = capture_controller_pane_target(tmux, controller_epoch, window_id, pane_id).await?;
+    let ownership = target.with_run_id(run_id);
+    ownership.validate()?;
+    Ok(ownership)
+}
+
+pub async fn capture_controller_pane_target(
+    tmux: &crate::services::tmux_ipc::TmuxIpc,
+    controller_epoch: &str,
+    window_id: WindowId,
+    pane_id: PaneId,
+) -> Result<ControllerPaneTarget> {
+    let server = tmux.server_identity().await?;
+    let pane = tmux
+        .pane_snapshot(tmux.session_name(), &window_id, &pane_id)
+        .await?
+        .context("new root controller pane disappeared before ownership capture")?;
+    anyhow::ensure!(
+        !pane.dead,
+        "new root controller pane exited before ownership capture"
+    );
+    let target = ControllerPaneTarget {
+        schema_version: 1,
+        controller_epoch: controller_epoch.to_owned(),
+        tmux_session: pane.session_name,
+        window_id,
+        pane_id,
+        pane_pid: pane.pid,
+        pane_start_ticks: process_start_ticks(pane.pid).await?,
+        tmux_server_pid: server.pid,
+        tmux_server_start_ticks: server.start_ticks,
+    };
+    target.validate()?;
+    Ok(target)
+}
+
+pub async fn controller_pane_target_is_live(
+    project_dir: &Path,
+    tmux: &crate::services::tmux_ipc::TmuxIpc,
+    target: &ControllerPaneTarget,
+) -> Result<bool> {
+    target.validate()?;
+    let epoch_path = project_dir.join(".exo/tl-loop/root.controller-epoch");
+    let epoch = tokio::fs::read_to_string(&epoch_path)
+        .await
+        .with_context(|| format!("read root controller epoch {}", epoch_path.display()))?;
+    if epoch.trim() != target.controller_epoch {
+        anyhow::bail!("root controller epoch changed; startup target is stale");
+    }
+    let server = tmux.server_identity().await?;
+    if server.pid != target.tmux_server_pid || server.start_ticks != target.tmux_server_start_ticks
+    {
+        anyhow::bail!("tmux server identity changed; root controller startup target is stale");
+    }
+    let owner = target.with_run_id("startup-pending");
+    match observe_controller_pane(tmux, &owner).await? {
+        ControllerPaneState::Live => Ok(true),
+        ControllerPaneState::Stopped => Ok(false),
+    }
+}
+
+/// Verify the current epoch, RunStore, tmux server, pane ID and process-start
+/// identity. `false` means the exact recorded pane is gone or dead; conflicts
+/// and unavailable inspection remain errors.
+pub async fn controller_ownership_is_live(
+    project_dir: &Path,
+    tmux: &crate::services::tmux_ipc::TmuxIpc,
+    target: &ControllerPaneOwnership,
+) -> Result<bool> {
+    verify_controller_epoch(project_dir, target).await?;
+    let server = tmux.server_identity().await?;
+    if server.pid != target.tmux_server_pid || server.start_ticks != target.tmux_server_start_ticks
+    {
+        anyhow::bail!("tmux server identity changed; root controller ownership is stale");
+    }
+    match observe_controller_pane(tmux, target).await? {
+        ControllerPaneState::Live => Ok(true),
+        ControllerPaneState::Stopped => Ok(false),
+    }
+}
+
+pub async fn persist_pending_controller_ownership(
+    project_dir: &Path,
+    ownership: &ControllerPaneOwnership,
+) -> Result<()> {
+    ownership.validate()?;
+    write_atomic(&pending_controller_ownership_path(project_dir), ownership).await
+}
+
+pub async fn clear_pending_controller_ownership(
+    project_dir: &Path,
+    expected_epoch: &str,
+) -> Result<()> {
+    let path = pending_controller_ownership_path(project_dir);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let pending: ControllerPaneOwnership = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse pending root controller target {}", path.display()))?;
+    pending.validate()?;
+    if pending.controller_epoch != expected_epoch {
+        anyhow::bail!(
+            "pending root controller target belongs to another startup epoch; preserving it"
+        );
+    }
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("remove pending controller target {}", path.display())),
+    }
 }
 
 pub async fn persist_controller_ownership(
@@ -185,11 +393,32 @@ where
         decision: &str,
     ) -> Result<crate::services::worktree_lifecycle::LifecycleGuard> {
         let guard = self.acquire_worktree_lifecycle(decision).await?;
-        if workspace_shutdown_path(self.project_dir()).exists() {
+        let path = workspace_shutdown_path(self.project_dir());
+        if path.exists()
+            && !completed_shutdown_allows_controller_registration(&path, decision).await?
+        {
             anyhow::bail!("workspace control-plane shutdown is pending; run init --continue to reconcile before dispatch");
         }
         Ok(guard)
     }
+}
+
+async fn completed_shutdown_allows_controller_registration(
+    path: &Path,
+    decision: &str,
+) -> Result<bool> {
+    if decision != ORDERED_CONTROLLER_REGISTRATION_DECISION {
+        return Ok(false);
+    }
+    let bytes = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("read workspace shutdown fence {}", path.display()))?;
+    let intent: WorkspaceShutdownIntent = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse workspace shutdown fence {}", path.display()))?;
+    if intent.schema_version != 1 || intent.operation_id.trim().is_empty() {
+        anyhow::bail!("workspace shutdown fence is malformed; startup reconciliation is required");
+    }
+    Ok(intent.phase == WorkspaceShutdownPhase::Complete)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -830,6 +1059,37 @@ mod tests {
             .await
             .unwrap();
         target
+    }
+
+    #[tokio::test]
+    async fn pending_target_cleanup_requires_its_exact_startup_epoch() {
+        let project = tempfile::tempdir().unwrap();
+        let target = ControllerPaneOwnership {
+            schema_version: 1,
+            controller_epoch: "epoch-current".to_owned(),
+            run_id: "run-1".to_owned(),
+            tmux_session: "workspace".to_owned(),
+            window_id: WindowId::parse("@7").unwrap(),
+            pane_id: PaneId::parse("%9").unwrap(),
+            pane_pid: 123,
+            pane_start_ticks: 456,
+            tmux_server_pid: 321,
+            tmux_server_start_ticks: 654,
+        };
+        persist_pending_controller_ownership(project.path(), &target)
+            .await
+            .unwrap();
+
+        let error = clear_pending_controller_ownership(project.path(), "other-epoch")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("another startup epoch"));
+        assert!(pending_controller_ownership_path(project.path()).exists());
+
+        clear_pending_controller_ownership(project.path(), "epoch-current")
+            .await
+            .unwrap();
+        assert!(!pending_controller_ownership_path(project.path()).exists());
     }
 
     #[tokio::test]

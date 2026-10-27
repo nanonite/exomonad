@@ -15,14 +15,26 @@ impl Drop for TmuxSession {
     }
 }
 
-pub fn create_exited_tl_session(socket_dir: &Path, session: &str) -> TmuxSession {
+pub async fn create_exited_tl_session(
+    socket_dir: &Path,
+    session: &str,
+    project: &Path,
+) -> TmuxSession {
     let config = socket_dir.join("tmux.conf");
     fs::write(&config, "set-window-option -g remain-on-exit on\n").unwrap();
     let output = Command::new("tmux")
         .env("TMUX_TMPDIR", socket_dir)
         .arg("-f")
         .arg(config)
-        .args(["new-session", "-d", "-s", session, "-n", "TL", "exit 0"])
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-n",
+            "TL",
+            "sleep 0.5; exit 0",
+        ])
         .output()
         .expect("create isolated existing tmux session");
     assert_success(&output, "create initial exited TL pane");
@@ -34,11 +46,63 @@ pub fn create_exited_tl_session(socket_dir: &Path, session: &str) -> TmuxSession
         &environment,
         "configure dirty-worktree preflight acknowledgement",
     );
+    persist_exact_controller_owner(socket_dir, session, project).await;
     wait_for_exited_tl(socket_dir, session);
     TmuxSession {
         socket_dir: socket_dir.to_path_buf(),
         name: session.to_string(),
     }
+}
+
+async fn persist_exact_controller_owner(socket_dir: &Path, session: &str, project: &Path) {
+    let pane_output = tmux(
+        socket_dir,
+        &[
+            "list-panes",
+            "-t",
+            session,
+            "-F",
+            "#{window_id}\t#{pane_id}\t#{pane_pid}",
+        ],
+    );
+    assert_success(&pane_output, "capture initial controller pane coordinates");
+    let pane = String::from_utf8_lossy(&pane_output.stdout)
+        .trim()
+        .split('\t')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(pane.len(), 3);
+    let server_output = tmux(socket_dir, &["display-message", "-p", "#{pid}"]);
+    assert_success(&server_output, "capture initial tmux server identity");
+    let server_pid = String::from_utf8_lossy(&server_output.stdout)
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    let pane_pid = pane[2].parse::<u32>().unwrap();
+    let ownership = serde_json::json!({
+        "schema_version": 1,
+        "controller_epoch": "fixture-controller-epoch",
+        "run_id": "root",
+        "tmux_session": session,
+        "window_id": pane[0],
+        "pane_id": pane[1],
+        "pane_pid": pane_pid,
+        "pane_start_ticks": exomonad_core::services::tmux_ipc::process_start_ticks(pane_pid).await.unwrap(),
+        "tmux_server_pid": server_pid,
+        "tmux_server_start_ticks": exomonad_core::services::tmux_ipc::process_start_ticks(server_pid).await.unwrap(),
+    });
+    let root = project.join(".exo/tl-loop/root");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        project.join(".exo/tl-loop/root.controller-epoch"),
+        "fixture-controller-epoch\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("controller-target.json"),
+        serde_json::to_vec_pretty(&ownership).unwrap(),
+    )
+    .unwrap();
 }
 
 pub fn wait_for_exited_tl(socket_dir: &Path, session: &str) {

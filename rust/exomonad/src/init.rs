@@ -7,10 +7,16 @@ use exomonad::config::{
 use exomonad_core::services::runtime_manifest::{
     PLAN_COMPATIBILITY_VERSION, PUBLICATION_REGISTRY_SCHEMA_VERSION, RUNTIME_PROTOCOL_VERSION,
 };
+use exomonad_core::services::tmux_ipc::WindowId;
 use exomonad_core::services::{
     agent_control::{
-        codex_lifecycle, read_invocation, read_invocation_conservatively, CapturedCodexTrust,
-        InvocationRecord,
+        capture_controller_pane_target, clear_pending_controller_ownership, codex_lifecycle,
+        controller_ownership_is_live, controller_pane_target_is_live, persist_controller_ownership,
+        persist_pending_controller_ownership, read_controller_ownership,
+        read_controller_target_for_routing, read_invocation, read_invocation_conservatively,
+        CapturedCodexTrust, ControllerPaneOwnership, ControllerPaneTarget, InvocationRecord,
+        WorkspaceShutdownIntent, WorkspaceShutdownPhase, ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH,
+        WORKSPACE_SHUTDOWN_RELATIVE_PATH,
     },
     pr_registry::{
         invocation_succession_reaches_current, read_published_heads,
@@ -120,6 +126,8 @@ struct OrderedSubTLProvisionRequest {
     parent_branch: String,
     working_dir: PathBuf,
     slice_id: String,
+    pr_number: Option<u64>,
+    head_sha: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3769,22 +3777,25 @@ fn ordered_invocation_matches_spec(record: &InvocationRecord, spec: &OrderedBran
         && record.routing.has_delivery_target()
 }
 
-fn recordless_ordered_sub_tl_specs(project_dir: &Path) -> Result<Vec<OrderedBranchSpec>> {
+fn ordered_sub_tl_recovery_specs(project_dir: &Path) -> Result<Vec<OrderedBranchSpec>> {
     ordered_branch_specs(project_dir).map(|specs| {
         specs
             .into_iter()
             .filter(|spec| {
-                if ordered_identity_state(project_dir, spec).ok()
-                    != Some(OrderedIdentityState::Matching)
-                {
-                    return false;
-                }
+                ordered_identity_state(project_dir, spec).ok()
+                    == Some(OrderedIdentityState::Matching)
+            })
+            .filter(|spec| {
                 let invocation_path = project_dir
                     .join(".exo/agents")
                     .join(&spec.agent_name)
                     .join(exomonad_core::services::agent_control::INVOCATION_FILENAME);
-                std::fs::symlink_metadata(invocation_path)
-                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                match std::fs::read(&invocation_path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                    Ok(bytes) => serde_json::from_slice::<InvocationRecord>(&bytes)
+                        .is_ok_and(|invocation| invocation.is_live()),
+                    Err(_) => false,
+                }
             })
             .collect()
     })
@@ -3871,36 +3882,63 @@ async fn reconcile_agent_continuations(project_dir: &Path) -> Result<(usize, usi
     Ok((preserved, recreated))
 }
 
-fn unique_ordered_tl_window(
-    windows: &[exomonad_core::services::tmux_ipc::WindowInfo],
-) -> Result<&exomonad_core::services::tmux_ipc::WindowInfo> {
-    let mut matches = windows.iter().filter(|window| window.window_name == "TL");
-    let window = matches
-        .next()
-        .context("cannot repair ordered sub-TL invocation without an existing TL window")?;
-    if matches.next().is_some() {
-        anyhow::bail!("cannot repair ordered sub-TL invocation with ambiguous TL windows");
-    }
-    Ok(window)
-}
-
 async fn repair_ordered_sub_tl_invocations(
     project_dir: &Path,
     socket_path: &Path,
-    windows: &[exomonad_core::services::tmux_ipc::WindowInfo],
+    controller_window: &WindowId,
 ) -> Result<usize> {
-    let specs = recordless_ordered_sub_tl_specs(project_dir)?;
+    let specs = ordered_sub_tl_recovery_specs(project_dir)?;
     if specs.is_empty() {
         return Ok(0);
     }
-    let expected_routing = exomonad_core::domain::RoutingInfo::window(
-        unique_ordered_tl_window(windows)?.window_id.clone(),
-    );
+    let expected_routing = exomonad_core::domain::RoutingInfo::window(controller_window.clone());
     let client = uds_client::ServerClient::new(socket_path.to_path_buf());
     for spec in &specs {
-        repair_one_ordered_sub_tl_invocation(project_dir, &client, spec, &expected_routing).await?;
+        let publication = ordered_sub_tl_publication_coordinates(project_dir, spec).await?;
+        repair_one_ordered_sub_tl_invocation(
+            project_dir,
+            &client,
+            spec,
+            &expected_routing,
+            publication,
+        )
+        .await?;
     }
     Ok(specs.len())
+}
+
+async fn ordered_sub_tl_publication_coordinates(
+    project_dir: &Path,
+    spec: &OrderedBranchSpec,
+) -> Result<Option<(u64, String)>> {
+    let agent_dir = project_dir.join(".exo/agents").join(&spec.agent_name);
+    let invocation = read_invocation(&agent_dir)
+        .await
+        .context("ordered controller invocation is unreadable during recovery")?;
+    let publications = read_published_heads(project_dir)
+        .await
+        .context("publication history is unavailable during ordered controller recovery")?;
+    let matches = publications
+        .into_iter()
+        .filter(|publication| {
+            publication.head_branch == spec.branch
+                && publication.base_branch == spec.parent_branch
+                && publication.slice_id.as_deref() == Some(spec.slice_id.as_str())
+                && invocation.as_ref().is_some_and(|record| {
+                    publication_matches_agent(&spec.agent_name, record, publication)
+                })
+        })
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        anyhow::bail!(
+            "ordered controller {} has ambiguous publication coordinates; startup recovery is blocked",
+            spec.agent_name
+        );
+    }
+    Ok(matches
+        .into_iter()
+        .next()
+        .map(|publication| (publication.pr_number, publication.head_sha)))
 }
 
 async fn repair_one_ordered_sub_tl_invocation(
@@ -3908,6 +3946,7 @@ async fn repair_one_ordered_sub_tl_invocation(
     client: &uds_client::ServerClient,
     spec: &OrderedBranchSpec,
     expected_routing: &exomonad_core::domain::RoutingInfo,
+    publication: Option<(u64, String)>,
 ) -> Result<()> {
     if ordered_identity_state(project_dir, spec)? != OrderedIdentityState::Matching {
         anyhow::bail!("ordered sub-TL identity changed before invocation repair");
@@ -3935,6 +3974,8 @@ async fn repair_one_ordered_sub_tl_invocation(
                 parent_branch: identity.parent_branch.to_string(),
                 working_dir: identity.working_dir.clone(),
                 slice_id,
+                pr_number: publication.as_ref().map(|(number, _)| *number),
+                head_sha: publication.map(|(_, sha)| sha),
             },
         )
         .await
@@ -5760,6 +5801,338 @@ async fn capture_or_warn(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ControllerStartupPhase {
+    Requested,
+    TargetCreated,
+    StateReconciled,
+    Released,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ControllerStartupIntent {
+    schema_version: u32,
+    controller_epoch: String,
+    #[serde(default)]
+    previous_controller_epoch: Option<String>,
+    tmux_session: String,
+    tmux_server_pid: u32,
+    tmux_server_start_ticks: u64,
+    continue_mode: bool,
+    root_run_id: Option<String>,
+    target: Option<ControllerPaneTarget>,
+    phase: ControllerStartupPhase,
+}
+
+impl ControllerStartupIntent {
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.schema_version == 1
+                && !self.controller_epoch.trim().is_empty()
+                && self
+                    .controller_epoch
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && !self.tmux_session.trim().is_empty()
+                && self.tmux_server_pid > 0
+                && self.tmux_server_start_ticks > 0,
+            "controller startup intent is incomplete or unsupported"
+        );
+        if let Some(previous) = self.previous_controller_epoch.as_deref() {
+            anyhow::ensure!(
+                !previous.trim().is_empty()
+                    && previous
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+                    && previous != self.controller_epoch,
+                "previous controller epoch is malformed or duplicates the new epoch"
+            );
+        }
+        if self.continue_mode {
+            anyhow::ensure!(
+                self.root_run_id
+                    .as_deref()
+                    .is_some_and(|run_id| !run_id.trim().is_empty()),
+                "continued controller startup has no accepted root RunStore identity"
+            );
+        }
+        if let Some(run_id) = self.root_run_id.as_deref() {
+            anyhow::ensure!(
+                !run_id.trim().is_empty(),
+                "controller startup RunStore identity is empty"
+            );
+        }
+        match (&self.target, self.phase) {
+            (None, ControllerStartupPhase::Requested) => {}
+            (Some(target), ControllerStartupPhase::TargetCreated)
+            | (Some(target), ControllerStartupPhase::StateReconciled)
+            | (Some(target), ControllerStartupPhase::Released) => {
+                target.validate()?;
+                anyhow::ensure!(
+                    target.controller_epoch == self.controller_epoch
+                        && target.tmux_session == self.tmux_session
+                        && target.tmux_server_pid == self.tmux_server_pid
+                        && target.tmux_server_start_ticks == self.tmux_server_start_ticks,
+                    "controller startup target conflicts with its durable session, epoch, or server identity"
+                );
+            }
+            _ => anyhow::bail!("controller startup phase and target evidence disagree"),
+        }
+        Ok(())
+    }
+}
+
+fn controller_startup_intent_path(project_dir: &Path) -> PathBuf {
+    project_dir
+        .join(".exo/tl-loop/root")
+        .join("controller-startup.json")
+}
+
+fn controller_start_release_path(project_dir: &Path, epoch: &str) -> PathBuf {
+    project_dir
+        .join(".exo/tl-loop/root/controller-startup")
+        .join(format!("{epoch}.release"))
+}
+
+fn persist_controller_startup_intent(
+    project_dir: &Path,
+    intent: &ControllerStartupIntent,
+) -> Result<()> {
+    intent.validate()?;
+    let path = controller_startup_intent_path(project_dir);
+    let parent = path
+        .parent()
+        .context("controller startup intent path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("tmp");
+    let bytes = serde_json::to_vec_pretty(intent)?;
+    let mut file = std::fs::File::create(&temporary)
+        .with_context(|| format!("create controller startup intent {}", temporary.display()))?;
+    use std::io::Write as _;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, &path)
+        .with_context(|| format!("replace controller startup intent {}", path.display()))?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn read_controller_startup_intent(project_dir: &Path) -> Result<Option<ControllerStartupIntent>> {
+    let path = controller_startup_intent_path(project_dir);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let intent: ControllerStartupIntent = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse controller startup intent {}", path.display()))?;
+    intent.validate()?;
+    Ok(Some(intent))
+}
+
+async fn locate_controller_target_by_epoch(
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+    epoch: &str,
+) -> Result<Option<ControllerPaneTarget>> {
+    let mut matches = Vec::new();
+    for pane in ipc
+        .pane_snapshots()
+        .await?
+        .into_iter()
+        .filter(|pane| !pane.dead)
+    {
+        let observed = match exomonad_core::services::tmux_ipc::process_environment_variable(
+            pane.pid,
+            "EXOMONAD_CONTROLLER_EPOCH",
+        ) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "inspect managed pane {} for controller startup recovery",
+                        pane.pane_id
+                    )
+                });
+            }
+        };
+        if observed.as_deref() == Some(epoch) {
+            matches.push(
+                capture_controller_pane_target(ipc, epoch, pane.window_id, pane.pane_id).await?,
+            );
+        }
+    }
+    if matches.len() > 1 {
+        anyhow::bail!("multiple managed panes claim the same controller startup epoch");
+    }
+    Ok(matches.pop())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InterruptedControllerStartup {
+    None,
+    Resumed,
+    TargetStopped {
+        original_continue_mode: bool,
+        root_run_id: Option<String>,
+    },
+}
+
+fn interrupted_startup_continue_mode(
+    startup: &InterruptedControllerStartup,
+    requested_continue_mode: bool,
+) -> bool {
+    match startup {
+        InterruptedControllerStartup::TargetStopped {
+            original_continue_mode: false,
+            root_run_id: None,
+        } => false,
+        _ => requested_continue_mode,
+    }
+}
+
+async fn reconcile_interrupted_controller_startup(
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+    project_dir: &Path,
+) -> Result<InterruptedControllerStartup> {
+    let Some(mut intent) = read_controller_startup_intent(project_dir)? else {
+        return Ok(InterruptedControllerStartup::None);
+    };
+    if intent.tmux_session != ipc.session_name() {
+        anyhow::bail!("interrupted controller startup belongs to another tmux session");
+    }
+    ensure_controller_epoch_for_startup(project_dir, &intent)?;
+    let server = ipc.server_identity().await?;
+    if server.pid != intent.tmux_server_pid || server.start_ticks != intent.tmux_server_start_ticks
+    {
+        anyhow::bail!(
+            "tmux server changed during controller startup; target recovery is uncertain"
+        );
+    }
+    if intent.target.is_none() {
+        intent.target = locate_controller_target_by_epoch(ipc, &intent.controller_epoch).await?;
+        if let Some(target) = intent.target.as_ref() {
+            intent.phase = ControllerStartupPhase::TargetCreated;
+            persist_controller_startup_intent(project_dir, &intent)?;
+            if intent.root_run_id.is_none() {
+                intent.root_run_id = read_optional_root_run_id(project_dir)?;
+            }
+            if let Some(run_id) = intent.root_run_id.as_ref() {
+                let ownership = target.with_run_id(run_id.clone());
+                persist_pending_controller_ownership(project_dir, &ownership).await?;
+            }
+            persist_controller_startup_intent(project_dir, &intent)?;
+        }
+    }
+    let Some(target) = intent.target.as_ref() else {
+        let original_continue_mode = intent.continue_mode;
+        let root_run_id = intent
+            .root_run_id
+            .clone()
+            .or(read_optional_root_run_id(project_dir)?);
+        clear_pending_controller_ownership(project_dir, &intent.controller_epoch).await?;
+        clear_controller_startup_intent(project_dir, &intent.controller_epoch)?;
+        return Ok(InterruptedControllerStartup::TargetStopped {
+            original_continue_mode,
+            root_run_id,
+        });
+    };
+    if !controller_pane_target_is_live(project_dir, ipc, target).await? {
+        let snapshot = ipc
+            .pane_snapshot(&target.tmux_session, &target.window_id, &target.pane_id)
+            .await?;
+        if snapshot.as_ref().is_some_and(|pane| pane.dead) {
+            ipc.kill_pane(&target.pane_id).await?;
+        }
+        let root_run_id = intent
+            .root_run_id
+            .clone()
+            .or(read_optional_root_run_id(project_dir)?);
+        if let Some(run_id) = root_run_id.as_ref() {
+            let ownership = target.with_run_id(run_id.clone());
+            persist_controller_ownership(project_dir, &ownership).await?;
+        }
+        clear_pending_controller_ownership(project_dir, &intent.controller_epoch).await?;
+        return Ok(InterruptedControllerStartup::TargetStopped {
+            original_continue_mode: intent.continue_mode,
+            root_run_id,
+        });
+    }
+    if intent.continue_mode {
+        let run_id = intent
+            .root_run_id
+            .clone()
+            .context("continued root startup has no accepted RunStore identity")?;
+        let pending = target.with_run_id(run_id);
+        persist_pending_controller_ownership(project_dir, &pending).await?;
+        let released =
+            controller_start_release_path(project_dir, &intent.controller_epoch).exists();
+        if !released {
+            reconcile_continue_state_before_controller(project_dir, ipc, &target.window_id).await?;
+            intent.phase = ControllerStartupPhase::StateReconciled;
+            persist_controller_startup_intent(project_dir, &intent)?;
+            release_controller_start(project_dir, &intent.controller_epoch)?;
+            intent.phase = ControllerStartupPhase::Released;
+            persist_controller_startup_intent(project_dir, &intent)?;
+        }
+    }
+    wait_for_tl_controller_startup(ipc, project_dir, target, &intent.controller_epoch).await?;
+    let final_run_id = read_root_run_id(project_dir)?;
+    let ownership = target.with_run_id(final_run_id);
+    persist_controller_ownership(project_dir, &ownership).await?;
+    clear_pending_controller_ownership(project_dir, &intent.controller_epoch).await?;
+    clear_controller_startup_intent(project_dir, &intent.controller_epoch)?;
+    ipc.set_window_remain_on_exit(&target.window_id, false)
+        .await?;
+    Ok(InterruptedControllerStartup::Resumed)
+}
+
+fn release_controller_start(project_dir: &Path, epoch: &str) -> Result<()> {
+    let path = controller_start_release_path(project_dir, epoch);
+    let parent = path
+        .parent()
+        .context("controller release path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(file) => {
+            file.sync_all()?;
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).with_context(|| format!("release controller {}", epoch)),
+    }
+    Ok(())
+}
+
+fn clear_controller_startup_intent(project_dir: &Path, epoch: &str) -> Result<()> {
+    let path = controller_startup_intent_path(project_dir);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let intent: ControllerStartupIntent = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse controller startup intent {}", path.display()))?;
+            if intent.controller_epoch != epoch {
+                anyhow::bail!("controller startup intent changed before completion");
+            }
+            std::fs::remove_file(&path)
+                .with_context(|| format!("remove controller startup intent {}", path.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    }
+    let release = controller_start_release_path(project_dir, epoch);
+    match std::fs::remove_file(&release) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("remove {}", release.display())),
+    }
+    Ok(())
+}
+
 async fn launch_tl_recovery(
     ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
     project_dir: &Path,
@@ -5772,7 +6145,28 @@ async fn launch_tl_recovery(
     if let Some(expected_digest) = controller_plan_digest {
         ensure_snapshot_digest_matches(project_dir, expected_digest)?;
     }
-    let controller_epoch = prepare_controller_spawn(project_dir)?;
+    let previous_controller_epoch = read_controller_epoch_state(project_dir)?;
+    let controller_epoch = allocate_controller_epoch();
+    let server = ipc.server_identity().await?;
+    let root_run_id = if continue_mode {
+        Some(read_root_run_id(project_dir)?)
+    } else {
+        None
+    };
+    let mut startup_intent = ControllerStartupIntent {
+        schema_version: 1,
+        controller_epoch: controller_epoch.clone(),
+        previous_controller_epoch,
+        tmux_session: ipc.session_name().to_owned(),
+        tmux_server_pid: server.pid,
+        tmux_server_start_ticks: server.start_ticks,
+        continue_mode,
+        root_run_id,
+        target: None,
+        phase: ControllerStartupPhase::Requested,
+    };
+    persist_controller_startup_intent(project_dir, &startup_intent)?;
+    prepare_controller_spawn_for_epoch(project_dir, &controller_epoch)?;
     let command = tl_loop_command(
         project_dir,
         tl_loop_root,
@@ -5780,53 +6174,145 @@ async fn launch_tl_recovery(
         controller_plan_digest,
     );
     let command = if continue_mode {
-        gate_controller_start(&command)
+        gate_controller_start(
+            &command,
+            &controller_start_release_path(project_dir, &controller_epoch),
+        )
     } else {
         command
     };
-    let tl_window = ipc.new_window("TL", project_dir, shell, &command).await?;
+    let command = match config.shell_command.as_ref() {
+        Some(shell_command) => {
+            format!("{} -c \"{}\"", shell_command, command.replace('"', "\\\""))
+        }
+        None => command,
+    };
+    let target_ids = ipc
+        .new_window_with_environment(
+            "TL",
+            project_dir,
+            shell,
+            &command,
+            &[("EXOMONAD_CONTROLLER_EPOCH", &controller_epoch)],
+        )
+        .await?;
+    let tl_window = target_ids.window_id.clone();
     ipc.set_window_remain_on_exit(&tl_window, true).await?;
+    let target = capture_controller_pane_target(
+        ipc,
+        &controller_epoch,
+        target_ids.window_id,
+        target_ids.pane_id,
+    )
+    .await?;
+    startup_intent.target = Some(target.clone());
+    startup_intent.phase = ControllerStartupPhase::TargetCreated;
+    persist_controller_startup_intent(project_dir, &startup_intent)?;
     if continue_mode {
-        if let Err(error) = reconcile_continue_state_before_controller(project_dir, ipc).await {
-            if let Err(kill_error) = ipc.kill_window(&tl_window).await {
-                warn!(window = %tl_window, error = %kill_error, "Failed to remove gated TL window after continuation repair failed");
-            }
-            return Err(error);
-        }
-        if let Err(error) = ipc
-            .inject_input(tl_window.as_str(), "start-controller", true, true)
-            .await
+        let pending = target.with_run_id(
+            startup_intent
+                .root_run_id
+                .clone()
+                .context("continued root RunStore identity disappeared")?,
+        );
+        persist_pending_controller_ownership(project_dir, &pending).await?;
+        if let Err(error) =
+            reconcile_continue_state_before_controller(project_dir, ipc, &target.window_id).await
         {
-            if let Err(kill_error) = ipc.kill_window(&tl_window).await {
-                warn!(window = %tl_window, error = %kill_error, "Failed to remove gated TL window after release failed");
-            }
-            return Err(error).context("failed to release the repaired TL controller");
+            return Err(error).context(
+                "continuation preflight remains recoverable in the exact gated controller pane",
+            );
         }
+        startup_intent.phase = ControllerStartupPhase::StateReconciled;
+        persist_controller_startup_intent(project_dir, &startup_intent)?;
+        release_controller_start(project_dir, &controller_epoch)?;
+        startup_intent.phase = ControllerStartupPhase::Released;
+        persist_controller_startup_intent(project_dir, &startup_intent)?;
     }
     let startup =
-        wait_for_tl_controller_startup(ipc, project_dir, &tl_window, &controller_epoch).await;
+        wait_for_tl_controller_startup(ipc, project_dir, &target, &controller_epoch).await;
     if startup.is_ok() {
+        let run_id = read_root_run_id(project_dir)?;
+        let ownership = target.with_run_id(run_id);
+        persist_controller_ownership(project_dir, &ownership).await?;
+        clear_pending_controller_ownership(project_dir, &controller_epoch).await?;
+        clear_controller_startup_intent(project_dir, &controller_epoch)?;
         ipc.set_window_remain_on_exit(&tl_window, false).await?;
     }
     startup
 }
 
-fn gate_controller_start(command: &str) -> String {
-    format!("read -r __exomonad_start_controller && {command}")
+fn gate_controller_start(command: &str, release_path: &Path) -> String {
+    let release = shell_escape::escape(release_path.display().to_string().into());
+    format!("while [ ! -f {release} ]; do sleep 0.1; done; {command}")
 }
 
 async fn reconcile_continue_state_before_controller(
     project_dir: &Path,
     ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+    controller_window: &WindowId,
 ) -> Result<()> {
-    let windows = ipc.list_windows().await?;
     let socket_path = project_dir.join(".exo/server.sock");
-    let repaired = repair_ordered_sub_tl_invocations(project_dir, &socket_path, &windows).await?;
+    let repaired =
+        repair_ordered_sub_tl_invocations(project_dir, &socket_path, controller_window).await?;
     let (preserved, recreated) = reconcile_agent_continuations(project_dir).await?;
+    let target = read_controller_target_for_routing(project_dir).await?;
+    if !controller_ownership_is_live(project_dir, ipc, &target).await? {
+        anyhow::bail!("pending root controller pane stopped before startup handoff completed");
+    }
+    archive_completed_workspace_shutdown(project_dir, &target)?;
     info!(
         repaired,
         preserved, recreated, "Reconciled agent provenance before TL controller startup"
     );
+    Ok(())
+}
+
+fn archive_completed_workspace_shutdown(
+    project_dir: &Path,
+    current_target: &ControllerPaneOwnership,
+) -> Result<()> {
+    let path = project_dir.join(WORKSPACE_SHUTDOWN_RELATIVE_PATH);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let intent: WorkspaceShutdownIntent = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse workspace shutdown intent {}", path.display()))?;
+    if intent.schema_version != 1
+        || intent.phase != WorkspaceShutdownPhase::Complete
+        || intent.operation_id.trim().is_empty()
+        || intent.target.run_id != current_target.run_id
+        || intent.target.tmux_session != current_target.tmux_session
+    {
+        anyhow::bail!("workspace shutdown handoff is incomplete or belongs to another root scope");
+    }
+    if !intent
+        .operation_id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        anyhow::bail!("workspace shutdown operation ID is unsafe for archival");
+    }
+    let archive_dir = project_dir.join(".exo/controller-lifecycle/archive");
+    std::fs::create_dir_all(&archive_dir)?;
+    let archive = archive_dir.join(format!("{}.json", intent.operation_id));
+    if archive.exists() {
+        let retained = std::fs::read(&archive)?;
+        if retained != bytes {
+            anyhow::bail!("workspace shutdown archive conflicts with its active intent");
+        }
+        std::fs::remove_file(&path)?;
+    } else {
+        std::fs::rename(&path, &archive).with_context(|| {
+            format!(
+                "archive completed workspace shutdown intent {}",
+                path.display()
+            )
+        })?;
+    }
+    std::fs::File::open(&archive_dir)?.sync_all()?;
     Ok(())
 }
 
@@ -5899,25 +6385,87 @@ async fn reconcile_existing_session(
     }
 
     ensure_watcher_dashboard_window(ipc, project_dir, shell).await?;
-
-    let windows = ipc.list_windows().await?;
-    let tl_window = windows.iter().find(|window| window.window_name == "TL");
-    let tl_alive = match tl_window {
-        Some(window) => {
-            let routing = exomonad_core::domain::RoutingInfo::window(window.window_id.clone());
-            ipc.routing_target_process_alive(&routing).await?
+    let interrupted_startup = reconcile_interrupted_controller_startup(ipc, project_dir).await?;
+    if interrupted_startup == InterruptedControllerStartup::Resumed {
+        return Ok(());
+    }
+    let root_needs_resume = root_tl_needs_resume(project_dir, continue_mode)?;
+    let owner_path = project_dir.join(ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH);
+    let mut ownership = match read_controller_ownership(project_dir).await {
+        Ok(ownership) => Some(ownership),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            None
+        }
+        Err(error) => return Err(error).context("root controller ownership is malformed"),
+    };
+    if ownership.as_ref().is_some_and(|target| {
+        read_controller_epoch(project_dir).as_deref() != Some(target.controller_epoch.as_str())
+    }) {
+        if matches!(
+            &interrupted_startup,
+            InterruptedControllerStartup::TargetStopped { .. }
+        ) && workspace_shutdown_phase(project_dir)? == Some(WorkspaceShutdownPhase::Complete)
+        {
+            ownership = None;
+        } else {
+            anyhow::bail!("root controller ownership does not match the current startup epoch; refusing target replacement");
+        }
+    }
+    if ownership.is_none()
+        && matches!(
+            &interrupted_startup,
+            InterruptedControllerStartup::TargetStopped { .. }
+        )
+        && (workspace_shutdown_phase(project_dir)? == Some(WorkspaceShutdownPhase::Complete)
+            || !project_dir.join(".exo/tl-loop/root/run.json").is_file())
+    {
+        if !root_needs_resume {
+            return Ok(());
+        }
+        let relaunch_continue_mode =
+            interrupted_startup_continue_mode(&interrupted_startup, continue_mode);
+        return launch_tl_recovery(
+            ipc,
+            project_dir,
+            shell,
+            tl_loop_root,
+            config,
+            controller_plan_digest,
+            relaunch_continue_mode,
+        )
+        .await;
+    }
+    let tl_alive = match ownership.as_ref() {
+        Some(target) => {
+            if target.tmux_session != session {
+                anyhow::bail!(
+                    "root controller ownership names another tmux session; refusing replacement"
+                );
+            }
+            controller_ownership_is_live(project_dir, ipc, target).await?
         }
         None => false,
     };
-    let root_needs_resume = root_tl_needs_resume(project_dir, continue_mode)?;
     if matches!(
         tl_window_recovery_action(restart_tl, tl_alive, root_needs_resume),
         TlWindowRecoveryAction::Keep
     ) {
         if continue_mode {
+            let Some(target) = ownership.as_ref() else {
+                info!(
+                    path = %owner_path.display(),
+                    "Keeping the existing session without retargeting an unowned legacy TL process"
+                );
+                return Ok(());
+            };
             let socket_path = project_dir.join(".exo/server.sock");
             let repaired =
-                repair_ordered_sub_tl_invocations(project_dir, &socket_path, &windows).await?;
+                repair_ordered_sub_tl_invocations(project_dir, &socket_path, &target.window_id)
+                    .await?;
             let (preserved, recreated) = reconcile_agent_continuations(project_dir).await?;
             info!(
                 repaired,
@@ -5929,13 +6477,19 @@ async fn reconcile_existing_session(
         return Ok(());
     }
 
-    if let Some(window) = tl_window {
-        info!(
-            window = %window.window_id,
-            restart_tl,
-            "Removing TL window before recovery"
+    let Some(target) = ownership.as_ref() else {
+        anyhow::bail!(
+            "cannot replace or recover the TL controller: exact pane ownership is missing at {}; refusing to infer it from a window name or index",
+            owner_path.display()
         );
-        ipc.kill_window(&window.window_id).await?;
+    };
+    info!(pane = %target.pane_id, restart_tl, "Reconciling exact root controller target before replacement");
+    if workspace_shutdown_phase(project_dir)?
+        .is_none_or(|phase| phase != WorkspaceShutdownPhase::Complete)
+    {
+        shutdown_and_restart_server(ipc, project_dir, shell, session, config, verbose).await?;
+    } else if tl_alive {
+        anyhow::bail!("workspace shutdown is already complete but the recorded root controller pane is live; refusing replacement");
     }
 
     launch_tl_recovery(
@@ -5948,6 +6502,67 @@ async fn reconcile_existing_session(
         continue_mode,
     )
     .await
+}
+
+fn workspace_shutdown_phase(project_dir: &Path) -> Result<Option<WorkspaceShutdownPhase>> {
+    let path = project_dir.join(WORKSPACE_SHUTDOWN_RELATIVE_PATH);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let intent: WorkspaceShutdownIntent = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse workspace shutdown intent {}", path.display()))?;
+    anyhow::ensure!(
+        intent.schema_version == 1 && !intent.operation_id.trim().is_empty(),
+        "workspace shutdown intent is malformed"
+    );
+    Ok(Some(intent.phase))
+}
+
+async fn shutdown_and_restart_server(
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+    project_dir: &Path,
+    shell: &str,
+    session: &str,
+    config: &Config,
+    verbose: bool,
+) -> Result<()> {
+    let client = uds_client::ServerClient::new(project_dir.join(".exo/server.sock"));
+    let result = client
+        .post_json::<_, Value>("/shutdown/workspace", &serde_json::json!({}))
+        .await;
+    if let Err(error) = result {
+        if workspace_shutdown_phase(project_dir)? != Some(WorkspaceShutdownPhase::Complete) {
+            return Err(error).context("workspace controller shutdown handoff did not complete");
+        }
+    }
+    if workspace_shutdown_phase(project_dir)? != Some(WorkspaceShutdownPhase::Complete) {
+        anyhow::bail!("workspace controller shutdown did not reach its durable complete phase");
+    }
+    wait_for_server_socket_shutdown(project_dir).await?;
+    if let Some(server) = ipc
+        .list_windows()
+        .await?
+        .into_iter()
+        .find(|window| window.window_name == "Server")
+    {
+        ipc.kill_window(&server.window_id).await?;
+    }
+    launch_server_recovery(ipc, project_dir, shell, session, config, verbose).await?;
+    ensure_watcher_dashboard_window(ipc, project_dir, shell).await?;
+    Ok(())
+}
+
+async fn wait_for_server_socket_shutdown(project_dir: &Path) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while server_socket_is_healthy(project_dir).await {
+        if Instant::now() >= deadline {
+            anyhow::bail!("server did not stop after the completed workspace controller shutdown");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
 }
 
 fn controller_exit_path(project_dir: &Path) -> PathBuf {
@@ -5969,12 +6584,75 @@ fn controller_epoch_path(project_dir: &Path) -> PathBuf {
     project_dir.join(".exo/tl-loop/root.controller-epoch")
 }
 
-#[cfg(test)]
+fn read_root_run_id(project_dir: &Path) -> Result<String> {
+    let path = project_dir.join(".exo/tl-loop/root/run.json");
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read root controller RunStore {}", path.display()))?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse root controller RunStore {}", path.display()))?;
+    value
+        .get("run_id")
+        .and_then(Value::as_str)
+        .filter(|run_id| !run_id.trim().is_empty())
+        .map(str::to_owned)
+        .with_context(|| format!("root controller RunStore {} has no run_id", path.display()))
+}
+
+fn read_optional_root_run_id(project_dir: &Path) -> Result<Option<String>> {
+    let path = project_dir.join(".exo/tl-loop/root/run.json");
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => read_root_run_id(project_dir).map(Some),
+        Ok(_) => anyhow::bail!("root RunStore {} is not a regular file", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect root RunStore {}", path.display()))
+        }
+    }
+}
+
 fn read_controller_epoch(project_dir: &Path) -> Option<String> {
     std::fs::read_to_string(controller_epoch_path(project_dir))
         .ok()
         .map(|epoch| epoch.trim().to_string())
         .filter(|epoch| !epoch.is_empty())
+}
+
+fn read_controller_epoch_state(project_dir: &Path) -> Result<Option<String>> {
+    let path = controller_epoch_path(project_dir);
+    match std::fs::read_to_string(&path) {
+        Ok(epoch) => {
+            let epoch = epoch.trim();
+            anyhow::ensure!(!epoch.is_empty(), "controller epoch marker is empty");
+            Ok(Some(epoch.to_owned()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("read controller epoch {}", path.display()))
+        }
+    }
+}
+
+fn ensure_controller_epoch_for_startup(
+    project_dir: &Path,
+    intent: &ControllerStartupIntent,
+) -> Result<()> {
+    let current_epoch = read_controller_epoch_state(project_dir)?;
+    if current_epoch.as_deref() == Some(intent.controller_epoch.as_str()) {
+        if intent.phase == ControllerStartupPhase::Requested && intent.target.is_none() {
+            prepare_controller_spawn_for_epoch(project_dir, &intent.controller_epoch)?;
+        }
+        return Ok(());
+    }
+    if intent.phase == ControllerStartupPhase::Requested
+        && intent.target.is_none()
+        && current_epoch == intent.previous_controller_epoch
+    {
+        prepare_controller_spawn_for_epoch(project_dir, &intent.controller_epoch)?;
+        return Ok(());
+    }
+    anyhow::bail!(
+        "interrupted controller startup epoch conflicts with the current marker; refusing target recovery"
+    )
 }
 
 fn render_controller_exit_reason(value: &Value) -> Option<String> {
@@ -6043,29 +6721,48 @@ fn clear_controller_exit_reason(project_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn write_controller_epoch(project_dir: &Path) -> Result<String> {
-    let marker = controller_epoch_path(project_dir);
-    let epoch = format!(
+fn allocate_controller_epoch() -> String {
+    format!(
         "controller-{}-{}",
         current_time_millis(),
         std::process::id()
-    );
+    )
+}
+
+fn write_controller_epoch(project_dir: &Path, epoch: &str) -> Result<()> {
+    let marker = controller_epoch_path(project_dir);
     if let Some(parent) = marker.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    std::fs::write(&marker, format!("{epoch}\n"))
-        .with_context(|| format!("failed to write {}", marker.display()))?;
+    let temporary = marker.with_extension("tmp");
+    let mut file = std::fs::File::create(&temporary)
+        .with_context(|| format!("create controller epoch marker {}", temporary.display()))?;
+    use std::io::Write as _;
+    file.write_all(format!("{epoch}\n").as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&temporary, &marker)
+        .with_context(|| format!("replace controller epoch marker {}", marker.display()))?;
+    if let Some(parent) = marker.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
     info!(path = %marker.display(), %epoch, "Wrote new controller spawn epoch");
-    Ok(epoch)
+    Ok(())
 }
 
+#[cfg(test)]
 fn prepare_controller_spawn(project_dir: &Path) -> Result<String> {
-    let controller_epoch = write_controller_epoch(project_dir)?;
+    let controller_epoch = allocate_controller_epoch();
+    prepare_controller_spawn_for_epoch(project_dir, &controller_epoch)?;
+    Ok(controller_epoch)
+}
+
+fn prepare_controller_spawn_for_epoch(project_dir: &Path, controller_epoch: &str) -> Result<()> {
+    write_controller_epoch(project_dir, controller_epoch)?;
     // A marker without this epoch belongs to an older controller process. Archive it
     // before creating the new window so the first liveness poll cannot misattribute it.
     let _ = controller_exit_reason_for_attempt(project_dir, &controller_epoch)?;
-    Ok(controller_epoch)
+    Ok(())
 }
 
 fn root_archive_path_at(project_dir: &Path, timestamp_ms: u128) -> Result<Option<PathBuf>> {
@@ -6171,15 +6868,14 @@ fn record_controller_exit_reason_for_attempt(
 async fn wait_for_tl_controller_startup(
     ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
     project_dir: &Path,
-    window_id: &exomonad_core::services::tmux_ipc::WindowId,
+    target: &ControllerPaneTarget,
     controller_epoch: &str,
 ) -> Result<()> {
     let deadline = Instant::now() + TL_CONTROLLER_STARTUP_TIMEOUT;
-    let routing = exomonad_core::domain::RoutingInfo::window(window_id.clone());
     let mut observed_alive = false;
 
     loop {
-        let process_alive = ipc.routing_target_process_alive(&routing).await?;
+        let process_alive = controller_pane_target_is_live(project_dir, ipc, target).await?;
         if process_alive {
             observed_alive = true;
         } else {
@@ -6213,7 +6909,7 @@ async fn wait_for_tl_controller_startup(
                 return tl_controller_startup_failure(
                     ipc,
                     project_dir,
-                    window_id,
+                    &target.window_id,
                     controller_epoch,
                     reason,
                 )
@@ -6223,9 +6919,12 @@ async fn wait_for_tl_controller_startup(
                 return tl_controller_startup_failure(
                     ipc,
                     project_dir,
-                    window_id,
+                    &target.window_id,
                     controller_epoch,
-                    format!("tmux window {window_id} exited before TL startup completed"),
+                    format!(
+                        "tmux controller pane {} exited before TL startup completed",
+                        target.pane_id
+                    ),
                 )
                 .await;
             }
@@ -6237,7 +6936,7 @@ async fn wait_for_tl_controller_startup(
                 return tl_controller_startup_failure(
                     ipc,
                     project_dir,
-                    window_id,
+                    &target.window_id,
                     controller_epoch,
                     reason,
                 )
@@ -6252,9 +6951,12 @@ async fn wait_for_tl_controller_startup(
             return tl_controller_startup_failure(
                 ipc,
                 project_dir,
-                window_id,
+                &target.window_id,
                 controller_epoch,
-                format!("tmux window {window_id} never became live during TL startup"),
+                format!(
+                    "tmux controller pane {} never became live during TL startup",
+                    target.pane_id
+                ),
             )
             .await;
         }
@@ -7149,51 +7851,16 @@ pub async fn run(
     }
     ensure_watcher_dashboard_window(&ipc, &cwd, &shell).await?;
 
-    // The human-facing TL window runs one coordinator: the Python controller.
-    // Root harness settings and root_command are intentionally ignored.
-    let tl_cwd = cwd.clone();
-    let base_command = tl_loop_command(
+    launch_tl_recovery(
+        &ipc,
         &cwd,
+        &shell,
         &tl_loop_root,
-        &TlLoopTimeouts::from(&config),
+        &config,
         controller_plan_digest.as_deref(),
-    );
-    let base_command = if mode == SessionMode::Continue {
-        gate_controller_start(&base_command)
-    } else {
-        base_command
-    };
-
-    let tl_command = match config.shell_command {
-        Some(ref sc) => format!("{} -c \"{}\"", sc, base_command.replace('"', "\\\"")),
-        None => base_command,
-    };
-
-    let controller_epoch = prepare_controller_spawn(&cwd)?;
-    let tl_window = ipc.new_window("TL", &tl_cwd, &shell, &tl_command).await?;
-    ipc.set_window_remain_on_exit(&tl_window, true).await?;
-    if mode == SessionMode::Continue {
-        if let Err(error) = reconcile_continue_state_before_controller(&cwd, &ipc).await {
-            if let Err(kill_error) = ipc.kill_window(&tl_window).await {
-                warn!(window = %tl_window, error = %kill_error, "Failed to remove gated TL window after continuation repair failed");
-            }
-            return Err(error);
-        }
-        if let Err(error) = ipc
-            .inject_input(tl_window.as_str(), "start-controller", true, true)
-            .await
-        {
-            if let Err(kill_error) = ipc.kill_window(&tl_window).await {
-                warn!(window = %tl_window, error = %kill_error, "Failed to remove gated TL window after release failed");
-            }
-            return Err(error).context("failed to release the repaired TL controller");
-        }
-    }
-    let startup = wait_for_tl_controller_startup(&ipc, &cwd, &tl_window, &controller_epoch).await;
-    if startup.is_ok() {
-        ipc.set_window_remain_on_exit(&tl_window, false).await?;
-    }
-    startup?;
+        mode == SessionMode::Continue,
+    )
+    .await?;
     drop(init_lifecycle_lock);
 
     // 5. Spawn companion agents
@@ -8773,7 +9440,7 @@ mod tests {
             start_invocation_with_provenance_and_context_and_mode, InvocationIdentityContext,
             InvocationMode, InvocationTrigger,
         };
-        use exomonad_core::services::tmux_ipc::{PaneId, WindowId, WindowInfo};
+        use exomonad_core::services::tmux_ipc::WindowId;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let project = tempfile::tempdir().unwrap();
@@ -8883,13 +9550,9 @@ mod tests {
             stream.write_all(&response).await.unwrap();
             stream.shutdown().await.unwrap();
         });
-        let windows = [WindowInfo {
-            window_id: WindowId::parse("@71").unwrap(),
-            window_name: "TL".to_owned(),
-            pane_id: PaneId::parse("%71").unwrap(),
-        }];
+        let controller_window = WindowId::parse("@71").unwrap();
         assert_eq!(
-            repair_ordered_sub_tl_invocations(project_dir, &socket_path, &windows)
+            repair_ordered_sub_tl_invocations(project_dir, &socket_path, &controller_window)
                 .await
                 .unwrap(),
             1
@@ -12307,6 +12970,240 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_pre_checkpoint_start_relaunches_the_accepted_plan_without_continue_guard() {
+        let interrupted = InterruptedControllerStartup::TargetStopped {
+            original_continue_mode: false,
+            root_run_id: None,
+        };
+        assert!(!interrupted_startup_continue_mode(&interrupted, true));
+
+        let interrupted_continue = InterruptedControllerStartup::TargetStopped {
+            original_continue_mode: true,
+            root_run_id: Some("root".to_owned()),
+        };
+        assert!(interrupted_startup_continue_mode(
+            &interrupted_continue,
+            true
+        ));
+        assert!(!interrupted_startup_continue_mode(
+            &InterruptedControllerStartup::None,
+            false
+        ));
+    }
+
+    #[test]
+    fn startup_intent_binds_target_to_its_exact_session_epoch_and_server() {
+        let target = ControllerPaneTarget {
+            schema_version: 1,
+            controller_epoch: "controller-123-45".to_owned(),
+            tmux_session: "workspace".to_owned(),
+            window_id: WindowId::parse("@7").unwrap(),
+            pane_id: exomonad_core::services::tmux_ipc::PaneId::parse("%9").unwrap(),
+            pane_pid: 123,
+            pane_start_ticks: 456,
+            tmux_server_pid: 321,
+            tmux_server_start_ticks: 654,
+        };
+        let intent = ControllerStartupIntent {
+            schema_version: 1,
+            controller_epoch: target.controller_epoch.clone(),
+            previous_controller_epoch: Some("controller-old-44".to_owned()),
+            tmux_session: target.tmux_session.clone(),
+            tmux_server_pid: target.tmux_server_pid,
+            tmux_server_start_ticks: target.tmux_server_start_ticks,
+            continue_mode: true,
+            root_run_id: Some("root".to_owned()),
+            target: Some(target.clone()),
+            phase: ControllerStartupPhase::TargetCreated,
+        };
+        intent.validate().unwrap();
+
+        let mut conflicting_session = intent.clone();
+        conflicting_session.target.as_mut().unwrap().tmux_session = "other".to_owned();
+        assert!(conflicting_session.validate().is_err());
+
+        let mut conflicting_epoch = intent.clone();
+        conflicting_epoch.target.as_mut().unwrap().controller_epoch = "older-epoch".to_owned();
+        assert!(conflicting_epoch.validate().is_err());
+
+        let mut conflicting_server = intent.clone();
+        conflicting_server.target.as_mut().unwrap().tmux_server_pid += 1;
+        assert!(conflicting_server.validate().is_err());
+
+        let mut missing_run_id = intent;
+        missing_run_id.root_run_id = None;
+        assert!(missing_run_id.validate().is_err());
+    }
+
+    #[test]
+    fn startup_intent_phase_cannot_claim_reconciliation_without_a_target() {
+        let intent = ControllerStartupIntent {
+            schema_version: 1,
+            controller_epoch: "controller-123-45".to_owned(),
+            previous_controller_epoch: None,
+            tmux_session: "workspace".to_owned(),
+            tmux_server_pid: 321,
+            tmux_server_start_ticks: 654,
+            continue_mode: false,
+            root_run_id: None,
+            target: None,
+            phase: ControllerStartupPhase::Released,
+        };
+        assert!(intent.validate().is_err());
+    }
+
+    #[test]
+    fn requested_startup_reconciles_epoch_write_only_when_previous_marker_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = controller_epoch_path(dir.path());
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "controller-old-44\n").unwrap();
+        let intent = ControllerStartupIntent {
+            schema_version: 1,
+            controller_epoch: "controller-new-45".to_owned(),
+            previous_controller_epoch: Some("controller-old-44".to_owned()),
+            tmux_session: "workspace".to_owned(),
+            tmux_server_pid: 321,
+            tmux_server_start_ticks: 654,
+            continue_mode: false,
+            root_run_id: None,
+            target: None,
+            phase: ControllerStartupPhase::Requested,
+        };
+
+        ensure_controller_epoch_for_startup(dir.path(), &intent).unwrap();
+        assert_eq!(
+            read_controller_epoch_state(dir.path()).unwrap().as_deref(),
+            Some("controller-new-45")
+        );
+
+        std::fs::write(&marker, "controller-foreign-46\n").unwrap();
+        let error = ensure_controller_epoch_for_startup(dir.path(), &intent).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("conflicts with the current marker"));
+        assert_eq!(
+            read_controller_epoch_state(dir.path()).unwrap().as_deref(),
+            Some("controller-foreign-46")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn interrupted_target_creation_is_adopted_by_epoch_without_name_scanning() {
+        use exomonad_core::services::tmux_ipc::TmuxIpc;
+
+        let previous_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
+        let socket = format!("exo-init-startup-{}", std::process::id());
+        std::env::set_var("EXOMONAD_TMUX_SOCKET", &socket);
+        let _restore = TmuxSocketRestore {
+            socket,
+            previous: previous_socket,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let session = format!("exo-init-startup-{}", std::process::id());
+        let new_session = Command::new("tmux")
+            .args([
+                "-L",
+                &_restore.socket,
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "sleep",
+                "300",
+            ])
+            .output()
+            .expect("create isolated tmux session");
+        assert!(new_session.status.success());
+        let ipc = TmuxIpc::new(&session);
+        let server = ipc.server_identity().await.unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("run.json"),
+            r#"{"run_id":"root","fsm":{"phase":"tl_done"}}"#,
+        )
+        .unwrap();
+        let epoch = "controller-startup-recovery-1290";
+        std::fs::write(controller_epoch_path(dir.path()), format!("{epoch}\n")).unwrap();
+        let intent = ControllerStartupIntent {
+            schema_version: 1,
+            controller_epoch: epoch.to_owned(),
+            previous_controller_epoch: None,
+            tmux_session: session.clone(),
+            tmux_server_pid: server.pid,
+            tmux_server_start_ticks: server.start_ticks,
+            continue_mode: false,
+            root_run_id: None,
+            target: None,
+            phase: ControllerStartupPhase::Requested,
+        };
+        persist_controller_startup_intent(dir.path(), &intent).unwrap();
+        let created = ipc
+            .new_window_with_environment(
+                "TL",
+                dir.path(),
+                "/bin/sh",
+                "sleep 3; exit 0",
+                &[("EXOMONAD_CONTROLLER_EPOCH", epoch)],
+            )
+            .await
+            .unwrap();
+        ipc.set_window_remain_on_exit(&created.window_id, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reconcile_interrupted_controller_startup(&ipc, dir.path())
+                .await
+                .unwrap(),
+            InterruptedControllerStartup::Resumed
+        );
+        let ownership = read_controller_ownership(dir.path()).await.unwrap();
+        assert_eq!(ownership.controller_epoch, epoch);
+        assert_eq!(ownership.run_id, "root");
+        assert_eq!(ownership.window_id, created.window_id);
+        assert_eq!(ownership.pane_id, created.pane_id);
+        assert!(read_controller_startup_intent(dir.path())
+            .unwrap()
+            .is_none());
+        assert!(!dir
+            .path()
+            .join(".exo/tl-loop/root/controller-target.pending.json")
+            .exists());
+        let tl_windows = ipc
+            .list_windows()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|window| window.window_name == "TL")
+            .count();
+        assert_eq!(
+            tl_windows, 1,
+            "recovery adopts the exact created target once"
+        );
+    }
+
+    struct TmuxSocketRestore {
+        socket: String,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for TmuxSocketRestore {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["-L", &self.socket, "kill-server"])
+                .status();
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var("EXOMONAD_TMUX_SOCKET", previous);
+            } else {
+                std::env::remove_var("EXOMONAD_TMUX_SOCKET");
+            }
+        }
+    }
+
+    #[test]
     fn root_tl_resume_reports_corrupt_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".exo/tl-loop/root");
@@ -12754,9 +13651,10 @@ mod tests {
         let preflight = source
             .find("run_tl_loop_preflight(&cwd")
             .expect("init must run TL preflight");
-        let tl_window = source
-            .rfind("ipc.new_window(\"TL\"")
-            .expect("init must create the TL window");
+        let tl_window = preflight
+            + source[preflight..]
+                .find("\n    launch_tl_recovery(")
+                .expect("init must launch the TL controller after preflight");
         assert!(
             preflight < tl_window,
             "preflight must fail before creating tmux windows"
@@ -12769,9 +13667,10 @@ mod tests {
         let server_wait = source
             .find("wait_for_server_startup(&cwd, ServerProcessProbe::ShellOnly")
             .expect("init must wait for the server before continuing");
-        let tl_window = source
-            .rfind("ipc.new_window(\"TL\"")
-            .expect("init must create the TL window");
+        let tl_window = server_wait
+            + source[server_wait..]
+                .find("\n    launch_tl_recovery(")
+                .expect("init must launch the TL controller after server readiness");
         assert!(
             server_wait < tl_window,
             "the TL window must not launch before the server socket is ready"
@@ -13372,9 +14271,10 @@ mod tests {
         let archive = source
             .find("complete_recreate_plan_transition_locked(&cwd")
             .expect("recreate must archive the prior root checkpoint");
-        let tl_window = source
-            .rfind("ipc.new_window(\"TL\"")
-            .expect("init must create the TL window");
+        let tl_window = archive
+            + source[archive..]
+                .find("\n    launch_tl_recovery(")
+                .expect("recreate must launch a TL controller after archiving");
 
         assert!(archive < tl_window);
     }
@@ -13558,11 +14458,20 @@ mod tests {
         let startup = source
             .find("let startup = wait_for_tl_controller_startup(&ipc, &cwd")
             .expect("init must wait for TL startup");
-        let release = source[startup..]
-            .find("if startup.is_ok() {\n        ipc.set_window_remain_on_exit(&tl_window, false)")
+        let completed = source[startup..]
+            .split_once("if startup.is_ok() {")
+            .expect("pane retention is released only after startup succeeds")
+            .1;
+        let owner = completed
+            .find("persist_controller_ownership(project_dir, &ownership)")
+            .expect("successful startup must first persist its exact controller owner");
+        let release = completed
+            .find("set_window_remain_on_exit(&tl_window, false)")
             .expect("successful startup must release pane retention");
-
-        assert!(release > 0);
+        assert!(
+            owner < release,
+            "controller ownership must precede pane release"
+        );
     }
 
     #[test]

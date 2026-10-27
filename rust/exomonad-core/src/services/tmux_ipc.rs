@@ -135,6 +135,12 @@ pub struct TmuxPaneSnapshot {
     pub dead: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxWindowTarget {
+    pub window_id: WindowId,
+    pub pane_id: PaneId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TmuxServerIdentity {
     pub pid: u32,
@@ -380,7 +386,7 @@ fn parse_pane_snapshot(line: &str) -> Result<TmuxPaneSnapshot> {
     })
 }
 
-async fn process_start_ticks(pid: u32) -> Result<u64> {
+pub async fn process_start_ticks(pid: u32) -> Result<u64> {
     let path = format!("/proc/{pid}/stat");
     let stat = tokio::fs::read_to_string(&path)
         .await
@@ -596,6 +602,39 @@ impl TmuxIpc {
         Ok(Some(snapshot))
     }
 
+    /// List pane identities only for this configured session. Callers that
+    /// reconcile a partially-created controller use this bounded scope rather
+    /// than inspecting host processes outside the managed tmux session.
+    pub async fn pane_snapshots(&self) -> Result<Vec<TmuxPaneSnapshot>> {
+        let output = tmux_command()
+            .args([
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}\t#{window_id}\t#{pane_id}\t#{pane_pid}\t#{pane_dead}",
+            ])
+            .output()
+            .await
+            .context("Failed to inspect tmux pane snapshots")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if session_missing(&stderr) {
+                return Ok(Vec::new());
+            }
+            anyhow::bail!("tmux pane inspection failed: {}", stderr.trim());
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(parse_pane_snapshot)
+            .collect::<Result<Vec<_>>>()
+            .map(|panes| {
+                panes
+                    .into_iter()
+                    .filter(|pane| pane.session_name == self.session_name)
+                    .collect()
+            })
+    }
+
     /// Read the process id of a window's pane from the selected tmux server.
     pub async fn pane_pid(window: &str) -> Result<Option<u32>> {
         info!(window, "Reading tmux pane process id");
@@ -758,6 +797,62 @@ impl TmuxIpc {
             WindowId::parse(&raw).context("Failed to parse window_id from tmux new-window")?;
         info!(session = %self.session_name, window = %window_id, name, "Created tmux window");
         Ok(window_id)
+    }
+
+    /// Create a controller window and retain the exact initial pane ID returned
+    /// by the same tmux operation. Environment values are scoped to this pane
+    /// and allow interrupted creation to be reconciled without a name/index scan.
+    pub async fn new_window_with_environment(
+        &self,
+        name: &str,
+        cwd: &Path,
+        shell: &str,
+        command: &str,
+        environment: &[(&str, &str)],
+    ) -> Result<TmuxWindowTarget> {
+        let mut args = vec![
+            "new-window".to_owned(),
+            "-P".to_owned(),
+            "-F".to_owned(),
+            "#{window_id}\t#{pane_id}".to_owned(),
+            "-t".to_owned(),
+            self.session_name.clone(),
+            "-n".to_owned(),
+            name.to_owned(),
+            "-c".to_owned(),
+            cwd.to_string_lossy().into_owned(),
+        ];
+        for (key, value) in environment {
+            args.extend(["-e".to_owned(), format!("{key}={value}")]);
+        }
+        args.extend([
+            shell.to_owned(),
+            "-l".to_owned(),
+            "-c".to_owned(),
+            command.to_owned(),
+        ]);
+        let output = tmux_command()
+            .args(args)
+            .output()
+            .await
+            .context("Failed to run tmux new-window with exact pane output")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "tmux new-window failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let fields = raw.trim().split('\t').collect::<Vec<_>>();
+        anyhow::ensure!(
+            fields.len() == 2,
+            "tmux returned malformed window/pane identity"
+        );
+        let target = TmuxWindowTarget {
+            window_id: WindowId::parse(fields[0])?,
+            pane_id: PaneId::parse(fields[1])?,
+        };
+        Ok(target)
     }
 
     pub async fn list_windows(&self) -> Result<Vec<WindowInfo>> {

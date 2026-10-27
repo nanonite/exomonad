@@ -20,9 +20,14 @@ pub use codex_lifecycle::{
     ProvisionedCodexAgent, RetainedProjectTrust,
 };
 pub use controller_lifecycle::{
-    persist_controller_ownership, read_controller_ownership, ControllerPaneOwnership,
+    capture_controller_ownership, capture_controller_pane_target,
+    clear_pending_controller_ownership, controller_ownership_is_live,
+    controller_pane_target_is_live, persist_controller_ownership,
+    persist_pending_controller_ownership, read_controller_ownership,
+    read_controller_target_for_routing, ControllerPaneOwnership, ControllerPaneTarget,
     WorkspaceShutdownIntent, WorkspaceShutdownPhase, WorkspaceShutdownResult,
-    ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH, WORKSPACE_SHUTDOWN_RELATIVE_PATH,
+    ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH, ROOT_CONTROLLER_PENDING_OWNERSHIP_RELATIVE_PATH,
+    WORKSPACE_SHUTDOWN_RELATIVE_PATH,
 };
 pub use invocation::{
     finish_invocation, finish_invocation_and_tombstone,

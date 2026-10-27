@@ -310,6 +310,7 @@ fn opencode_model_ref(model: &str, variant: Option<&str>) -> String {
     }
 }
 
+#[cfg(test)]
 fn select_ordered_sub_tl_window(
     windows: &[super::tmux_ipc::WindowInfo],
 ) -> Result<&super::tmux_ipc::WindowInfo> {
@@ -540,11 +541,12 @@ impl<
             ));
         }
 
-        let routing = self.ordered_sub_tl_routing().await.map_err(|_| {
-            ordered_provision_failure(
-                super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
-                "no unique current TL delivery target is available for ordered controller provisioning",
-            )
+        let routing = self.ordered_sub_tl_routing().await.map_err(|error| {
+            anyhow::Error::new(super::OrderedSubTLProvisionFailure {
+                kind: super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                message: "no unique current TL delivery target is available for ordered controller provisioning",
+            })
+            .context(error)
         })?;
         if let Some(prior) = prior_invocation
             .as_ref()
@@ -831,14 +833,18 @@ impl<
         let tmux = self
             .tmux()
             .context("ordered sub-TL tmux session is unavailable")?;
-        let windows = tmux
-            .list_windows()
+        let target = super::read_controller_target_for_routing(self.project_dir())
             .await
-            .context("failed to list windows for ordered sub-TL routing")?;
-        match select_ordered_sub_tl_window(&windows) {
-            Ok(window) => Ok(RoutingInfo::window(window.window_id.clone())),
-            Err(error) => Err(error),
+            .context("exact root controller ownership is unavailable for ordered sub-TL routing")?;
+        if !super::controller_ownership_is_live(self.project_dir(), &tmux, &target)
+            .await
+            .context("exact root controller pane could not be validated")?
+        {
+            anyhow::bail!(
+                "exact root controller pane is stopped; ordered sub-TL routing is blocked"
+            );
         }
+        Ok(RoutingInfo::window(target.window_id))
     }
 
     pub(crate) fn runtime_role_context(&self, role: &crate::domain::Role) -> Result<String> {
@@ -2410,6 +2416,51 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn ordered_sub_tl_routing_uses_exact_persisted_target_not_window_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        let tmux = OrderedTestTmux::new();
+        let target = tmux.window_id_for_session();
+        tmux.rename_window(&target, "renamed-controller");
+        persist_test_controller_ownership(&project_dir, &tmux.session, &target).await;
+        let service = ordered_service_using_tmux_route(&project_dir, &tmux.session, &target).await;
+
+        let route = service
+            .ordered_sub_tl_routing()
+            .await
+            .expect("exact persisted controller target is used after a rename");
+        assert_eq!(route.window_id.as_ref(), Some(&target));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordered_sub_tl_routing_refuses_a_named_window_without_controller_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        let tmux = OrderedTestTmux::new();
+        let target = tmux.window_id_for_session();
+        tmux.rename_window(&target, "TL");
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.clone();
+        services.git_wt = Arc::new(crate::services::git_worktree::GitWorktreeService::new(
+            project_dir.clone(),
+        ));
+        services.agent_resolver = Arc::new(AgentResolver::load(project_dir).await);
+        let service =
+            AgentControlService::new(Arc::new(services)).with_tmux_session(tmux.session.clone());
+
+        let error = service
+            .ordered_sub_tl_routing()
+            .await
+            .expect_err("a display name cannot authorize controller routing");
+        assert!(
+            format!("{error:#}").contains("exact root controller ownership is unavailable"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn ordered_sub_tl_provisioning_is_idempotent_and_rejects_conflicts() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = temp.path().to_path_buf();
@@ -3035,7 +3086,14 @@ mod tests {
     async fn ordered_service_using_tmux_route(
         project_dir: &Path,
         session: &str,
+        controller_window: &super::super::tmux_ipc::WindowId,
     ) -> AgentControlService<crate::services::Services> {
+        if !project_dir
+            .join(super::ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH)
+            .exists()
+        {
+            persist_test_controller_ownership(project_dir, session, controller_window).await;
+        }
         let mut services = crate::services::Services::test();
         services.project_dir = project_dir.to_path_buf();
         services.git_wt = Arc::new(crate::services::git_worktree::GitWorktreeService::new(
@@ -3043,6 +3101,44 @@ mod tests {
         ));
         services.agent_resolver = Arc::new(AgentResolver::load(project_dir.to_path_buf()).await);
         AgentControlService::new(Arc::new(services)).with_tmux_session(session.to_string())
+    }
+
+    async fn persist_test_controller_ownership(
+        project_dir: &Path,
+        session: &str,
+        controller_window: &super::super::tmux_ipc::WindowId,
+    ) {
+        let root = project_dir.join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).expect("create test root checkpoint directory");
+        std::fs::write(root.join("run.json"), r#"{"run_id":"root"}"#)
+            .expect("write test root run identity");
+        std::fs::write(
+            project_dir.join(".exo/tl-loop/root.controller-epoch"),
+            "test-epoch\n",
+        )
+        .expect("write test controller epoch");
+        let tmux = super::super::tmux_ipc::TmuxIpc::new(session);
+        let pane = tmux
+            .pane_snapshots()
+            .await
+            .expect("list test-session panes")
+            .into_iter()
+            .find(|pane| {
+                pane.session_name == session && pane.window_id == *controller_window && !pane.dead
+            })
+            .expect("test session has a live controller pane");
+        let owner = super::capture_controller_ownership(
+            &tmux,
+            "test-epoch",
+            "root",
+            pane.window_id,
+            pane.pane_id,
+        )
+        .await
+        .expect("capture exact test controller target");
+        super::persist_controller_ownership(project_dir, &owner)
+            .await
+            .expect("persist test controller ownership");
     }
 
     fn invocation_start_count(project_dir: &Path, agent_id: &str, invocation_id: &str) -> usize {
@@ -3537,7 +3633,7 @@ mod tests {
         let old_target = tmux.new_target("TL");
         let old_routing = RoutingInfo::window(old_target.clone());
         let agent_dir = project_dir.join(".exo/agents/ordered-child");
-        let first_id = ordered_service_using_tmux_route(&project_dir, &tmux.session)
+        let first_id = ordered_service_using_tmux_route(&project_dir, &tmux.session, &old_target)
             .await
             .provision_ordered_sub_tl(record.clone())
             .await
@@ -3569,8 +3665,11 @@ mod tests {
 
         let new_target = tmux.new_target("TL");
         assert_ne!(new_target, old_target);
-        let service_a = ordered_service_using_tmux_route(&project_dir, &tmux.session).await;
-        let service_b = ordered_service_using_tmux_route(&project_dir, &tmux.session).await;
+        persist_test_controller_ownership(&project_dir, &tmux.session, &new_target).await;
+        let service_a =
+            ordered_service_using_tmux_route(&project_dir, &tmux.session, &new_target).await;
+        let service_b =
+            ordered_service_using_tmux_route(&project_dir, &tmux.session, &new_target).await;
         let (retry_a, retry_b) = tokio::join!(
             service_a.provision_ordered_sub_tl(record.clone()),
             service_b.provision_ordered_sub_tl(record.clone()),
@@ -3633,7 +3732,7 @@ mod tests {
             1
         );
         assert_eq!(
-            ordered_service_using_tmux_route(&project_dir, &tmux.session)
+            ordered_service_using_tmux_route(&project_dir, &tmux.session, &new_target)
                 .await
                 .provision_ordered_sub_tl(record.clone())
                 .await
@@ -3681,10 +3780,12 @@ mod tests {
             Some(&recreated_target),
             "fresh server target identity differs from the lost target"
         );
-        let recovered_again = ordered_service_using_tmux_route(&project_dir, &tmux.session)
-            .await
-            .provision_ordered_sub_tl(record.clone())
-            .await;
+        persist_test_controller_ownership(&project_dir, &tmux.session, &recreated_target).await;
+        let recovered_again =
+            ordered_service_using_tmux_route(&project_dir, &tmux.session, &recreated_target)
+                .await
+                .provision_ordered_sub_tl(record.clone())
+                .await;
         let recovered_again = recovered_again
             .expect("a fully lost session permits one evidence-backed controller restart");
         let final_invocation = read_invocation(&agent_dir)
@@ -3710,7 +3811,7 @@ mod tests {
             1
         );
         assert_eq!(
-            ordered_service_using_tmux_route(&project_dir, &tmux.session)
+            ordered_service_using_tmux_route(&project_dir, &tmux.session, &recreated_target)
                 .await
                 .provision_ordered_sub_tl(record)
                 .await
@@ -3805,12 +3906,12 @@ mod tests {
             ledger_owned: true,
             slice_id: Some("ordered-child".to_string()),
         };
-        let first_id = ordered_service_using_tmux_route(&project_dir, &tmux.session)
+        let first_id = ordered_service_using_tmux_route(&project_dir, &tmux.session, &target)
             .await
             .provision_ordered_sub_tl(child.clone())
             .await
             .expect("the child can share its declared parent TL delivery window");
-        let repeated_id = ordered_service_using_tmux_route(&project_dir, &tmux.session)
+        let repeated_id = ordered_service_using_tmux_route(&project_dir, &tmux.session, &target)
             .await
             .provision_ordered_sub_tl(child.clone())
             .await
@@ -3831,7 +3932,7 @@ mod tests {
             serde_json::to_vec_pretty(&conflicting_parent).unwrap(),
         )
         .unwrap();
-        let error = ordered_service_using_tmux_route(&project_dir, &tmux.session)
+        let error = ordered_service_using_tmux_route(&project_dir, &tmux.session, &target)
             .await
             .provision_ordered_sub_tl(child)
             .await
@@ -3886,7 +3987,7 @@ mod tests {
             slice_id: Some("ordered-reuse".to_string()),
         };
         let agent_dir = project_dir.join(".exo/agents/ordered-reuse");
-        let first_id = ordered_service_using_tmux_route(&project_dir, &tmux.session)
+        let first_id = ordered_service_using_tmux_route(&project_dir, &tmux.session, &old_target)
             .await
             .provision_ordered_sub_tl(record.clone())
             .await
@@ -3897,7 +3998,7 @@ mod tests {
         tmux.kill_server();
         let reused_target = tmux.restart_session_with_tl();
         assert_eq!(reused_target, old_target);
-        let error = ordered_service_using_tmux_route(&project_dir, &tmux.session)
+        let error = ordered_service_using_tmux_route(&project_dir, &tmux.session, &old_target)
             .await
             .provision_ordered_sub_tl(record)
             .await
@@ -3909,7 +4010,10 @@ mod tests {
                 .code(),
             "ordered_sub_tl_lifecycle_blocked"
         );
-        assert!(format!("{error:#}").contains("target reuse cannot be distinguished"));
+        assert!(
+            format!("{error:#}").contains("exact root controller pane could not be validated"),
+            "unexpected lifecycle diagnostic: {error:#}"
+        );
         assert_eq!(
             std::fs::read(agent_dir.join("invocation.json")).unwrap(),
             invocation_before

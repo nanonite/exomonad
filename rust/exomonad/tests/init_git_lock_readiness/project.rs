@@ -48,7 +48,7 @@ _project(
     project,
     candidate_issue_id=None,
     include_completed_spawn_journal=True,
-    legacy_completed_dispatch=True,
+    legacy_completed_dispatch=False,
     legacy_integration_coordinator_binding=True,
     terminal_aggregate_handoff=True,
 )
@@ -62,6 +62,9 @@ shutil.rmtree(project / ".exo" / "ledger", ignore_errors=True)
         .status()
         .expect("seed runnable checkpoint");
     assert!(status.success(), "runnable checkpoint creation failed");
+    let root_agent = project.join(".exo/agents/root");
+    fs::create_dir_all(&root_agent).unwrap();
+    fs::write(root_agent.join(".birth_branch"), "main\n").unwrap();
 }
 
 fn install_controller_inputs(project: &Path, repository: &Path) {

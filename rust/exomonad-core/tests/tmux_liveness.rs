@@ -7,7 +7,9 @@
 
 use exomonad_core::domain::RoutingInfo;
 use exomonad_core::services::event_log::EventLog;
-use exomonad_core::services::tmux_ipc::{routing_target_alive, PaneId, TmuxIpc, WindowId};
+use exomonad_core::services::tmux_ipc::{
+    process_environment_variable, routing_target_alive, PaneId, TmuxIpc, WindowId,
+};
 use serde_json::json;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -219,6 +221,58 @@ async fn window_exists_reports_false_after_the_window_is_killed() {
             .expect("probe succeeds"),
         "a killed window must not read as alive"
     );
+}
+
+#[tokio::test]
+async fn created_controller_target_keeps_exact_ids_and_epoch_after_window_rename() {
+    if !tmux_available() {
+        return;
+    }
+    let session = TestSession::create("exo-liveness-controller-target");
+    let cwd = tempfile::tempdir().expect("temporary controller working directory");
+    let ipc = session.ipc();
+    let target = ipc
+        .new_window_with_environment(
+            "TL",
+            cwd.path(),
+            "/bin/sh",
+            "sleep 30",
+            &[("EXOMONAD_CONTROLLER_EPOCH", "controller-test-epoch")],
+        )
+        .await
+        .expect("new-window returns exact window and pane IDs");
+    let before = ipc
+        .pane_snapshot(session.name.as_str(), &target.window_id, &target.pane_id)
+        .await
+        .expect("pane inspection succeeds")
+        .expect("the newly created pane remains present");
+
+    assert!(!before.dead);
+    assert_eq!(before.window_id, target.window_id);
+    assert_eq!(before.pane_id, target.pane_id);
+    assert_eq!(
+        process_environment_variable(before.pid, "EXOMONAD_CONTROLLER_EPOCH")
+            .expect("the owned pane environment is readable")
+            .as_deref(),
+        Some("controller-test-epoch")
+    );
+
+    let rename_target = format!("{}:{}", session.name, target.window_id);
+    let renamed = test_tmux_command()
+        .args(["rename-window", "-t", &rename_target, "renamed-controller"])
+        .status()
+        .expect("tmux rename-window");
+    assert!(
+        renamed.success(),
+        "tmux could not rename the controller window"
+    );
+    let after = ipc
+        .pane_snapshot(session.name.as_str(), &target.window_id, &target.pane_id)
+        .await
+        .expect("pane inspection still succeeds after rename")
+        .expect("window title does not affect exact pane identity");
+    assert_eq!(after.window_id, target.window_id);
+    assert_eq!(after.pane_id, target.pane_id);
 }
 
 #[tokio::test]

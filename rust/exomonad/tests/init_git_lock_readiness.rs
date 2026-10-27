@@ -24,7 +24,7 @@ async fn init_continue_recovers_managed_orphan_and_attaches_once() {
     configure_project(&project, &session);
     seed_runnable_checkpoint(&project);
     preserve_unrelated_edits(&project);
-    let tmux_session = create_exited_tl_session(&socket_dir, &session);
+    let tmux_session = create_exited_tl_session(&socket_dir, &session, &project).await;
 
     let index = fs::read(project.join(".git/index")).unwrap();
     let status = git_output(&project, &["status", "--porcelain"]);
@@ -57,6 +57,13 @@ async fn init_continue_recovers_managed_orphan_and_attaches_once() {
     assert_init_recovered(&first, "init --continue after orphan recovery");
     assert_recovery_preserved_state(&project, &lock, &index, &status);
     assert_restarted_controller(&socket_dir, &session, &old_tl);
+    let controller_target = assert_exact_controller_ownership(
+        &project,
+        &socket_dir,
+        &session,
+        &window_id(&socket_dir, &session, "TL"),
+    )
+    .await;
 
     let live_tl = window_id(&socket_dir, &session, "TL");
     let repeat = run_init(&project, &home, &socket_dir, &session);
@@ -64,7 +71,87 @@ async fn init_continue_recovers_managed_orphan_and_attaches_once() {
     assert_exactly_one_live_role_window(&socket_dir, &session, "TL");
     assert_eq!(window_id(&socket_dir, &session, "TL"), live_tl);
     assert_eq!(quarantine_count(&project), 1);
+    assert_eq!(
+        fs::read(project.join(".exo/tl-loop/root/controller-target.json")).unwrap(),
+        controller_target,
+        "repeat init must preserve exact root pane ownership and epoch"
+    );
     drop(tmux_session);
+}
+
+async fn assert_exact_controller_ownership(
+    project: &Path,
+    socket_dir: &Path,
+    session: &str,
+    expected_window_id: &str,
+) -> Vec<u8> {
+    let path = project.join(".exo/tl-loop/root/controller-target.json");
+    let bytes = fs::read(&path).expect("successful init persists exact controller ownership");
+    let owner: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(owner["schema_version"], 1);
+    assert_eq!(owner["run_id"], "root");
+    assert_eq!(owner["tmux_session"], session);
+    assert_eq!(owner["window_id"], expected_window_id);
+    assert_eq!(
+        owner["controller_epoch"],
+        fs::read_to_string(project.join(".exo/tl-loop/root.controller-epoch"))
+            .unwrap()
+            .trim()
+    );
+
+    let panes = tmux(
+        socket_dir,
+        &[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\t#{window_id}\t#{pane_id}\t#{pane_pid}\t#{pane_dead}",
+        ],
+    );
+    assert_success(&panes, "inspect exact root controller pane");
+    let pane_output = String::from_utf8_lossy(&panes.stdout).into_owned();
+    let pane = pane_output
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            (fields.len() == 5 && fields[0] == session && fields[1] == expected_window_id)
+                .then_some(fields)
+        })
+        .next()
+        .expect("the recorded root window has an exact pane");
+    assert_eq!(owner["pane_id"], pane[2]);
+    assert_eq!(owner["pane_pid"].as_u64(), pane[3].parse::<u64>().ok());
+    assert_eq!(pane[4], "0", "the persisted controller pane must be live");
+    let pane_pid = pane[3].parse::<u32>().unwrap();
+    assert_eq!(
+        owner["pane_start_ticks"].as_u64(),
+        Some(
+            exomonad_core::services::tmux_ipc::process_start_ticks(pane_pid)
+                .await
+                .unwrap()
+        )
+    );
+
+    let server = tmux(socket_dir, &["display-message", "-p", "#{pid}"]);
+    assert_success(&server, "inspect exact tmux server process");
+    let server_pid = String::from_utf8_lossy(&server.stdout)
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    assert_eq!(owner["tmux_server_pid"].as_u64(), Some(server_pid.into()));
+    assert_eq!(
+        owner["tmux_server_start_ticks"].as_u64(),
+        Some(
+            exomonad_core::services::tmux_ipc::process_start_ticks(server_pid)
+                .await
+                .unwrap()
+        )
+    );
+    let run: serde_json::Value =
+        serde_json::from_slice(&fs::read(project.join(".exo/tl-loop/root/run.json")).unwrap())
+            .unwrap();
+    assert_eq!(owner["run_id"], run["run_id"]);
+    bytes
 }
 
 #[cfg(target_os = "linux")]
