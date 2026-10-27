@@ -754,11 +754,27 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::shutdown_endpoint_path;
+    use super::{shutdown_endpoint_path, Cli, Commands};
+    use clap::Parser;
 
     #[test]
     fn shutdown_defaults_to_server_only_and_workspace_mode_is_explicit() {
         assert_eq!(shutdown_endpoint_path(false), "/shutdown");
         assert_eq!(shutdown_endpoint_path(true), "/shutdown/workspace");
+    }
+
+    #[test]
+    fn shutdown_cli_flag_is_explicit_and_defaults_to_server_only() {
+        let default = Cli::try_parse_from(["exomonad", "shutdown"]).unwrap();
+        assert!(matches!(
+            default.command,
+            Commands::Shutdown { workspace: false }
+        ));
+
+        let workspace = Cli::try_parse_from(["exomonad", "shutdown", "--workspace"]).unwrap();
+        assert!(matches!(
+            workspace.command,
+            Commands::Shutdown { workspace: true }
+        ));
     }
 }
