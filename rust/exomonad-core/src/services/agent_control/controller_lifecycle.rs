@@ -686,6 +686,22 @@ mod tests {
                 .expect("configure retained dead panes");
             assert!(status.success(), "tmux accepts remain-on-exit");
         }
+
+        fn ignore_controller_interrupt(&self) {
+            let status = Self::command(&self.socket)
+                .args([
+                    "respawn-pane",
+                    "-k",
+                    "-t",
+                    self.pane.as_str(),
+                    "sh",
+                    "-c",
+                    "trap '' INT; exec sleep 300",
+                ])
+                .status()
+                .expect("restart controller pane with SIGINT ignored");
+            assert!(status.success(), "tmux restarts the controller pane");
+        }
     }
 
     impl Drop for IsolatedTmux {
@@ -970,6 +986,43 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stubborn_controller_uses_bounded_exact_pane_fallback() {
+        let project = tempfile::tempdir().unwrap();
+        let tmux = IsolatedTmux::new();
+        let worker_pane = tmux.add_worker_pane();
+        tmux.ignore_controller_interrupt();
+        let target = seed_root_target(project.path(), &tmux).await;
+        let route = RoutingInfo::window(tmux.window.clone());
+        let _root_invocation = seed_running_invocation(
+            project.path(),
+            "root",
+            route,
+            identity("root", "main", "main", true, Some("root")),
+        )
+        .await;
+        let service = service_for(project.path(), &tmux.session).await;
+
+        let started = Instant::now();
+        let result = service
+            .shutdown_workspace_control_plane()
+            .await
+            .expect("bounded exact-pane fallback retires the unresponsive controller");
+        let elapsed = started.elapsed();
+
+        assert!(elapsed >= Duration::from_secs(2), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+        assert_eq!(result.status, "complete");
+        let tmux_ipc = crate::services::tmux_ipc::TmuxIpc::new(&tmux.session);
+        assert!(tmux_ipc
+            .pane_snapshot(&tmux.session, &target.window_id, &target.pane_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(tmux_ipc.pane_exists(&worker_pane).await.unwrap());
     }
 
     #[tokio::test]
