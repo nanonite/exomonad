@@ -1756,6 +1756,55 @@ elif [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
     e2e_log "Emitted active event-shaped blocker $KANI_BLOCKER_EVENT_ID at ledger sequence $KANI_BLOCKER_RUN_SEQ before controller continuation"
 fi
 
+if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" && "${E2E_BLOCKER_ONLY:-0}" != "1" ]]; then
+    (
+        cd "$AGG_REPO"
+        HOME="$AGG_HOME" "$EXOMONAD_BIN" shutdown --workspace
+    ) > "$AGG_DIR/prior-workspace-shutdown.log" 2>&1 \
+        || { cat "$AGG_DIR/prior-workspace-shutdown.log"; e2e_fail "explicit disposable workspace shutdown did not complete"; }
+    python3 - "$AGG_REPO" <<'PY' \
+        || e2e_fail "explicit workspace shutdown did not retain completion for the exact old controller"
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+target = json.loads((repo / ".exo/tl-loop/root/controller-target.json").read_text())
+shutdown = json.loads((repo / ".exo/controller-lifecycle/workspace-shutdown.json").read_text())
+assert shutdown["phase"] == "complete"
+assert shutdown["target"]["controller_epoch"] == target["controller_epoch"]
+assert shutdown["target"]["window_id"] == target["window_id"]
+assert shutdown["target"]["pane_id"] == target["pane_id"]
+PY
+    for _ in $(seq 1 100); do
+        [[ ! -S "$AGG_REPO/.exo/server.sock" ]] && break
+        sleep 0.1
+    done
+    [[ ! -S "$AGG_REPO/.exo/server.sock" ]] \
+        || e2e_fail "explicit workspace shutdown did not retire the disposable Server socket"
+    tmux kill-window -t "$AGGREGATE_SESSION:Server" 2>/dev/null || true
+    tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_SERVER_COMMAND"
+    tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
+    for _ in $(seq 1 100); do
+        if python3 - "$AGG_REPO/.exo/server.sock" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(0.2)
+client.connect(sys.argv[1])
+client.close()
+PY
+        then
+            break
+        fi
+        sleep 0.1
+    done
+    [[ -S "$AGG_REPO/.exo/server.sock" ]] \
+        || { tmux capture-pane -p -t "$AGGREGATE_SESSION:Server" > "$AGG_DIR/server-pane-no-socket.log" 2>&1 || true; cat "$AGG_DIR/server-pane-no-socket.log"; e2e_fail "Server did not restart after the completed workspace shutdown"; }
+    e2e_log "Completed explicit workspace shutdown and server-only restart before init continuation"
+fi
+
 AGG_INIT_STATUS=0
 if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" && "${E2E_BLOCKER_ONLY:-0}" != "1" ]]; then
     run_init_with_interrupted_handoff
