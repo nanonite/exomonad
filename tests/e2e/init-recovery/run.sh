@@ -430,6 +430,115 @@ assert_one_live_window() {
     [[ "$pane_dead" == "0" ]] || e2e_fail "repeat init returned without a live $role window"
 }
 
+run_init_with_interrupted_handoff() {
+    local startup_path="$AGG_REPO/.exo/tl-loop/root/controller-startup.json"
+    local first_pid first_status phase target window pane pane_pid epoch worker worker_index controller_index
+    local second_pid second_status
+    HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
+        "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
+        > "$AGG_DIR/init-interrupted-handoff.log" 2>&1 &
+    first_pid=$!
+
+    target=""
+    for _ in $(seq 1 300); do
+        if [[ -s "$startup_path" ]]; then
+            target="$(python3 - "$startup_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+intent = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+target = intent.get("target")
+if target and intent.get("phase") in {"target_created", "state_reconciled", "released"}:
+    print(" ".join((
+        target["window_id"], target["pane_id"], str(target["pane_pid"]),
+        intent["controller_epoch"],
+    )))
+PY
+)"
+            [[ -n "$target" ]] && break
+        fi
+        if ! kill -0 "$first_pid" 2>/dev/null; then
+            wait "$first_pid" || first_status=$?
+            cat "$AGG_DIR/init-interrupted-handoff.log"
+            e2e_fail "init exited before the controller startup target was persisted (status ${first_status:-0})"
+        fi
+        sleep 0.05
+    done
+    [[ -n "$target" ]] || e2e_fail "init did not persist a controller startup target within the bounded wait"
+    read -r window pane pane_pid epoch <<< "$target"
+
+    worker="$(tmux split-window -b -d -P -F '#{pane_id}' -t "$pane" -c "$AGG_REPO" 'sleep 300')"
+    [[ -n "$worker" && "$worker" != "$pane" ]] || e2e_fail "shared TL worker pane was not created"
+    controller_index="$(tmux display-message -p -t "$pane" '#{pane_index}')"
+    worker_index="$(tmux display-message -p -t "$worker" '#{pane_index}')"
+    [[ "$worker_index" == "0" && "$controller_index" != "0" ]] \
+        || e2e_fail "shared-pane fixture did not place the worker before the exact controller pane"
+    tmux select-pane -t "$worker"
+    tmux rename-window -t "$window" "Shared TL"
+    kill -STOP "$pane_pid"
+
+    phase=""
+    for _ in $(seq 1 300); do
+        phase="$(python3 - "$startup_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+print(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")).get("phase", ""))
+PY
+        )"
+        [[ "$phase" == "released" ]] && break
+        if ! kill -0 "$first_pid" 2>/dev/null; then
+            wait "$first_pid" || first_status=$?
+            cat "$AGG_DIR/init-interrupted-handoff.log"
+            e2e_fail "init exited before the startup release fence was persisted (status ${first_status:-0})"
+        fi
+        sleep 0.05
+    done
+    [[ "$phase" == "released" ]] || e2e_fail "startup did not reach the released handoff phase"
+    kill -KILL "$first_pid"
+    wait "$first_pid" || first_status=$?
+    [[ -s "$startup_path" ]] || e2e_fail "interrupted init removed the startup intent before ownership commit"
+
+    HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
+        "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
+        > "$AGG_DIR/init.log" 2>&1 &
+    second_pid=$!
+    sleep 0.5
+    if ! kill -0 "$second_pid" 2>/dev/null; then
+        wait "$second_pid" || second_status=$?
+        cat "$AGG_DIR/init.log"
+        e2e_fail "startup recovery did not wait for the exact gated controller target (status ${second_status:-0})"
+    fi
+    kill -CONT "$pane_pid"
+    second_status=0
+    wait "$second_pid" || second_status=$?
+    AGG_INIT_STATUS="$second_status"
+
+    python3 - "$AGG_REPO" "$window" "$pane" "$pane_pid" "$epoch" "$worker" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+window, pane, pane_pid, epoch, worker = sys.argv[2:]
+owner = json.loads((repo / ".exo/tl-loop/root/controller-target.json").read_text())
+assert owner["window_id"] == window and owner["pane_id"] == pane
+assert str(owner["pane_pid"]) == pane_pid and owner["controller_epoch"] == epoch
+assert not (repo / ".exo/tl-loop/root/controller-startup.json").exists()
+assert not (repo / ".exo/tl-loop/root/controller-target.pending.json").exists()
+assert subprocess.run(["tmux", "display-message", "-p", "-t", worker, "#{pane_id}"],
+                      check=True, capture_output=True, text=True).stdout.strip() == worker
+assert subprocess.run(["tmux", "display-message", "-p", "-t", window, "#{pane_id}"],
+                      check=True, capture_output=True, text=True).stdout.strip() == worker
+print(json.dumps({"controller_window": window, "controller_pane": pane,
+                  "worker_pane": worker, "epoch": epoch, "handoff": "reconciled"}))
+PY
+    e2e_log "PASS: init recovered the interrupted released handoff to the same exact controller pane while preserving selected worker pane $worker"
+}
+
 capture_local_edit_state() {
     python3 - "$AGG_REPO" <<'PY'
 import hashlib
@@ -1611,9 +1720,13 @@ elif [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
 fi
 
 AGG_INIT_STATUS=0
-HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
-    "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
-    > "$AGG_DIR/init.log" 2>&1 || AGG_INIT_STATUS=$?
+if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" && "${E2E_BLOCKER_ONLY:-0}" != "1" ]]; then
+    run_init_with_interrupted_handoff
+else
+    HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
+        "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
+        > "$AGG_DIR/init.log" 2>&1 || AGG_INIT_STATUS=$?
+fi
 if [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
     assert_blocked_human_gate_hold "$AGG_INIT_STATUS" "$AGG_DIR/init.log" \
         "$AGG_REPO/.exo/tl-loop/root/controller-output.log"

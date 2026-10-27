@@ -180,34 +180,48 @@ impl<
             .join("worktrees")
             .join(internal_name.as_str());
 
-        // Try direct cleanup via stored window_id (O(1), no listing needed)
-        let mut window_closed = false;
+        // Prefer the exact pane when a route carries both pane and window
+        // metadata; killing the window could also kill its owning controller.
+        let mut target_closed = false;
+        let mut stable_target_found = false;
         for routing_dir in [&agent_config_dir, &worktree_config_dir] {
             if let Ok(routing) = RoutingInfo::read_from_dir(routing_dir).await {
-                if let Some(wid) = routing.window_id {
-                    let tmux = self.tmux()?;
-                    match tmux.kill_window(&wid).await {
-                        Ok(()) => {
-                            info!(identifier, path = %routing_dir.display(), "Closed tmux window via stored window_id");
-                            window_closed = true;
-                            break;
-                        }
-                        Err(e) => {
-                            warn!(identifier, path = %routing_dir.display(), error = %e, "kill_window by stored ID failed, falling back to name match");
-                        }
+                let result = match (&routing.pane_id, &routing.window_id) {
+                    (Some(pane), _) => {
+                        stable_target_found = true;
+                        self.tmux()?.kill_pane(pane).await
+                    }
+                    (None, Some(window)) => {
+                        stable_target_found = true;
+                        self.tmux()?.kill_window(window).await
+                    }
+                    (None, None) => continue,
+                };
+                match result {
+                    Ok(()) => {
+                        info!(identifier, path = %routing_dir.display(), "Closed tmux target by stored route");
+                        target_closed = true;
+                        break;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to close exact tmux target for {identifier}")
+                        });
                     }
                 }
             }
         }
 
-        // Close tmux window if found in list
-        if !window_closed {
+        // Display names are only a legacy cleanup fallback when no stable
+        // routing identity was recorded. A failed exact target is actionable
+        // and must not be redirected to a similarly named window.
+        if !target_closed && !stable_target_found {
             if let Some(target_window) = display_name {
                 let windows = self.get_tmux_windows().await.unwrap_or_default();
                 for window in &windows {
                     if window == &target_window {
                         if let Err(e) = self.close_tmux_window(window).await {
-                            warn!(window_name = %window, error = %e, "Failed to close tmux window (may not exist)");
+                            warn!(window_name = %window, error = %e, "Failed to close legacy tmux window (may not exist)");
                         }
                         break;
                     }

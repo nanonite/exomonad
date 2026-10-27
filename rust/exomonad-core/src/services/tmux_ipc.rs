@@ -439,6 +439,7 @@ fn pane_process_state(
             continue;
         }
         let target_matches = match (window_id, pane_id) {
+            (Some(window), Some(pane)) => fields[1] == window && fields[2] == pane,
             (Some(window), None) => fields[1] == window,
             (None, Some(pane)) => fields[2] == pane,
             _ => false,
@@ -1696,10 +1697,15 @@ impl TmuxIpc {
         }
 
         let listing = String::from_utf8_lossy(&output.stdout);
-        let state = if let Some(window_id) = &routing.window_id {
+        let state = if let Some(pane_id) = &routing.pane_id {
+            pane_process_state(
+                &listing,
+                &self.session_name,
+                routing.window_id.as_ref().map(WindowId::as_str),
+                Some(pane_id.as_str()),
+            )?
+        } else if let Some(window_id) = &routing.window_id {
             pane_process_state(&listing, &self.session_name, Some(window_id.as_str()), None)?
-        } else if let Some(pane_id) = &routing.pane_id {
-            pane_process_state(&listing, &self.session_name, None, Some(pane_id.as_str()))?
         } else {
             None
         };
@@ -1719,13 +1725,15 @@ impl TmuxIpc {
 /// Stable routing IDs are authoritative when present; display-name scans are
 /// only a fallback for legacy entries that have no routing record.
 pub async fn routing_target_alive(routing: &RoutingInfo, tmux: &TmuxIpc) -> Result<bool> {
-    if let Some(window_id) = &routing.window_id {
-        return tmux.window_exists(window_id).await;
+    match (&routing.window_id, &routing.pane_id) {
+        (Some(window_id), Some(pane_id)) => Ok(tmux
+            .pane_snapshot(tmux.session_name(), window_id, pane_id)
+            .await?
+            .is_some()),
+        (Some(window_id), None) => tmux.window_exists(window_id).await,
+        (None, Some(pane_id)) => tmux.pane_exists(pane_id).await,
+        (None, None) => Ok(false),
     }
-    if let Some(pane_id) = &routing.pane_id {
-        return tmux.pane_exists(pane_id).await;
-    }
-    Ok(false)
 }
 
 #[cfg(test)]
@@ -1820,6 +1828,14 @@ mod tests {
         assert_eq!(
             pane_process_state(listing, "other", None, Some("%8")).unwrap(),
             Some(false)
+        );
+        assert_eq!(
+            pane_process_state(listing, "workspace", Some("@3"), Some("%7")).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            pane_process_state(listing, "workspace", Some("@42"), Some("%7")).unwrap(),
+            None
         );
     }
 

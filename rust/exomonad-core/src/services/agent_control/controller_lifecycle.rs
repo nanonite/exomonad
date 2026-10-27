@@ -22,6 +22,8 @@ pub const ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH: &str =
     ".exo/tl-loop/root/controller-target.json";
 pub const ROOT_CONTROLLER_PENDING_OWNERSHIP_RELATIVE_PATH: &str =
     ".exo/tl-loop/root/controller-target.pending.json";
+pub const CONTROLLER_STARTUP_INTENT_RELATIVE_PATH: &str =
+    ".exo/tl-loop/root/controller-startup.json";
 pub const WORKSPACE_SHUTDOWN_RELATIVE_PATH: &str =
     ".exo/controller-lifecycle/workspace-shutdown.json";
 const WORKSPACE_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
@@ -153,6 +155,10 @@ pub fn controller_ownership_path(project_dir: &Path) -> PathBuf {
 
 pub fn pending_controller_ownership_path(project_dir: &Path) -> PathBuf {
     project_dir.join(ROOT_CONTROLLER_PENDING_OWNERSHIP_RELATIVE_PATH)
+}
+
+pub fn controller_startup_intent_path(project_dir: &Path) -> PathBuf {
+    project_dir.join(CONTROLLER_STARTUP_INTENT_RELATIVE_PATH)
 }
 
 pub fn workspace_shutdown_path(project_dir: &Path) -> PathBuf {
@@ -399,8 +405,88 @@ where
         {
             anyhow::bail!("workspace control-plane shutdown is pending; run init --continue to reconcile before dispatch");
         }
+        if controller_startup_handoff_pending(self.project_dir()).await?
+            && decision != ORDERED_CONTROLLER_REGISTRATION_DECISION
+        {
+            anyhow::bail!("controller startup handoff is incomplete; run init --continue to reconcile before dispatch");
+        }
         Ok(guard)
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ControllerStartupFencePhase {
+    Requested,
+    TargetCreated,
+    StateReconciled,
+    Released,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControllerStartupFenceIntent {
+    schema_version: u32,
+    controller_epoch: String,
+    tmux_session: String,
+    tmux_server_pid: u32,
+    tmux_server_start_ticks: u64,
+    continue_mode: bool,
+    #[serde(default)]
+    root_run_id: Option<String>,
+    #[serde(default)]
+    target: Option<ControllerPaneTarget>,
+    phase: ControllerStartupFencePhase,
+}
+
+impl ControllerStartupFenceIntent {
+    fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.schema_version == 1
+                && !self.controller_epoch.trim().is_empty()
+                && !self.tmux_session.trim().is_empty()
+                && self.tmux_server_pid > 0
+                && self.tmux_server_start_ticks > 0,
+            "controller startup handoff intent is incomplete or unsupported"
+        );
+        if self.continue_mode {
+            anyhow::ensure!(
+                self.root_run_id
+                    .as_deref()
+                    .is_some_and(|run_id| !run_id.trim().is_empty()),
+                "continued controller startup handoff lacks its accepted root identity"
+            );
+        }
+        match (&self.target, &self.phase) {
+            (None, ControllerStartupFencePhase::Requested) => {}
+            (Some(target), ControllerStartupFencePhase::TargetCreated)
+            | (Some(target), ControllerStartupFencePhase::StateReconciled)
+            | (Some(target), ControllerStartupFencePhase::Released) => {
+                target.validate()?;
+                anyhow::ensure!(
+                    target.controller_epoch == self.controller_epoch
+                        && target.tmux_session == self.tmux_session
+                        && target.tmux_server_pid == self.tmux_server_pid
+                        && target.tmux_server_start_ticks == self.tmux_server_start_ticks,
+                    "controller startup handoff target conflicts with its durable identity"
+                );
+            }
+            _ => anyhow::bail!("controller startup handoff phase and target disagree"),
+        }
+        Ok(())
+    }
+}
+
+async fn controller_startup_handoff_pending(project_dir: &Path) -> Result<bool> {
+    let path = controller_startup_intent_path(project_dir);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let intent: ControllerStartupFenceIntent = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse controller startup handoff fence {}", path.display()))?;
+    intent.validate()?;
+    Ok(true)
 }
 
 async fn completed_shutdown_allows_controller_registration(
@@ -506,12 +592,17 @@ async fn collect_shared_controller_bindings(
         let Some(invocation) = invocation::read_invocation(&agent_dir).await? else {
             continue;
         };
-        if !invocation.is_live()
-            || invocation.routing.window_id.as_ref().map(WindowId::as_str)
-                != Some(target.window_id.as_str())
-            || invocation.routing.pane_id.is_some()
+        if !invocation.is_live() || invocation.routing.window_id.as_ref() != Some(&target.window_id)
         {
             continue;
+        }
+        match invocation.routing.pane_id.as_ref() {
+            Some(pane_id) if pane_id == &target.pane_id => {}
+            Some(_) => continue,
+            None if agent_id == "root" => {}
+            None => anyhow::bail!(
+                "live invocation {agent_id} shares the controller window without an exact pane binding"
+            ),
         }
         if agent_id != "root" {
             let identity = identities.get(&agent_id).context(
@@ -594,12 +685,17 @@ async fn count_worker_panes(project_dir: &Path, target: &ControllerPaneOwnership
         let Some(invocation) = invocation::read_invocation(&agent_dir).await? else {
             continue;
         };
-        if invocation.is_live()
-            && invocation.routing.window_id.as_ref().map(WindowId::as_str)
-                == Some(target.window_id.as_str())
-            && invocation.routing.pane_id.is_some()
+        if invocation.is_live() && invocation.routing.window_id.as_ref() == Some(&target.window_id)
         {
-            count = count.saturating_add(1);
+            match invocation.routing.pane_id.as_ref() {
+                Some(pane_id) if pane_id == &target.pane_id => {}
+                Some(_) => count = count.saturating_add(1),
+                None if entry.file_name() == "root" => {}
+                None => anyhow::bail!(
+                    "live invocation {} shares the controller window without an exact pane binding",
+                    entry.file_name().to_string_lossy()
+                ),
+            }
         }
     }
     Ok(count)
@@ -727,8 +823,9 @@ async fn finish_controller_binding(
     if !current.is_live() {
         return Ok(());
     }
+    let legacy_root_window_route = binding.agent_id == "root" && current.routing.pane_id.is_none();
     if current.routing.window_id.as_ref() != Some(&target.window_id)
-        || current.routing.pane_id.is_some()
+        || (current.routing.pane_id.as_ref() != Some(&target.pane_id) && !legacy_root_window_route)
     {
         anyhow::bail!(
             "controller route changed during workspace shutdown; preserving current owner"
@@ -1093,6 +1190,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_permit_stays_fenced_until_startup_handoff_is_removed() {
+        let project = tempfile::tempdir().unwrap();
+        let service = service_for(project.path(), "workspace").await;
+        let startup_path = project
+            .path()
+            .join(".exo/tl-loop/root/controller-startup.json");
+        tokio::fs::create_dir_all(startup_path.parent().unwrap())
+            .await
+            .unwrap();
+        // This test has no workspace-shutdown marker: the startup intent itself
+        // must continue fencing ordinary dispatch after init archives shutdown.
+        for continue_mode in [false, true] {
+            for phase in [
+                "requested",
+                "target_created",
+                "state_reconciled",
+                "released",
+            ] {
+                let target = ControllerPaneTarget {
+                    schema_version: 1,
+                    controller_epoch: "epoch-1".to_owned(),
+                    tmux_session: "workspace".to_owned(),
+                    window_id: WindowId::parse("@7").unwrap(),
+                    pane_id: PaneId::parse("%9").unwrap(),
+                    pane_pid: 123,
+                    pane_start_ticks: 456,
+                    tmux_server_pid: 321,
+                    tmux_server_start_ticks: 654,
+                };
+                let target_value = if phase == "requested" {
+                    serde_json::Value::Null
+                } else {
+                    let ownership = target.with_run_id("run-1");
+                    tokio::fs::write(
+                        pending_controller_ownership_path(project.path()),
+                        serde_json::to_vec(&ownership).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                    if phase == "released" {
+                        tokio::fs::write(
+                            controller_ownership_path(project.path()),
+                            serde_json::to_vec(&ownership).unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    serde_json::to_value(target).unwrap()
+                };
+                tokio::fs::write(
+                    &startup_path,
+                    serde_json::to_vec(&serde_json::json!({
+                        "schema_version": 1,
+                        "controller_epoch": "epoch-1",
+                        "previous_controller_epoch": null,
+                        "tmux_session": "workspace",
+                        "tmux_server_pid": 321,
+                        "tmux_server_start_ticks": 654,
+                        "continue_mode": continue_mode,
+                        "root_run_id": if continue_mode { Some("run-1") } else { None },
+                        "target": target_value,
+                        "phase": phase
+                    }))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+                let error = service
+                    .acquire_dispatch_permit("start another worker")
+                    .await
+                    .expect_err("ordinary dispatch remains fenced until startup commits");
+                assert!(error.to_string().contains("controller startup handoff"));
+                drop(
+                    service
+                        .acquire_dispatch_permit("register an ordered sub-TL controller invocation")
+                        .await
+                        .expect("ordered controller registration can reconcile startup"),
+                );
+            }
+        }
+
+        tokio::fs::remove_file(startup_path).await.unwrap();
+        drop(
+            service
+                .acquire_dispatch_permit("start another worker")
+                .await
+                .expect("dispatch resumes after startup handoff is committed"),
+        );
+    }
+
+    #[tokio::test]
     #[serial_test::serial]
     async fn workspace_shutdown_stops_only_verified_controller_and_is_idempotent() {
         let project = tempfile::tempdir().unwrap();
@@ -1100,7 +1289,7 @@ mod tests {
         let worker_pane = tmux.add_worker_pane();
         tmux.retain_exited_panes();
         let target = seed_root_target(project.path(), &tmux).await;
-        let mut root_route = RoutingInfo::window(tmux.window.clone());
+        let root_route = RoutingInfo::window_pane(tmux.window.clone(), target.pane_id.clone());
         let _root_invocation = seed_running_invocation(
             project.path(),
             "root",
@@ -1143,8 +1332,6 @@ mod tests {
             identity("worker-codex", "main", "main", false, None),
         )
         .await;
-        root_route.parent_tab = None;
-
         let service = service_for(project.path(), &tmux.session).await;
         let result = service
             .shutdown_workspace_control_plane()

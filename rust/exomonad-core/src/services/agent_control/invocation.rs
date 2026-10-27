@@ -5,7 +5,7 @@
 //! the identity, worktree, branch, PR, or inbox. The mutation lock plus
 //! atomic rename keep a stale process exit from overwriting a newer attempt.
 
-use super::{AgentType, RoutingInfo};
+use super::{read_controller_target_for_routing, AgentType, RoutingInfo};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -471,12 +471,47 @@ pub(crate) async fn routing_owner_matches_invocation_or_parent(
     let Some(parent_invocation) = read_locked(&parent_dir).await? else {
         return Ok(false);
     };
-    Ok(parent_invocation.is_live()
-        && parent_invocation.invocation_id == owner.invocation_id
-        && parent_invocation.generation == owner.generation
-        && parent_invocation
-            .routing
-            .same_delivery_target(delivery_target))
+    if !parent_invocation.is_live()
+        || parent_invocation.invocation_id != owner.invocation_id
+        || parent_invocation.generation != owner.generation
+    {
+        return Ok(false);
+    }
+    if parent_invocation
+        .routing
+        .same_delivery_target(delivery_target)
+    {
+        return Ok(true);
+    }
+    parent_window_route_matches_exact_controller_pane(
+        agent_dir,
+        &parent_invocation.routing,
+        delivery_target,
+    )
+    .await
+}
+
+async fn parent_window_route_matches_exact_controller_pane(
+    agent_dir: &Path,
+    parent_routing: &RoutingInfo,
+    delivery_target: &RoutingInfo,
+) -> Result<bool> {
+    if parent_routing.pane_id.is_some()
+        || delivery_target.pane_id.is_none()
+        || parent_routing.window_id != delivery_target.window_id
+    {
+        return Ok(false);
+    }
+    let project_dir = agent_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .context("agent directory is outside the project registry")?;
+    let target = read_controller_target_for_routing(project_dir).await?;
+    Ok(
+        Some(&target.window_id) == delivery_target.window_id.as_ref()
+            && Some(&target.pane_id) == delivery_target.pane_id.as_ref(),
+    )
 }
 
 async fn require_expected_live_invocation(
@@ -1077,10 +1112,12 @@ pub(crate) async fn finish_invocation_after_controller_pane_stopped(
     if !current.is_live() {
         return Ok(current);
     }
+    let legacy_root_window_route =
+        agent_id_from_dir(agent_dir)? == "root" && current.routing.pane_id.is_none();
     if current.routing.window_id.as_ref() != Some(&target.window_id)
-        || current.routing.pane_id.is_some()
+        || (current.routing.pane_id.as_ref() != Some(&target.pane_id) && !legacy_root_window_route)
     {
-        anyhow::bail!("controller invocation no longer uses the accepted shared TL route");
+        anyhow::bail!("controller invocation no longer uses the accepted shared TL pane");
     }
     let server = tmux.server_identity().await?;
     if server.pid != target.tmux_server_pid || server.start_ticks != target.tmux_server_start_ticks

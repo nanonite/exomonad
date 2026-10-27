@@ -1,4 +1,26 @@
 aggregate_tl_panes() {
+    local ownership window pane
+    if [[ -n "${AGG_REPO:-}" ]]; then
+        ownership="$AGG_REPO/.exo/tl-loop/root/controller-target.json"
+    else
+        ownership=""
+    fi
+    if [[ -n "$ownership" && -s "$ownership" ]]; then
+        read -r window pane < <(python3 - "$ownership" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+owner = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(owner["window_id"], owner["pane_id"])
+PY
+)
+        tmux list-panes -s -t "$AGGREGATE_SESSION" \
+            -F '#{window_name} #{window_id} #{pane_id} #{pane_dead}' \
+            | awk -v owner_window="$window" -v owner_pane="$pane" \
+                '($2 == owner_window && $3 == owner_pane) || ($1 == "TL" && $2 != owner_window) { print $2, $3, $4 }'
+        return
+    fi
     tmux list-panes -s -t "$AGGREGATE_SESSION" \
         -F '#{window_name} #{window_id} #{pane_id} #{pane_dead}' \
         | awk '$1 == "TL" { print $2, $3, $4 }'

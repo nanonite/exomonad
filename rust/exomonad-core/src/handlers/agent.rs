@@ -5549,11 +5549,14 @@ fn invocation_is_fresh(previous: Option<&InvocationRecord>, current: &Invocation
 }
 
 fn invocation_target_label(invocation: &InvocationRecord) -> String {
+    if let Some(pane_id) = invocation.routing.pane_id.as_ref() {
+        return match invocation.routing.window_id.as_ref() {
+            Some(window_id) => format!("pane {pane_id} in window {window_id}"),
+            None => format!("pane {pane_id}"),
+        };
+    }
     if let Some(window_id) = invocation.routing.window_id.as_ref() {
         return format!("window {window_id}");
-    }
-    if let Some(pane_id) = invocation.routing.pane_id.as_ref() {
-        return format!("pane {pane_id}");
     }
     "unresolved target".to_string()
 }
@@ -5565,10 +5568,10 @@ fn invocation_handoff_to_proto(
     ready: bool,
     outcome: &str,
 ) -> InvocationHandoff {
-    let (target_type, target_id) = if let Some(window_id) = invocation.routing.window_id.as_ref() {
-        ("window", window_id.to_string())
-    } else if let Some(pane_id) = invocation.routing.pane_id.as_ref() {
+    let (target_type, target_id) = if let Some(pane_id) = invocation.routing.pane_id.as_ref() {
         ("pane", pane_id.to_string())
+    } else if let Some(window_id) = invocation.routing.window_id.as_ref() {
+        ("window", window_id.to_string())
     } else {
         ("none", String::new())
     };

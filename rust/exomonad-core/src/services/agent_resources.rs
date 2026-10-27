@@ -223,19 +223,28 @@ async fn close_agent_tmux_window(project_dir: &Path, agent_slug: &str, worktree_
         let Ok(routing) = RoutingInfo::read_from_dir(&routing_dir).await else {
             continue;
         };
-        let Some(window_id) = routing.window_id else {
-            debug!(path = %routing_dir.display(), agent = agent_slug, "Agent routing has no tmux window id");
-            continue;
+        let (target_kind, target_id) = match (&routing.pane_id, &routing.window_id) {
+            (Some(pane), _) => ("pane", pane.as_str().to_owned()),
+            (None, Some(window)) => ("window", window.as_str().to_owned()),
+            (None, None) => {
+                debug!(path = %routing_dir.display(), agent = agent_slug, "Agent routing has no tmux target");
+                continue;
+            }
         };
 
         let tmux = TmuxIpc::new("");
-        match tmux.kill_window(&window_id).await {
+        let result = match (&routing.pane_id, &routing.window_id) {
+            (Some(pane), _) => tmux.kill_pane(pane).await,
+            (None, Some(window)) => tmux.kill_window(window).await,
+            (None, None) => continue,
+        };
+        match result {
             Ok(()) => {
-                info!(agent = agent_slug, window = %window_id, path = %routing_dir.display(), "Closed agent tmux window before worktree removal");
+                info!(agent = agent_slug, target_kind, target = %target_id, path = %routing_dir.display(), "Closed agent tmux target before worktree removal");
                 return;
             }
             Err(error) => {
-                warn!(agent = agent_slug, window = %window_id, path = %routing_dir.display(), error = %error, "Failed to close agent tmux window before worktree removal");
+                warn!(agent = agent_slug, target_kind, target = %target_id, path = %routing_dir.display(), error = %error, "Failed to close agent tmux target before worktree removal");
             }
         }
     }

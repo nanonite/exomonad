@@ -615,20 +615,7 @@ async fn kill_agent_window(
         return false;
     }
 
-    if let Some(window_id) = &routing.window_id {
-        let target = format!("{}:{}", session, window_id.as_str());
-        let status = tmux.kill_window(window_id).await;
-        match status {
-            Ok(()) => {
-                info!(agent = %slug, target = %target, "Cleaned exited agent window");
-                true
-            }
-            Err(e) => {
-                warn!(agent = %slug, error = %e, "Failed to run tmux kill-window");
-                false
-            }
-        }
-    } else if let Some(pane_id) = &routing.pane_id {
+    if let Some(pane_id) = &routing.pane_id {
         let target = format!("{}:{}", session, pane_id.as_str());
         let status = tmux.kill_pane(pane_id).await;
         match status {
@@ -638,6 +625,19 @@ async fn kill_agent_window(
             }
             Err(e) => {
                 warn!(agent = %slug, error = %e, "Failed to run tmux kill-pane");
+                false
+            }
+        }
+    } else if let Some(window_id) = &routing.window_id {
+        let target = format!("{}:{}", session, window_id.as_str());
+        let status = tmux.kill_window(window_id).await;
+        match status {
+            Ok(()) => {
+                info!(agent = %slug, target = %target, "Cleaned exited agent window");
+                true
+            }
+            Err(e) => {
+                warn!(agent = %slug, error = %e, "Failed to run tmux kill-window");
                 false
             }
         }

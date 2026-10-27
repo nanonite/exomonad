@@ -26,8 +26,8 @@ pub use controller_lifecycle::{
     persist_pending_controller_ownership, read_controller_ownership,
     read_controller_target_for_routing, ControllerPaneOwnership, ControllerPaneTarget,
     WorkspaceShutdownIntent, WorkspaceShutdownPhase, WorkspaceShutdownResult,
-    ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH, ROOT_CONTROLLER_PENDING_OWNERSHIP_RELATIVE_PATH,
-    WORKSPACE_SHUTDOWN_RELATIVE_PATH,
+    CONTROLLER_STARTUP_INTENT_RELATIVE_PATH, ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH,
+    ROOT_CONTROLLER_PENDING_OWNERSHIP_RELATIVE_PATH, WORKSPACE_SHUTDOWN_RELATIVE_PATH,
 };
 pub use invocation::{
     finish_invocation, finish_invocation_and_tombstone,

@@ -859,6 +859,23 @@ impl RoutingInfo {
         }
     }
 
+    /// Address one pane inside a window without relying on that window's
+    /// selected pane. The window remains available for scope and ownership
+    /// checks; consumers must prefer the exact pane as the destination.
+    pub fn window_pane(
+        window_id: crate::services::tmux_ipc::WindowId,
+        pane_id: crate::services::tmux_ipc::PaneId,
+    ) -> Self {
+        Self {
+            window_id: Some(window_id),
+            pane_id: Some(pane_id),
+            parent_tab: None,
+            owner_agent_id: None,
+            owner_invocation_id: None,
+            owner_generation: None,
+        }
+    }
+
     pub fn pane(pane_id: crate::services::tmux_ipc::PaneId, parent_tab: &str) -> Self {
         Self {
             window_id: None,

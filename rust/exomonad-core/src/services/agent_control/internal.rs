@@ -844,7 +844,7 @@ impl<
                 "exact root controller pane is stopped; ordered sub-TL routing is blocked"
             );
         }
-        Ok(RoutingInfo::window(target.window_id))
+        Ok(RoutingInfo::window_pane(target.window_id, target.pane_id))
     }
 
     pub(crate) fn runtime_role_context(&self, role: &crate::domain::Role) -> Result<String> {
@@ -2461,6 +2461,77 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn ordered_controller_route_keeps_owned_pane_when_worker_is_selected() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        let tmux = OrderedTestTmux::new();
+        let window = tmux.window_id_for_session();
+        let panes = super::super::tmux_ipc::TmuxIpc::new(&tmux.session)
+            .pane_snapshots()
+            .await
+            .unwrap();
+        let worker = panes
+            .iter()
+            .find(|pane| pane.window_id == window)
+            .unwrap()
+            .pane_id
+            .clone();
+        let controller = tmux.split_pane(&window);
+        tmux.rename_window(&window, "renamed-controller");
+        tmux.select_pane(&worker);
+        persist_test_controller_ownership_for_pane(
+            &project_dir,
+            &tmux.session,
+            &window,
+            &controller,
+        )
+        .await;
+        let service = ordered_service_using_tmux_route(&project_dir, &tmux.session, &window).await;
+
+        let route = service
+            .ordered_sub_tl_routing()
+            .await
+            .expect("controller route survives worker selection and window rename");
+
+        assert_eq!(route.window_id.as_ref(), Some(&window));
+        assert_eq!(route.pane_id.as_ref(), Some(&controller));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordered_controller_route_is_not_live_when_only_worker_pane_survives() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        let tmux = OrderedTestTmux::new();
+        let window = tmux.window_id_for_session();
+        let panes = super::super::tmux_ipc::TmuxIpc::new(&tmux.session)
+            .pane_snapshots()
+            .await
+            .unwrap();
+        let worker = panes
+            .iter()
+            .find(|pane| pane.window_id == window)
+            .unwrap()
+            .pane_id
+            .clone();
+        let controller = tmux.split_pane(&window);
+        persist_test_controller_ownership_for_pane(
+            &project_dir,
+            &tmux.session,
+            &window,
+            &controller,
+        )
+        .await;
+        tmux.kill_pane(&controller);
+        let service = ordered_service_using_tmux_route(&project_dir, &tmux.session, &window).await;
+        let ipc = super::super::tmux_ipc::TmuxIpc::new(&tmux.session);
+
+        assert!(ipc.pane_exists(&worker).await.unwrap());
+        assert!(service.ordered_sub_tl_routing().await.is_err());
+    }
+
+    #[tokio::test]
     async fn ordered_sub_tl_provisioning_is_idempotent_and_rejects_conflicts() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = temp.path().to_path_buf();
@@ -3012,6 +3083,21 @@ mod tests {
             .expect("tmux returns a valid window ID")
         }
 
+        fn pane_index(&self, pane_id: &super::super::tmux_ipc::PaneId) -> String {
+            let output = Self::command(&self.socket)
+                .args([
+                    "display-message",
+                    "-p",
+                    "-t",
+                    pane_id.as_str(),
+                    "#{pane_index}",
+                ])
+                .output()
+                .expect("read isolated pane index");
+            assert!(output.status.success(), "tmux reports the pane index");
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+
         fn kill_target(&self, target: &super::super::tmux_ipc::WindowId) {
             let status = Self::command(&self.socket)
                 .args(["kill-window", "-t", target.as_str()])
@@ -3030,6 +3116,46 @@ mod tests {
                 .status()
                 .expect("rename isolated tmux window");
             assert!(status.success(), "isolated window rename succeeds");
+        }
+
+        fn split_pane(
+            &self,
+            window: &super::super::tmux_ipc::WindowId,
+        ) -> super::super::tmux_ipc::PaneId {
+            let output = Self::command(&self.socket)
+                .args([
+                    "split-window",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-t",
+                    window.as_str(),
+                    "sh",
+                    "-c",
+                    "sleep 300",
+                ])
+                .output()
+                .expect("split isolated controller pane");
+            assert!(output.status.success(), "controller pane starts");
+            super::super::tmux_ipc::PaneId::parse(String::from_utf8_lossy(&output.stdout).trim())
+                .expect("tmux returns a valid controller pane ID")
+        }
+
+        fn select_pane(&self, pane: &super::super::tmux_ipc::PaneId) {
+            let status = Self::command(&self.socket)
+                .args(["select-pane", "-t", pane.as_str()])
+                .status()
+                .expect("select isolated worker pane");
+            assert!(status.success(), "worker pane becomes selected");
+        }
+
+        fn kill_pane(&self, pane: &super::super::tmux_ipc::PaneId) {
+            let status = Self::command(&self.socket)
+                .args(["kill-pane", "-t", pane.as_str()])
+                .status()
+                .expect("remove isolated controller pane");
+            assert!(status.success(), "controller pane is removed");
         }
 
         fn restart_session_with_tl(&self) -> super::super::tmux_ipc::WindowId {
@@ -3139,6 +3265,36 @@ mod tests {
         super::persist_controller_ownership(project_dir, &owner)
             .await
             .expect("persist test controller ownership");
+    }
+
+    async fn persist_test_controller_ownership_for_pane(
+        project_dir: &Path,
+        session: &str,
+        controller_window: &super::super::tmux_ipc::WindowId,
+        controller_pane: &super::super::tmux_ipc::PaneId,
+    ) {
+        let root = project_dir.join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).expect("create test root checkpoint directory");
+        std::fs::write(root.join("run.json"), r#"{"run_id":"root"}"#)
+            .expect("write test root run identity");
+        std::fs::write(
+            project_dir.join(".exo/tl-loop/root.controller-epoch"),
+            "test-epoch\n",
+        )
+        .expect("write test controller epoch");
+        let tmux = super::super::tmux_ipc::TmuxIpc::new(session);
+        let owner = super::capture_controller_ownership(
+            &tmux,
+            "test-epoch",
+            "root",
+            controller_window.clone(),
+            controller_pane.clone(),
+        )
+        .await
+        .expect("capture exact test controller target");
+        super::persist_controller_ownership(project_dir, &owner)
+            .await
+            .expect("persist exact test controller target");
     }
 
     fn invocation_start_count(project_dir: &Path, agent_id: &str, invocation_id: &str) -> usize {
@@ -3867,7 +4023,29 @@ mod tests {
         .unwrap();
 
         let tmux = OrderedTestTmux::new();
-        let target = tmux.new_target("TL");
+        let target = tmux.window_id_for_session();
+        let panes = super::super::tmux_ipc::TmuxIpc::new(&tmux.session)
+            .pane_snapshots()
+            .await
+            .unwrap();
+        let worker = panes
+            .iter()
+            .find(|pane| pane.window_id == target)
+            .unwrap()
+            .pane_id
+            .clone();
+        let controller = tmux.split_pane(&target);
+        tmux.rename_window(&target, "renamed-controller");
+        tmux.select_pane(&worker);
+        assert_eq!(tmux.pane_index(&worker), "0");
+        assert_eq!(tmux.pane_index(&controller), "1");
+        persist_test_controller_ownership_for_pane(
+            &project_dir,
+            &tmux.session,
+            &target,
+            &controller,
+        )
+        .await;
         let routing = RoutingInfo::window(target.clone());
         let root_invocation = invocation::start_invocation_with_provenance(
             &root_dir,
@@ -3910,13 +4088,28 @@ mod tests {
             .await
             .provision_ordered_sub_tl(child.clone())
             .await
-            .expect("the child can share its declared parent TL delivery window");
+            .expect("the child can share the exact parent controller pane");
         let repeated_id = ordered_service_using_tmux_route(&project_dir, &tmux.session, &target)
             .await
             .provision_ordered_sub_tl(child.clone())
             .await
             .expect("the parent-owned window remains a valid shared delivery target");
         assert_eq!(first_id, repeated_id);
+        let child_invocation = read_invocation(&project_dir.join(".exo/agents/ordered-child"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child_invocation.routing.window_id, Some(target.clone()));
+        assert_eq!(child_invocation.routing.pane_id, Some(controller.clone()));
+        assert!(tmux_ipc.pane_exists(&worker).await.unwrap());
+        let selected = OrderedTestTmux::command(&tmux.socket)
+            .args(["display-message", "-p", "-t", target.as_str(), "#{pane_id}"])
+            .output()
+            .expect("read selected pane after child provisioning");
+        assert_eq!(
+            String::from_utf8_lossy(&selected.stdout).trim(),
+            worker.as_str()
+        );
         let owner = tmux_ipc.routing_owner_state(&routing).await.unwrap();
         assert!(
             matches!(owner, super::super::tmux_ipc::RoutingOwnerState::Owned(ref owner)
@@ -3925,7 +4118,7 @@ mod tests {
                 && owner.generation == root_invocation.generation)
         );
 
-        let mut conflicting_parent = root_identity;
+        let mut conflicting_parent = root_identity.clone();
         conflicting_parent.birth_branch = BirthBranch::try_from_str("main.other-parent").unwrap();
         std::fs::write(
             root_dir.join("identity.json"),
@@ -3934,7 +4127,7 @@ mod tests {
         .unwrap();
         let error = ordered_service_using_tmux_route(&project_dir, &tmux.session, &target)
             .await
-            .provision_ordered_sub_tl(child)
+            .provision_ordered_sub_tl(child.clone())
             .await
             .expect_err("a shared pane owned by an unrelated parent must remain blocked");
         assert_eq!(
@@ -3944,6 +4137,48 @@ mod tests {
                 .code(),
             "ordered_sub_tl_ownership_conflict"
         );
+
+        std::fs::write(
+            root_dir.join("identity.json"),
+            serde_json::to_vec_pretty(&root_identity).unwrap(),
+        )
+        .unwrap();
+        let before_pane_loss = read_invocation(&project_dir.join(".exo/agents/ordered-child"))
+            .await
+            .unwrap()
+            .unwrap();
+        tmux.kill_pane(&controller);
+        assert!(tmux_ipc.pane_exists(&worker).await.unwrap());
+        let unavailable = ordered_service_using_tmux_route(&project_dir, &tmux.session, &target)
+            .await
+            .provision_ordered_sub_tl(child)
+            .await
+            .expect_err("a surviving worker pane cannot substitute for the controller pane");
+        assert!(format!("{unavailable:#}").contains("exact root controller pane is stopped"));
+        let after_pane_loss = read_invocation(&project_dir.join(".exo/agents/ordered-child"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after_pane_loss.invocation_id,
+            before_pane_loss.invocation_id
+        );
+        assert!(
+            !super::super::tmux_ipc::routing_target_alive(&after_pane_loss.routing, &tmux_ipc)
+                .await
+                .unwrap(),
+            "the stored controller route is not live when only the worker pane remains"
+        );
+        assert_eq!(
+            invocation_start_count(
+                &project_dir,
+                "ordered-child",
+                &before_pane_loss.invocation_id
+            ),
+            1,
+            "controller pane loss cannot create a replacement invocation"
+        );
+        assert!(tmux_ipc.pane_exists(&worker).await.unwrap());
     }
 
     #[tokio::test]

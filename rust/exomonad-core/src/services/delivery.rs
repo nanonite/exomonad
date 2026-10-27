@@ -7,6 +7,7 @@ use crate::services::tmux_events;
 use crate::services::{
     GuidanceBatch, GuidanceBatchRequest, GuidanceIdentity, GuidanceItemInput, QueueClass,
 };
+use anyhow::Context;
 use claude_teams_bridge as teams_mailbox;
 use claude_teams_bridge::TeamRegistry;
 use exomonad_proto::effects::events::{event, AgentMessage, Event};
@@ -28,11 +29,17 @@ pub enum DeliveryResult {
     Failed,
 }
 
-fn routing_tmux_target(routing: &serde_json::Value) -> Option<String> {
-    routing["pane_id"]
-        .as_str()
-        .or_else(|| routing["window_id"].as_str())
-        .map(ToOwned::to_owned)
+fn routing_tmux_target(routing: &RoutingInfo) -> Option<String> {
+    routing
+        .pane_id
+        .as_ref()
+        .map(|pane_id| pane_id.as_str().to_owned())
+        .or_else(|| {
+            routing
+                .window_id
+                .as_ref()
+                .map(|window_id| window_id.as_str().to_owned())
+        })
 }
 
 fn agent_type_from_key(agent_key: &str) -> crate::services::AgentType {
@@ -92,14 +99,58 @@ async fn mark_agent_exited(agent_dir: &std::path::Path, expected_target: &str) {
 }
 
 fn routing_matches_tmux_target(routing: &RoutingInfo, expected_target: &str) -> bool {
-    routing
-        .pane_id
-        .as_ref()
-        .is_some_and(|pane_id| pane_id.as_str() == expected_target)
-        || routing
+    match routing.pane_id.as_ref() {
+        Some(pane_id) => pane_id.as_str() == expected_target,
+        None => routing
             .window_id
             .as_ref()
-            .is_some_and(|window_id| window_id.as_str() == expected_target)
+            .is_some_and(|window_id| window_id.as_str() == expected_target),
+    }
+}
+
+async fn exact_root_controller_routing(
+    project_dir: &std::path::Path,
+    tmux_session: &str,
+) -> anyhow::Result<RoutingInfo> {
+    let owner = crate::services::agent_control::read_controller_target_for_routing(project_dir)
+        .await
+        .context("read exact root controller ownership for guidance")?;
+    anyhow::ensure!(
+        owner.tmux_session == tmux_session,
+        "root controller ownership names a different tmux session"
+    );
+    let tmux = crate::services::tmux_ipc::TmuxIpc::new(tmux_session);
+    anyhow::ensure!(
+        crate::services::agent_control::controller_ownership_is_live(project_dir, &tmux, &owner)
+            .await
+            .context("validate exact root controller ownership for guidance")?,
+        "exact root controller pane is not live"
+    );
+
+    let root_routing_path = project_dir.join(".exo/agents/root/routing.json");
+    match tokio::fs::read(&root_routing_path).await {
+        Ok(bytes) => {
+            let recorded: RoutingInfo = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse {}", root_routing_path.display()))?;
+            anyhow::ensure!(
+                recorded
+                    .window_id
+                    .as_ref()
+                    .is_none_or(|window| window == &owner.window_id)
+                    && recorded
+                        .pane_id
+                        .as_ref()
+                        .is_none_or(|pane| pane == &owner.pane_id)
+                    && (recorded.window_id.is_some() || recorded.pane_id.is_some()),
+                "root routing conflicts with exact controller pane ownership"
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", root_routing_path.display()));
+        }
+    }
+    Ok(RoutingInfo::window_pane(owner.window_id, owner.pane_id))
 }
 
 async fn tmux_target_alive(target: &str) -> Result<bool, String> {
@@ -154,16 +205,31 @@ async fn current_tmux_pane_target(target: &str) -> Option<String> {
 async fn routing_target_alive_or_cleanup(
     project_dir: &std::path::Path,
     agent_dir_name: &str,
-    target: &str,
+    routing: &RoutingInfo,
     agent_key: &str,
     from: &crate::domain::AgentName,
 ) -> bool {
-    match tmux_target_alive(target).await {
+    let Some(target) = routing_tmux_target(routing) else {
+        return false;
+    };
+    let session = match std::env::var("EXOMONAD_TMUX_SESSION") {
+        Ok(session) if !session.trim().is_empty() => session,
+        Ok(_) => {
+            warn!(agent = %agent_key, "EXOMONAD_TMUX_SESSION is empty");
+            return false;
+        }
+        Err(error) => {
+            warn!(agent = %agent_key, %error, "EXOMONAD_TMUX_SESSION is unavailable");
+            return false;
+        }
+    };
+    let tmux = crate::services::tmux_ipc::TmuxIpc::new(&session);
+    match tmux.routing_target_process_alive(routing).await {
         Ok(true) => true,
         Ok(false) => {
             let agent_dir = project_dir.join(".exo/agents").join(agent_dir_name);
-            mark_agent_exited(&agent_dir, target).await;
-            let detail = worker_gone_detail(agent_key, target);
+            mark_agent_exited(&agent_dir, &target).await;
+            let detail = worker_gone_detail(agent_key, &target);
             tracing::info!(
                 otel.name = "message.delivery",
                 agent_id = %from,
@@ -1325,32 +1391,72 @@ async fn deliver_via_tmux(
                         format!("{}-{}", agent_key, suffix),
                     ]
                 }),
-        );
+        )
+        .collect::<Vec<_>>();
 
     let mut routing_target = None;
     let mut routing_parent_tab = None;
     let mut matched_dir_name = None;
-    for dir_name in routing_candidates {
-        let path = agents_dir.join(&dir_name).join("routing.json");
-        if let Ok(content) = tokio::fs::read_to_string(&path).await {
-            if let Ok(routing) = serde_json::from_str::<serde_json::Value>(&content) {
-                let target = routing_tmux_target(&routing);
-
-                if let Some(t) = target {
-                    routing_target = Some(t);
-                    routing_parent_tab = routing["parent_tab"].as_str().map(|s| s.to_string());
-                    matched_dir_name = Some(dir_name.clone());
-                    break;
+    if slug == "root" {
+        let session = match std::env::var("EXOMONAD_TMUX_SESSION") {
+            Ok(session) if !session.trim().is_empty() => session,
+            _ => return DeliveryResult::Failed,
+        };
+        match exact_root_controller_routing(project_dir, &session).await {
+            Ok(routing) => {
+                if let Some(target) = routing_tmux_target(&routing) {
+                    routing_target = Some((target, routing));
+                    matched_dir_name = Some("root".to_owned());
                 }
+            }
+            Err(error) => {
+                warn!(agent = %agent_key, %error, "refusing controller delivery without exact live pane ownership");
+                return DeliveryResult::Failed;
             }
         }
     }
 
-    if let Some(target) = routing_target {
+    for dir_name in routing_candidates.iter().filter(|_| slug != "root") {
+        let path = agents_dir.join(dir_name).join("routing.json");
+        let content = match tokio::fs::read_to_string(&path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                warn!(agent = %agent_key, path = %path.display(), %error, "could not read persisted routing");
+                return DeliveryResult::Failed;
+            }
+        };
+        let routing = match serde_json::from_str::<RoutingInfo>(&content) {
+            Ok(routing) => routing,
+            Err(error) => {
+                warn!(agent = %agent_key, path = %path.display(), %error, "persisted routing is malformed");
+                return DeliveryResult::Failed;
+            }
+        };
+        if identity_requires_exact_controller_route(&agents_dir.join(dir_name), slug == "root")
+            && routing.pane_id.is_none()
+        {
+            warn!(agent = %agent_key, path = %path.display(), "controller routing is missing its exact pane identity");
+            return DeliveryResult::Failed;
+        }
+        if let Some(target) = routing_tmux_target(&routing) {
+            routing_target = Some((target, routing.clone()));
+            routing_parent_tab = routing.parent_tab.clone();
+            matched_dir_name = Some(dir_name.clone());
+            break;
+        }
+        if identity_requires_exact_controller_route(&agents_dir.join(dir_name), slug == "root") {
+            warn!(agent = %agent_key, path = %path.display(), "controller routing lacks an exact tmux target");
+            return DeliveryResult::Failed;
+        }
+    }
+
+    if let Some((target, routing)) = routing_target {
         let Some(ref dir_name) = matched_dir_name else {
             return DeliveryResult::Failed;
         };
-        if !routing_target_alive_or_cleanup(project_dir, dir_name, &target, agent_key, from).await {
+        if !routing_target_alive_or_cleanup(project_dir, dir_name, &routing, agent_key, from).await
+        {
             return DeliveryResult::Failed;
         }
 
@@ -1389,6 +1495,15 @@ async fn deliver_via_tmux(
             cache_key,
         )
         .await;
+    }
+
+    if identity_requires_exact_controller_route_in_candidates(
+        &agents_dir,
+        &routing_candidates,
+        slug == "root",
+    ) {
+        warn!(agent = %agent_key, "refusing display-name fallback for a controller without persisted exact routing");
+        return DeliveryResult::Failed;
     }
 
     tracing::Span::current().record("delivery_method", "tmux");
@@ -1447,6 +1562,32 @@ async fn deliver_via_tmux(
         cache_key,
     )
     .await
+}
+
+fn identity_requires_exact_controller_route(agent_dir: &std::path::Path, root: bool) -> bool {
+    if root {
+        return true;
+    }
+    match std::fs::read(agent_dir.join("identity.json")) {
+        Ok(content) => match serde_json::from_slice::<serde_json::Value>(&content) {
+            Ok(identity) => {
+                identity["ledger_owned"] == true && identity["slice_id"].as_str().is_some()
+            }
+            Err(_) => true,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+fn identity_requires_exact_controller_route_in_candidates(
+    agents_dir: &std::path::Path,
+    candidates: &[String],
+    root: bool,
+) -> bool {
+    candidates
+        .iter()
+        .any(|name| identity_requires_exact_controller_route(&agents_dir.join(name), root))
 }
 
 async fn deliver_to_agent_mailbox(
@@ -2289,21 +2430,336 @@ mod tests {
 
     #[test]
     fn test_routing_tmux_target_prefers_worker_pane_id() {
-        let routing = serde_json::json!({
-            "pane_id": "%42",
-            "window_id": "@7",
-            "parent_tab": "TL"
-        });
+        let routing = RoutingInfo::window_pane(
+            crate::services::tmux_ipc::WindowId::parse("@7").unwrap(),
+            crate::services::tmux_ipc::PaneId::parse("%42").unwrap(),
+        );
 
         assert_eq!(routing_tmux_target(&routing), Some("%42".to_string()));
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn persisted_controller_guidance_targets_owned_pane_when_worker_is_selected() {
+        let temp = tempfile::tempdir().expect("create isolated delivery workspace");
+        let socket = format!("exo-delivery-route-{}", uuid::Uuid::new_v4());
+        let session = format!("exo-delivery-route-{}", uuid::Uuid::new_v4());
+        let previous_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
+        let previous_session = std::env::var_os("EXOMONAD_TMUX_SESSION");
+        std::env::set_var("EXOMONAD_TMUX_SOCKET", &socket);
+        std::env::set_var("EXOMONAD_TMUX_SESSION", &session);
+        let _environment = DeliveryTmuxEnvironment {
+            socket: socket.clone(),
+            previous_socket,
+            previous_session,
+        };
+
+        let command = |args: &[&str]| {
+            let mut command = std::process::Command::new("tmux");
+            command.args(["-L", socket.as_str()]).args(args);
+            command
+        };
+        let started = command(&[
+            "new-session",
+            "-d",
+            "-s",
+            &session,
+            "-n",
+            "TL",
+            "sh",
+            "-c",
+            "sleep 300",
+        ])
+        .status()
+        .expect("start isolated delivery tmux session");
+        assert!(started.success(), "isolated delivery tmux session starts");
+
+        let window = String::from_utf8(
+            command(&["display-message", "-p", "-t", &session, "#{window_id}"])
+                .output()
+                .expect("read delivery window")
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let worker = String::from_utf8(
+            command(&["display-message", "-p", "-t", &session, "#{pane_id}"])
+                .output()
+                .expect("read worker pane")
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let controller = String::from_utf8(
+            command(&[
+                "split-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                &window,
+                "sh",
+                "-c",
+                "sleep 300",
+            ])
+            .output()
+            .expect("create controller pane")
+            .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let worker_index = String::from_utf8(
+            command(&["display-message", "-p", "-t", &worker, "#{pane_index}"])
+                .output()
+                .expect("read worker pane index")
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        assert_eq!(worker_index, "0", "worker occupies pane index zero");
+        let controller_index = String::from_utf8(
+            command(&["display-message", "-p", "-t", &controller, "#{pane_index}"])
+                .output()
+                .expect("read controller pane index")
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        assert_eq!(controller_index, "1", "controller is a separate pane");
+        command(&["select-pane", "-t", &worker])
+            .status()
+            .expect("select worker pane");
+        command(&["rename-window", "-t", &window, "renamed-controller"])
+            .status()
+            .expect("rename controller window");
+
+        let route = crate::domain::RoutingInfo::window_pane(
+            crate::services::tmux_ipc::WindowId::parse(&window).unwrap(),
+            crate::services::tmux_ipc::PaneId::parse(&controller).unwrap(),
+        );
+        let routing_dir = temp.path().join(".exo/agents/root");
+        std::fs::create_dir_all(&routing_dir).unwrap();
+        let routing_path = routing_dir.join("routing.json");
+        std::fs::write(&routing_path, serde_json::to_vec(&route).unwrap()).unwrap();
+        std::fs::write(
+            routing_dir.join("identity.json"),
+            br#"{"ledger_owned":true,"slice_id":"root"}"#,
+        )
+        .unwrap();
+        let root_state = temp.path().join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root_state).unwrap();
+        std::fs::write(root_state.join("run.json"), br#"{"run_id":"root"}"#).unwrap();
+        std::fs::write(
+            temp.path().join(".exo/tl-loop/root.controller-epoch"),
+            "test-epoch\n",
+        )
+        .unwrap();
+        let tmux = crate::services::tmux_ipc::TmuxIpc::new(&session);
+        let ownership = crate::services::agent_control::capture_controller_ownership(
+            &tmux,
+            "test-epoch",
+            "root",
+            crate::services::tmux_ipc::WindowId::parse(&window).unwrap(),
+            crate::services::tmux_ipc::PaneId::parse(&controller).unwrap(),
+        )
+        .await
+        .unwrap();
+        crate::services::agent_control::persist_controller_ownership(temp.path(), &ownership)
+            .await
+            .unwrap();
+        let durable_routing: RoutingInfo =
+            serde_json::from_slice(&std::fs::read(&routing_path).unwrap()).unwrap();
+        let target = routing_tmux_target(&durable_routing).expect("routing has a target");
+        assert_eq!(target, controller);
+        assert!(
+            tmux.routing_target_process_alive(&durable_routing)
+                .await
+                .unwrap(),
+            "exact pane and window pair is live"
+        );
+        let wrong_window = RoutingInfo::window_pane(
+            crate::services::tmux_ipc::WindowId::parse("@999999").unwrap(),
+            crate::services::tmux_ipc::PaneId::parse(&controller).unwrap(),
+        );
+        assert!(!tmux
+            .routing_target_process_alive(&wrong_window)
+            .await
+            .unwrap());
+
+        let delivered = deliver_via_tmux(
+            temp.path(),
+            "root",
+            "TL",
+            &agent_name("test-sender"),
+            "controller-guidance-marker",
+            None,
+        )
+        .await;
+        assert_eq!(delivered, DeliveryResult::Tmux);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let controller_output = command(&["capture-pane", "-p", "-t", &controller])
+                    .output()
+                    .expect("capture controller pane");
+                let worker_output = command(&["capture-pane", "-p", "-t", &worker])
+                    .output()
+                    .expect("capture worker pane");
+                assert!(controller_output.status.success());
+                assert!(worker_output.status.success());
+                let controller_text = String::from_utf8_lossy(&controller_output.stdout);
+                let worker_text = String::from_utf8_lossy(&worker_output.stdout);
+                assert!(
+                    !worker_text.contains("controller-guidance-marker"),
+                    "selected worker must not receive controller guidance"
+                );
+                if controller_text.contains("controller-guidance-marker") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("production delivery injects guidance into the owned pane");
+
+        let window_only =
+            RoutingInfo::window(crate::services::tmux_ipc::WindowId::parse(&window).unwrap());
+        std::fs::write(&routing_path, serde_json::to_vec(&window_only).unwrap()).unwrap();
+        assert_eq!(
+            deliver_via_tmux(
+                temp.path(),
+                "root",
+                "renamed-controller",
+                &agent_name("test-sender"),
+                "controller-guidance-from-legacy-window-route",
+                None,
+            )
+            .await,
+            DeliveryResult::Tmux,
+            "authoritative controller ownership upgrades a legacy window route to its exact pane"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let controller_text = String::from_utf8_lossy(
+                    &command(&["capture-pane", "-p", "-t", &controller])
+                        .output()
+                        .expect("capture controller after legacy route")
+                        .stdout,
+                )
+                .into_owned();
+                let worker_text = String::from_utf8_lossy(
+                    &command(&["capture-pane", "-p", "-t", &worker])
+                        .output()
+                        .expect("capture worker after legacy route")
+                        .stdout,
+                )
+                .into_owned();
+                assert!(!worker_text.contains("controller-guidance-from-legacy-window-route"));
+                if controller_text.contains("controller-guidance-from-legacy-window-route") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("legacy window coordinates are resolved to the owned pane");
+        let wrong_window_route = RoutingInfo::window_pane(
+            crate::services::tmux_ipc::WindowId::parse("@999999").unwrap(),
+            crate::services::tmux_ipc::PaneId::parse(&controller).unwrap(),
+        );
+        std::fs::write(
+            &routing_path,
+            serde_json::to_vec(&wrong_window_route).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            deliver_via_tmux(
+                temp.path(),
+                "root",
+                "renamed-controller",
+                &agent_name("test-sender"),
+                "conflicting-controller-route-must-not-deliver",
+                None,
+            )
+            .await,
+            DeliveryResult::Failed,
+            "conflicting persisted controller coordinates are rejected"
+        );
+        std::fs::remove_file(&routing_path).unwrap();
+        assert_eq!(
+            deliver_via_tmux(
+                temp.path(),
+                "root",
+                "renamed-controller",
+                &agent_name("test-sender"),
+                "controller-guidance-from-durable-owner",
+                None,
+            )
+            .await,
+            DeliveryResult::Tmux,
+            "the exact durable controller target routes guidance when agent routing is absent"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let controller_text = String::from_utf8_lossy(
+                    &command(&["capture-pane", "-p", "-t", &controller])
+                        .output()
+                        .expect("capture controller after missing-route recovery")
+                        .stdout,
+                )
+                .into_owned();
+                let worker_text = String::from_utf8_lossy(
+                    &command(&["capture-pane", "-p", "-t", &worker])
+                        .output()
+                        .expect("capture worker after missing-route recovery")
+                        .stdout,
+                )
+                .into_owned();
+                assert!(!worker_text.contains("controller-guidance-from-durable-owner"));
+                if controller_text.contains("controller-guidance-from-durable-owner") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("missing routing is recovered from exact durable controller ownership");
+    }
+
+    struct DeliveryTmuxEnvironment {
+        socket: String,
+        previous_socket: Option<std::ffi::OsString>,
+        previous_session: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for DeliveryTmuxEnvironment {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &self.socket, "kill-server"])
+                .status();
+            restore_test_env("EXOMONAD_TMUX_SOCKET", self.previous_socket.take());
+            restore_test_env("EXOMONAD_TMUX_SESSION", self.previous_session.take());
+        }
+    }
+
+    fn restore_test_env(key: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
+
     #[test]
     fn test_routing_tmux_target_uses_exact_window_id_for_leaf_delivery() {
-        let routing = serde_json::json!({
-            "window_id": "@7",
-            "parent_tab": "TL"
-        });
+        let routing = RoutingInfo::window(
+            crate::services::tmux_ipc::WindowId::parse("@7").expect("valid window ID"),
+        );
 
         assert_eq!(routing_tmux_target(&routing), Some("@7".to_string()));
     }
@@ -2322,6 +2778,13 @@ mod tests {
         );
         assert!(routing_matches_tmux_target(&pane_routing, "%42"));
         assert!(!routing_matches_tmux_target(&pane_routing, "@7"));
+
+        let exact_pane_routing = RoutingInfo::window_pane(
+            crate::services::tmux_ipc::WindowId::parse("@7").expect("valid window id"),
+            crate::services::tmux_ipc::PaneId::parse("%42").expect("valid pane id"),
+        );
+        assert!(routing_matches_tmux_target(&exact_pane_routing, "%42"));
+        assert!(!routing_matches_tmux_target(&exact_pane_routing, "@7"));
     }
 
     #[tokio::test]

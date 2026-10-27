@@ -7,7 +7,7 @@ use exomonad::config::{
 use exomonad_core::services::runtime_manifest::{
     PLAN_COMPATIBILITY_VERSION, PUBLICATION_REGISTRY_SCHEMA_VERSION, RUNTIME_PROTOCOL_VERSION,
 };
-use exomonad_core::services::tmux_ipc::WindowId;
+use exomonad_core::services::tmux_ipc::{PaneId, WindowId};
 use exomonad_core::services::{
     agent_control::{
         capture_controller_pane_target, clear_pending_controller_ownership, codex_lifecycle,
@@ -15,8 +15,8 @@ use exomonad_core::services::{
         persist_pending_controller_ownership, read_controller_ownership,
         read_controller_target_for_routing, read_invocation, read_invocation_conservatively,
         CapturedCodexTrust, ControllerPaneOwnership, ControllerPaneTarget, InvocationRecord,
-        WorkspaceShutdownIntent, WorkspaceShutdownPhase, ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH,
-        WORKSPACE_SHUTDOWN_RELATIVE_PATH,
+        WorkspaceShutdownIntent, WorkspaceShutdownPhase, CONTROLLER_STARTUP_INTENT_RELATIVE_PATH,
+        ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH, WORKSPACE_SHUTDOWN_RELATIVE_PATH,
     },
     pr_registry::{
         invocation_succession_reaches_current, read_published_heads,
@@ -3886,12 +3886,16 @@ async fn repair_ordered_sub_tl_invocations(
     project_dir: &Path,
     socket_path: &Path,
     controller_window: &WindowId,
+    controller_pane: &PaneId,
 ) -> Result<usize> {
     let specs = ordered_sub_tl_recovery_specs(project_dir)?;
     if specs.is_empty() {
         return Ok(0);
     }
-    let expected_routing = exomonad_core::domain::RoutingInfo::window(controller_window.clone());
+    let expected_routing = exomonad_core::domain::RoutingInfo::window_pane(
+        controller_window.clone(),
+        controller_pane.clone(),
+    );
     let client = uds_client::ServerClient::new(socket_path.to_path_buf());
     for spec in &specs {
         let publication = ordered_sub_tl_publication_coordinates(project_dir, spec).await?;
@@ -5884,9 +5888,7 @@ impl ControllerStartupIntent {
 }
 
 fn controller_startup_intent_path(project_dir: &Path) -> PathBuf {
-    project_dir
-        .join(".exo/tl-loop/root")
-        .join("controller-startup.json")
+    project_dir.join(CONTROLLER_STARTUP_INTENT_RELATIVE_PATH)
 }
 
 fn controller_start_release_path(project_dir: &Path, epoch: &str) -> PathBuf {
@@ -6069,7 +6071,7 @@ async fn reconcile_interrupted_controller_startup(
         let released =
             controller_start_release_path(project_dir, &intent.controller_epoch).exists();
         if !released {
-            reconcile_continue_state_before_controller(project_dir, ipc, &target.window_id).await?;
+            reconcile_continue_state_before_controller(project_dir, ipc, target).await?;
             intent.phase = ControllerStartupPhase::StateReconciled;
             persist_controller_startup_intent(project_dir, &intent)?;
             release_controller_start(project_dir, &intent.controller_epoch)?;
@@ -6081,6 +6083,9 @@ async fn reconcile_interrupted_controller_startup(
     let final_run_id = read_root_run_id(project_dir)?;
     let ownership = target.with_run_id(final_run_id);
     persist_controller_ownership(project_dir, &ownership).await?;
+    if intent.continue_mode {
+        archive_completed_workspace_shutdown(project_dir, &ownership)?;
+    }
     clear_pending_controller_ownership(project_dir, &intent.controller_epoch).await?;
     clear_controller_startup_intent(project_dir, &intent.controller_epoch)?;
     ipc.set_window_remain_on_exit(&target.window_id, false)
@@ -6217,7 +6222,7 @@ async fn launch_tl_recovery(
         );
         persist_pending_controller_ownership(project_dir, &pending).await?;
         if let Err(error) =
-            reconcile_continue_state_before_controller(project_dir, ipc, &target.window_id).await
+            reconcile_continue_state_before_controller(project_dir, ipc, &target).await
         {
             return Err(error).context(
                 "continuation preflight remains recoverable in the exact gated controller pane",
@@ -6235,6 +6240,9 @@ async fn launch_tl_recovery(
         let run_id = read_root_run_id(project_dir)?;
         let ownership = target.with_run_id(run_id);
         persist_controller_ownership(project_dir, &ownership).await?;
+        if continue_mode {
+            archive_completed_workspace_shutdown(project_dir, &ownership)?;
+        }
         clear_pending_controller_ownership(project_dir, &controller_epoch).await?;
         clear_controller_startup_intent(project_dir, &controller_epoch)?;
         ipc.set_window_remain_on_exit(&tl_window, false).await?;
@@ -6250,17 +6258,21 @@ fn gate_controller_start(command: &str, release_path: &Path) -> String {
 async fn reconcile_continue_state_before_controller(
     project_dir: &Path,
     ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
-    controller_window: &WindowId,
+    controller_target: &ControllerPaneTarget,
 ) -> Result<()> {
     let socket_path = project_dir.join(".exo/server.sock");
-    let repaired =
-        repair_ordered_sub_tl_invocations(project_dir, &socket_path, controller_window).await?;
+    let repaired = repair_ordered_sub_tl_invocations(
+        project_dir,
+        &socket_path,
+        &controller_target.window_id,
+        &controller_target.pane_id,
+    )
+    .await?;
     let (preserved, recreated) = reconcile_agent_continuations(project_dir).await?;
     let target = read_controller_target_for_routing(project_dir).await?;
     if !controller_ownership_is_live(project_dir, ipc, &target).await? {
         anyhow::bail!("pending root controller pane stopped before startup handoff completed");
     }
-    archive_completed_workspace_shutdown(project_dir, &target)?;
     info!(
         repaired,
         preserved, recreated, "Reconciled agent provenance before TL controller startup"
@@ -6463,9 +6475,13 @@ async fn reconcile_existing_session(
                 return Ok(());
             };
             let socket_path = project_dir.join(".exo/server.sock");
-            let repaired =
-                repair_ordered_sub_tl_invocations(project_dir, &socket_path, &target.window_id)
-                    .await?;
+            let repaired = repair_ordered_sub_tl_invocations(
+                project_dir,
+                &socket_path,
+                &target.window_id,
+                &target.pane_id,
+            )
+            .await?;
             let (preserved, recreated) = reconcile_agent_continuations(project_dir).await?;
             info!(
                 repaired,
@@ -9440,7 +9456,7 @@ mod tests {
             start_invocation_with_provenance_and_context_and_mode, InvocationIdentityContext,
             InvocationMode, InvocationTrigger,
         };
-        use exomonad_core::services::tmux_ipc::WindowId;
+        use exomonad_core::services::tmux_ipc::{PaneId, WindowId};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let project = tempfile::tempdir().unwrap();
@@ -9509,8 +9525,10 @@ mod tests {
                     .as_ref()
             );
 
-            let routing =
-                exomonad_core::domain::RoutingInfo::window(WindowId::parse("@71").unwrap());
+            let routing = exomonad_core::domain::RoutingInfo::window_pane(
+                WindowId::parse("@71").unwrap(),
+                PaneId::parse("%71").unwrap(),
+            );
             let invocation = start_invocation_with_provenance_and_context_and_mode(
                 &project_for_server.join(".exo/agents/stage"),
                 AgentType::Codex,
@@ -9551,10 +9569,16 @@ mod tests {
             stream.shutdown().await.unwrap();
         });
         let controller_window = WindowId::parse("@71").unwrap();
+        let controller_pane = PaneId::parse("%71").unwrap();
         assert_eq!(
-            repair_ordered_sub_tl_invocations(project_dir, &socket_path, &controller_window)
-                .await
-                .unwrap(),
+            repair_ordered_sub_tl_invocations(
+                project_dir,
+                &socket_path,
+                &controller_window,
+                &controller_pane,
+            )
+            .await
+            .unwrap(),
             1
         );
         server.await.unwrap();
