@@ -1524,7 +1524,44 @@ tmux kill-session -t "$AGGREGATE_SESSION" 2>/dev/null || true
 # Keep the test transport scoped to the session after the isolated server is
 # created. This prevents Git selectors from being copied into its global env.
 unset GIT_SSH_COMMAND E2E_GIT_REMOTE_DIR
-tmux new-session -d -s "$AGGREGATE_SESSION" -n TL "sleep 0.2; exit 0"
+BOOTSTRAP_WINDOW="$(tmux new-session -d -P -F '#{window_id}' -s "$AGGREGATE_SESSION" -n TL "exec sleep 300")"
+tmux set-window-option -t "$BOOTSTRAP_WINDOW" remain-on-exit on
+read -r BOOTSTRAP_PANE BOOTSTRAP_PANE_PID <<< "$(tmux display-message -p -t "$BOOTSTRAP_WINDOW" '#{pane_id} #{pane_pid}')"
+BOOTSTRAP_SERVER_PID="$(tmux display-message -p -t "$AGGREGATE_SESSION" '#{pid}')"
+python3 - "$AGG_REPO" "$AGGREGATE_SESSION" "$BOOTSTRAP_WINDOW" "$BOOTSTRAP_PANE" \
+    "$BOOTSTRAP_PANE_PID" "$BOOTSTRAP_SERVER_PID" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+session, window, pane = sys.argv[2:5]
+pane_pid, server_pid = (int(value) for value in sys.argv[5:7])
+
+def start_ticks(pid: int) -> int:
+    stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    fields = stat[stat.rfind(")") + 2 :].split()
+    return int(fields[19])
+
+root = json.loads((repo / ".exo/tl-loop/root/run.json").read_text(encoding="utf-8"))
+epoch = f"e2e-prior-root-{server_pid}-{pane_pid}"
+target = {
+    "schema_version": 1,
+    "controller_epoch": epoch,
+    "run_id": root["run_id"],
+    "tmux_session": session,
+    "window_id": window,
+    "pane_id": pane,
+    "pane_pid": pane_pid,
+    "pane_start_ticks": start_ticks(pane_pid),
+    "tmux_server_pid": server_pid,
+    "tmux_server_start_ticks": start_ticks(server_pid),
+}
+root_dir = repo / ".exo/tl-loop/root"
+(root_dir / "controller-target.json").write_text(json.dumps(target) + "\n", encoding="utf-8")
+(repo / ".exo/tl-loop/root.controller-epoch").write_text(epoch + "\n", encoding="utf-8")
+print(f"Seeded exact prior-controller fixture from observed tmux target {window}:{pane}")
+PY
 if tmux show-environment -g | cut -d= -f1 | grep -q '^GIT_'; then
     e2e_fail "isolated Phase 8 tmux server inherited a Git environment override"
 fi
@@ -1542,17 +1579,17 @@ tmux set-environment -t "$AGGREGATE_SESSION" E2E_AGG_REPO "$AGG_REPO"
 # replacement invocation must use the operator's current Codex configuration.
 tmux set-environment -t "$AGGREGATE_SESSION" CODEX_HOME "$CODEX_HOME"
 tmux set-environment -t "$AGGREGATE_SESSION" HOME "$AGG_HOME"
-tmux set-window-option -t "$AGGREGATE_SESSION:TL" remain-on-exit on
 [[ "$(tmux show-environment -t "$AGGREGATE_SESSION" GIT_SSH_COMMAND)" == \
     "GIT_SSH_COMMAND=$AGG_DIR/git-ssh" ]] \
     || e2e_fail "aggregate tmux session did not retain its isolated Git transport"
+tmux send-keys -t "$BOOTSTRAP_PANE" C-c
 for _ in $(seq 1 30); do
-    [[ "$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name} #{pane_dead}' | awk '$1 == "TL" { print $2; exit }')" == "1" ]] && break
+    [[ "$(tmux display-message -p -t "$BOOTSTRAP_PANE" '#{pane_dead}')" == "1" ]] && break
     sleep 0.1
 done
-DEAD_TL_ID="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name} #{window_id} #{pane_dead}' | awk '$1 == "TL" { print $2, $3; exit }')"
-[[ "${DEAD_TL_ID##* }" == "1" ]] || e2e_fail "aggregate fixture did not start with an exited TL pane"
-read -r DEAD_TL_WINDOW _ <<< "$DEAD_TL_ID"
+[[ "$(tmux display-message -p -t "$BOOTSTRAP_PANE" '#{pane_dead}')" == "1" ]] \
+    || e2e_fail "aggregate fixture did not stop the exact recorded prior controller pane"
+DEAD_TL_WINDOW="$BOOTSTRAP_WINDOW"
 
 CONTROLLER_EPOCH_PATH="$AGG_REPO/.exo/tl-loop/root.controller-epoch"
 PRE_RECOVERY_CONTROLLER_EPOCH="$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)"
