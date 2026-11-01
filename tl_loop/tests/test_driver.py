@@ -9807,6 +9807,233 @@ def _config(*, active: bool = True) -> TLLoopConfig:
     )
 
 
+def test_root_dispatch_waits_for_committed_init_handoff_and_repeats_idempotently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "root"
+    epoch = "startup-handoff-test-1290"
+    state_root = tmp_path / ".exo" / "tl-loop"
+    run_dir = state_root / run_id
+    run_dir.mkdir(parents=True)
+    target = {
+        "schema_version": 1,
+        "controller_epoch": epoch,
+        "tmux_session": "test-session",
+        "window_id": "@4",
+        "pane_id": "%9",
+        "pane_pid": 54321,
+        "pane_start_ticks": 987654,
+        "tmux_server_pid": 12345,
+        "tmux_server_start_ticks": 456789,
+    }
+    intent = {
+        "schema_version": 1,
+        "controller_epoch": epoch,
+        "previous_controller_epoch": None,
+        "tmux_session": "test-session",
+        "tmux_server_pid": target["tmux_server_pid"],
+        "tmux_server_start_ticks": target["tmux_server_start_ticks"],
+        "continue_mode": True,
+        "root_run_id": run_id,
+        "target": target,
+        "phase": "released",
+    }
+    (state_root / "root.controller-epoch").write_text(epoch + "\n", encoding="utf-8")
+    startup_path = run_dir / "controller-startup.json"
+    startup_path.write_text(json.dumps(intent), encoding="utf-8")
+
+    entered_handoff = threading.Event()
+    original_wait = driver_module.wait_for_root_controller_handoff
+
+    def observed_wait(*args: Any, **kwargs: Any) -> Any:
+        entered_handoff.set()
+        kwargs["timeout_seconds"] = 5
+        return original_wait(*args, **kwargs)
+
+    monkeypatch.setattr(driver_module, "wait_for_root_controller_handoff", observed_wait)
+    transport = RecordingTransport(
+        spawned_agent_id="leaf-a-codex",
+        spawned_invocation_id="invocation-1290-leaf-a",
+    )
+    work_clock_reads: list[float] = []
+    config = replace(
+        _config(),
+        active=True,
+        agent_id="root",
+        controller_startup_epoch=epoch,
+        run_id=run_id,
+        session_mode="continue",
+        project_root=tmp_path,
+        root_dir=state_root,
+        keep_alive_on_waiting=False,
+        work_clock=lambda: work_clock_reads.append(time.monotonic()) or time.monotonic(),
+    )
+    plan = WorkPlan.from_mapping(
+        {
+            "leaves": [
+                {
+                    "name": "leaf-a",
+                    "task": "perform the requested change",
+                    "chainlink_issue_id": None,
+                }
+            ]
+        }
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            run_tl_loop,
+            run_id,
+            plan,
+            SyntheticQueue([]),
+            EffectClient(transport),
+            config=config,
+            root_dir=state_root,
+        )
+        assert entered_handoff.wait(5), "root controller did not enter the startup handoff wait"
+        assert transport.calls == []
+        assert work_clock_reads == []
+        waiting_state = RunStore(run_id, state_root).load()
+        assert waiting_state.slices["leaf-a"].status is SliceStatus.PENDING
+        assert all(gate.status is not GateStatus.PENDING for gate in waiting_state.gates)
+
+        (run_dir / "controller-target.json").write_text(
+            json.dumps({**target, "run_id": run_id}), encoding="utf-8"
+        )
+        startup_path.unlink()
+        completed = future.result(timeout=10)
+    assert completed.final_state.slices["leaf-a"].status is SliceStatus.DISPATCH_UNCONFIRMED
+    assert [name for name, _ in transport.calls].count("spawn_leaf") == 1
+
+    repeated = run_tl_loop(
+        run_id,
+        plan,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=config,
+        root_dir=state_root,
+    )
+    assert repeated.final_state.slices["leaf-a"].status is SliceStatus.DISPATCH_UNCONFIRMED
+    assert [name for name, _ in transport.calls].count("spawn_leaf") == 1
+
+
+def test_root_dispatch_defers_without_effects_when_final_owner_conflicts(
+    tmp_path: Path,
+) -> None:
+    run_id = "root"
+    epoch = "startup-handoff-expected"
+    state_root = tmp_path / ".exo" / "tl-loop"
+    run_dir = state_root / run_id
+    run_dir.mkdir(parents=True)
+    (state_root / "root.controller-epoch").write_text(epoch + "\n", encoding="utf-8")
+    owner = {
+        "schema_version": 1,
+        "controller_epoch": "foreign-epoch",
+        "run_id": run_id,
+        "tmux_session": "test-session",
+        "window_id": "@4",
+        "pane_id": "%9",
+        "pane_pid": 54321,
+        "pane_start_ticks": 987654,
+        "tmux_server_pid": 12345,
+        "tmux_server_start_ticks": 456789,
+    }
+    (run_dir / "controller-target.json").write_text(json.dumps(owner), encoding="utf-8")
+    transport = RecordingTransport(spawned_agent_id="leaf-a-codex")
+    result = run_tl_loop(
+        run_id,
+        WorkPlan.from_mapping(
+            {
+                "leaves": [
+                    {
+                        "name": "leaf-a",
+                        "task": "perform the requested change",
+                        "chainlink_issue_id": None,
+                    }
+                ]
+            }
+        ),
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=replace(
+            _config(),
+            agent_id="root",
+            controller_startup_epoch=epoch,
+            run_id=run_id,
+            session_mode="continue",
+            project_root=tmp_path,
+            root_dir=state_root,
+            work_clock=lambda: pytest.fail("handoff hold must not start active-work timing"),
+        ),
+        root_dir=state_root,
+    )
+
+    assert result.diagnostics["controller_startup_handoff"] == "pending"
+    assert "does not match this run and epoch" in result.diagnostics["reason"]
+    assert result.final_state.slices["leaf-a"].status is SliceStatus.PENDING
+    assert result.final_state.fsm.phase is not TLPhase.TLFailed
+    assert not any(gate.name.startswith("tl-dispatch-failed-") for gate in result.final_state.gates)
+    assert transport.calls == []
+
+
+def test_nested_root_ignores_inherited_parent_startup_epoch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = tmp_path / ".exo" / "tl-loop"
+    child_dir = state_root / "root" / "kani"
+    child_dir.mkdir(parents=True)
+    (state_root / "root.controller-epoch").write_text("parent-epoch\n", encoding="utf-8")
+    (state_root / "root" / "kani.controller-epoch").write_text("child-epoch\n", encoding="utf-8")
+    handoff_calls: list[str] = []
+
+    def observe_handoff(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        handoff_calls.append("called")
+        return driver_module.HandoffWaitResult(False, "parent startup still pending")
+
+    monkeypatch.setattr(driver_module, "wait_for_root_controller_handoff", observe_handoff)
+    transport = RecordingTransport(spawned_agent_id="kani-leaf-codex")
+    result = run_tl_loop(
+        "kani",
+        WorkPlan.from_mapping(
+            {
+                "leaves": [
+                    {
+                        "name": "issue-814",
+                        "task": "resume the Kani work",
+                        "chainlink_issue_id": None,
+                    }
+                ]
+            }
+        ),
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=replace(
+            _config(),
+            active=True,
+            agent_id="root",
+            controller_startup_epoch="parent-epoch",
+            parent_run_id="root",
+            parent_agent_id="root",
+            parent_branch="main",
+            branch="main.kani",
+            depth=1,
+            run_id="kani",
+            session_mode="continue",
+            project_root=tmp_path,
+            root_dir=state_root / "root",
+            keep_alive_on_waiting=False,
+        ),
+        root_dir=state_root / "root",
+    )
+
+    assert handoff_calls == []
+    assert "controller_startup_handoff" not in (result.diagnostics or {})
+    assert [name for name, _ in transport.calls].count("spawn_leaf") == 1
+    assert result.final_state.controller_epoch == "child-epoch"
+
+
 def _lifecycle_events(run_id: str) -> list[EventEnvelope]:
     return [
         _canonical_event(1, "agent.spawned", "worker-a", run_id),

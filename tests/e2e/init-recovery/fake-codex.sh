@@ -79,6 +79,45 @@ if response.get("success") is not True:
 PY
 }
 
+if [[ "$role" == "dev" && "${E2E_FAST_START:-0}" == "1" ]]; then
+    [[ "$(basename "$0")" == "codex" && "$model" == "gpt-6-luna" && "$effort" == "xhigh" ]] || {
+        printf 'unexpected immediate-start worker route: %s/%s/%s\n' \
+            "$(basename "$0")" "$model" "$effort" >&2
+        exit 1
+    }
+    [[ -n "${E2E_FAST_REPO:-}" && ! -e "$E2E_FAST_REPO/.exo/tl-loop/root/controller-startup.json" ]] || {
+        printf 'worker launched before the init startup handoff committed\n' >&2
+        exit 1
+    }
+    python3 - "$E2E_FAST_REPO" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+owner = json.loads((repo / ".exo/tl-loop/root/controller-target.json").read_text())
+epoch = (repo / ".exo/tl-loop/root.controller-epoch").read_text().strip()
+assert owner["run_id"] == "root" and owner["controller_epoch"] == epoch
+PY
+    record_event fast_start_worker_started "$(python3 - "$PWD" <<'PY'
+import json
+import os
+import sys
+
+print(json.dumps({"working_directory": sys.argv[1], "pid": os.getpid()}))
+PY
+)"
+    printf 'fast-start task became active\n' > "$PWD/fast-start-task.txt"
+    record_event fast_start_task_active "$(python3 - "$PWD/fast-start-task.txt" <<'PY'
+import json
+import sys
+
+print(json.dumps({"task_marker": sys.argv[1]}))
+PY
+)"
+    exec sleep "${E2E_FAST_WORKER_LIFETIME:-120}"
+fi
+
 if [[ "$role" == "dev" && "$agent" == *issue-814* ]]; then
     if [[ "$(basename "$0")" == "opencode" ]]; then
         record_event historical_opencode_owner_failed '{"reason":"accepted OpenCode invocation ended in a terminal provider failure"}'

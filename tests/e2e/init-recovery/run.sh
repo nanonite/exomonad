@@ -45,6 +45,8 @@ if [[ "${E2E_HISTORICAL_PARENT_STALL:-0}" == "1" && "${E2E_TERMINAL_PROVIDER_FAI
 fi
 MOCK_PID=""
 WASM_ARTIFACT_DIR=""
+FAST_SERVER_PID=""
+FAST_SESSION="e2e-init-fast-handoff"
 INITIAL_TMUX="${TMUX:-}"
 INITIAL_TMUX_TMPDIR="${TMUX_TMPDIR:-}"
 AGGREGATE_TMUX_TMPDIR=""
@@ -759,6 +761,10 @@ cleanup() {
     # the remainder of the trap so every step below always executes.
     set +e
     if [[ -n "$AGGREGATE_TMUX_TMPDIR" ]]; then
+        if [[ -n "$FAST_SESSION" ]]; then
+            env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$AGGREGATE_TMUX_TMPDIR" \
+                tmux kill-session -t "$FAST_SESSION" 2>/dev/null
+        fi
         env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$AGGREGATE_TMUX_TMPDIR" \
             tmux kill-session -t "$AGGREGATE_SESSION" 2>/dev/null
         case "$AGGREGATE_TMUX_TMPDIR" in
@@ -781,6 +787,10 @@ cleanup() {
     if [[ -n "$MOCK_PID" ]] && kill -0 "$MOCK_PID" 2>/dev/null; then
         kill "$MOCK_PID" 2>/dev/null
         wait "$MOCK_PID" 2>/dev/null
+    fi
+    if [[ -n "$FAST_SERVER_PID" ]] && kill -0 "$FAST_SERVER_PID" 2>/dev/null; then
+        kill "$FAST_SERVER_PID" 2>/dev/null
+        wait "$FAST_SERVER_PID" 2>/dev/null
     fi
     if (( code != 0 )); then
         KEEP_E2E_WORKDIR=1
@@ -3191,6 +3201,11 @@ for run in runs:
 print("pre-existing OpenCode owner resumed once as Codex; exact owner and reviewer routes verified")
 PY
 e2e_log "PASS: actual init --continue recovered the merged aggregate, commit-all tidied the parent before a real worker/reviewer route, preserved ignored runtime data and completed receipts, and repeat init added no duplicate commit or dispatch (handoff=$HANDOFF_COMMIT_SHA, leaf_pr=$POST_TIDY_LEAF_PR, archive=$AGGREGATE_ARCHIVE_SHA256, host=$EXOMONAD_BIN_SHA256, devswarm=$GUEST_WASM_SHA256, e2e-test=$E2E_WASM_SHA256, build=$AGGREGATE_BUILD_ID)"
+
+e2e_phase "Phase 9" "Starting fresh immediately runnable work and checking the committed startup handoff boundary..."
+bash "$SCRIPT_DIR/fast-start-acceptance.sh" \
+    "$EXOMONAD_BIN" "$AGG_DIR/fast-start" "$AGG_HOME" "$CODEX_HOME" \
+    "$PROJECT_ROOT" "$WASM_ARTIFACT_DIR" "$AGG_REPO" "$AGG_MOCK_URL"
 
 echo ""
 echo "============================================"

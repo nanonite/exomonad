@@ -197,6 +197,7 @@ from tl_loop.loop.schedule import (
     suspend_dependents,
     withhold_unsatisfiable_dependents,
 )
+from tl_loop.loop.startup_handoff import wait_for_root_controller_handoff
 from tl_loop.loop.work_clock import ActiveWorkClock
 from tl_loop.ordered import (
     AggregateCandidate,
@@ -1321,6 +1322,7 @@ class TLLoopConfig:
     branch: str = "main"
     worktree: str | Path | None = None
     agent_id: str | None = None
+    controller_startup_epoch: str | None = None
     parent_branch: str | None = None
     parent_run_id: str | None = None
     parent_agent_id: str | None = None
@@ -1388,6 +1390,7 @@ class TLLoopConfig:
             raise ValueError("enable_reviewer_spawn must be a boolean")
         _optional_text(self.merge_strategy, "merge_strategy")
         _optional_text(self.working_dir, "working_dir")
+        _optional_text(self.controller_startup_epoch, "controller_startup_epoch")
         if self.repository_identity is not None and not isinstance(
             self.repository_identity, RepositoryIdentity
         ):
@@ -2024,6 +2027,33 @@ def run_tl_loop(
         store,
         prior_terminal_reason=continued_failed_root_reason,
     )
+    if (
+        selected.controller_startup_epoch is not None
+        and selected.parent_run_id is None
+        and selected.depth == 0
+    ):
+        handoff = wait_for_root_controller_handoff(
+            store.run_dir,
+            run_id=run_id,
+            controller_epoch=selected.controller_startup_epoch,
+            agent_id=selected.agent_id,
+            cancel_event=selected.cancel_event,
+        )
+        if not handoff.ready or state.controller_epoch != selected.controller_startup_epoch:
+            reason = handoff.reason or "checkpoint controller epoch differs from init target"
+            LOGGER.warning(
+                "[TL loop] root controller startup handoff deferred run_id=%s reason=%s",
+                run_id,
+                reason,
+            )
+            return TLRunResult(
+                state,
+                tuple(effects_log),
+                (),
+                (),
+                diagnostics={"controller_startup_handoff": "pending", "reason": reason},
+                journal_entries=_journal_entries(effects_log),
+            )
     try:
         return _run_loop(
             run_id,
