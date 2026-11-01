@@ -9976,6 +9976,230 @@ def test_root_dispatch_defers_without_effects_when_final_owner_conflicts(
     assert transport.calls == []
 
 
+@pytest.mark.parametrize(
+    "missing_field",
+    (
+        "schema_version",
+        "controller_epoch",
+        "run_id",
+        "tmux_session",
+        "window_id",
+        "pane_id",
+        "pane_pid",
+        "pane_start_ticks",
+        "tmux_server_pid",
+        "tmux_server_start_ticks",
+    ),
+)
+def test_root_dispatch_defers_when_final_owner_field_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing_field: str
+) -> None:
+    _assert_root_dispatch_defers_for_owner(tmp_path, monkeypatch, {"remove": missing_field})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("schema_version", True),
+        ("controller_epoch", ""),
+        ("controller_epoch", 3),
+        ("run_id", None),
+        ("tmux_session", "  "),
+        ("tmux_session", False),
+        ("window_id", "window-4"),
+        ("window_id", "@x"),
+        ("window_id", []),
+        ("pane_id", "pane-9"),
+        ("pane_id", "%q"),
+        ("pane_id", 9),
+        ("pane_pid", True),
+        ("pane_pid", 0),
+        ("pane_pid", 2**32),
+        ("pane_start_ticks", False),
+        ("pane_start_ticks", 0),
+        ("pane_start_ticks", 2**64),
+        ("tmux_server_pid", True),
+        ("tmux_server_pid", -1),
+        ("tmux_server_pid", 2**32),
+        ("tmux_server_start_ticks", "404"),
+        ("tmux_server_start_ticks", 0),
+        ("tmux_server_start_ticks", 2**64),
+    ),
+)
+def test_root_dispatch_defers_when_final_owner_field_is_invalid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, value: object
+) -> None:
+    _assert_root_dispatch_defers_for_owner(tmp_path, monkeypatch, {"set": (field, value)})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (("run_id", "another-root"), ("controller_epoch", "another-epoch")),
+)
+def test_root_dispatch_defers_when_final_owner_identity_conflicts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+) -> None:
+    _assert_root_dispatch_defers_for_owner(tmp_path, monkeypatch, {"set": (field, value)})
+
+
+def _assert_root_dispatch_defers_for_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: dict[str, Any],
+) -> None:
+    run_id = "root"
+    epoch = "startup-handoff-expected"
+    state_root = tmp_path / ".exo" / "tl-loop"
+    run_dir = state_root / run_id
+    run_dir.mkdir(parents=True)
+    (state_root / "root.controller-epoch").write_text(epoch + "\n", encoding="utf-8")
+    owner: dict[str, Any] = {
+        "schema_version": 1,
+        "controller_epoch": epoch,
+        "run_id": run_id,
+        "tmux_session": "test-session",
+        "window_id": "@4",
+        "pane_id": "%9",
+        "pane_pid": 54321,
+        "pane_start_ticks": 987654,
+        "tmux_server_pid": 12345,
+        "tmux_server_start_ticks": 456789,
+    }
+    if "remove" in mutation:
+        del owner[mutation["remove"]]
+    else:
+        field, value = mutation["set"]
+        owner[field] = value
+    (run_dir / "controller-target.json").write_text(json.dumps(owner), encoding="utf-8")
+    transport = RecordingTransport(spawned_agent_id="leaf-a-codex")
+
+    def reject_live_loop(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        pytest.fail("incomplete final ownership authorized the live controller loop")
+
+    monkeypatch.setattr(driver_module, "_run_loop", reject_live_loop)
+    result = run_tl_loop(
+        run_id,
+        WorkPlan.from_mapping(
+            {
+                "leaves": [
+                    {
+                        "name": "leaf-a",
+                        "task": "perform the requested change",
+                        "chainlink_issue_id": None,
+                    }
+                ]
+            }
+        ),
+        SyntheticQueue([]),
+        EffectClient(transport),
+        config=replace(
+            _config(),
+            agent_id="root",
+            controller_startup_epoch=epoch,
+            run_id=run_id,
+            session_mode="continue",
+            project_root=tmp_path,
+            root_dir=state_root,
+            work_clock=lambda: pytest.fail("invalid ownership must not start active-work timing"),
+        ),
+        root_dir=state_root,
+    )
+
+    assert result.diagnostics["controller_startup_handoff"] == "pending"
+    assert "final controller ownership" in result.diagnostics["reason"]
+    assert result.final_state.slices["leaf-a"].status is SliceStatus.PENDING
+    assert result.final_state.fsm.phase is not TLPhase.TLFailed
+    assert not any(gate.name.startswith("tl-dispatch-failed-") for gate in result.final_state.gates)
+    assert transport.calls == []
+
+
+def test_root_dispatch_defers_when_final_owner_coordinates_conflict_after_intent_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "root"
+    epoch = "startup-handoff-target-conflict"
+    state_root = tmp_path / ".exo" / "tl-loop"
+    run_dir = state_root / run_id
+    run_dir.mkdir(parents=True)
+    (state_root / "root.controller-epoch").write_text(epoch + "\n", encoding="utf-8")
+    target = {
+        "schema_version": 1,
+        "controller_epoch": epoch,
+        "tmux_session": "test-session",
+        "window_id": "@4",
+        "pane_id": "%9",
+        "pane_pid": 54321,
+        "pane_start_ticks": 987654,
+        "tmux_server_pid": 12345,
+        "tmux_server_start_ticks": 456789,
+    }
+    intent = {
+        "schema_version": 1,
+        "controller_epoch": epoch,
+        "previous_controller_epoch": None,
+        "tmux_session": target["tmux_session"],
+        "tmux_server_pid": target["tmux_server_pid"],
+        "tmux_server_start_ticks": target["tmux_server_start_ticks"],
+        "continue_mode": True,
+        "root_run_id": run_id,
+        "target": target,
+        "phase": "released",
+    }
+    (run_dir / "controller-startup.json").write_text(json.dumps(intent), encoding="utf-8")
+    (run_dir / "controller-target.json").write_text(
+        json.dumps({**target, "run_id": run_id, "pane_id": "%10"}), encoding="utf-8"
+    )
+    entered_handoff = threading.Event()
+    original_wait = driver_module.wait_for_root_controller_handoff
+
+    def observed_wait(*args: Any, **kwargs: Any) -> Any:
+        entered_handoff.set()
+        kwargs["timeout_seconds"] = 2
+        return original_wait(*args, **kwargs)
+
+    monkeypatch.setattr(driver_module, "wait_for_root_controller_handoff", observed_wait)
+    transport = RecordingTransport(spawned_agent_id="leaf-a-codex")
+    plan = WorkPlan.from_mapping(
+        {"leaves": [{"name": "leaf-a", "task": "task", "chainlink_issue_id": None}]}
+    )
+    config = replace(
+        _config(),
+        agent_id="root",
+        controller_startup_epoch=epoch,
+        run_id=run_id,
+        session_mode="continue",
+        project_root=tmp_path,
+        root_dir=state_root,
+        work_clock=lambda: pytest.fail("target conflict must not start active-work timing"),
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            run_tl_loop,
+            run_id,
+            plan,
+            SyntheticQueue([]),
+            EffectClient(transport),
+            config=config,
+            root_dir=state_root,
+        )
+        assert entered_handoff.wait(5)
+        assert transport.calls == []
+        (run_dir / "controller-startup.json").unlink()
+        result = future.result(timeout=5)
+
+    assert result.diagnostics["controller_startup_handoff"] == "pending"
+    assert "differs from the startup target" in result.diagnostics["reason"]
+    assert result.final_state.slices["leaf-a"].status is SliceStatus.PENDING
+    assert result.final_state.fsm.phase is not TLPhase.TLFailed
+    assert not any(gate.name.startswith("tl-dispatch-failed-") for gate in result.final_state.gates)
+    assert transport.calls == []
+
+
 def test_nested_root_ignores_inherited_parent_startup_epoch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

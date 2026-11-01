@@ -12,6 +12,8 @@ from typing import Any
 STARTUP_HANDOFF_TIMEOUT_SECONDS = 30.0
 STARTUP_HANDOFF_POLL_SECONDS = 0.05
 _PHASES = {"target_created": 1, "state_reconciled": 2, "released": 3}
+_MAX_U32 = 2**32 - 1
+_MAX_U64 = 2**64 - 1
 _TARGET_FIELDS = (
     "controller_epoch",
     "tmux_session",
@@ -122,6 +124,8 @@ def _read_and_match_owner(
     owner, error = _read_required_object(path, "final controller ownership")
     if error:
         return HandoffWaitResult(False, error)
+    if not _valid_owner_record(owner):
+        return HandoffWaitResult(False, "final controller ownership is incomplete or malformed")
     if not _owner_identity_matches(owner, run_id, epoch):
         return HandoffWaitResult(
             False, "final controller ownership does not match this run and epoch"
@@ -134,13 +138,11 @@ def _read_and_match_owner(
 
 
 def _owner_identity_matches(owner: dict[str, Any], run_id: str, epoch: str) -> bool:
-    return (
-        type(owner.get("schema_version")) is int
-        and owner["schema_version"] == 1
-        and owner.get("run_id") == run_id
-        and owner.get("controller_epoch") == epoch
-        and _valid_target(owner, owner)
-    )
+    return owner["run_id"] == run_id and owner["controller_epoch"] == epoch
+
+
+def _valid_owner_record(owner: dict[str, Any]) -> bool:
+    return _nonempty_text(owner.get("run_id")) and _valid_target_shape(owner)
 
 
 def _validate_intent(
@@ -169,8 +171,8 @@ def _valid_intent_header(intent: dict[str, Any], epoch: str, phase: object, targ
         and isinstance(phase, str)
         and phase in _PHASES
         and isinstance(target, dict)
-        and _positive_int(intent.get("tmux_server_pid"))
-        and _positive_int(intent.get("tmux_server_start_ticks"))
+        and _positive_int(intent.get("tmux_server_pid"), _MAX_U32)
+        and _positive_int(intent.get("tmux_server_start_ticks"), _MAX_U64)
         and isinstance(intent.get("tmux_session"), str)
         and bool(intent["tmux_session"].strip())
     )
@@ -193,17 +195,36 @@ def _validated_intent(
 
 def _valid_target(target: dict[str, Any], intent: dict[str, Any]) -> bool:
     return (
-        type(target.get("schema_version")) is int
-        and target["schema_version"] == 1
+        _valid_target_shape(target)
         and all(target.get(key) == intent.get(key) for key in _TARGET_FIELDS[:2])
         and all(target.get(key) == intent.get(key) for key in _TARGET_FIELDS[6:])
-        and isinstance(target.get("window_id"), str)
-        and bool(target["window_id"].strip())
-        and isinstance(target.get("pane_id"), str)
-        and bool(target["pane_id"].strip())
-        and _positive_int(target.get("pane_pid"))
-        and _positive_int(target.get("pane_start_ticks"))
     )
+
+
+def _valid_target_shape(target: dict[str, Any]) -> bool:
+    return (
+        type(target.get("schema_version")) is int
+        and target["schema_version"] == 1
+        and _nonempty_text(target.get("controller_epoch"))
+        and _nonempty_text(target.get("tmux_session"))
+        and _valid_tmux_id(target.get("window_id"), "@")
+        and _valid_tmux_id(target.get("pane_id"), "%")
+        and _positive_int(target.get("pane_pid"), _MAX_U32)
+        and _positive_int(target.get("pane_start_ticks"), _MAX_U64)
+        and _positive_int(target.get("tmux_server_pid"), _MAX_U32)
+        and _positive_int(target.get("tmux_server_start_ticks"), _MAX_U64)
+    )
+
+
+def _valid_tmux_id(value: object, prefix: str) -> bool:
+    if not isinstance(value, str) or len(value) < 2 or value[0] != prefix:
+        return False
+    suffix = value[1:]
+    return suffix.isascii() and suffix.isdigit()
+
+
+def _nonempty_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _same_handoff(left: dict[str, Any], right: dict[str, Any]) -> bool:
@@ -251,5 +272,5 @@ def _wait_poll(cancel_event: threading.Event | None, seconds: float) -> None:
         cancel_event.wait(seconds)
 
 
-def _positive_int(value: object) -> bool:
-    return type(value) is int and value > 0
+def _positive_int(value: object, maximum: int) -> bool:
+    return type(value) is int and 0 < value <= maximum
