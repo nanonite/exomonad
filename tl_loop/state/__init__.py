@@ -9,6 +9,21 @@ from .plan_manifest import (
     build_plan_manifest,
     validate_manifest_revision,
 )
+from .reference_verification import (
+    ProvenanceKind,
+    ReferenceProjectObservation,
+    ReferenceSourceState,
+    ReferenceVerificationError,
+    ReferenceVerificationEvidence,
+    ReferenceVerificationRequirement,
+    VerificationKind,
+    VerificationOutcome,
+    VerificationProvenance,
+)
+from .reference_verification_assessment import (
+    ReferenceVerificationDecision,
+    assess_reference_verification,
+)
 from .review_validation import review_validation_disposition, review_validation_is_fresh
 from .schema import (
     BUDGET_KEYS,
@@ -94,6 +109,13 @@ __all__ = [
     "MutationError",
     "OrderedStageState",
     "PlanManifest",
+    "ProvenanceKind",
+    "ReferenceProjectObservation",
+    "ReferenceSourceState",
+    "ReferenceVerificationDecision",
+    "ReferenceVerificationError",
+    "ReferenceVerificationEvidence",
+    "ReferenceVerificationRequirement",
     "ResumeState",
     "ReviewPolicySource",
     "ReviewValidationDisposition",
@@ -107,9 +129,13 @@ __all__ = [
     "StateReadError",
     "Validator",
     "Verdict",
+    "VerificationKind",
+    "VerificationOutcome",
+    "VerificationProvenance",
     "WorktreeClaimError",
     "WriteHooks",
     "apply",
+    "assess_reference_verification",
     "build_legacy_manifest",
     "build_plan_manifest",
     "checkpoint",
