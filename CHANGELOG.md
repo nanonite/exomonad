@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Fix reference submodule handoff and enforce Git repository boundaries (#1291)
 - Preserve reference gitlinks during scope handoff (#1293)
 - Persist and recover exact root controller target ownership through init (#1290)
 - Reset invocation-local stall parks before replaying continued plans (#1284)
