@@ -941,8 +941,6 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
             != "fresh_continue_reconciles_invocation_local_stall"
             or stall_audit.get("superseded_by_epoch")
             != root_checkpoint.get("controller_epoch")
-            or root_checkpoint.get("events", {}).get("last_consumed_offset", 0)
-            < baseline.get("historical_parent_stall_event_seq", 0)
         ):
             raise RuntimeError(
                 "continued root did not supersede only the prior Kani stall projection"
@@ -952,18 +950,32 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
     owner_dir = Path(baseline["owner_dir"])
     agent_log = Path(os.environ["E2E_AGENT_LOG"])
     deadline = time.monotonic() + 180
+    expected_stall_offset = int(baseline.get("historical_parent_stall_event_seq") or 0)
+    observed_root_offset = 0
     accepted: tuple[dict[str, Any], dict[str, Any], dict[str, Any]] | None = None
     while time.monotonic() < deadline:
-        child = json.loads(child_path.read_text(encoding="utf-8"))
-        leaf = child.get("slices", {}).get(OWNER_SLICE, {})
         try:
+            child = json.loads(child_path.read_text(encoding="utf-8"))
+            root_checkpoint = json.loads(
+                (root_dir / "run.json").read_text(encoding="utf-8")
+            )
             current_invocation = invocation(owner_dir)
             publications = json.loads(
                 (repository / ".exo/published-heads.json").read_text(encoding="utf-8")
             ).get("heads", [])
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, TypeError):
             time.sleep(0.1)
             continue
+        root_events = root_checkpoint.get("events")
+        observed_root_offset = (
+            root_events.get("last_consumed_offset", 0)
+            if isinstance(root_events, dict)
+            and isinstance(root_events.get("last_consumed_offset", 0), int)
+            and not isinstance(root_events.get("last_consumed_offset", 0), bool)
+            else 0
+        )
+        historical_stall_consumed = observed_root_offset >= expected_stall_offset
+        leaf = child.get("slices", {}).get(OWNER_SLICE, {})
         publication_matches = [
             row
             for row in publications
@@ -989,7 +1001,7 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
                 and current_invocation.get("exit_classification") == "one_shot_complete"
             )
         )
-        if (
+        if historical_stall_consumed and (
             current_invocation.get("invocation_id")
             != baseline["prior_invocation"]["invocation_id"]
             and successor_finished_successfully
@@ -1031,6 +1043,12 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
                 break
         time.sleep(0.1)
     if accepted is None:
+        if observed_root_offset < expected_stall_offset:
+            raise RuntimeError(
+                "continued root did not acknowledge the historical stall within the "
+                f"recovery window: offset={observed_root_offset}, "
+                f"required={expected_stall_offset}"
+            )
         raise RuntimeError(
             "production controller did not checkpoint the resumed #814 owner, adopt its PR, "
             "and launch the exact-head reviewer before timeout"
