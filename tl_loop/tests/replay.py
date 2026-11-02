@@ -57,7 +57,9 @@ class RecordingTransport:
             head = arguments.get("expected_head_sha")
             fingerprint = arguments.get("expected_source_fingerprint")
             resolved_head = head if isinstance(head, str) else "1" * 40
-            resolved_fingerprint = fingerprint if isinstance(fingerprint, str) else "2" * 64
+            resolved_fingerprint = (
+                fingerprint if isinstance(fingerprint, str) else "git-snapshot-v2:" + "2" * 64
+            )
             return {
                 "success": True,
                 "result": {
