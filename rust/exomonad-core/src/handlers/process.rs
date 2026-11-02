@@ -6,6 +6,7 @@
 
 use super::git_process_audit::{
     is_git_executable, validate_git_target, validate_git_working_directory, GitProcessContext,
+    GitProcessRequest,
 };
 use super::process_supervision::{run_supervised, ProcessRunError};
 use crate::effects::{
@@ -136,10 +137,13 @@ impl ProcessEffects for ProcessHandler {
                     &self.project_dir,
                     &ctx.working_dir,
                     &resolved_dir,
-                    &req.env,
-                    &operation_id,
-                    ctx.agent_name.as_ref(),
-                    ctx.birth_branch.as_str(),
+                    GitProcessRequest {
+                        args: &req.args,
+                        environment: &req.env,
+                        operation_id: &operation_id,
+                        agent_id: ctx.agent_name.as_ref(),
+                        birth_branch: ctx.birth_branch.as_str(),
+                    },
                 )
                 .await?,
             )
@@ -527,6 +531,78 @@ mod tests {
         assert!(error.to_string().contains("Git path overrides"));
         assert!(std::fs::read_dir(outside_objects).unwrap().next().is_none());
         assert!(!root.join(".exo/logs").exists());
+    }
+
+    #[tokio::test]
+    async fn process_handler_blocks_nested_git_mutators_before_starting_a_process() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let initialize = ["init", "-q", "-b", "main"];
+        assert_git_fixture_succeeded(run_git_fixture_output(root, &initialize), &initialize);
+        let handler = ProcessHandler::with_project_dir(root.to_path_buf());
+        let commands = [
+            vec!["submodule", "update", "--init", "--recursive"],
+            vec!["submodule", "init"],
+            vec!["submodule", "deinit", "--", "vendor/reference"],
+            vec!["submodule", "foreach", "git", "fetch"],
+            vec!["submodule", "sync", "--recursive"],
+            vec!["submodule", "absorbgitdirs"],
+            vec!["fetch", "--recurse-submodules=on-demand"],
+            vec!["push", "--recurse-submodules=on-demand"],
+            vec!["checkout", "--recurse-submodules", "HEAD"],
+            vec!["worktree", "add", ".exo/worktrees/bypass", "HEAD"],
+            vec!["clone", "https://example.invalid/reference.git", "clone"],
+            vec!["init", "nested"],
+            vec!["clean", "-ffdx"],
+        ];
+
+        for args in commands {
+            let request = RunRequest {
+                command: "git".into(),
+                args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                working_dir: ".".into(),
+                env: std::collections::HashMap::new(),
+                timeout_ms: 5_000,
+            };
+            let error = handler
+                .run(request, &test_ctx_at(root))
+                .await
+                .expect_err("nested Git mutation must be refused before process start");
+            assert!(error.to_string().contains("git_mutation_unavailable"));
+        }
+
+        assert!(!root.join("nested/.git").exists());
+        assert!(!root.join("clone/.git").exists());
+        assert!(!root.join(".exo/worktrees/bypass").exists());
+        assert!(!root.join(".exo/logs").exists());
+    }
+
+    #[tokio::test]
+    async fn process_handler_keeps_read_only_submodule_and_worktree_inspection_available() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let initialize = ["init", "-q", "-b", "main"];
+        assert_git_fixture_succeeded(run_git_fixture_output(root, &initialize), &initialize);
+        let handler = ProcessHandler::with_project_dir(root.to_path_buf());
+
+        for args in [
+            vec!["submodule", "status"],
+            vec!["submodule", "summary"],
+            vec!["worktree", "list"],
+        ] {
+            let request = RunRequest {
+                command: "git".into(),
+                args: args.iter().map(|arg| (*arg).to_string()).collect(),
+                working_dir: ".".into(),
+                env: std::collections::HashMap::new(),
+                timeout_ms: 5_000,
+            };
+            let response = handler
+                .run(request, &test_ctx_at(root))
+                .await
+                .unwrap_or_else(|error| panic!("git {args:?} should remain available: {error}"));
+            assert_eq!(response.exit_code, 0, "git {args:?}");
+        }
     }
 
     #[tokio::test]

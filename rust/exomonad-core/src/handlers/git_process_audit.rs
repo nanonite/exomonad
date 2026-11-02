@@ -1,5 +1,6 @@
 //! Mutation leases and durable audit records for direct Git process effects.
 
+use super::git_process_policy::validate_git_command;
 use super::process_supervision::{GitProcessAudit, ProcessRunOutput};
 use crate::effects::{EffectError, EffectResult};
 use crate::services::{
@@ -15,6 +16,14 @@ use std::time::Duration;
 
 const GIT_PROCESS_LEASE_WAIT: Duration = Duration::from_secs(2);
 
+pub(crate) struct GitProcessRequest<'a> {
+    pub args: &'a [String],
+    pub environment: &'a HashMap<String, String>,
+    pub operation_id: &'a str,
+    pub agent_id: &'a str,
+    pub birth_branch: &'a str,
+}
+
 pub(crate) struct GitProcessContext {
     leases: GitMutationLeaseSet,
     event_log: EventLog,
@@ -28,20 +37,18 @@ impl GitProcessContext {
         project_dir: &Path,
         worktree: &Path,
         command_directory: &Path,
-        request_env: &HashMap<String, String>,
-        operation_id: &str,
-        agent_id: &str,
-        birth_branch: &str,
+        request: GitProcessRequest<'_>,
     ) -> EffectResult<Self> {
-        let leases = acquire_git_leases(project_dir, worktree, operation_id).await?;
-        validate_git_working_directory(worktree, command_directory, request_env)?;
+        let leases = acquire_git_leases(project_dir, worktree, request.operation_id).await?;
+        validate_git_working_directory(worktree, command_directory, request.environment)?;
+        validate_git_command(request.args, command_directory, request.environment)?;
         let event_log = open_event_log(project_dir)?;
         let context = Self {
             leases,
             event_log,
-            operation_id: operation_id.to_string(),
-            agent_id: agent_id.to_string(),
-            birth_branch: birth_branch.to_string(),
+            operation_id: request.operation_id.to_string(),
+            agent_id: request.agent_id.to_string(),
+            birth_branch: request.birth_branch.to_string(),
         };
         context.record_requested()?;
         Ok(context)

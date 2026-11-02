@@ -24,6 +24,7 @@ pub mod forgejo_as_github;
 pub mod fs;
 pub mod git;
 mod git_process_audit;
+mod git_process_policy;
 mod git_snapshot;
 pub mod github;
 pub mod groups;
