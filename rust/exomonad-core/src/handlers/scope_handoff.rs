@@ -12,7 +12,7 @@ use crate::services::{
 };
 use exomonad_proto::effects::agent::{PrepareScopeHandoffRequest, PrepareScopeHandoffResponse};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::Read;
@@ -34,6 +34,25 @@ pub(crate) async fn prepare_scope_handoff(
     birth_branch: &str,
     request: PrepareScopeHandoffRequest,
 ) -> EffectResult<PrepareScopeHandoffResponse> {
+    prepare_scope_handoff_with_git(
+        project_dir,
+        source_worktree,
+        authenticated_controller,
+        birth_branch,
+        request,
+        OsString::from("git"),
+    )
+    .await
+}
+
+async fn prepare_scope_handoff_with_git(
+    project_dir: &Path,
+    source_worktree: &Path,
+    authenticated_controller: &str,
+    birth_branch: &str,
+    request: PrepareScopeHandoffRequest,
+    git_binary: OsString,
+) -> EffectResult<PrepareScopeHandoffResponse> {
     validate_request(&request, authenticated_controller)?;
     let source_worktree = canonical_source_worktree(project_dir, source_worktree)
         .map_err(EffectError::invalid_input)?;
@@ -44,6 +63,7 @@ pub(crate) async fn prepare_scope_handoff(
         &operation_identity,
         authenticated_controller,
         birth_branch,
+        git_binary,
     )
     .await
     {
@@ -70,6 +90,7 @@ pub(crate) async fn prepare_scope_handoff(
 }
 
 struct HandoffContext {
+    git_binary: OsString,
     worktree: PathBuf,
     branch: String,
     head: String,
@@ -115,6 +136,7 @@ impl HandoffContext {
         operation_identity: &str,
         agent_id: &str,
         birth_branch: &str,
+        git_binary: OsString,
     ) -> Result<Self, String> {
         let safety = GitMutationSafety::new(project_dir.to_path_buf());
         let target = if source_worktree.is_absolute() {
@@ -143,6 +165,7 @@ impl HandoffContext {
         let event_log = EventLog::open(project_dir.join(".exo/logs"))
             .map_err(|_| "durable Git operation audit is unavailable".to_string())?;
         let mut context = Self {
+            git_binary,
             worktree: paths.worktree_root,
             branch: String::new(),
             head: String::new(),
@@ -170,6 +193,28 @@ impl HandoffContext {
     ) -> Result<String, String> {
         let output = self
             .git(arguments.iter().map(OsString::from).collect(), cancellation)
+            .await
+            .map_err(|failure| failure.message)?;
+        if !output.status.success() {
+            return Err(git_refusal(output.status, "Git inspection failed"));
+        }
+        String::from_utf8(output.stdout)
+            .map(|value| value.trim().to_string())
+            .map_err(|_| "Git returned malformed repository evidence".to_string())
+    }
+
+    async fn git_text_with_index(
+        &self,
+        arguments: &[&str],
+        index_file: &Path,
+        cancellation: &mut oneshot::Receiver<()>,
+    ) -> Result<String, String> {
+        let output = self
+            .git_with_index(
+                arguments.iter().map(OsString::from).collect(),
+                Some(index_file),
+                cancellation,
+            )
             .await
             .map_err(|failure| failure.message)?;
         if !output.status.success() {
@@ -297,6 +342,15 @@ impl HandoffContext {
         arguments: Vec<OsString>,
         cancellation: &mut oneshot::Receiver<()>,
     ) -> Result<super::process_supervision::ProcessRunOutput, GitFailure> {
+        self.git_with_index(arguments, None, cancellation).await
+    }
+
+    async fn git_with_index(
+        &self,
+        arguments: Vec<OsString>,
+        index_file: Option<&Path>,
+        cancellation: &mut oneshot::Receiver<()>,
+    ) -> Result<super::process_supervision::ProcessRunOutput, GitFailure> {
         let command_id = format!("{}-{}", self.operation_identity, uuid::Uuid::new_v4());
         let paths = &index_lease(&self.leases)
             .ok_or_else(|| {
@@ -330,7 +384,7 @@ impl HandoffContext {
             agent_id: &self.agent_id,
             birth_branch: &self.birth_branch,
         };
-        let mut command = Command::new("git");
+        let mut command = Command::new(&self.git_binary);
         command
             .args(arguments)
             .current_dir(&self.worktree)
@@ -342,6 +396,9 @@ impl HandoffContext {
             .env_remove("GIT_OBJECT_DIRECTORY")
             .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
             .kill_on_drop(true);
+        if let Some(index_file) = index_file {
+            command.env("GIT_INDEX_FILE", index_file);
+        }
         let result = run_supervised(
             &mut command,
             Some(GIT_TIMEOUT),
@@ -635,7 +692,20 @@ async fn execute_handoff_body(
                 .to_string(),
         );
     }
-    let expected_tree = context.git_text(&["write-tree"], cancellation).await?;
+    let commit_index = isolated_commit_index(context)?;
+    stage_handoff_snapshot(context, &allowed_paths, commit_index.path(), cancellation).await?;
+    let expected_tree = context
+        .git_text_with_index(&["write-tree"], commit_index.path(), cancellation)
+        .await?;
+    validate_handoff_tree(
+        context,
+        &expected_tree,
+        &context.head,
+        &snapshot_entries,
+        &allowed_paths,
+        cancellation,
+    )
+    .await?;
 
     let message = commit_message(
         &handoff_identity,
@@ -644,7 +714,10 @@ async fn execute_handoff_body(
         &context.branch,
         &expected_tree,
     );
-    let commit_result = match context.git(message, cancellation).await {
+    let commit_result = match context
+        .git_with_index(message, Some(commit_index.path()), cancellation)
+        .await
+    {
         Ok(output) => output,
         Err(failure) => {
             let outcome = match failure.outcome {
@@ -942,6 +1015,136 @@ async fn reject_unfinished_git_operation(
         }
     }
     Ok(())
+}
+
+fn isolated_commit_index(context: &HandoffContext) -> Result<tempfile::NamedTempFile, String> {
+    let lease = index_lease(&context.leases)
+        .ok_or_else(|| "Git mutation lease does not cover the worktree index".to_string())?;
+    let metadata = fs::symlink_metadata(&lease.paths.index_file)
+        .map_err(|_| "Git index could not be inspected for the commit snapshot".to_string())?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("Git index is not a regular file; refusing handoff commit".to_string());
+    }
+    let snapshot = fs::read(&lease.paths.index_file)
+        .map_err(|_| "Git index snapshot could not be read safely".to_string())?;
+    let index_parent = lease
+        .paths
+        .index_file
+        .parent()
+        .ok_or_else(|| "Git index has no safe parent directory".to_string())?;
+    let mut isolated = tempfile::Builder::new()
+        .prefix("exo-handoff-index-")
+        .tempfile_in(index_parent)
+        .map_err(|_| "isolated Git commit index could not be created".to_string())?;
+    use std::io::Write;
+    isolated
+        .write_all(&snapshot)
+        .map_err(|_| "isolated Git commit index could not be initialized".to_string())?;
+    isolated
+        .flush()
+        .map_err(|_| "isolated Git commit index could not be synchronized".to_string())?;
+    Ok(isolated)
+}
+
+async fn validate_handoff_tree(
+    context: &HandoffContext,
+    tree: &str,
+    parent: &str,
+    accepted_snapshot: &GitEntrySnapshot,
+    allowed_paths: &[Vec<u8>],
+    cancellation: &mut oneshot::Receiver<()>,
+) -> Result<(), String> {
+    let changed = context
+        .git_bytes(
+            vec![
+                "diff".into(),
+                "--no-renames".into(),
+                "--name-only".into(),
+                "-z".into(),
+                parent.into(),
+                tree.into(),
+            ],
+            cancellation,
+        )
+        .await?;
+    let changed = path_set(&changed)?;
+    let allowed = allowed_paths.iter().cloned().collect::<BTreeSet<_>>();
+    if let Some(path) = changed.difference(&allowed).next() {
+        return Err(format!(
+            "handoff commit snapshot contains an unauthorized path {}; index evidence changed during commit preparation",
+            escape_path(path)
+        ));
+    }
+
+    let committed_entries = context
+        .git_bytes(
+            vec!["ls-tree".into(), "-r".into(), "-z".into(), tree.into()],
+            cancellation,
+        )
+        .await?;
+    let committed = GitEntrySnapshot::parse(&[], &committed_entries, &[])?;
+    if gitlink_tree_entries(&committed) != gitlink_tree_entries(accepted_snapshot) {
+        return Err(
+            "handoff commit snapshot does not preserve the accepted reference gitlinks; no parent commit was created"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn gitlink_tree_entries(snapshot: &GitEntrySnapshot) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    snapshot
+        .entries()
+        .iter()
+        .filter_map(|(path, entry)| {
+            let head = entry.head.as_ref()?;
+            (head.mode == 0o160000 && head.object_type == b"commit")
+                .then(|| (path.clone(), head.object_id.clone()))
+        })
+        .collect()
+}
+
+async fn stage_handoff_snapshot(
+    context: &HandoffContext,
+    allowed_paths: &[Vec<u8>],
+    index_file: &Path,
+    cancellation: &mut oneshot::Receiver<()>,
+) -> Result<(), String> {
+    let mut present = Vec::new();
+    for path in allowed_paths {
+        let full_path = context.worktree.join(path_to_os(path)?);
+        match fs::symlink_metadata(full_path) {
+            Ok(_) => present.push(path.clone()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut arguments = vec![
+                    OsString::from("update-index"),
+                    OsString::from("--force-remove"),
+                    OsString::from("--"),
+                ];
+                arguments.push(path_to_os(path)?);
+                run_required_git_with_index(
+                    context,
+                    arguments,
+                    index_file,
+                    cancellation,
+                    "deleted handoff path could not be removed from the commit snapshot",
+                )
+                .await?;
+            }
+            Err(_) => return Err("handoff path could not be inspected safely".to_string()),
+        }
+    }
+    if present.is_empty() {
+        return Ok(());
+    }
+    run_required_git_with_index(
+        context,
+        git_add_arguments(&present)?,
+        index_file,
+        cancellation,
+        "authorized handoff paths could not be staged into the commit snapshot",
+    )
+    .await
 }
 
 async fn worktree_fingerprint(
@@ -1765,6 +1968,24 @@ async fn run_required_git(
     }
 }
 
+async fn run_required_git_with_index(
+    context: &HandoffContext,
+    arguments: Vec<OsString>,
+    index_file: &Path,
+    cancellation: &mut oneshot::Receiver<()>,
+    refusal: &str,
+) -> Result<(), String> {
+    let output = context
+        .git_with_index(arguments, Some(index_file), cancellation)
+        .await
+        .map_err(|failure| failure.message)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(git_refusal(output.status, refusal))
+    }
+}
+
 async fn require_commit_identity(
     context: &HandoffContext,
     cancellation: &mut oneshot::Receiver<()>,
@@ -2148,6 +2369,70 @@ mod tests {
             reference_index_before
         );
         assert_eq!(repository.commit_count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn external_reference_index_writes_cannot_change_the_handoff_commit_tree() {
+        for boundary in ["write-tree", "commit"] {
+            let repository = TestRepository::new();
+            let reference = TestRepository::new();
+            let accepted_reference = repository.add_reference_gitlink("reference", &reference);
+            let changed_reference = TestRepository::new();
+            changed_reference.write("tracked.txt", "unauthorized pointer\n");
+            changed_reference.git(&["add", "tracked.txt"]);
+            changed_reference.git(&["commit", "-m", "unauthorized pointer"]);
+            let injected_reference = changed_reference.head();
+            repository.write("tracked.txt", "authorized parent edit\n");
+            let inspection = run(&repository, request(false, "", "")).await;
+            assert!(inspection.ready, "{}", inspection.error);
+
+            let real_git = find_git_executable();
+            let real_index = repository.path().join(".git/index");
+            let wrapper = repository.path().join(".git/git-race-wrapper");
+            let invoked = repository.path().join(".git/race-invoked");
+            let script = format!(
+                "#!/bin/sh\nset -e\nif [ \"$1\" = \"{boundary}\" ]; then\n  touch {}\n  GIT_INDEX_FILE={} {} update-index --cacheinfo {}\nfi\nexec {} \"$@\"\n",
+                shell_quote(invoked.to_string_lossy().as_ref()),
+                shell_quote(real_index.to_string_lossy().as_ref()),
+                shell_quote(real_git.to_string_lossy().as_ref()),
+                shell_quote(&format!("160000,{injected_reference},tools/reference")),
+                shell_quote(real_git.to_string_lossy().as_ref()),
+            );
+            fs::write(&wrapper, script).unwrap();
+            set_executable(&wrapper);
+
+            let response = run_with_git(
+                &repository,
+                request(true, &inspection.head_after, &inspection.source_fingerprint),
+                wrapper.as_os_str(),
+            )
+            .await;
+            assert!(
+                invoked.exists(),
+                "test Git wrapper did not intercept {boundary}: {}",
+                response.error
+            );
+
+            assert_eq!(
+                repository.git(&["rev-parse", "HEAD:tools/reference"]),
+                accepted_reference,
+                "the commit tree must retain the accepted reference at {boundary}"
+            );
+            let staged_reference = repository.git(&["ls-files", "--stage", "tools/reference"]);
+            assert_eq!(
+                staged_reference.split_whitespace().nth(1),
+                Some(injected_reference.as_str()),
+                "the concurrent index write is preserved for operator review; staged={staged_reference}; injected={injected_reference}"
+            );
+            assert_eq!(
+                repository.git(&["show", "HEAD:tracked.txt"]),
+                "authorized parent edit"
+            );
+            assert_eq!(response.outcome, "committed_with_new_changes");
+            assert!(!response.ready);
+            assert!(response.error.contains("staged pointer or type change"));
+        }
     }
 
     #[tokio::test]
@@ -2647,6 +2932,34 @@ mod tests {
         .unwrap()
     }
 
+    async fn run_with_git(
+        repository: &TestRepository,
+        request: PrepareScopeHandoffRequest,
+        git_binary: &OsStr,
+    ) -> PrepareScopeHandoffResponse {
+        prepare_scope_handoff_with_git(
+            repository.path(),
+            Path::new("."),
+            "controller",
+            "main",
+            request,
+            git_binary.to_os_string(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn find_git_executable() -> PathBuf {
+        std::env::split_paths(&std::env::var_os("PATH").expect("test PATH"))
+            .map(|directory| directory.join("git"))
+            .find(|candidate| candidate.is_file())
+            .expect("test environment has Git on PATH")
+    }
+
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
     async fn typed_snapshot(repository: &TestRepository) -> GitEntrySnapshot {
         let context = HandoffContext::prepare(
             repository.path(),
@@ -2654,6 +2967,7 @@ mod tests {
             "typed-snapshot-test",
             "controller",
             "main",
+            OsString::from("git"),
         )
         .await
         .expect("test repository is mutation-ready");
