@@ -14,13 +14,14 @@ set -euo pipefail
 # call there. That failure is expected and tolerated: those phases assert
 # tmux window state and server socket health, not controller outcomes.
 #
-# Phase 7 exercises what phases 1-6 deliberately don't: continuation of a
+# Aggregate recovery exercises what phases 1-6 deliberately don't: continuation of a
 # reviewed, completed leaf through the embedded controller, real watcher,
 # real ledger, and production merge tool. It verifies merge and post-merge
 # completion, not just tmux repair. The checkpoint's review, handoff, and
 # publication evidence are seeded from exact mock-Forgejo records so this
 # phase tests the installed controller/tool boundary without simulating an
-# agent or claiming a reviewer was recovered from the event stream.
+# agent or claiming a reviewer was recovered from the event stream. Its Kani
+# worktree also carries uninitialized reference gitlinks through recovery.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/harness.sh
@@ -1202,6 +1203,10 @@ chainlink show 814 --db "$AGG_REPO/.chainlink/issues.db" \
     || e2e_fail "disposable issue #814 is not readable"
 rg -Fq 'Status: open' "$AGG_DIR/chainlink-issue-814.log" \
     || e2e_fail "disposable issue #814 must remain open for routed recovery"
+REFERENCE_GITLINKS="$AGG_DIR/reference-gitlinks.json"
+python3 "$SCRIPT_DIR/reference-gitlinks.py" seed \
+    --repo "$AGG_REPO" --projects "$AGG_DIR/reference-projects" \
+    --output "$REFERENCE_GITLINKS"
 git -C "$AGG_REPO" commit --allow-empty -q -m "aggregate recovery base"
 printf 'tracked staged baseline\n' > "$AGG_REPO/preserved-staged.txt"
 printf 'tracked unstaged baseline\n' > "$AGG_REPO/preserved-unstaged.txt"
@@ -1209,6 +1214,9 @@ git -C "$AGG_REPO" add .gitignore .forgejo/workflows/ci.yml CHANGELOG.md preserv
 git -C "$AGG_REPO" add -f .exo/harness_policy.toml .exo/tracked-runtime-policy.toml
 git -C "$AGG_REPO" commit -q -m "add local edit preservation baselines"
 git -C "$AGG_REPO" push -u origin main -q
+python3 "$SCRIPT_DIR/reference-gitlinks.py" verify \
+    --repo "$AGG_REPO" --baseline "$REFERENCE_GITLINKS"
+e2e_log "Seeded and verified two unchanged, uninitialized reference gitlinks without fetching either project"
 
 AGG_MOCK_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
 AGG_MOCK_URL="http://127.0.0.1:$AGG_MOCK_PORT"
@@ -1400,6 +1408,11 @@ assert invocation["generation"] == 1 and invocation["ended_at"] is not None
 assert invocation["branch"] == kani["branch"] and invocation["worktree"] == kani["worktree"]
 assert invocation.get("pr_number") is None and invocation.get("head_sha") is None
 PY
+KANI_WORKTREE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["slices"]["kani"]["worktree"])' \
+    "$AGG_REPO/.exo/tl-loop/root/run.json")"
+python3 "$SCRIPT_DIR/reference-gitlinks.py" verify \
+    --repo "$KANI_WORKTREE" --baseline "$REFERENCE_GITLINKS"
+e2e_log "Kani worktree contains the same untouched, uninitialized reference gitlinks before recovery"
 AGGREGATE_PR="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["aggregate_pr"])' "$AGG_DIR/seed.json")"
 AGGREGATE_BASE_SHA="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["base_sha"])' "$AGG_DIR/seed.json")"
 AGGREGATE_REMOTE_HEAD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["aggregate_remote_head"])' "$AGG_DIR/seed.json")"
@@ -1858,6 +1871,8 @@ if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" ]]; then
         --output "$AGG_DIR/configured-owner-resume.json" \
         > "$AGG_DIR/configured-owner-resume.stdout" \
         || { cat "$AGG_DIR/configured-owner-resume.stdout"; e2e_fail "controller did not recover the accepted terminal OpenCode owner through Codex and reviewer flow"; }
+    python3 "$SCRIPT_DIR/reference-gitlinks.py" verify \
+        --repo "$KANI_WORKTREE" --baseline "$REFERENCE_GITLINKS"
 elif [[ "${E2E_BLOCKER_ONLY:-0}" == "1" ]]; then
     # Seed the historical owner only after both child and parent projections
     # have durably consumed the blocker. A live owner must not affect routing
@@ -2329,6 +2344,8 @@ PY
         --repo "$AGG_REPO" --baseline "$AGG_DIR/configured-owner-resume.json" \
         > "$AGG_DIR/configured-owner-resume-repeat.stdout" \
         || { cat "$AGG_DIR/configured-owner-resume-repeat.stdout"; e2e_fail "terminal-owner repeat duplicated or rewrote the successor flow"; }
+    python3 "$SCRIPT_DIR/reference-gitlinks.py" verify \
+        --repo "$KANI_WORKTREE" --baseline "$REFERENCE_GITLINKS"
     python3 - "$AGG_REPO" "$AGG_DIR/terminal-effects-before-repeat.json" <<'PY' \
         || e2e_fail "terminal-owner repeat changed accepted checkpoints or dispatch evidence"
 import hashlib
@@ -2944,6 +2961,8 @@ PY
 HANDOFF_COMMIT_REPORT="$(assert_scope_handoff_commit)"
 printf '%s\n' "$HANDOFF_COMMIT_REPORT" > "$AGG_DIR/scope-handoff-commit.json"
 HANDOFF_COMMIT_SHA="$(git -C "$AGG_REPO" rev-parse HEAD)"
+python3 "$SCRIPT_DIR/reference-gitlinks.py" verify \
+    --repo "$AGG_REPO" --baseline "$REFERENCE_GITLINKS"
 [[ "$(git -C "$AGG_REPO" rev-parse main)" == "$HANDOFF_COMMIT_SHA" ]] \
     || e2e_fail "parent branch does not point at its audited handoff commit"
 [[ "$(git -C "$AGG_REPO" rev-parse refs/remotes/origin/main)" == "$AGGREGATE_REMOTE_HEAD" ]] \

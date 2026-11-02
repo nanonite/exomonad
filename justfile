@@ -802,7 +802,7 @@ check-e2e-init-recovery:
     bash -n tests/e2e/init-recovery/tl-window-state.sh
     bash -n tests/e2e/init-recovery/test-tl-window-state.sh
     tests/e2e/init-recovery/test-tl-window-state.sh
-    {{py}} -m py_compile tests/e2e/init-recovery/seed_checkpoint.py tests/e2e/init-recovery/seed_publication.py tests/e2e/init-recovery/seed_aggregate_checkpoint.py tests/e2e/init-recovery/configured-owner-resume.py
+    {{py}} -m py_compile tests/e2e/init-recovery/seed_checkpoint.py tests/e2e/init-recovery/seed_publication.py tests/e2e/init-recovery/seed_aggregate_checkpoint.py tests/e2e/init-recovery/configured-owner-resume.py tests/e2e/init-recovery/reference-gitlinks.py
 
 # Run the real-server --continue identity-preservation and corruption
 # classification acceptance scenario (chainlink #1019).
