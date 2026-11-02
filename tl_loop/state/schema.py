@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Literal, TypeAlias, cast
@@ -25,6 +25,11 @@ from .aggregate_approval import (
     validate_receipt_document,
 )
 from .plan_manifest import ManifestError, PlanManifest
+from .reference_verification import (
+    ReferenceVerificationError,
+    ReferenceVerificationEvidence,
+    validate_reference_verification_document,
+)
 from .repository_identity import canonical_repository_url
 
 BLOCK_CAUSE_VALUES = frozenset(
@@ -487,6 +492,7 @@ RUN_KEYS = frozenset(
         "integration",
         "repository_identity",
         "repository_identity_migration",
+        "reference_verification",
         "state_version",
         "reducer_version",
         "controller_epoch",
@@ -1116,6 +1122,7 @@ class RunState:
     reviewer_max_rounds: int | None = None
     reviewer_max_rounds_source: ReviewPolicySource | None = None
     plan_manifest: PlanManifest | None = None
+    reference_verification: tuple[ReferenceVerificationEvidence, ...] = ()
     recursive_fsm: object | None = None
 
 
@@ -1178,6 +1185,13 @@ def _validate_document(doc: object, *, allow_legacy_identity: bool) -> None:
         expected_run_id=root.get("run_id"),
         repository_identity=root.get("repository_identity"),
     )
+    try:
+        reference_evidence = validate_reference_verification_document(
+            root.get("reference_verification")
+        )
+        _validate_reference_verification_binding(root, reference_evidence, errors)
+    except ReferenceVerificationError as error:
+        errors.append(("run.reference_verification", str(error)))
 
     fsm = _object(root.get("fsm"), "run.fsm", FSM_KEYS, errors)
     if fsm is not None:
@@ -1211,6 +1225,36 @@ def _validate_document(doc: object, *, allow_legacy_identity: bool) -> None:
 
     if errors:
         raise SchemaError(errors)
+
+
+def _validate_reference_verification_binding(
+    root: Mapping[str, object],
+    evidence: Sequence[ReferenceVerificationEvidence],
+    errors: list[tuple[str, str]],
+) -> None:
+    if not evidence:
+        return
+    expected_run = root.get("run_id")
+    manifest = root.get("plan_manifest")
+    expected_scope = manifest.get("scope_id") if isinstance(manifest, Mapping) else None
+    if not isinstance(expected_scope, str) or not expected_scope:
+        errors.append(("run.reference_verification", "requires a persisted plan manifest scope"))
+        return
+    for index, record in enumerate(evidence):
+        if record.run_id != expected_run:
+            errors.append(
+                (
+                    f"run.reference_verification.records[{index}].run_id",
+                    "does not match the checkpoint run_id",
+                )
+            )
+        if record.scope_id != expected_scope:
+            errors.append(
+                (
+                    f"run.reference_verification.records[{index}].scope_id",
+                    "does not match the persisted plan manifest scope",
+                )
+            )
 
 
 def _version(

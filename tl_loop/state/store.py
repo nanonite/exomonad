@@ -78,6 +78,11 @@ from .plan_manifest import (
     build_legacy_manifest,
     validate_manifest_revision,
 )
+from .reference_verification import (
+    ReferenceVerificationError,
+    ReferenceVerificationEvidence,
+    validate_reference_verification_document,
+)
 from .repository_identity_migration import (
     ChildIdentityEvidence,
     RepositoryIdentityMigrationError,
@@ -164,6 +169,10 @@ class QuarantineStorageError(RuntimeError):
 
 class _TaskBlockedDispositionAlreadyRecorded(Exception):
     """Abort an atomic write when the exact disposition is already durable."""
+
+
+class _ReferenceEvidenceAlreadyRecorded(Exception):
+    """Abort an atomic write when the evidence identity is already durable."""
 
 
 def _validate_task_blocked_dispositions(value: object) -> None:
@@ -281,6 +290,7 @@ class ResumeState:
     reviewer_max_rounds_source: ReviewPolicySource | None = None
     session_mode: SessionMode | None = None
     plan_manifest: PlanManifest | None = None
+    reference_verification: tuple[ReferenceVerificationEvidence, ...] = ()
     recursive_fsm: object | None = None
 
     @property
@@ -1083,6 +1093,59 @@ class RunStore:
         assert isinstance(entries, list)
         return tuple(MappingProxyType(dict(item)) for item in entries if isinstance(item, dict))
 
+    def record_reference_verification(self, evidence: ReferenceVerificationEvidence) -> bool:
+        """Append one immutable reference result to this run checkpoint exactly once."""
+        if not isinstance(evidence, ReferenceVerificationEvidence):
+            raise TypeError("evidence must be a ReferenceVerificationEvidence")
+        if evidence.run_id != self.run_id:
+            raise ValueError("reference verification evidence run identity differs from this store")
+        encoded = evidence.to_document()
+
+        def mutate(document: dict[str, object]) -> dict[str, object]:
+            if document.get("run_id") != evidence.run_id:
+                raise ValueError(
+                    "reference verification evidence run identity differs from checkpoint"
+                )
+            raw_manifest = document.get("plan_manifest")
+            if not isinstance(raw_manifest, Mapping):
+                raise TypeError("reference verification requires a persisted plan scope")
+            manifest = PlanManifest.from_document(raw_manifest)
+            if manifest.scope_id != evidence.scope_id:
+                raise ValueError(
+                    "reference verification evidence scope identity differs from checkpoint"
+                )
+            try:
+                existing_records = validate_reference_verification_document(
+                    document.get("reference_verification")
+                )
+            except ReferenceVerificationError as error:
+                raise ValueError(
+                    f"stored reference verification evidence is malformed: {error}"
+                ) from error
+            for existing in existing_records:
+                if existing.evidence_id != evidence.evidence_id:
+                    continue
+                if existing.identity_document() == evidence.identity_document():
+                    raise _ReferenceEvidenceAlreadyRecorded
+                raise ValueError(
+                    f"conflicting reference verification evidence for {evidence.evidence_id!r}"
+                )
+            document["reference_verification"] = {
+                "schema_version": 1,
+                "records": [item.to_document() for item in existing_records] + [encoded],
+            }
+            return document
+
+        try:
+            apply(self.run_dir, mutate)
+        except _ReferenceEvidenceAlreadyRecorded:
+            return False
+        return True
+
+    def reference_verification_evidence(self) -> tuple[ReferenceVerificationEvidence, ...]:
+        """Return the typed immutable evidence records retained by the checkpoint."""
+        return self.load().reference_verification
+
     def append_audit_event(self, event: Mapping[str, object]) -> None:
         """Retain one refused historical event permanently for audit.
 
@@ -1644,6 +1707,7 @@ def resume(run_id: str, *, root_dir: str | Path = DEFAULT_ROOT) -> ResumeState:
         reviewer_max_rounds_source=state.reviewer_max_rounds_source,
         session_mode=state.session_mode,
         plan_manifest=state.plan_manifest,
+        reference_verification=state.reference_verification,
         recursive_fsm=state.recursive_fsm,
     )
 
@@ -1667,6 +1731,7 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
         "ordered_stages",
         "integration",
         "repository_identity",
+        "reference_verification",
         "state_version",
         "reducer_version",
         "controller_epoch",
@@ -2813,6 +2878,9 @@ def _decode(document: dict[str, object]) -> RunState:
             PlanManifest.from_document(cast(dict[str, object], document["plan_manifest"]))
             if document.get("plan_manifest") is not None
             else None
+        ),
+        reference_verification=validate_reference_verification_document(
+            document.get("reference_verification")
         ),
         recursive_fsm=recursive_fsm,
     )
