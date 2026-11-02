@@ -999,7 +999,9 @@ class RecordingTransport:
             expected_fingerprint = arguments.get("expected_source_fingerprint")
             head = expected_head if isinstance(expected_head, str) else "1" * 40
             fingerprint = (
-                expected_fingerprint if isinstance(expected_fingerprint, str) else "2" * 64
+                expected_fingerprint
+                if isinstance(expected_fingerprint, str)
+                else "git-snapshot-v2:" + "2" * 64
             )
             return _scope_handoff_tool_response(
                 arguments,
@@ -1257,7 +1259,7 @@ class ScopeHandoffTransport(RecordingTransport):
     source_worktree: str = "/tmp/accepted-source"
     head: str = "1" * 40
     committed_head: str = "3" * 40
-    fingerprint: str = "2" * 64
+    fingerprint: str = "git-snapshot-v2:" + "2" * 64
     dirty: bool = True
     inspection_error: str | None = None
     change_before_apply: bool = False
@@ -1275,7 +1277,7 @@ class ScopeHandoffTransport(RecordingTransport):
         if self.change_before_apply:
             self.change_before_apply = False
             self.head = "4" * 40
-            self.fingerprint = "5" * 64
+            self.fingerprint = "git-snapshot-v2:" + "5" * 64
         return self._apply(arguments)
 
     def _inspection(self, arguments: JsonObject) -> JsonObject:
@@ -1436,7 +1438,7 @@ def test_scope_handoff_receipt_distinguishes_committed_and_remaining_paths() -> 
                 branch="main",
                 head_before="1" * 40,
                 head_after="1" * 40 if outcome in {"ready", "no_changes"} else "2" * 40,
-                fingerprint="3" * 64,
+                fingerprint="git-snapshot-v2:" + "3" * 64,
                 outcome=outcome,
                 ready=True,
                 commit_sha="" if outcome in {"ready", "no_changes"} else "2" * 40,
@@ -1449,12 +1451,18 @@ def test_scope_handoff_receipt_distinguishes_committed_and_remaining_paths() -> 
         driver_module._scope_handoff_response_error(response("ready", [], ["612e747874"]), expected)
         is None
     )
+    legacy = response("no_changes", [], [])
+    cast(dict[str, object], legacy.raw["result"])["source_fingerprint"] = "3" * 64
+    assert (
+        driver_module._scope_handoff_response_error(legacy, expected)
+        == "scope handoff receipt uses a legacy unversioned fingerprint; inspect again before applying"
+    )
     assert (
         driver_module._scope_handoff_response_error(
             response("no_changes", [], []),
             expected,
             expected_head="1" * 40,
-            expected_fingerprint="3" * 64,
+            expected_fingerprint="git-snapshot-v2:" + "3" * 64,
         )
         is None
     )
@@ -1465,7 +1473,7 @@ def test_scope_handoff_receipt_distinguishes_committed_and_remaining_paths() -> 
             changed_noop_head,
             expected,
             expected_head="1" * 40,
-            expected_fingerprint="3" * 64,
+            expected_fingerprint="git-snapshot-v2:" + "3" * 64,
         )
         == "no-op scope handoff receipt changed source HEAD"
     )
@@ -1476,7 +1484,7 @@ def test_scope_handoff_receipt_distinguishes_committed_and_remaining_paths() -> 
             committed_noop,
             expected,
             expected_head="1" * 40,
-            expected_fingerprint="3" * 64,
+            expected_fingerprint="git-snapshot-v2:" + "3" * 64,
         )
         == "no-op scope handoff receipt reports a commit"
     )
@@ -1491,7 +1499,7 @@ def test_scope_handoff_receipt_distinguishes_committed_and_remaining_paths() -> 
             response("committed", ["612e747874"], []),
             expected,
             expected_head="1" * 40,
-            expected_fingerprint="3" * 64,
+            expected_fingerprint="git-snapshot-v2:" + "3" * 64,
         )
         is None
     )
@@ -1505,7 +1513,7 @@ def test_scope_handoff_receipt_distinguishes_committed_and_remaining_paths() -> 
             mismatched_alias,
             expected,
             expected_head="1" * 40,
-            expected_fingerprint="3" * 64,
+            expected_fingerprint="git-snapshot-v2:" + "3" * 64,
         ),
     )
 

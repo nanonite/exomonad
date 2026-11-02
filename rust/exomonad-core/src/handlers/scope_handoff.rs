@@ -4,6 +4,7 @@
 //! Git subprocess runs under the existing managed-process supervisor while one
 //! refs/index lease set remains held across inspection, staging, and commit.
 
+use super::git_snapshot::{GitEntrySnapshot, GitlinkObservation};
 use super::process_supervision::{run_supervised, GitProcessAudit, ProcessRunError};
 use crate::effects::{EffectError, EffectResult};
 use crate::services::{
@@ -24,6 +25,7 @@ use tokio::sync::oneshot;
 const LEASE_WAIT: Duration = Duration::from_secs(2);
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const COMMIT_SUBJECT: &str = "Prepare parent worktree for ordered subTL handoff";
+const SNAPSHOT_FINGERPRINT_PREFIX: &str = "git-snapshot-v2:";
 
 pub(crate) async fn prepare_scope_handoff(
     project_dir: &Path,
@@ -364,8 +366,9 @@ async fn execute_handoff_body(
         return Err("scope handoff is blocked by unresolved Git conflicts".to_string());
     }
 
-    let snapshot_paths = current_worktree_paths(context, cancellation).await?;
-    let snapshot = fingerprint_paths(context, &snapshot_paths)?;
+    let snapshot_entries = current_worktree_snapshot(context, cancellation).await?;
+    let snapshot = fingerprint_snapshot(&context.worktree, &snapshot_entries, true)?;
+    let pre_staging_worktree = fingerprint_snapshot(&context.worktree, &snapshot_entries, false)?;
     let changed_paths = changed_path_hex(context, cancellation).await?;
     if !request.apply
         && !request.expected_head_sha.is_empty()
@@ -457,8 +460,8 @@ async fn execute_handoff_body(
     )
     .await?;
     let after_staging =
-        fingerprint_with_current_paths(context, &snapshot_paths, cancellation).await?;
-    if after_staging != snapshot {
+        fingerprint_with_current_paths(context, &snapshot_entries, cancellation).await?;
+    if after_staging != pre_staging_worktree {
         append_handoff_event(
             context,
             "tl.scope_handoff.blocked",
@@ -814,26 +817,23 @@ async fn worktree_fingerprint(
     context: &HandoffContext,
     cancellation: &mut oneshot::Receiver<()>,
 ) -> Result<String, String> {
-    let paths = current_worktree_paths(context, cancellation).await?;
-    fingerprint_paths(context, &paths)
+    let snapshot = current_worktree_snapshot(context, cancellation).await?;
+    fingerprint_snapshot(&context.worktree, &snapshot, true)
 }
 
-async fn current_worktree_paths(
+async fn current_worktree_snapshot(
     context: &HandoffContext,
     cancellation: &mut oneshot::Receiver<()>,
-) -> Result<BTreeSet<Vec<u8>>, String> {
-    let tracked = context
-        .git_bytes(vec!["ls-files".into(), "-z".into()], cancellation)
+) -> Result<GitEntrySnapshot, String> {
+    let index_stages = context
+        .git_bytes(
+            vec!["ls-files".into(), "--stage".into(), "-z".into()],
+            cancellation,
+        )
         .await?;
     let committed = context
         .git_bytes(
-            vec![
-                "ls-tree".into(),
-                "-r".into(),
-                "-z".into(),
-                "--name-only".into(),
-                "HEAD".into(),
-            ],
+            vec!["ls-tree".into(), "-r".into(), "-z".into(), "HEAD".into()],
             cancellation,
         )
         .await?;
@@ -848,28 +848,33 @@ async fn current_worktree_paths(
             cancellation,
         )
         .await?;
-    let mut paths = path_set(&tracked)?;
-    paths.extend(path_set(&committed)?);
-    paths.extend(path_set(&untracked)?);
-    Ok(paths)
+    let mut snapshot = GitEntrySnapshot::parse(&index_stages, &committed, &untracked)?;
+    snapshot.observe_references(&context.worktree)?;
+    Ok(snapshot)
 }
 
 async fn fingerprint_with_current_paths(
     context: &HandoffContext,
-    original_paths: &BTreeSet<Vec<u8>>,
+    original_entries: &GitEntrySnapshot,
     cancellation: &mut oneshot::Receiver<()>,
 ) -> Result<String, String> {
-    let mut paths = current_worktree_paths(context, cancellation).await?;
-    paths.extend(original_paths.iter().cloned());
-    fingerprint_paths(context, &paths)
+    let entries = current_worktree_snapshot(context, cancellation)
+        .await?
+        .with_paths_from(original_entries);
+    fingerprint_snapshot(&context.worktree, &entries, false)
 }
 
-fn fingerprint_paths(
-    context: &HandoffContext,
-    paths: &BTreeSet<Vec<u8>>,
+fn fingerprint_snapshot(
+    worktree: &Path,
+    snapshot: &GitEntrySnapshot,
+    include_index: bool,
 ) -> Result<String, String> {
     let mut digest = Sha256::new();
-    for path in paths {
+    digest.update(b"exo-scope-handoff-git-snapshot-v2\0");
+    digest.update([u8::from(include_index)]);
+    for (path, entry) in snapshot.entries() {
+        digest.update((path.len() as u64).to_be_bytes());
+        digest.update(path);
         let relative = PathBuf::from(path_to_os(path)?);
         if relative.is_absolute()
             || relative
@@ -878,14 +883,87 @@ fn fingerprint_paths(
         {
             return Err("Git reported an unsafe worktree path".to_string());
         }
-        hash_worktree_path(
-            &mut digest,
-            &context.worktree,
-            &context.worktree.join(relative),
-            path,
-        )?;
+        hash_git_entry_metadata(&mut digest, entry, include_index);
+        let full_path = worktree.join(relative);
+        if entry.is_gitlink() {
+            digest.update(b"gitlink-reference-observation-v1\0");
+            reject_symlinked_parent(worktree, path)?;
+            let observation = entry.gitlink_observation.ok_or_else(|| {
+                "reference gitlink state was not observed; retry inspection before handoff"
+                    .to_string()
+            })?;
+            if matches!(
+                observation,
+                GitlinkObservation::InitializedDirectory
+                    | GitlinkObservation::InitializedFile
+                    | GitlinkObservation::UnsupportedContents
+            ) {
+                return Err(format!(
+                    "reference gitlink {} is initialized or contains unsupported local state; inspect its scoped HEAD and status before handoff",
+                    escape_path(path)
+                ));
+            }
+            digest.update([gitlink_observation_byte(observation)]);
+        } else {
+            digest.update(b"worktree-path-content-v1\0");
+            hash_worktree_path(&mut digest, worktree, &full_path, path)?;
+        }
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(format!(
+        "{SNAPSHOT_FINGERPRINT_PREFIX}{:x}",
+        digest.finalize()
+    ))
+}
+
+fn hash_git_entry_metadata(
+    digest: &mut Sha256,
+    entry: &super::git_snapshot::GitPathEntry,
+    include_index: bool,
+) {
+    digest.update(b"git-entry-metadata-v1\0");
+    if let Some(head) = &entry.head {
+        digest.update([1]);
+        digest.update(head.mode.to_be_bytes());
+        hash_length_prefixed(digest, &head.object_type);
+        hash_length_prefixed(digest, &head.object_id);
+    } else {
+        digest.update([0]);
+    }
+    if include_index && entry.is_gitlink() {
+        let gitlink_entries = entry
+            .index
+            .iter()
+            .filter(|index| index.mode == 0o160000)
+            .collect::<Vec<_>>();
+        digest.update((gitlink_entries.len() as u64).to_be_bytes());
+        for index in gitlink_entries {
+            digest.update(index.mode.to_be_bytes());
+            digest.update([index.stage]);
+            hash_length_prefixed(digest, &index.object_id);
+        }
+    }
+}
+
+fn hash_length_prefixed(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+}
+
+fn gitlink_observation_byte(observation: GitlinkObservation) -> u8 {
+    match observation {
+        GitlinkObservation::Missing => 0,
+        GitlinkObservation::Uninitialized => 1,
+        GitlinkObservation::InitializedDirectory => 2,
+        GitlinkObservation::InitializedFile => 3,
+        GitlinkObservation::UnsupportedContents => 4,
+    }
+}
+
+fn escape_path(path: &[u8]) -> String {
+    path.iter()
+        .flat_map(|byte| std::ascii::escape_default(*byte))
+        .map(char::from)
+        .collect()
 }
 
 fn hash_worktree_path(
@@ -894,8 +972,6 @@ fn hash_worktree_path(
     full_path: &Path,
     relative: &[u8],
 ) -> Result<(), String> {
-    digest.update((relative.len() as u64).to_be_bytes());
-    digest.update(relative);
     reject_symlinked_parent(root, relative)?;
     match fs::symlink_metadata(full_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => digest.update([0]),
@@ -1332,12 +1408,17 @@ fn validate_request(
     if !request.expected_head_sha.is_empty() && !valid_object_id(&request.expected_head_sha) {
         return Err(EffectError::invalid_input("expected_head_sha is malformed"));
     }
-    if !request.expected_source_fingerprint.is_empty()
-        && !is_sha256(&request.expected_source_fingerprint)
-    {
-        return Err(EffectError::invalid_input(
-            "expected_source_fingerprint is malformed",
-        ));
+    if !request.expected_source_fingerprint.is_empty() {
+        if is_sha256(&request.expected_source_fingerprint) {
+            return Err(EffectError::invalid_input(
+                "expected_source_fingerprint uses the legacy unversioned snapshot format; inspect again before applying",
+            ));
+        }
+        if !is_current_snapshot_fingerprint(&request.expected_source_fingerprint) {
+            return Err(EffectError::invalid_input(
+                "expected_source_fingerprint is malformed or uses an unsupported snapshot version",
+            ));
+        }
     }
     Ok(())
 }
@@ -1355,6 +1436,12 @@ fn valid_object_id(value: &str) -> bool {
 
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_current_snapshot_fingerprint(value: &str) -> bool {
+    value
+        .strip_prefix(SNAPSHOT_FINGERPRINT_PREFIX)
+        .is_some_and(is_sha256)
 }
 
 fn operation_identity(request: &PrepareScopeHandoffRequest, source: &Path) -> String {
@@ -1607,6 +1694,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clean_uninitialized_reference_gitlinks_do_not_block_noop_handoff() {
+        let repository = TestRepository::new();
+        let llmlift = TestRepository::new();
+        let skillopt = TestRepository::new();
+        let llmlift_commit = llmlift.head();
+        let skillopt_commit = skillopt.head();
+        repository.write(
+            ".gitmodules",
+            "[submodule \"llmlift\"]\n\tpath = tools/llmlift\n\turl = https://example.invalid/llmlift.git\n[submodule \"skillopt\"]\n\tpath = tools/skillopt\n\turl = https://example.invalid/skillopt.git\n",
+        );
+        repository.git(&["add", ".gitmodules"]);
+        let llmlift_entry = format!("160000,{llmlift_commit},tools/llmlift");
+        let skillopt_entry = format!("160000,{skillopt_commit},tools/skillopt");
+        repository.git(&["update-index", "--add", "--cacheinfo", &llmlift_entry]);
+        repository.git(&["update-index", "--add", "--cacheinfo", &skillopt_entry]);
+        fs::create_dir_all(repository.path().join("tools/llmlift")).unwrap();
+        fs::create_dir_all(repository.path().join("tools/skillopt")).unwrap();
+        repository.git(&["commit", "-m", "add reference gitlinks"]);
+        let parent_head = repository.head();
+        let tracked_entries = repository.git(&["ls-files", "--stage"]);
+        assert!(tracked_entries.contains("160000"));
+        assert!(repository.path().join("tools/llmlift").is_dir());
+        assert!(repository.path().join("tools/skillopt").is_dir());
+        assert!(!repository.path().join("tools/llmlift/.git").exists());
+        assert!(!repository.path().join("tools/skillopt/.git").exists());
+
+        let inspected = run(&repository, request(false, "", "")).await;
+        assert!(inspected.ready, "{}", inspected.error);
+        assert_eq!(inspected.outcome, "no_changes");
+        assert_eq!(repository.head(), parent_head);
+        assert!(repository.git(&["status", "--porcelain"]).is_empty());
+        assert!(repository.path().join("tools/llmlift").is_dir());
+        assert!(repository.path().join("tools/skillopt").is_dir());
+    }
+
+    #[tokio::test]
+    async fn typed_snapshot_detects_a_real_index_gitlink_pointer_change() {
+        let repository = TestRepository::new();
+        let first_reference = TestRepository::new();
+        let second_reference = TestRepository::new();
+        let first_oid = first_reference.head();
+        second_reference.write("tracked.txt", "different reference revision\n");
+        second_reference.git(&["add", "tracked.txt"]);
+        second_reference.git(&["commit", "-m", "different reference revision"]);
+        let second_oid = second_reference.head();
+        assert_ne!(first_oid, second_oid);
+        repository.write(
+            ".gitmodules",
+            "[submodule \"reference\"]\n\tpath = tools/reference\n\turl = https://example.invalid/reference.git\n",
+        );
+        repository.git(&["add", ".gitmodules"]);
+        let initial_entry = format!("160000,{first_oid},tools/reference");
+        repository.git(&["update-index", "--add", "--cacheinfo", &initial_entry]);
+        fs::create_dir_all(repository.path().join("tools/reference")).unwrap();
+        repository.git(&["commit", "-m", "add reference"]);
+
+        let before = typed_snapshot(&repository).await;
+        let reference = before.entries().get(b"tools/reference".as_slice()).unwrap();
+        assert_eq!(
+            reference.head.as_ref().unwrap().object_id,
+            first_oid.as_bytes()
+        );
+        assert_eq!(reference.index[0].object_id, first_oid.as_bytes());
+        assert!(reference.is_gitlink());
+
+        let changed_entry = format!("160000,{second_oid},tools/reference");
+        repository.git(&["update-index", "--cacheinfo", &changed_entry]);
+        let after = typed_snapshot(&repository).await;
+        let changed_reference = after.entries().get(b"tools/reference".as_slice()).unwrap();
+        assert_eq!(
+            changed_reference.head.as_ref().unwrap().object_id,
+            first_oid.as_bytes()
+        );
+        assert_eq!(changed_reference.index[0].object_id, second_oid.as_bytes());
+        assert_ne!(before, after);
+        assert_ne!(
+            fingerprint_snapshot(repository.path(), &before, true).unwrap(),
+            fingerprint_snapshot(repository.path(), &after, true).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn initialized_gitlink_is_observed_and_held_without_mutating_the_parent_index() {
+        let repository = TestRepository::new();
+        let reference = TestRepository::new();
+        let reference_oid = reference.head();
+        repository.write(
+            ".gitmodules",
+            "[submodule \"reference\"]\n\tpath = tools/reference\n\turl = https://example.invalid/reference.git\n",
+        );
+        repository.git(&["add", ".gitmodules"]);
+        let gitlink = format!("160000,{reference_oid},tools/reference");
+        repository.git(&["update-index", "--add", "--cacheinfo", &gitlink]);
+        let reference_path = repository.path().join("tools/reference");
+        fs::create_dir_all(&reference_path).unwrap();
+        let initialized = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&reference_path)
+            .status()
+            .unwrap();
+        assert!(initialized.success());
+        repository.git(&["commit", "-m", "add initialized reference"]);
+        let original_head = repository.head();
+        let original_index = repository.git(&["ls-files", "--stage"]);
+
+        let held = run(&repository, request(false, "", "")).await;
+
+        assert!(!held.ready);
+        assert!(held
+            .error
+            .contains("initialized or contains unsupported local state"));
+        assert_eq!(repository.head(), original_head);
+        assert_eq!(repository.git(&["ls-files", "--stage"]), original_index);
+        assert!(repository.path().join("tools/reference/.git").is_dir());
+    }
+
+    #[tokio::test]
     async fn clean_source_is_a_noop_and_scope_is_limited_to_callers_worktree() {
         let repository = TestRepository::new();
         let sibling_directory = tempfile::tempdir().unwrap();
@@ -1829,9 +2033,27 @@ mod tests {
 
     #[test]
     fn authenticated_controller_is_required() {
-        let request = request(true, &"a".repeat(40), &"b".repeat(64));
+        let request = request(
+            true,
+            &"a".repeat(40),
+            &format!("{SNAPSHOT_FINGERPRINT_PREFIX}{}", "b".repeat(64)),
+        );
         assert!(validate_request(&request, "other-controller").is_err());
         assert!(validate_request(&request, "controller").is_ok());
+    }
+
+    #[test]
+    fn legacy_unversioned_snapshot_fingerprint_requires_fresh_inspection() {
+        let request = request(true, &"a".repeat(40), &"b".repeat(64));
+        let error = validate_request(&request, "controller").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("legacy unversioned snapshot format"));
+        assert!(!is_current_snapshot_fingerprint(&"b".repeat(64)));
+        assert!(is_current_snapshot_fingerprint(&format!(
+            "{SNAPSHOT_FINGERPRINT_PREFIX}{}",
+            "b".repeat(64)
+        )));
     }
 
     #[tokio::test]
@@ -1928,6 +2150,24 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    async fn typed_snapshot(repository: &TestRepository) -> GitEntrySnapshot {
+        let context = HandoffContext::prepare(
+            repository.path(),
+            Path::new("."),
+            "typed-snapshot-test",
+            "controller",
+            "main",
+        )
+        .await
+        .expect("test repository is mutation-ready");
+        let (cancel_sender, mut cancellation) = oneshot::channel();
+        let snapshot = current_worktree_snapshot(&context, &mut cancellation)
+            .await
+            .expect("Git entries parse into the typed snapshot");
+        drop(cancel_sender);
+        snapshot
     }
 
     fn request(apply: bool, head: &str, fingerprint: &str) -> PrepareScopeHandoffRequest {

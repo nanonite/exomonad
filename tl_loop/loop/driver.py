@@ -17324,8 +17324,11 @@ def _scope_handoff_response_error(
             return f"scope handoff receipt has conflicting {key}"
     if not _is_git_object_id(payload.get("head_before")):
         return "scope handoff receipt is missing a valid source HEAD"
-    if not _is_sha256_text(payload.get("source_fingerprint")):
-        return "scope handoff receipt is missing its source fingerprint"
+    fingerprint = payload.get("source_fingerprint")
+    if isinstance(fingerprint, str) and _is_sha256_text(fingerprint):
+        return "scope handoff receipt uses a legacy unversioned fingerprint; inspect again before applying"
+    if not _is_scope_handoff_fingerprint(fingerprint):
+        return "scope handoff receipt is missing a supported source fingerprint"
     committed_paths = _scope_handoff_paths(payload.get("committed_paths"))
     remaining_paths = _scope_handoff_paths(payload.get("remaining_dirty_paths"))
     if committed_paths is None or remaining_paths is None:
@@ -17406,6 +17409,16 @@ def _is_sha256_text(value: object) -> bool:
         isinstance(value, str)
         and len(value) == 64
         and all(character in "0123456789abcdefABCDEF" for character in value)
+    )
+
+
+def _is_scope_handoff_fingerprint(value: object) -> bool:
+    """Accept only the explicitly versioned typed Git snapshot digest."""
+    prefix = "git-snapshot-v2:"
+    return (
+        isinstance(value, str)
+        and value.startswith(prefix)
+        and _is_sha256_text(value[len(prefix) :])
     )
 
 

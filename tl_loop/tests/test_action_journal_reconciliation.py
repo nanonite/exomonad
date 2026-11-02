@@ -191,7 +191,7 @@ def test_scope_handoff_unknown_replays_exact_snapshot_without_operator_gate(tmp_
         "child_scope_id": "node:architecture",
         "expected_branch": "main",
         "expected_head_sha": "a" * 40,
-        "expected_source_fingerprint": "b" * 64,
+        "expected_source_fingerprint": "git-snapshot-v2:" + "b" * 64,
     }
     intent = _Intent(
         operation="prepare_scope_handoff",
@@ -225,7 +225,7 @@ def test_scope_handoff_unknown_replays_exact_snapshot_without_operator_gate(tmp_
                     "head_before": "a" * 40,
                     "head_after": "c" * 40,
                     "commit_sha": "c" * 40,
-                    "source_fingerprint": "b" * 64,
+                    "source_fingerprint": "git-snapshot-v2:" + "b" * 64,
                     "changed_paths": [],
                     "committed_paths": ["747261636b65642e747874"],
                     "remaining_dirty_paths": [],
