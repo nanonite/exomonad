@@ -1318,21 +1318,24 @@ mod tests {
     #[serial_test::serial]
     async fn cleanup_agent_releases_codex_trust_after_removing_every_resource() {
         let codex = IsolatedCodex::default();
-        let temp = tempfile::tempdir().unwrap();
-        let project = temp.path().to_path_buf();
+        let (_temp, project, _) = init_residue_repo();
+        let git_wt = Arc::new(GitWorktreeService::new(project.clone()));
         let mut services = Services::test();
         services.project_dir = project.clone();
         let resolver = Arc::new(AgentResolver::load(project.clone()).await);
         services.agent_resolver = resolver.clone();
-        services.git_wt = Arc::new(GitWorktreeService::new(project.clone()));
+        services.git_wt = git_wt.clone();
         let service = AgentControlService::new(Arc::new(services));
         let agent_name = AgentName::try_from_str("stale-codex").unwrap();
+        let default_branch = fixture_branch(&project);
+        let branch = BranchName::try_from_str(format!("{default_branch}.stale").as_str()).unwrap();
+        let base = BranchName::try_from_str(default_branch.as_str()).unwrap();
         let record = AgentIdentityRecord {
             agent_name: agent_name.clone(),
             slug: Slug::try_from_str("stale").unwrap(),
             agent_type: AgentType::Codex,
-            birth_branch: BirthBranch::try_from_str("main.stale").unwrap(),
-            parent_branch: BirthBranch::try_from_str("main").unwrap(),
+            birth_branch: BirthBranch::try_from_str(branch.as_str()).unwrap(),
+            parent_branch: BirthBranch::try_from_str(base.as_str()).unwrap(),
             working_dir: ".exo/worktrees/stale".into(),
             display_name: "🤖 stale-codex".to_string(),
             topology: Topology::WorktreePerAgent,
@@ -1347,7 +1350,10 @@ mod tests {
         // A worktree agent keeps its generated Codex config in the worktree it
         // runs in, so that is where the trust has to be claimed from.
         let worktree = project.join(".exo/worktrees/stale");
-        tokio::fs::create_dir_all(&worktree).await.unwrap();
+        tokio::fs::create_dir_all(worktree.parent().unwrap())
+            .await
+            .unwrap();
+        git_wt.create_workspace(&worktree, &branch, &base).unwrap();
         codex.provision(&worktree, agent_name.as_str());
         assert_eq!(codex.hook_trust_entries(), 3);
 

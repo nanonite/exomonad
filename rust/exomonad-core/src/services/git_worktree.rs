@@ -2,11 +2,17 @@
 //!
 //! All operations shell out to git.
 
+use super::git_mutation::{GitMutationLeaseSet, GitMutationResource, GitMutationSafety};
 use crate::domain::BranchName;
 use crate::effects::EffectError;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
 use tracing::{error, info, warn};
+
+const WORKTREE_MUTATION_LEASE_WAIT: Duration = Duration::from_secs(2);
+const WORKTREE_MUTATION_LEASE_RESOURCES: [GitMutationResource; 2] =
+    [GitMutationResource::SharedRefs, GitMutationResource::Index];
 
 /// Custom error type for git worktree operations.
 #[derive(Debug, Error)]
@@ -145,6 +151,15 @@ pub(crate) fn headless_git_command() -> std::process::Command {
     let mut command = std::process::Command::new("git");
     apply_headless_git_env(&mut command);
     command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_OBJECT_DIRECTORY_RELATIVE")
+        .env_remove("GIT_QUARANTINE_PATH")
+        .env_remove("GIT_SHALLOW_FILE");
+    command
 }
 
 pub(crate) fn apply_headless_git_env(
@@ -221,6 +236,129 @@ fn last_branch_segment(branch: &str) -> Option<&str> {
 impl GitWorktreeService {
     pub fn new(project_dir: PathBuf) -> Self {
         Self { project_dir }
+    }
+
+    fn managed_worktree_path(&self, path: &Path) -> Result<PathBuf, WorktreeError> {
+        let project_root = self.canonical_path(&self.project_dir, "managed repository root")?;
+        let safety = GitMutationSafety::new(project_root.clone());
+        let paths = safety
+            .resolve_paths_with_index_override(path, None)
+            .map_err(|error| WorktreeError::GitError {
+                message: format!("Git mutation boundary refused the requested worktree: {error}"),
+            })?;
+        Ok(paths.worktree_root)
+    }
+
+    fn validate_worktree_destination(&self, path: &Path) -> Result<PathBuf, WorktreeError> {
+        let root = self.canonical_path(&self.project_dir, "managed repository root")?;
+        let requested = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let mut normalized = PathBuf::new();
+        for component in requested.components() {
+            match component {
+                Component::ParentDir => {
+                    return Err(WorktreeError::GitError {
+                        message: "worktree destination contains parent traversal".to_string(),
+                    });
+                }
+                Component::CurDir => {}
+                component => normalized.push(component.as_os_str()),
+            }
+        }
+        if normalized == root {
+            return Err(WorktreeError::GitError {
+                message: "managed repository root cannot be a worktree destination".to_string(),
+            });
+        }
+
+        let mut current = PathBuf::new();
+        for component in normalized.components() {
+            current.push(component.as_os_str());
+            match std::fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(WorktreeError::GitError {
+                        message: "worktree destination crosses a symbolic link".to_string(),
+                    });
+                }
+                Ok(_) => {
+                    let resolved = self.canonical_path(&current, "worktree destination")?;
+                    current = resolved;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => {
+                    return Err(WorktreeError::GitError {
+                        message: format!(
+                            "cannot inspect worktree destination component: {}",
+                            error.kind()
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(normalized)
+    }
+
+    fn acquire_repository_mutation_lease(&self) -> Result<GitMutationLeaseSet, WorktreeError> {
+        let root = self.canonical_path(&self.project_dir, "managed repository root")?;
+        let safety = GitMutationSafety::new(root.clone());
+        safety
+            .acquire_set_with_index_override(
+                &root,
+                &WORKTREE_MUTATION_LEASE_RESOURCES,
+                &format!("git-worktree-{}", uuid::Uuid::new_v4()),
+                WORKTREE_MUTATION_LEASE_WAIT,
+                None,
+            )
+            .map_err(|error| WorktreeError::GitError {
+                message: format!("Git mutation lease unavailable: {error}"),
+            })
+    }
+
+    fn acquire_worktree_mutation_lease(
+        &self,
+        path: &Path,
+    ) -> Result<(PathBuf, GitMutationLeaseSet), WorktreeError> {
+        let canonical = self.managed_worktree_path(path)?;
+        let lease = self.acquire_repository_mutation_lease()?;
+        let refreshed = self.managed_worktree_path(&canonical)?;
+        if refreshed != canonical {
+            return Err(WorktreeError::GitError {
+                message: "Git worktree identity changed while acquiring the mutation lease"
+                    .to_string(),
+            });
+        }
+        Ok((canonical, lease))
+    }
+
+    fn validate_registered_removal_target(&self, path: &Path) -> Result<PathBuf, WorktreeError> {
+        if std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(WorktreeError::PathUnregistered {
+                path: path.display().to_string(),
+            });
+        }
+        let candidate = self.canonical_path(path, "worktree removal target")?;
+        let root = self.canonical_path(&self.project_dir, "managed repository root")?;
+        if candidate == root || !self.is_linked_worktree_root(&candidate) {
+            return Err(WorktreeError::PathUnregistered {
+                path: candidate.display().to_string(),
+            });
+        }
+        let registered = self.list_worktrees()?.iter().any(|worktree| {
+            std::fs::canonicalize(&worktree.path)
+                .is_ok_and(|registered_path| registered_path == candidate)
+        });
+        if !registered {
+            return Err(WorktreeError::PathUnregistered {
+                path: candidate.display().to_string(),
+            });
+        }
+        Ok(candidate)
     }
 
     fn prepare_repository_for_worktrees(&self) -> Result<(), WorktreeError> {
@@ -353,6 +491,7 @@ impl GitWorktreeService {
 
     /// Drop stale worktree registrations whose directories no longer exist.
     pub fn prune_worktrees(&self) -> Result<(), WorktreeError> {
+        let _lease = self.acquire_repository_mutation_lease()?;
         let output = self.git_output(&self.project_dir, &["worktree", "prune"])?;
         if !output.status.success() {
             return Err(WorktreeError::GitError {
@@ -890,6 +1029,9 @@ impl GitWorktreeService {
         base_ref: &str,
         create_branch: bool,
     ) -> Result<(), WorktreeError> {
+        self.validate_repository(&self.project_dir)?;
+        let _lease = self.acquire_repository_mutation_lease()?;
+        let path = self.validate_worktree_destination(path)?;
         self.prepare_repository_for_worktrees()?;
         info!(path = %path.display(), branch = %branch, base = %base_ref, "Creating git worktree");
 
@@ -899,7 +1041,7 @@ impl GitWorktreeService {
             command.args(["-b", branch.as_str()]);
         }
         let output = command
-            .arg(path)
+            .arg(&path)
             .arg(base_ref)
             .current_dir(&self.project_dir)
             .output()
@@ -922,7 +1064,7 @@ impl GitWorktreeService {
             .rsplit('.')
             .next()
             .unwrap_or(branch.as_str());
-        self.set_worktree_identity(path, agent_name)
+        self.set_worktree_identity(&path, agent_name)
     }
 
     /// Create a detached-HEAD worktree at the tip of an existing branch or ref.
@@ -936,6 +1078,9 @@ impl GitWorktreeService {
         at_ref: &str,
         identity_name: &str,
     ) -> Result<(), WorktreeError> {
+        self.validate_repository(&self.project_dir)?;
+        let _lease = self.acquire_repository_mutation_lease()?;
+        let path = self.validate_worktree_destination(path)?;
         self.prepare_repository_for_worktrees()?;
         info!(path = %path.display(), at_ref, "Creating detached reviewer worktree");
 
@@ -959,7 +1104,7 @@ impl GitWorktreeService {
             return Err(self.parse_git_stderr(&stderr));
         }
 
-        self.set_worktree_identity(path, identity_name)?;
+        self.set_worktree_identity(&path, identity_name)?;
         info!(path = %path.display(), at_ref, "Reviewer worktree created (detached HEAD)");
         Ok(())
     }
@@ -968,7 +1113,13 @@ impl GitWorktreeService {
     ///
     /// Equivalent to: `git worktree remove --force {path}`
     pub fn remove_workspace(&self, path: &Path) -> Result<(), WorktreeError> {
-        info!(path = %path.display(), "Removing git worktree");
+        if !path.exists() {
+            self.validate_worktree_destination(path)?;
+            return Ok(());
+        }
+        let _lease = self.acquire_repository_mutation_lease()?;
+        let path = self.validate_registered_removal_target(path)?;
+        info!(path = %path.display(), "Removing registered git worktree");
 
         let output = headless_git_command()
             .args(["worktree", "remove", "--force", &path.to_string_lossy()])
@@ -980,20 +1131,7 @@ impl GitWorktreeService {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // If the worktree dir doesn't exist, git worktree remove fails — clean up manually
-            if path.exists() {
-                warn!(stderr = %stderr, "git worktree remove failed, removing directory manually");
-                std::fs::remove_dir_all(path).map_err(|e| WorktreeError::GitError {
-                    message: format!("Failed to remove worktree dir {}: {}", path.display(), e),
-                })?;
-            } else {
-                warn!(stderr = %stderr, "git worktree remove failed (directory already gone)");
-            }
-            // Also prune stale worktree entries
-            let _ = headless_git_command()
-                .args(["worktree", "prune"])
-                .current_dir(&self.project_dir)
-                .output();
+            return Err(self.parse_git_stderr(&stderr));
         }
 
         info!(path = %path.display(), "Worktree removed");
@@ -1047,6 +1185,7 @@ impl GitWorktreeService {
         remote: &str,
         forgejo_token: Option<&str>,
     ) -> Result<(), WorktreeError> {
+        let (workspace_path, _lease) = self.acquire_worktree_mutation_lease(workspace_path)?;
         info!(branch = %branch, remote = %remote, path = %workspace_path.display(), "Pushing branch to remote");
 
         let output = push_remote_command(remote, branch, forgejo_token)
@@ -1070,6 +1209,7 @@ impl GitWorktreeService {
     ///
     /// Equivalent to: `git fetch` (run in workspace_path)
     pub fn fetch(&self, workspace_path: &Path) -> Result<(), WorktreeError> {
+        let (workspace_path, _lease) = self.acquire_worktree_mutation_lease(workspace_path)?;
         info!(path = %workspace_path.display(), "git fetch");
 
         let output = headless_git_command()
@@ -1118,6 +1258,7 @@ impl GitWorktreeService {
     ///
     /// Equivalent to: `git branch -D {name}` (from project_dir)
     pub fn delete_bookmark(&self, name: &BranchName) -> Result<(), WorktreeError> {
+        let _lease = self.acquire_repository_mutation_lease()?;
         info!(branch = %name, "Deleting local branch");
 
         let output = headless_git_command()
@@ -1147,6 +1288,7 @@ impl GitWorktreeService {
         name: &BranchName,
         revision: Option<&crate::domain::Revision>,
     ) -> Result<(), WorktreeError> {
+        let (workspace_path, _lease) = self.acquire_worktree_mutation_lease(workspace_path)?;
         info!(branch = %name, revision = ?revision, path = %workspace_path.display(), "Creating local branch");
 
         let mut args = vec!["branch", name.as_str()];
@@ -1359,6 +1501,11 @@ mod tests {
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    fn git_ref_exists(repo_dir: &std::path::Path, reference: &str) -> bool {
+        run_fixture_git_command(repo_dir, &["show-ref", "--verify", reference])
+            .is_ok_and(|output| output.status.success())
+    }
+
     fn run_git(repo_dir: &std::path::Path, args: &[&str]) {
         run_fixture_git_command(repo_dir, args).unwrap_or_else(|error| {
             panic!("git {args:?} failed: {error}");
@@ -1388,6 +1535,147 @@ mod tests {
 
         assert!(worktree_path.exists());
         assert!(worktree_path.join(".git").exists());
+    }
+
+    #[test]
+    fn create_workspace_tracks_an_explicit_external_worktree_for_the_same_repository() {
+        let temp = TempDir::new().expect("failed to create temporary directory");
+        let repository = temp.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        init_fixture_git_repository(&repository).expect("git init failed");
+        run_fixture_git_command(&repository, &["config", "user.email", "test@example.com"])
+            .unwrap();
+        run_fixture_git_command(&repository, &["config", "user.name", "Test User"]).unwrap();
+        run_fixture_git_command(
+            &repository,
+            &["commit", "--allow-empty", "-m", "Initial commit"],
+        )
+        .unwrap();
+
+        let outside = temp.path().join("outside-worktree");
+        let service = GitWorktreeService::new(repository.clone());
+        let branch = BranchName::try_from_str("main.outside")
+            .expect("literal validated string is non-empty");
+        let base = BranchName::try_from_str("main").expect("literal validated string is non-empty");
+
+        service
+            .create_workspace(&outside, &branch, &base)
+            .expect("an explicitly assigned linked worktree remains in the same repository");
+        assert_eq!(service.managed_worktree_path(&outside).unwrap(), outside);
+        service.remove_workspace(&outside).unwrap();
+        assert!(!outside.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_workspace_rejects_a_destination_reached_through_a_symlink() {
+        let temp = TempDir::new().expect("failed to create temporary directory");
+        let repository = temp.path().join("repository");
+        std::fs::create_dir(&repository).unwrap();
+        init_fixture_git_repository(&repository).expect("git init failed");
+        run_fixture_git_command(&repository, &["config", "user.email", "test@example.com"])
+            .unwrap();
+        run_fixture_git_command(&repository, &["config", "user.name", "Test User"]).unwrap();
+        run_fixture_git_command(
+            &repository,
+            &["commit", "--allow-empty", "-m", "Initial commit"],
+        )
+        .unwrap();
+        let real_parent = temp.path().join("real-parent");
+        std::fs::create_dir(&real_parent).unwrap();
+        let linked_parent = temp.path().join("linked-parent");
+        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+        let destination = linked_parent.join("worktree");
+        let service = GitWorktreeService::new(repository);
+        let branch =
+            BranchName::try_from_str("main.linked").expect("literal validated string is non-empty");
+        let base = BranchName::try_from_str("main").expect("literal validated string is non-empty");
+
+        let error = service
+            .create_workspace(&destination, &branch, &base)
+            .expect_err("a destination path through a symlink must be refused");
+
+        assert!(error.to_string().contains("symbolic link"));
+        assert!(!real_parent.join("worktree").exists());
+    }
+
+    #[test]
+    fn remove_workspace_preserves_unregistered_nested_bare_repository() {
+        let (temp, service) = init_test_repo();
+        let nested = temp.path().join("tools/reference.git");
+        std::fs::create_dir_all(&nested).unwrap();
+        init_bare_fixture_git_repository(&nested).expect("nested bare repository init failed");
+        let canary = nested.join("operator-data");
+        std::fs::write(&canary, "preserve this repository\n").unwrap();
+
+        let error = service
+            .remove_workspace(&nested)
+            .expect_err("an unregistered nested repository must not be removed as a worktree");
+
+        assert!(matches!(error, WorktreeError::PathUnregistered { .. }));
+        assert_eq!(
+            std::fs::read_to_string(canary).unwrap(),
+            "preserve this repository\n"
+        );
+        assert!(nested.join("HEAD").exists());
+    }
+
+    #[test]
+    fn fetch_refuses_nested_repository_before_mutating_its_refs() {
+        let (temp, service) = init_test_repo();
+        let nested = temp.path().join("tools/reference");
+        std::fs::create_dir_all(&nested).unwrap();
+        init_fixture_git_repository(&nested).expect("nested repository init failed");
+        run_fixture_git_command(&nested, &["config", "user.email", "test@example.com"]).unwrap();
+        run_fixture_git_command(&nested, &["config", "user.name", "Test User"]).unwrap();
+        std::fs::write(nested.join("reference.txt"), "reference\n").unwrap();
+        run_fixture_git_command(&nested, &["add", "reference.txt"]).unwrap();
+        run_fixture_git_command(&nested, &["commit", "-m", "reference commit"]).unwrap();
+
+        let remote = temp.path().join("reference-remote.git");
+        std::fs::create_dir(&remote).unwrap();
+        init_bare_fixture_git_repository(&remote).expect("bare remote init failed");
+        run_fixture_git_command(
+            &nested,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        )
+        .unwrap();
+        let branch = get_default_branch(&nested);
+        run_fixture_git_command(&nested, &["push", "origin", &branch]).unwrap();
+        let remote_tracking = format!("refs/remotes/origin/{branch}");
+        run_fixture_git_command(&nested, &["update-ref", "-d", &remote_tracking]).unwrap();
+        assert!(!git_ref_exists(&nested, &remote_tracking));
+
+        let error = service
+            .fetch(&nested)
+            .expect_err("parent repository service must not fetch a nested repository");
+
+        assert!(error.to_string().contains("different common Git directory"));
+        assert!(!git_ref_exists(&nested, &remote_tracking));
+    }
+
+    #[test]
+    fn create_bookmark_waits_for_the_shared_git_mutation_lease() {
+        let (temp, service) = init_test_repo();
+        let safety = crate::services::GitMutationSafety::new(temp.path().to_path_buf());
+        let held = safety
+            .acquire(
+                temp.path(),
+                crate::services::GitMutationResource::SharedRefs,
+                "test-held-ref-lease",
+                std::time::Duration::ZERO,
+            )
+            .expect("test must acquire the shared refs lease");
+        let branch = BranchName::try_from_str("main.must-wait")
+            .expect("literal validated string is non-empty");
+
+        let error = service
+            .create_bookmark(temp.path(), &branch, None)
+            .expect_err("repository mutations must respect the existing shared lease");
+
+        assert!(error.to_string().contains("lease"));
+        assert!(!service.branch_exists(&branch).unwrap());
+        drop(held);
     }
 
     #[test]

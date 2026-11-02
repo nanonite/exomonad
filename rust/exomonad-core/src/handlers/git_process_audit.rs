@@ -195,7 +195,7 @@ pub(crate) fn validate_git_target(
     {
         return Err(EffectError::custom(
             "git_mutation_unavailable",
-            "managed Git process does not allow repository path overrides; set working_dir to the target worktree and remove Git path overrides",
+            "managed Git process does not allow Git path overrides; set working_dir to the target worktree and remove Git path overrides",
         ));
     }
     Ok(())
@@ -223,6 +223,14 @@ pub(crate) fn validate_git_working_directory(
             "managed Git process working_dir resolves to a different repository; use the owning worktree root",
         ));
     }
+    let declared_top_level = effective_git_top_level(&root, request_env)?;
+    let command_top_level = effective_git_top_level(&directory, request_env)?;
+    if declared_top_level != root || command_top_level != root {
+        return Err(EffectError::custom(
+            "git_mutation_unavailable",
+            "managed Git process resolves outside the declared worktree; use the owning worktree root",
+        ));
+    }
     Ok(())
 }
 
@@ -247,6 +255,10 @@ fn effective_git_dir(
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_OBJECT_DIRECTORY_RELATIVE")
+        .env_remove("GIT_QUARANTINE_PATH")
+        .env_remove("GIT_SHALLOW_FILE")
         .output()
         .map_err(|_| git_identity_unavailable())?;
     if !output.status.success() {
@@ -261,6 +273,36 @@ fn effective_git_dir(
     canonical_directory(Path::new(git_dir))
 }
 
+fn effective_git_top_level(
+    directory: &Path,
+    request_env: &HashMap<String, String>,
+) -> EffectResult<std::path::PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(directory)
+        .envs(request_env)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_OBJECT_DIRECTORY_RELATIVE")
+        .env_remove("GIT_QUARANTINE_PATH")
+        .env_remove("GIT_SHALLOW_FILE")
+        .output()
+        .map_err(|_| git_identity_unavailable())?;
+    if !output.status.success() {
+        return Err(git_identity_unavailable());
+    }
+    let top_level = std::str::from_utf8(&output.stdout)
+        .map_err(|_| git_identity_unavailable())?
+        .trim();
+    if top_level.is_empty() {
+        return Err(git_identity_unavailable());
+    }
+    canonical_directory(Path::new(top_level))
+}
+
 fn git_identity_unavailable() -> EffectError {
     EffectError::custom(
         "git_mutation_unavailable",
@@ -271,7 +313,14 @@ fn git_identity_unavailable() -> EffectError {
 fn command_overrides_git_target(args: &[String]) -> bool {
     let mut index = 0;
     while let Some(argument) = args.get(index).map(String::as_str) {
-        if is_target_override(argument) {
+        if is_target_override(argument) || config_option_overrides_worktree(argument) {
+            return true;
+        }
+        if (argument == "-c" || argument == "--config-env")
+            && args
+                .get(index + 1)
+                .is_some_and(|value| is_worktree_config_assignment(value))
+        {
             return true;
         }
         if !argument.starts_with('-') {
@@ -292,6 +341,22 @@ fn is_target_override(argument: &str) -> bool {
         || argument.starts_with("--work-tree=")
 }
 
+fn config_option_overrides_worktree(argument: &str) -> bool {
+    if let Some(value) = argument.strip_prefix("--config-env=") {
+        return is_worktree_config_assignment(value);
+    }
+    argument
+        .strip_prefix("-c")
+        .filter(|value| !value.is_empty())
+        .is_some_and(is_worktree_config_assignment)
+}
+
+fn is_worktree_config_assignment(value: &str) -> bool {
+    value
+        .split_once('=')
+        .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("core.worktree"))
+}
+
 fn global_option_takes_value(argument: &str) -> bool {
     matches!(
         argument,
@@ -309,20 +374,53 @@ fn env_overrides_git_target(request_env: &HashMap<String, String>) -> bool {
         GIT_TARGET_ENV_KEYS
             .iter()
             .any(|allowed| key.eq_ignore_ascii_case(allowed))
-    })
+    }) || env_sets_worktree_config(request_env)
 }
 
 fn ambient_git_target_override() -> bool {
-    GIT_TARGET_ENV_KEYS
-        .iter()
-        .any(|key| std::env::var_os(key).is_some())
+    let ambient = std::env::vars().collect::<HashMap<_, _>>();
+    env_overrides_git_target(&ambient)
 }
 
-const GIT_TARGET_ENV_KEYS: [&str; 4] = [
+fn env_sets_worktree_config(environment: &HashMap<String, String>) -> bool {
+    if environment
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case("GIT_CONFIG_PARAMETERS"))
+    {
+        return true;
+    }
+    let Some(count) = environment
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("GIT_CONFIG_COUNT"))
+        .map(|(_, value)| value)
+    else {
+        return false;
+    };
+    let Ok(count) = count.parse::<usize>() else {
+        return true;
+    };
+    if count > MAX_GIT_CONFIG_ENV_ITEMS {
+        return true;
+    }
+    (0..count).any(|index| {
+        environment
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(&format!("GIT_CONFIG_KEY_{index}")))
+            .is_some_and(|(_, value)| value.eq_ignore_ascii_case("core.worktree"))
+    })
+}
+
+const MAX_GIT_CONFIG_ENV_ITEMS: usize = 128;
+
+const GIT_TARGET_ENV_KEYS: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_COMMON_DIR",
     "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_OBJECT_DIRECTORY_RELATIVE",
+    "GIT_QUARANTINE_PATH",
+    "GIT_SHALLOW_FILE",
 ];
 
 fn digest(value: &str) -> String {
@@ -371,6 +469,41 @@ mod tests {
         let env_error = validate_git_target(&[], &request_env).unwrap_err();
         assert!(env_error.to_string().contains("Git path overrides"));
         assert!(!env_error.to_string().contains("secret-index"));
+    }
+
+    #[test]
+    fn managed_git_rejects_external_object_storage_and_worktree_config_overrides() {
+        let object_directory =
+            HashMap::from([("GIT_OBJECT_DIRECTORY".into(), "/outside/objects".into())]);
+        assert!(validate_git_target(&[], &object_directory).is_err());
+
+        let worktree_config = vec![
+            "-c".into(),
+            "core.worktree=/outside/assigned-worktree".into(),
+            "clean".into(),
+        ];
+        assert!(validate_git_target(&worktree_config, &HashMap::new()).is_err());
+
+        let config_environment = vec![
+            "--config-env=core.worktree=EXTERNAL_WORKTREE".into(),
+            "status".into(),
+        ];
+        assert!(validate_git_target(&config_environment, &HashMap::new()).is_err());
+
+        let injected_config = HashMap::from([
+            ("GIT_CONFIG_COUNT".into(), "1".into()),
+            ("GIT_CONFIG_KEY_0".into(), "core.worktree".into()),
+            (
+                "GIT_CONFIG_VALUE_0".into(),
+                "/outside/assigned-worktree".into(),
+            ),
+        ]);
+        assert!(validate_git_target(&[], &injected_config).is_err());
+        assert!(!command_overrides_git_target(&[
+            "-c".into(),
+            "user.name=per-worktree".into(),
+            "status".into(),
+        ]));
     }
 
     #[test]

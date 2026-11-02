@@ -4659,10 +4659,6 @@ mod tests {
     struct PullRequestFixture {
         /// Owns the temporary repository for the fixture's lifetime.
         _temp: tempfile::TempDir,
-        /// Owns the scratch directory the leaf worktree is created in, kept
-        /// outside the repository so a fixture leaves nothing behind in the main
-        /// worktree.
-        _worktrees: tempfile::TempDir,
         /// Keeps the fake Forgejo serving for the fixture's lifetime.
         forge: MockServer,
         repo: PathBuf,
@@ -4702,8 +4698,7 @@ mod tests {
             git(&repo, &["remote", "add", "origin", HOSTED_REMOTE]);
             let head = git_output(&repo, &["rev-parse", branch.as_str()]);
 
-            let worktrees = tempfile::tempdir().expect("failed to create the worktree dir");
-            let leaf_path = worktrees.path().join(slug);
+            let leaf_path = repo.join(".exo/worktrees").join(slug);
             let git_wt = Arc::new(GitWorktreeService::new(repo.clone()));
             let forge = MockServer::start().await;
             let mut services = crate::services::Services::test();
@@ -4731,7 +4726,6 @@ mod tests {
                 head,
                 leaf: agent(&format!("{slug}-codex")),
                 forge,
-                _worktrees: worktrees,
                 _temp: temp,
             }
         }
@@ -4794,6 +4788,8 @@ mod tests {
         /// provisioning does before the task is composed, and return the guard
         /// that a refusal must still clean up.
         fn attach_leaf_worktree(&self) -> WorktreeRollback {
+            std::fs::create_dir_all(self.leaf_path.parent().expect("leaf path has a parent"))
+                .expect("failed to create the managed worktree parent");
             self.service
                 .git_wt()
                 .create_workspace_from_existing_branch(&self.leaf_path, &self.branch)

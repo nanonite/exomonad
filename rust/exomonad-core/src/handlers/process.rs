@@ -497,6 +497,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_handler_rejects_git_object_writes_outside_the_assigned_repository() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("assigned");
+        std::fs::create_dir(&root).unwrap();
+        let initialize = ["init", "-q", "-b", "main"];
+        assert_git_fixture_succeeded(run_git_fixture_output(&root, &initialize), &initialize);
+        std::fs::write(root.join("source.txt"), "assigned source\n").unwrap();
+
+        let outside_objects = temporary.path().join("external-objects");
+        std::fs::create_dir(&outside_objects).unwrap();
+        let handler = ProcessHandler::with_project_dir(root.clone());
+        let request = RunRequest {
+            command: "git".into(),
+            args: vec!["hash-object".into(), "-w".into(), "source.txt".into()],
+            working_dir: ".".into(),
+            env: std::collections::HashMap::from([(
+                "GIT_OBJECT_DIRECTORY".into(),
+                outside_objects.to_string_lossy().into_owned(),
+            )]),
+            timeout_ms: 5_000,
+        };
+
+        let error = handler
+            .run(request, &test_ctx_at(&root))
+            .await
+            .expect_err("managed Git must reject an external object directory");
+
+        assert!(error.to_string().contains("Git path overrides"));
+        assert!(std::fs::read_dir(outside_objects).unwrap().next().is_none());
+        assert!(!root.join(".exo/logs").exists());
+    }
+
+    #[tokio::test]
     async fn test_run_subdirectory_allowed() {
         let handler = ProcessHandler::new();
         let ctx = test_ctx();
