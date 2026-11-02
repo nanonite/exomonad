@@ -73,6 +73,9 @@ def _assess_requirement(
         )
         return
     current, candidate = observed[0], candidates[-1]
+    if current.remote_url is None:
+        blockers.append(f"current reference identity is unavailable at {requirement.path}")
+        return
     if current.remote_url != requirement.remote_url:
         blockers.append(
             f"current reference identity differs from the requirement at {requirement.path}"

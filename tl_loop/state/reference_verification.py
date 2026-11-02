@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -38,6 +38,7 @@ _EVIDENCE_KEYS = frozenset(
         "recorded_at",
     }
 )
+_REQUIREMENT_KEYS = frozenset({"path", "remote_url", "kind", "command", "required"})
 _PROVENANCE_KEYS = frozenset({"kind", "invocation_id", "artifact_ref", "artifact_sha256", "actor"})
 
 
@@ -89,6 +90,32 @@ class ReferenceVerificationRequirement:
         _validate_command(self.command)
         if type(self.required) is not bool:
             raise ReferenceVerificationError("required must be a boolean")
+
+    def to_document(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "remote_url": self.remote_url,
+            "kind": self.kind.value,
+            "command": self.command,
+            "required": self.required,
+        }
+
+    @classmethod
+    def from_document(cls, value: object) -> ReferenceVerificationRequirement:
+        if not isinstance(value, Mapping) or frozenset(value) != _REQUIREMENT_KEYS:
+            raise ReferenceVerificationError(
+                "reference verification requirement has an unsupported shape"
+            )
+        required = value.get("required")
+        if type(required) is not bool:
+            raise ReferenceVerificationError("required must be a boolean")
+        return cls(
+            path=_required_text(value, "path"),
+            remote_url=_required_text(value, "remote_url"),
+            kind=_enum_value(value.get("kind"), VerificationKind, "verification kind"),
+            command=_required_text(value, "command"),
+            required=required,
+        )
 
 
 @dataclass(frozen=True)
@@ -294,13 +321,14 @@ class ReferenceProjectObservation:
     """Fresh read-only identity, commit and source-state observation."""
 
     path: str
-    remote_url: str
+    remote_url: str | None
     commit_sha: str | None
     source_state: ReferenceSourceState
 
     def __post_init__(self) -> None:
         _validate_path(self.path)
-        _validate_canonical_url(self.remote_url)
+        if self.remote_url is not None:
+            _validate_canonical_url(self.remote_url)
         if self.commit_sha is not None and not _OID.fullmatch(self.commit_sha):
             raise ReferenceVerificationError(
                 "observed commit_sha must be a lowercase Git object ID"
@@ -326,6 +354,21 @@ def validate_reference_verification_document(
     if len(set(identifiers)) != len(identifiers):
         raise ReferenceVerificationError("run.reference_verification repeats an evidence_id")
     return parsed
+
+
+def parse_reference_verification_requirements(
+    value: object,
+) -> tuple[ReferenceVerificationRequirement, ...]:
+    """Parse the closed, task-local reference-check declaration shape."""
+    if value is None:
+        return ()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ReferenceVerificationError("reference_verification_requirements must be an array")
+    requirements = tuple(ReferenceVerificationRequirement.from_document(item) for item in value)
+    keys = [(item.path, item.kind, item.command) for item in requirements]
+    if len(set(keys)) != len(keys):
+        raise ReferenceVerificationError("reference verification requirements contain duplicates")
+    return requirements
 
 
 def _evidence_id(identity: Mapping[str, object]) -> str:

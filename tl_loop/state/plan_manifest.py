@@ -750,7 +750,7 @@ def _integration_contract(value: object) -> Mapping[str, object]:
 def _node_declaration(value: Mapping[str, object], kind: str) -> Mapping[str, object]:
     """Retain task metadata needed to reconstruct the exact child declaration."""
     fields = {
-        "worker": ("task_timeout_seconds",),
+        "worker": ("task_timeout_seconds", "reference_verification_requirements"),
         "leaf": (
             "context",
             "read_first",
@@ -758,8 +758,13 @@ def _node_declaration(value: Mapping[str, object], kind: str) -> Mapping[str, ob
             "verify",
             "done_criteria",
             "task_timeout_seconds",
+            "reference_verification_requirements",
         ),
-        "sub_tl": ("order_explicit", "task_timeout_seconds"),
+        "sub_tl": (
+            "order_explicit",
+            "task_timeout_seconds",
+            "reference_verification_requirements",
+        ),
         "legacy": (),
     }[kind]
     declaration = {name: value[name] for name in fields if name in value}

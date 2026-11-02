@@ -278,6 +278,29 @@ lazy path on a later call once the effect succeeds, with no second post-merge
 entry point. Persisting the resolved identity also clears that recovery gate so
 it cannot suppress the remaining post-merge boundaries.
 
+## Declared reference verification
+
+A worker, leaf, or ordered `sub_tl` declaration may include a
+`reference_verification_requirements` array. Each item has `path`, canonical
+credential-free `remote_url`, `kind` (`build` or `test`), exact descriptive
+`command`, and a boolean `required`. The array is retained in the accepted
+manifest node declaration and reconstructed from that manifest on continuation;
+editing `plan.json` alone cannot silently change the accepted checks.
+
+Before dispatching that declaration, the production scheduler calls
+`_reference_verification_ready`. It reads only persisted RunStore evidence and
+fresh local Git observations: the reference must be a declared gitlink in the
+parent HEAD and index, its own canonical remote and HEAD must match, and its
+tracked/untracked source must currently be clean. Required evidence must match
+the accepted run/scope, path, identity, exact current commit, kind and command,
+have a passed outcome and non-claim provenance. Missing, stale, dirty,
+unavailable, failed, not-run, or timed-out evidence leaves that declaration
+pending and emits a bounded controller diagnostic. An optional requirement
+never blocks. No build/test command is executed by the controller, and
+verification success grants no Git mutation authority. Evidence is appended
+through `RunStore.record_reference_verification`; its immutable record keeps
+the command, outcome and provenance for audit and continuation.
+
 ## Direct-leaf/worker scope draining
 
 `WorkPlan.sub_tls` empty is the direct-leaf/worker scope shape. It has no

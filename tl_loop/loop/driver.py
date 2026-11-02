@@ -175,6 +175,7 @@ from tl_loop.loop.integration_lineage import GitLineageError, verify_aggregate_l
 from tl_loop.loop.nested_recovery import verified_nested_recovery_wait
 from tl_loop.loop.observability import emit_controller_event
 from tl_loop.loop.recovery_policy import policy_for_cause
+from tl_loop.loop.reference_verification import observe_reference_project
 from tl_loop.loop.review import (
     IntegrationEvidenceMismatch,
     ReviewContract,
@@ -262,6 +263,12 @@ from tl_loop.state.plan_manifest import (
     build_plan_manifest,
 )
 from tl_loop.state.plan_revision_manifest import retain_scope_revisions
+from tl_loop.state.reference_verification import (
+    ReferenceVerificationError,
+    ReferenceVerificationRequirement,
+    parse_reference_verification_requirements,
+)
+from tl_loop.state.reference_verification_assessment import assess_reference_verification
 from tl_loop.state.repository_identity import (
     canonical_repository_url,
     repository_api_coordinates,
@@ -1136,6 +1143,7 @@ class WorkerTask:
     task_timeout_seconds: float | None = None
     task_timeout_declared: bool = False
     chainlink_issue_id: int | None = None
+    reference_verification_requirements: tuple[ReferenceVerificationRequirement, ...] = ()
 
     def __post_init__(self) -> None:
         _require_text(self.name, "worker name")
@@ -1143,6 +1151,7 @@ class WorkerTask:
         _optional_text(self.agent_type, "worker agent_type")
         _validate_task_timeout(self.task_timeout_seconds, "worker task_timeout_seconds")
         _validate_chainlink_issue_id(self.chainlink_issue_id, "worker chainlink_issue_id")
+        _validate_reference_requirements(self.reference_verification_requirements)
 
 
 @dataclass(frozen=True)
@@ -1164,6 +1173,7 @@ class LeafTask:
     task_timeout_seconds: float | None = None
     task_timeout_declared: bool = False
     chainlink_issue_id: int | None = None
+    reference_verification_requirements: tuple[ReferenceVerificationRequirement, ...] = ()
 
     def __post_init__(self) -> None:
         _require_text(self.name, "leaf name")
@@ -1172,6 +1182,7 @@ class LeafTask:
         _optional_text(self.context, "leaf context")
         _validate_task_timeout(self.task_timeout_seconds, "leaf task_timeout_seconds")
         _validate_chainlink_issue_id(self.chainlink_issue_id, "leaf chainlink_issue_id")
+        _validate_reference_requirements(self.reference_verification_requirements)
         for field_name, values in (
             ("boundary", self.boundary),
             ("read_first", self.read_first),
@@ -1249,6 +1260,7 @@ class SubTLTask:
     task_timeout_seconds: float | None = None
     task_timeout_declared: bool = False
     chainlink_issue_id: int | None = None
+    reference_verification_requirements: tuple[ReferenceVerificationRequirement, ...] = ()
 
     def __post_init__(self) -> None:
         _require_text(self.name, "sub-TL name")
@@ -1269,6 +1281,7 @@ class SubTLTask:
             raise TypeError("sub-TL order_explicit must be a boolean")
         _validate_task_timeout(self.task_timeout_seconds, "sub-TL task_timeout_seconds")
         _validate_chainlink_issue_id(self.chainlink_issue_id, "sub-TL chainlink_issue_id")
+        _validate_reference_requirements(self.reference_verification_requirements)
 
 
 @dataclass(frozen=True)
@@ -17050,6 +17063,42 @@ def _dispatch_pass_stops(state: RunState) -> bool:
     return not _held_by_dispatch_park(state)
 
 
+def _reference_verification_ready(
+    task_name: str,
+    requirements: Sequence[ReferenceVerificationRequirement],
+    state: RunState,
+    config: TLLoopConfig,
+    store: RunStore,
+) -> bool:
+    required = tuple(requirement for requirement in requirements if requirement.required)
+    if not required:
+        return True
+    manifest = state.plan_manifest
+    if manifest is None:
+        LOGGER.warning(
+            "reference verification blocks %s: accepted manifest is unavailable", task_name
+        )
+        return False
+    workspace = config.worktree or config.project_root
+    observations = tuple(
+        observe_reference_project(workspace, requirement) for requirement in required
+    )
+    decision = assess_reference_verification(
+        required,
+        store.reference_verification_evidence(),
+        observations,
+        run_id=store.run_id,
+        scope_id=manifest.scope_id,
+    )
+    if not decision.ready:
+        LOGGER.warning(
+            "required reference verification blocks %s: %s",
+            task_name,
+            "; ".join(decision.blockers),
+        )
+    return decision.ready
+
+
 def _dispatch_children(
     plan: WorkPlan,
     state: RunState,
@@ -17063,6 +17112,10 @@ def _dispatch_children(
     before_slices = state.slices
     for worker in plan.workers:
         if not _dispatch_candidate(worker.name, state, config):
+            continue
+        if not _reference_verification_ready(
+            worker.name, worker.reference_verification_requirements, state, config, store
+        ):
             continue
         attempt = _prepare_spawn(worker.name, state, config, effects, store, effects_log)
         state = store.load()
@@ -17106,6 +17159,10 @@ def _dispatch_children(
             return state
     for leaf in plan.leaves:
         if not _dispatch_candidate(leaf.name, state, config):
+            continue
+        if not _reference_verification_ready(
+            leaf.name, leaf.reference_verification_requirements, state, config, store
+        ):
             continue
         attempt = _prepare_spawn(leaf.name, state, config, effects, store, effects_log)
         state = store.load()
@@ -17723,6 +17780,13 @@ def _run_sub_tls(
             )
             and not _ordered_child_complete(task, current)
         )
+        pending = tuple(
+            task
+            for task in pending
+            if _reference_verification_ready(
+                task.name, task.reference_verification_requirements, state, config, store
+            )
+        )
         for task in pending:
             current = state.slices.get(task.name)
             if current is None or current.status not in {SliceStatus.PENDING, SliceStatus.READY}:
@@ -17760,6 +17824,15 @@ def _run_sub_tls(
                 stage.order, state, current_order, plan, store
             )
             continue
+        dispatch_pending = tuple(
+            task
+            for task in pending
+            if _reference_verification_ready(
+                task.name, task.reference_verification_requirements, store.load(), config, store
+            )
+        )
+        if not dispatch_pending:
+            return store.load()
         if not any(
             current is not None and current.status is not SliceStatus.PENDING
             for current in stage_states
@@ -17776,11 +17849,11 @@ def _run_sub_tls(
                 effects,
                 effects_log,
             )
-        _validate_stage_event_routes(pending)
+        _validate_stage_event_routes(dispatch_pending)
         if config.max_parallel_slices == 0:
             raise LoopLimitExceeded("max_parallel_slices must permit one recursive child")
         state, spawned = _prepare_sub_tl_stage(
-            pending, state, config, source, effects, store, effects_log, stage.order
+            dispatch_pending, state, config, source, effects, store, effects_log, stage.order
         )
         width = config.max_parallel_slices or len(spawned)
         stage_recovery = False
@@ -28609,6 +28682,7 @@ def _manifest_plan(plan: WorkPlan) -> Mapping[str, object]:
                 if task.task_timeout_declared
                 else {}
             ),
+            **_reference_requirements_document(task.reference_verification_requirements),
         }
         for task in plan.workers
     ]
@@ -28633,6 +28707,7 @@ def _manifest_plan(plan: WorkPlan) -> Mapping[str, object]:
                 if task.task_timeout_declared
                 else {}
             ),
+            **_reference_requirements_document(task.reference_verification_requirements),
         }
         for task in plan.leaves
     ]
@@ -28660,6 +28735,7 @@ def _manifest_plan(plan: WorkPlan) -> Mapping[str, object]:
                     if task.task_timeout_declared
                     else {}
                 ),
+                **_reference_requirements_document(task.reference_verification_requirements),
             }
         )
     return {"workers": workers, "leaves": leaves, "sub_tls": sub_tls}
@@ -28742,6 +28818,7 @@ def _work_plan_from_manifest(manifest: PlanManifest) -> WorkPlan:
                     _manifest_timeout(declaration),
                     "task_timeout_seconds" in declaration,
                     node.chainlink_issue_id,
+                    _manifest_reference_requirements(declaration),
                 )
             )
         elif node.kind == "leaf":
@@ -28760,6 +28837,9 @@ def _work_plan_from_manifest(manifest: PlanManifest) -> WorkPlan:
                     task_timeout_seconds=_manifest_timeout(declaration),
                     task_timeout_declared="task_timeout_seconds" in declaration,
                     chainlink_issue_id=node.chainlink_issue_id,
+                    reference_verification_requirements=_manifest_reference_requirements(
+                        declaration
+                    ),
                 )
             )
         elif node.kind == "sub_tl":
@@ -28781,6 +28861,9 @@ def _work_plan_from_manifest(manifest: PlanManifest) -> WorkPlan:
                     task_timeout_seconds=_manifest_timeout(declaration),
                     task_timeout_declared="task_timeout_seconds" in declaration,
                     chainlink_issue_id=node.chainlink_issue_id,
+                    reference_verification_requirements=_manifest_reference_requirements(
+                        declaration
+                    ),
                 )
             )
         else:
@@ -28788,6 +28871,26 @@ def _work_plan_from_manifest(manifest: PlanManifest) -> WorkPlan:
                 f"manifest node {node.node_id!r} has legacy kind {node.kind!r} and cannot be resumed"
             )
     return normalize_work_plan(WorkPlan(tuple(workers), tuple(leaves), tuple(sub_tls)))
+
+
+def _reference_requirements_document(
+    requirements: Sequence[ReferenceVerificationRequirement],
+) -> dict[str, object]:
+    if not requirements:
+        return {}
+    return {
+        "reference_verification_requirements": [
+            requirement.to_document() for requirement in requirements
+        ]
+    }
+
+
+def _manifest_reference_requirements(
+    declaration: Mapping[str, object],
+) -> tuple[ReferenceVerificationRequirement, ...]:
+    return parse_reference_verification_requirements(
+        declaration.get("reference_verification_requirements")
+    )
 
 
 def _manifest_timeout(declaration: Mapping[str, object]) -> float | None:
@@ -29175,6 +29278,7 @@ def _sub_tl(value: object, *, path: str = "plan.sub_tls[0]") -> SubTLTask:
         "integration",
         "task_timeout_seconds",
         "chainlink_issue_id",
+        "reference_verification_requirements",
     }
     unknown = sorted(set(value) - allowed)
     if unknown:
@@ -29205,6 +29309,9 @@ def _sub_tl(value: object, *, path: str = "plan.sub_tls[0]") -> SubTLTask:
         chainlink_issue_id=_optional_chainlink_issue_id(
             value.get("chainlink_issue_id"), f"{path}.chainlink_issue_id"
         ),
+        reference_verification_requirements=_reference_verification_requirements(
+            value.get("reference_verification_requirements"), "sub-TL"
+        ),
     )
 
 
@@ -29220,6 +29327,26 @@ def _optional_chainlink_issue_id(value: object, path: str) -> int | None:
     if type(value) is not int or value <= 0:
         raise ChainlinkIssueBindingError(f"{path} must be a positive integer or null")
     return value
+
+
+def _validate_reference_requirements(value: object) -> None:
+    if not isinstance(value, tuple) or any(
+        not isinstance(item, ReferenceVerificationRequirement) for item in value
+    ):
+        raise TypeError("reference verification requirements must be typed declarations")
+    keys = [(item.path, item.kind, item.command) for item in value]
+    if len(set(keys)) != len(keys):
+        raise ReferenceVerificationError("reference verification requirements contain duplicates")
+
+
+def _reference_verification_requirements(
+    value: object, kind: str
+) -> tuple[ReferenceVerificationRequirement, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise TypeError(f"{kind}.reference_verification_requirements must be an array")
+    return parse_reference_verification_requirements(list(value))
 
 
 def _validate_chainlink_issue_id(value: object, path: str) -> None:
@@ -29373,7 +29500,14 @@ def _worker(value: object) -> WorkerTask:
         raise TypeError("worker task must be an object")
     _reject_unknown_task_keys(
         value,
-        {"name", "task", "agent_type", "task_timeout_seconds", "chainlink_issue_id"},
+        {
+            "name",
+            "task",
+            "agent_type",
+            "task_timeout_seconds",
+            "chainlink_issue_id",
+            "reference_verification_requirements",
+        },
         "worker",
     )
     return WorkerTask(
@@ -29386,6 +29520,9 @@ def _worker(value: object) -> WorkerTask:
         task_timeout_declared="task_timeout_seconds" in value,
         chainlink_issue_id=_optional_chainlink_issue_id(
             value.get("chainlink_issue_id"), "worker.chainlink_issue_id"
+        ),
+        reference_verification_requirements=_reference_verification_requirements(
+            value.get("reference_verification_requirements"), "worker"
         ),
     )
 
@@ -29414,6 +29551,7 @@ def _leaf(value: object, *, path: str = "plan.leaves[0]") -> LeafTask:
             "depends_on",
             "task_timeout_seconds",
             "chainlink_issue_id",
+            "reference_verification_requirements",
         },
         "leaf",
     )
@@ -29434,6 +29572,9 @@ def _leaf(value: object, *, path: str = "plan.leaves[0]") -> LeafTask:
         task_timeout_declared="task_timeout_seconds" in value,
         chainlink_issue_id=_optional_chainlink_issue_id(
             value.get("chainlink_issue_id"), "leaf.chainlink_issue_id"
+        ),
+        reference_verification_requirements=_reference_verification_requirements(
+            value.get("reference_verification_requirements"), "leaf"
         ),
     )
 
