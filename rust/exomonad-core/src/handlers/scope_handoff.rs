@@ -1561,7 +1561,7 @@ async fn find_handoff_commit(
         )
         .await?;
     let fields: Vec<&[u8]> = output.split(|byte| *byte == 0).collect();
-    for record in fields.chunks_exact(3) {
+    for record in fields.chunks(3).take(fields.len() / 3) {
         let sha = String::from_utf8_lossy(record[0]).trim().to_string();
         let parent = String::from_utf8_lossy(record[1]).trim().to_string();
         let body = String::from_utf8_lossy(record[2]);

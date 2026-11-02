@@ -278,8 +278,7 @@ fn commit_long_option_takes_value(argument: &str) -> usize {
 }
 
 fn commit_short_option_restages_paths(argument: &str) -> bool {
-    let mut characters = argument.chars().skip(1).peekable();
-    while let Some(character) = characters.next() {
+    for character in argument.chars().skip(1) {
         if matches!(character, 'a' | 'i' | 'o' | 'p') {
             return true;
         }
