@@ -375,7 +375,11 @@ fn cas_failure(
 
 async fn authoritative_base_sha(dir: &str, base_ref: &str) -> Result<String> {
     let remote = configured_remote(dir).await?;
-    run_git(dir, &["fetch", "--prune", &remote]).await?;
+    run_git(
+        dir,
+        &["fetch", "--prune", "--recurse-submodules=no", &remote],
+    )
+    .await?;
     let remote_ref = format!("refs/remotes/{remote}/{base_ref}");
     run_git(dir, &["rev-parse", "--verify", &remote_ref]).await
 }
@@ -443,7 +447,18 @@ async fn ensure_head_object(dir: &str, head_sha: &str, pr_number: Option<u64>) -
     };
     let remote = configured_remote(dir).await?;
     let refspec = format!("refs/pull/{pr_number}/head");
-    if let Err(error) = run_git(dir, &["fetch", "--no-tags", &remote, &refspec]).await {
+    if let Err(error) = run_git(
+        dir,
+        &[
+            "fetch",
+            "--no-tags",
+            "--recurse-submodules=no",
+            &remote,
+            &refspec,
+        ],
+    )
+    .await
+    {
         anyhow::bail!("pr_head_unreachable: fetch of {refspec} from {remote} failed: {error}");
     }
     if run_git(dir, &["cat-file", "-e", &object]).await.is_err() {

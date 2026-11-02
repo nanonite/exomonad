@@ -291,7 +291,7 @@ pub(super) async fn fetch_target_branch(
     let remote_ref = format!("refs/remotes/{remote}/{branch}");
     let refspec = format!("+refs/heads/{branch}:{remote_ref}");
     let output = git_command(project_dir)
-        .args(["fetch", "--no-tags", remote])
+        .args(["fetch", "--no-tags", "--recurse-submodules=no", remote])
         .arg(&refspec)
         .output()
         .await
@@ -390,7 +390,7 @@ pub(super) async fn delete_remote_branch_with_lease(
     let lease = format!("--force-with-lease=refs/heads/{branch}:{expected_sha}");
     let refspec = format!(":refs/heads/{branch}");
     let output = git_command(project_dir)
-        .args(["push", remote, &lease, &refspec])
+        .args(["push", "--recurse-submodules=no", remote, &lease, &refspec])
         .output()
         .await
         .with_context(|| format!("delete remote branch {remote}/{branch}"))?;

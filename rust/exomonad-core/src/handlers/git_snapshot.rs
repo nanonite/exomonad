@@ -147,6 +147,15 @@ impl GitEntrySnapshot {
         Ok(())
     }
 
+    pub(crate) fn validate_gitlink_index_identity(&self) -> Result<(), String> {
+        for (path, entry) in &self.entries {
+            if entry.is_gitlink() {
+                validate_gitlink_identity(path, entry)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn allowed_workspace_paths(
         &self,
         changed_paths: &BTreeSet<Vec<u8>>,

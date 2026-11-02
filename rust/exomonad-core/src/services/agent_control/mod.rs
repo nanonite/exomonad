@@ -447,6 +447,7 @@ pub(crate) async fn ensure_branch_fetched(
         .args([
             "fetch",
             "--force",
+            "--recurse-submodules=no",
             &remote,
             &format!("{branch_str}:{tracking_ref}"),
         ])

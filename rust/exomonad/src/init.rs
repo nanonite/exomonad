@@ -867,7 +867,7 @@ fn delete_remote_branch_with_lease(
     let lease = format!("--force-with-lease=refs/heads/{branch}:{expected_sha}");
     let refspec = format!(":refs/heads/{branch}");
     let output = std::process::Command::new("git")
-        .args(["push", remote, &lease, &refspec])
+        .args(["push", "--recurse-submodules=no", remote, &lease, &refspec])
         .current_dir(project_dir)
         .output()
         .with_context(|| format!("failed to delete remote branch {remote}/{branch}"))?;
@@ -1441,7 +1441,13 @@ fn seed_isolated_prerequisite(
     let project = project_dir.to_string_lossy();
     let fetched = run_git(
         isolated,
-        &["fetch", "--no-tags", project.as_ref(), &temp_ref],
+        &[
+            "fetch",
+            "--no-tags",
+            "--recurse-submodules=no",
+            project.as_ref(),
+            &temp_ref,
+        ],
         "fetch bundle prerequisite into isolated repository",
     );
     let _ = run_git(
@@ -1504,7 +1510,13 @@ fn verify_preservation_bundle(project_dir: &Path, path: &Path, expected_head: &s
     for (_, reference) in &advertised {
         run_git(
             isolated_repo,
-            &["fetch", "--no-tags", bundle.as_ref(), reference],
+            &[
+                "fetch",
+                "--no-tags",
+                "--recurse-submodules=no",
+                bundle.as_ref(),
+                reference,
+            ],
             "restore preservation bundle into isolated repository",
         )
         .with_context(|| {
@@ -1575,7 +1587,13 @@ fn preserve_leaf_unmerged_commits(
         let refspec = format!("+refs/heads/{branch}:{temp_ref}");
         run_git(
             project_dir,
-            &["fetch", "--no-tags", remote_name, &refspec],
+            &[
+                "fetch",
+                "--no-tags",
+                "--recurse-submodules=no",
+                remote_name,
+                &refspec,
+            ],
             "fetch remote leaf commits for preservation",
         )?;
     }

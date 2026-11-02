@@ -4845,7 +4845,7 @@ async fn ensure_git_revision_reachable(
     }
 
     let fetched = Command::new("git")
-        .args(["fetch", "--all", "--prune"])
+        .args(["fetch", "--all", "--prune", "--recurse-submodules=no"])
         .current_dir(project_dir)
         .output()
         .await

@@ -117,18 +117,6 @@ impl ProcessEffects for ProcessHandler {
             );
         }
 
-        let mut cmd = tokio::process::Command::new(&req.command);
-        cmd.args(&req.args)
-            .current_dir(&resolved_dir)
-            .kill_on_drop(true);
-
-        if !req.env.is_empty() {
-            cmd.envs(&req.env);
-        }
-        if let Some(chainlink_db) = self.chainlink_db_env(&req) {
-            cmd.env(CHAINLINK_DB_ENV, chainlink_db);
-        }
-
         let git_process = if is_git_executable(&req.command) {
             validate_git_target(&req.args, &req.env)?;
             validate_git_working_directory(&ctx.working_dir, &resolved_dir, &req.env)?;
@@ -150,6 +138,27 @@ impl ProcessEffects for ProcessHandler {
         } else {
             None
         };
+        let command_args = git_process
+            .as_ref()
+            .map(GitProcessContext::command_args)
+            .unwrap_or(&req.args);
+        let mut cmd = tokio::process::Command::new(&req.command);
+        cmd.args(command_args)
+            .current_dir(&resolved_dir)
+            .kill_on_drop(true);
+
+        if !req.env.is_empty() {
+            cmd.envs(&req.env);
+        }
+        if let Some(index_file) = git_process
+            .as_ref()
+            .and_then(GitProcessContext::commit_index_path)
+        {
+            cmd.env("GIT_INDEX_FILE", index_file);
+        }
+        if let Some(chainlink_db) = self.chainlink_db_env(&req) {
+            cmd.env(CHAINLINK_DB_ENV, chainlink_db);
+        }
         let timeout = (req.timeout_ms > 0).then(|| Duration::from_millis(req.timeout_ms));
         let (cancel_sender, mut cancel_receiver) = oneshot::channel();
         let _cancellation_signal = ProcessCancellationSignal(Some(cancel_sender));
@@ -575,6 +584,339 @@ mod tests {
         assert!(!root.join("clone/.git").exists());
         assert!(!root.join(".exo/worktrees/bypass").exists());
         assert!(!root.join(".exo/logs").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_handler_commit_all_excludes_reference_gitlinks_and_holds_staged_pointers() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        for arguments in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "process test"],
+            vec!["config", "user.email", "process-test@example.invalid"],
+        ] {
+            assert_git_fixture_succeeded(run_git_fixture_output(&root, &arguments), &arguments);
+        }
+        std::fs::create_dir_all(root.join("tools")).unwrap();
+        let reference_source = temporary.path().join("reference-source");
+        std::fs::create_dir(&reference_source).unwrap();
+        for arguments in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "reference test"],
+            vec!["config", "user.email", "reference-test@example.invalid"],
+        ] {
+            assert_git_fixture_succeeded(
+                run_git_fixture_output(&reference_source, &arguments),
+                &arguments,
+            );
+        }
+        std::fs::write(reference_source.join("ref.txt"), "reference base\n").unwrap();
+        let add_reference = ["add", "ref.txt"];
+        assert_git_fixture_succeeded(
+            run_git_fixture_output(&reference_source, &add_reference),
+            &add_reference,
+        );
+        let commit_reference = ["commit", "-q", "-m", "reference base"];
+        assert_git_fixture_succeeded(
+            run_git_fixture_output(&reference_source, &commit_reference),
+            &commit_reference,
+        );
+        let reference_oid = String::from_utf8(
+            run_git_fixture_output(&reference_source, &["rev-parse", "HEAD"]).stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let reference_path = root.join("tools/reference");
+        let clone = std::process::Command::new("git")
+            .args(["clone", "-q", "--local"])
+            .arg(&reference_source)
+            .arg(&reference_path)
+            .output()
+            .unwrap();
+        assert!(
+            clone.status.success(),
+            "{}",
+            String::from_utf8_lossy(&clone.stderr)
+        );
+        std::fs::write(
+            root.join(".gitmodules"),
+            "[submodule \"reference\"]\n\tpath = tools/reference\n\turl = https://example.invalid/reference.git\n",
+        )
+        .unwrap();
+        let add_modules = ["add", ".gitmodules"];
+        assert_git_fixture_succeeded(run_git_fixture_output(&root, &add_modules), &add_modules);
+        let gitlink = format!("160000,{reference_oid},tools/reference");
+        assert_git_fixture_succeeded(
+            run_git_fixture_output(&root, &["update-index", "--add", "--cacheinfo", &gitlink]),
+            &["update-index", "--add", "--cacheinfo", &gitlink],
+        );
+        let initial_commit = ["commit", "-q", "-m", "workspace with reference"];
+        assert_git_fixture_succeeded(
+            run_git_fixture_output(&root, &initial_commit),
+            &initial_commit,
+        );
+
+        std::fs::write(reference_path.join("ref.txt"), "reference advanced\n").unwrap();
+        let nested_add = ["add", "ref.txt"];
+        assert_git_fixture_succeeded(
+            run_git_fixture_output(&reference_path, &nested_add),
+            &nested_add,
+        );
+        let nested_commit = ["commit", "-q", "-m", "reference advanced"];
+        assert_git_fixture_succeeded(
+            run_git_fixture_output(&reference_path, &nested_commit),
+            &nested_commit,
+        );
+        std::fs::write(root.join("parent.txt"), "ordinary parent edit\n").unwrap();
+
+        let handler = ProcessHandler::with_project_dir(root.clone());
+        let add_response = handler
+            .run(
+                RunRequest {
+                    command: "git".into(),
+                    args: vec!["add".into(), "-A".into()],
+                    working_dir: ".".into(),
+                    env: std::collections::HashMap::new(),
+                    timeout_ms: 5_000,
+                },
+                &test_ctx_at(&root),
+            )
+            .await
+            .expect("commit-all staging should run for ordinary workspace files");
+        assert_eq!(add_response.exit_code, 0, "{}", add_response.stderr);
+        let staged = String::from_utf8(
+            run_git_fixture_output(&root, &["diff", "--cached", "--name-only"]).stdout,
+        )
+        .unwrap();
+        assert!(staged.lines().any(|path| path == "parent.txt"));
+        assert!(!staged.lines().any(|path| path == "tools/reference"));
+
+        let commit_response = handler
+            .run(
+                RunRequest {
+                    command: "git".into(),
+                    args: vec!["commit".into(), "-m".into(), "parent change".into()],
+                    working_dir: ".".into(),
+                    env: std::collections::HashMap::new(),
+                    timeout_ms: 5_000,
+                },
+                &test_ctx_at(&root),
+            )
+            .await
+            .expect("ordinary staged workspace changes should commit");
+        assert_eq!(commit_response.exit_code, 0, "{}", commit_response.stderr);
+        assert_eq!(
+            String::from_utf8(
+                run_git_fixture_output(&root, &["rev-parse", "HEAD:tools/reference"]).stdout
+            )
+            .unwrap()
+            .trim(),
+            reference_oid
+        );
+
+        let advanced_reference_oid = String::from_utf8(
+            run_git_fixture_output(&reference_path, &["rev-parse", "HEAD"]).stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let head_before_pathspec =
+            String::from_utf8(run_git_fixture_output(&root, &["rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim()
+                .to_string();
+        let pathspec_commit = handler
+            .run(
+                RunRequest {
+                    command: "git".into(),
+                    args: vec![
+                        "commit".into(),
+                        "-m".into(),
+                        "unauthorized reference pathspec".into(),
+                        "tools/reference".into(),
+                    ],
+                    working_dir: ".".into(),
+                    env: std::collections::HashMap::new(),
+                    timeout_ms: 5_000,
+                },
+                &test_ctx_at(&root),
+            )
+            .await
+            .expect_err("commit pathspec must not restage a reference from its worktree");
+        assert!(
+            pathspec_commit
+                .to_string()
+                .contains("commit options that stage worktree paths are refused"),
+            "unexpected pathspec refusal: {pathspec_commit}"
+        );
+        assert_eq!(
+            String::from_utf8(run_git_fixture_output(&root, &["rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim(),
+            head_before_pathspec,
+            "refusing the pathspec must leave the parent commit unchanged"
+        );
+        let update_refusal = handler
+            .run(
+                RunRequest {
+                    command: "git".into(),
+                    args: vec![
+                        "update-index".into(),
+                        "--cacheinfo".into(),
+                        format!("160000,{advanced_reference_oid},tools/reference"),
+                    ],
+                    working_dir: ".".into(),
+                    env: std::collections::HashMap::new(),
+                    timeout_ms: 5_000,
+                },
+                &test_ctx_at(&root),
+            )
+            .await
+            .expect_err("direct update-index must not change a parent gitlink");
+        assert!(update_refusal
+            .to_string()
+            .contains("direct update-index is refused"));
+
+        std::fs::write(
+            root.join("race.txt"),
+            "commit before external index writer\n",
+        )
+        .unwrap();
+        let stage_race = handler
+            .run(
+                RunRequest {
+                    command: "git".into(),
+                    args: vec!["add".into(), "-A".into()],
+                    working_dir: ".".into(),
+                    env: std::collections::HashMap::new(),
+                    timeout_ms: 5_000,
+                },
+                &test_ctx_at(&root),
+            )
+            .await
+            .expect("ordinary workspace edits remain stageable");
+        assert_eq!(stage_race.exit_code, 0, "{}", stage_race.stderr);
+        let real_git = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|directory| directory.join("git"))
+            .find(|candidate| candidate.is_file())
+            .unwrap();
+        let actual_index = root.join(".git/index");
+        let wrapper = root.join(".git/git");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"commit\" ]; then GIT_INDEX_FILE='{}' '{}' update-index --cacheinfo '{}'; fi\nexec '{}' \"$@\"\n",
+                actual_index.display(),
+                real_git.display(),
+                format!("160000,{advanced_reference_oid},tools/reference"),
+                real_git.display(),
+            ),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut wrapper_permissions = std::fs::metadata(&wrapper).unwrap().permissions();
+        wrapper_permissions.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, wrapper_permissions).unwrap();
+        let head_before_race =
+            String::from_utf8(run_git_fixture_output(&root, &["rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim()
+                .to_string();
+        let racing_commit = handler
+            .run(
+                RunRequest {
+                    command: wrapper.to_string_lossy().into_owned(),
+                    args: vec!["commit".into(), "-m".into(), "concurrent commit".into()],
+                    working_dir: ".".into(),
+                    env: std::collections::HashMap::new(),
+                    timeout_ms: 5_000,
+                },
+                &test_ctx_at(&root),
+            )
+            .await
+            .expect("commit should use its immutable index snapshot");
+        assert_eq!(racing_commit.exit_code, 0, "{}", racing_commit.stderr);
+        assert_eq!(
+            String::from_utf8(
+                run_git_fixture_output(&root, &["rev-parse", "HEAD:tools/reference"]).stdout
+            )
+            .unwrap()
+            .trim(),
+            reference_oid,
+            "external index change immediately before commit must not enter its tree"
+        );
+        let staged_reference = String::from_utf8(
+            run_git_fixture_output(&root, &["ls-files", "--stage", "tools/reference"]).stdout,
+        )
+        .unwrap();
+        assert!(staged_reference.contains(&advanced_reference_oid));
+
+        let parent_head =
+            String::from_utf8(run_git_fixture_output(&root, &["rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim()
+                .to_string();
+        let staged_refusal = handler
+            .run(
+                RunRequest {
+                    command: "git".into(),
+                    args: vec!["commit".into(), "-m".into(), "unauthorized pointer".into()],
+                    working_dir: ".".into(),
+                    env: std::collections::HashMap::new(),
+                    timeout_ms: 5_000,
+                },
+                &test_ctx_at(&root),
+            )
+            .await
+            .expect_err("pre-staged unauthorized reference pointer must block commit");
+        assert!(staged_refusal
+            .to_string()
+            .contains("reference Git mutation refused"));
+        assert_eq!(
+            String::from_utf8(run_git_fixture_output(&root, &["rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim(),
+            parent_head
+        );
+        assert_ne!(head_before_race, parent_head);
+
+        let alternate = temporary.path().join("alternate-reference");
+        std::fs::create_dir(&alternate).unwrap();
+        for arguments in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "assigned reference"],
+            vec!["config", "user.email", "assigned-reference@example.invalid"],
+        ] {
+            assert_git_fixture_succeeded(
+                run_git_fixture_output(&alternate, &arguments),
+                &arguments,
+            );
+        }
+        std::fs::write(alternate.join("file.txt"), "assigned work\n").unwrap();
+        let alternate_add = ["add", "-A"];
+        assert_git_fixture_succeeded(
+            run_git_fixture_output(&alternate, &alternate_add),
+            &alternate_add,
+        );
+        let assigned_handler = ProcessHandler::with_project_dir(alternate.clone());
+        let assigned_ctx = test_ctx_at(&alternate);
+        let assigned = assigned_handler
+            .run(
+                RunRequest {
+                    command: "git".into(),
+                    args: vec!["commit".into(), "-m".into(), "assigned work".into()],
+                    working_dir: ".".into(),
+                    env: std::collections::HashMap::new(),
+                    timeout_ms: 5_000,
+                },
+                &assigned_ctx,
+            )
+            .await
+            .expect("a separately assigned repository keeps ordinary Git behavior");
+        assert_eq!(assigned.exit_code, 0, "{}", assigned.stderr);
     }
 
     #[tokio::test]

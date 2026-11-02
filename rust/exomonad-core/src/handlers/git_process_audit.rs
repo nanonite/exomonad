@@ -1,6 +1,8 @@
 //! Mutation leases and durable audit records for direct Git process effects.
 
-use super::git_process_policy::validate_git_command;
+use super::git_process_policy::{
+    is_git_commit, prepare_git_command, validate_gitlink_index_identity,
+};
 use super::process_supervision::{GitProcessAudit, ProcessRunOutput};
 use crate::effects::{EffectError, EffectResult};
 use crate::services::{
@@ -26,6 +28,8 @@ pub(crate) struct GitProcessRequest<'a> {
 
 pub(crate) struct GitProcessContext {
     leases: GitMutationLeaseSet,
+    command_args: Vec<String>,
+    commit_index: Option<tempfile::NamedTempFile>,
     event_log: EventLog,
     operation_id: String,
     agent_id: String,
@@ -41,10 +45,24 @@ impl GitProcessContext {
     ) -> EffectResult<Self> {
         let leases = acquire_git_leases(project_dir, worktree, request.operation_id).await?;
         validate_git_working_directory(worktree, command_directory, request.environment)?;
-        validate_git_command(request.args, command_directory, request.environment)?;
+        let command_args =
+            prepare_git_command(request.args, command_directory, request.environment)?;
+        let commit_index = if is_git_commit(request.args) {
+            let index = isolated_commit_index(&leases)?;
+            validate_gitlink_index_identity(
+                command_directory,
+                request.environment,
+                Some(index.path()),
+            )?;
+            Some(index)
+        } else {
+            None
+        };
         let event_log = open_event_log(project_dir)?;
         let context = Self {
             leases,
+            command_args,
+            commit_index,
             event_log,
             operation_id: request.operation_id.to_string(),
             agent_id: request.agent_id.to_string(),
@@ -52,6 +70,16 @@ impl GitProcessContext {
         };
         context.record_requested()?;
         Ok(context)
+    }
+
+    pub(crate) fn command_args(&self) -> &[String] {
+        &self.command_args
+    }
+
+    pub(crate) fn commit_index_path(&self) -> Option<&Path> {
+        self.commit_index
+            .as_ref()
+            .map(tempfile::NamedTempFile::path)
     }
 
     fn index_lease(&self) -> EffectResult<&GitMutationLease> {
@@ -88,6 +116,7 @@ impl GitProcessContext {
             "git_dir": paths.git_dir,
             "common_git_dir": paths.common_git_dir,
             "index_file": paths.index_file,
+            "isolated_commit_index_file": self.commit_index_path(),
         });
         self.append_event("git.process.requested", &data, "managed Git process intent")
     }
@@ -146,6 +175,66 @@ impl GitProcessContext {
             })?;
         Ok(())
     }
+}
+
+fn isolated_commit_index(leases: &GitMutationLeaseSet) -> EffectResult<tempfile::NamedTempFile> {
+    let lease = leases
+        .leases()
+        .iter()
+        .find(|lease| lease.resource == GitMutationResource::Index)
+        .ok_or_else(|| {
+            EffectError::custom(
+                "git_mutation_unavailable",
+                "managed Git commit has no index mutation lease; no process was started",
+            )
+        })?;
+    let metadata = fs::symlink_metadata(&lease.paths.index_file).map_err(|_| {
+        EffectError::custom(
+            "git_mutation_unavailable",
+            "managed Git commit index could not be inspected; stage changes before committing",
+        )
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(EffectError::custom(
+            "git_mutation_unavailable",
+            "managed Git commit index is not a regular file; no process was started",
+        ));
+    }
+    let bytes = fs::read(&lease.paths.index_file).map_err(|_| {
+        EffectError::custom(
+            "git_mutation_unavailable",
+            "managed Git commit index could not be read safely; no process was started",
+        )
+    })?;
+    let parent = lease.paths.index_file.parent().ok_or_else(|| {
+        EffectError::custom(
+            "git_mutation_unavailable",
+            "managed Git commit index has no safe parent directory",
+        )
+    })?;
+    let mut index = tempfile::Builder::new()
+        .prefix("exo-process-commit-index-")
+        .tempfile_in(parent)
+        .map_err(|_| {
+            EffectError::custom(
+                "git_mutation_unavailable",
+                "isolated Git commit index could not be created",
+            )
+        })?;
+    use std::io::Write;
+    index.write_all(&bytes).map_err(|_| {
+        EffectError::custom(
+            "git_mutation_unavailable",
+            "isolated Git commit index could not be initialized",
+        )
+    })?;
+    index.flush().map_err(|_| {
+        EffectError::custom(
+            "git_mutation_unavailable",
+            "isolated Git commit index could not be synchronized",
+        )
+    })?;
+    Ok(index)
 }
 
 async fn acquire_git_leases(

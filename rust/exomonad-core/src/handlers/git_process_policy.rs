@@ -1,5 +1,6 @@
 //! Guard Git commands launched through process.run from mutating nested repositories.
 
+use super::git_snapshot::GitEntrySnapshot;
 use crate::effects::{EffectError, EffectResult};
 use std::collections::HashMap;
 use std::path::Path;
@@ -7,7 +8,25 @@ use std::process::Command;
 
 const MAX_GIT_CONFIG_ENV_ITEMS: usize = 128;
 
+#[cfg(test)]
 pub(crate) fn validate_git_command(
+    args: &[String],
+    directory: &Path,
+    request_env: &HashMap<String, String>,
+) -> EffectResult<()> {
+    prepare_git_command(args, directory, request_env).map(|_| ())
+}
+
+pub(crate) fn prepare_git_command(
+    args: &[String],
+    directory: &Path,
+    request_env: &HashMap<String, String>,
+) -> EffectResult<Vec<String>> {
+    validate_git_command_policy(args, directory, request_env)?;
+    protect_reference_mutation(args, directory, request_env)
+}
+
+fn validate_git_command_policy(
     args: &[String],
     directory: &Path,
     request_env: &HashMap<String, String>,
@@ -55,6 +74,271 @@ pub(crate) fn validate_git_command(
         }
     }
     Ok(())
+}
+
+fn protect_reference_mutation(
+    args: &[String],
+    directory: &Path,
+    request_env: &HashMap<String, String>,
+) -> EffectResult<Vec<String>> {
+    let Some((command_index, command)) = git_subcommand(args) else {
+        return Ok(args.to_vec());
+    };
+    if !matches!(command, "add" | "commit" | "update-index") {
+        return Ok(args.to_vec());
+    }
+    let snapshot = read_gitlink_snapshot(directory, request_env, None)?;
+    snapshot
+        .validate_gitlink_index_identity()
+        .map_err(|reason| {
+            recursive_git_refusal(&format!("reference Git mutation refused: {reason}"))
+        })?;
+    let reference_paths = snapshot
+        .entries()
+        .iter()
+        .filter_map(|(path, entry)| {
+            entry
+                .head
+                .as_ref()
+                .is_some_and(|head| head.mode == 0o160000)
+                .then_some(path.as_slice())
+        })
+        .collect::<Vec<_>>();
+    if reference_paths.is_empty() {
+        return Ok(args.to_vec());
+    }
+    match command {
+        "update-index" => Err(recursive_git_refusal(
+            "direct update-index is refused in a repository with reference gitlinks; use the scoped Git service",
+        )),
+        "commit" if commit_restages_paths(&args[command_index + 1..]) => Err(
+            recursive_git_refusal(
+                "commit options that stage worktree paths are refused in a repository with reference gitlinks; stage ordinary workspace paths first",
+            ),
+        ),
+        "add" => append_reference_exclusions(args, command_index, &reference_paths),
+        _ => Ok(args.to_vec()),
+    }
+}
+
+pub(crate) fn validate_gitlink_index_identity(
+    directory: &Path,
+    request_env: &HashMap<String, String>,
+    index_file: Option<&Path>,
+) -> EffectResult<()> {
+    read_gitlink_snapshot(directory, request_env, index_file)?
+        .validate_gitlink_index_identity()
+        .map_err(|reason| {
+            recursive_git_refusal(&format!("reference Git mutation refused: {reason}"))
+        })
+}
+
+pub(crate) fn is_git_commit(args: &[String]) -> bool {
+    git_subcommand(args).is_some_and(|(_, command)| command == "commit")
+}
+
+fn read_gitlink_snapshot(
+    directory: &Path,
+    request_env: &HashMap<String, String>,
+    index_file: Option<&Path>,
+) -> EffectResult<GitEntrySnapshot> {
+    let index = git_readonly(
+        directory,
+        request_env,
+        &["ls-files", "--stage", "-z"],
+        index_file,
+    )?;
+    let head = match git_readonly(
+        directory,
+        request_env,
+        &["ls-tree", "-r", "-z", "HEAD"],
+        None,
+    ) {
+        Ok(head) => head,
+        Err(_) if unborn_branch_exists(directory, request_env)? => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    GitEntrySnapshot::parse(&index, &head, &[]).map_err(|reason| {
+        recursive_git_refusal(&format!(
+            "reference Git state could not be verified: {reason}"
+        ))
+    })
+}
+
+fn unborn_branch_exists(
+    directory: &Path,
+    request_env: &HashMap<String, String>,
+) -> EffectResult<bool> {
+    let output = Command::new("git")
+        .args(["symbolic-ref", "--quiet", "HEAD"])
+        .current_dir(directory)
+        .envs(request_env)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .output()
+        .map_err(|_| recursive_git_refusal("Git HEAD could not be inspected"))?;
+    Ok(output.status.success())
+}
+
+fn git_readonly(
+    directory: &Path,
+    request_env: &HashMap<String, String>,
+    args: &[&str],
+    index_file: Option<&Path>,
+) -> EffectResult<Vec<u8>> {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(directory)
+        .envs(request_env)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES");
+    if let Some(index_file) = index_file {
+        command.env("GIT_INDEX_FILE", index_file);
+    }
+    let output = command
+        .output()
+        .map_err(|_| recursive_git_refusal("reference Git state could not be inspected"))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(recursive_git_refusal(
+            "reference Git state could not be inspected",
+        ))
+    }
+}
+
+fn commit_restages_paths(args: &[String]) -> bool {
+    if args.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "-a" | "--all"
+                | "--include"
+                | "-i"
+                | "--only"
+                | "-o"
+                | "--interactive"
+                | "--patch"
+                | "-p"
+                | "--pathspec-from-file"
+                | "--pathspec-file-nul"
+        ) || argument.starts_with("--pathspec-from-file=")
+    }) {
+        return true;
+    }
+    commit_has_pathspec(args)
+}
+
+fn commit_has_pathspec(args: &[String]) -> bool {
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if argument == "--" || !argument.starts_with('-') {
+            return true;
+        }
+        if argument.starts_with("--") {
+            index += 1 + commit_long_option_takes_value(argument);
+        } else if commit_short_option_restages_paths(argument) {
+            return true;
+        } else {
+            index += 1 + commit_short_option_takes_value(argument);
+        }
+    }
+    false
+}
+
+fn commit_long_option_takes_value(argument: &str) -> usize {
+    let option = argument.split_once('=').map_or(argument, |(name, _)| name);
+    if argument.contains('=') {
+        return 0;
+    }
+    usize::from(matches!(
+        option,
+        "--message"
+            | "--file"
+            | "--author"
+            | "--date"
+            | "--reuse-message"
+            | "--reedit-message"
+            | "--fixup"
+            | "--squash"
+            | "--cleanup"
+            | "--template"
+            | "--trailer"
+            | "--pathspec-from-file"
+    ))
+}
+
+fn commit_short_option_restages_paths(argument: &str) -> bool {
+    let mut characters = argument.chars().skip(1).peekable();
+    while let Some(character) = characters.next() {
+        if matches!(character, 'a' | 'i' | 'o' | 'p') {
+            return true;
+        }
+        if matches!(character, 'm' | 'F' | 'C' | 'c' | 't') {
+            return false;
+        }
+    }
+    false
+}
+
+fn commit_short_option_takes_value(argument: &str) -> usize {
+    let mut characters = argument.chars().skip(1).peekable();
+    while let Some(character) = characters.next() {
+        if matches!(character, 'm' | 'F' | 'C' | 'c' | 't') {
+            return usize::from(characters.peek().is_none());
+        }
+        if character == 'S' {
+            return 0;
+        }
+    }
+    0
+}
+
+fn append_reference_exclusions(
+    args: &[String],
+    command_index: usize,
+    references: &[&[u8]],
+) -> EffectResult<Vec<String>> {
+    if args.iter().any(|argument| {
+        argument == "--pathspec-from-file" || argument.starts_with("--pathspec-from-file=")
+    }) {
+        return Err(recursive_git_refusal(
+            "git add pathspec files cannot be verified against reference boundaries",
+        ));
+    }
+    let command_args = &args[command_index + 1..];
+    let has_delimiter = command_args.iter().any(|argument| argument == "--");
+    let has_pathspec = pathspecs_after_options(command_args);
+    let mut prepared = args.to_vec();
+    if !has_delimiter {
+        prepared.push("--".into());
+    }
+    if !has_pathspec {
+        prepared.push(".".into());
+    }
+    for reference in references {
+        let path = std::str::from_utf8(reference).map_err(|_| {
+            recursive_git_refusal("non-UTF-8 reference path cannot be excluded safely from git add")
+        })?;
+        prepared.push(format!(":(top,exclude,literal){path}"));
+    }
+    Ok(prepared)
+}
+
+fn pathspecs_after_options(args: &[String]) -> bool {
+    if let Some(delimiter) = args.iter().position(|argument| argument == "--") {
+        return delimiter + 1 < args.len();
+    }
+    args.iter().any(|argument| !argument.starts_with('-'))
 }
 
 fn recursive_git_refusal(message: &str) -> EffectError {

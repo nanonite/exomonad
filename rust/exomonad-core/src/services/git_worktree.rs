@@ -200,7 +200,7 @@ fn push_remote_command(
             .arg("-c")
             .arg(format!("http.extraheader=Authorization: token {token}"));
     }
-    command.args(["push", remote, branch.as_str()]);
+    command.args(["push", "--recurse-submodules=no", remote, branch.as_str()]);
     command
 }
 
@@ -1213,7 +1213,7 @@ impl GitWorktreeService {
         info!(path = %workspace_path.display(), "git fetch");
 
         let output = headless_git_command()
-            .args(["fetch"])
+            .args(["fetch", "--recurse-submodules=no"])
             .current_dir(workspace_path)
             .output()
             .map_err(|e| WorktreeError::GitError {
@@ -1403,6 +1403,7 @@ mod tests {
                 "-c",
                 "http.extraheader=Authorization: token secret-token",
                 "push",
+                "--recurse-submodules=no",
                 "origin",
                 "feature-auth",
             ]
@@ -1425,6 +1426,7 @@ mod tests {
                 "-c",
                 "http.extraheader=Authorization: token secret-token",
                 "push",
+                "--recurse-submodules=no",
                 "forgejo",
                 "feature-auth",
             ]
@@ -1441,7 +1443,10 @@ mod tests {
             .map(|arg| arg.to_string_lossy().to_string())
             .collect::<Vec<_>>();
 
-        assert_eq!(args, vec!["push", "origin", "feature-auth"]);
+        assert_eq!(
+            args,
+            vec!["push", "--recurse-submodules=no", "origin", "feature-auth"]
+        );
     }
 
     #[test]
@@ -1652,6 +1657,173 @@ mod tests {
 
         assert!(error.to_string().contains("different common Git directory"));
         assert!(!git_ref_exists(&nested, &remote_tracking));
+    }
+
+    #[test]
+    fn fetch_disables_recursive_updates_from_local_global_and_environment_config() {
+        let (temp, service) = init_test_repo();
+        let root = temp.path();
+        let child_remote = root.join("reference-remote.git");
+        std::fs::create_dir(&child_remote).unwrap();
+        init_bare_fixture_git_repository(&child_remote).unwrap();
+        let child_source = root.join("reference-source");
+        std::fs::create_dir(&child_source).unwrap();
+        init_fixture_git_repository(&child_source).unwrap();
+        run_git(
+            &child_source,
+            &["config", "user.email", "reference@example.invalid"],
+        );
+        run_git(&child_source, &["config", "user.name", "Reference"]);
+        std::fs::write(child_source.join("reference.txt"), "reference base\n").unwrap();
+        run_git(&child_source, &["add", "reference.txt"]);
+        run_git(&child_source, &["commit", "-m", "reference base"]);
+        run_git(
+            &child_source,
+            &["remote", "add", "origin", child_remote.to_str().unwrap()],
+        );
+        let child_branch = get_default_branch(&child_source);
+        run_git(&child_source, &["push", "-u", "origin", &child_branch]);
+        let initial_reference = branch_head(
+            &child_source,
+            &BranchName::try_from_str(&child_branch).unwrap(),
+        );
+
+        let nested = root.join("tools/reference");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        run_git(
+            root,
+            &[
+                "clone",
+                "--quiet",
+                "--local",
+                child_source.to_str().unwrap(),
+                nested.to_str().unwrap(),
+            ],
+        );
+        run_git(
+            &nested,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                child_remote.to_str().unwrap(),
+            ],
+        );
+        let child_tracking = format!("refs/remotes/origin/{child_branch}");
+        run_git(&nested, &["update-ref", "-d", &child_tracking]);
+        std::fs::write(
+            root.join(".gitmodules"),
+            format!(
+                "[submodule \"reference\"]\n\tpath = tools/reference\n\turl = {}\n",
+                child_remote.display()
+            ),
+        )
+        .unwrap();
+        run_git(root, &["add", ".gitmodules"]);
+        run_git(
+            root,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{initial_reference},tools/reference"),
+            ],
+        );
+        run_git(root, &["commit", "-m", "add reference"]);
+
+        let parent_remote = root.join("parent-remote.git");
+        std::fs::create_dir(&parent_remote).unwrap();
+        init_bare_fixture_git_repository(&parent_remote).unwrap();
+        let parent_branch = get_default_branch(root);
+        run_git(
+            root,
+            &["remote", "add", "origin", parent_remote.to_str().unwrap()],
+        );
+        run_git(root, &["push", "-u", "origin", &parent_branch]);
+        let parent_update = root.join("parent-update");
+        run_git(
+            root,
+            &[
+                "clone",
+                "--quiet",
+                parent_remote.to_str().unwrap(),
+                parent_update.to_str().unwrap(),
+            ],
+        );
+        run_git(
+            &parent_update,
+            &["config", "user.email", "parent@example.invalid"],
+        );
+        run_git(&parent_update, &["config", "user.name", "Parent"]);
+
+        std::fs::write(child_source.join("reference.txt"), "reference advanced\n").unwrap();
+        run_git(&child_source, &["add", "reference.txt"]);
+        run_git(&child_source, &["commit", "-m", "advance reference"]);
+        run_git(&child_source, &["push", "origin", &child_branch]);
+        let updated_reference = branch_head(
+            &child_source,
+            &BranchName::try_from_str(&child_branch).unwrap(),
+        );
+        run_git(
+            &parent_update,
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("160000,{updated_reference},tools/reference"),
+            ],
+        );
+        std::fs::write(parent_update.join("parent.txt"), "remote parent update\n").unwrap();
+        run_git(&parent_update, &["add", "parent.txt"]);
+        run_git(&parent_update, &["commit", "-m", "advance parent"]);
+        run_git(&parent_update, &["push", "origin", &parent_branch]);
+        let parent_remote_head = branch_head(
+            &parent_update,
+            &BranchName::try_from_str(&parent_branch).unwrap(),
+        );
+        run_git(
+            root,
+            &["config", "--local", "fetch.recurseSubmodules", "true"],
+        );
+        run_git(root, &["config", "--local", "submodule.recurse", "true"]);
+
+        let global_config = root.join("global.gitconfig");
+        std::fs::write(&global_config, "[fetch]\n\trecurseSubmodules = true\n").unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("fetch_with_injected_config_child")
+            .arg("--nocapture")
+            .env("EXOMONAD_FETCH_FIXTURE", root)
+            .env("GIT_CONFIG_GLOBAL", &global_config)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "fetch.recurseSubmodules")
+            .env("GIT_CONFIG_VALUE_0", "true")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "fetch child failed: {}{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(String::from_utf8_lossy(&child.stdout).contains("running 1 test"));
+        let parent_tracking = format!("refs/remotes/origin/{parent_branch}");
+        assert!(git_ref_exists(root, &parent_tracking));
+        assert!(!git_ref_exists(&nested, &child_tracking));
+        assert_eq!(
+            service.remote_evidence(&BranchName::try_from_str(&parent_branch).unwrap()),
+            RemoteEvidence::AtSha(parent_remote_head),
+            "parent fetch should succeed while recursive reference fetch remains disabled"
+        );
+    }
+
+    #[test]
+    fn fetch_with_injected_config_child() {
+        let Ok(root) = std::env::var("EXOMONAD_FETCH_FIXTURE") else {
+            return;
+        };
+        let path = PathBuf::from(root);
+        GitWorktreeService::new(path.clone())
+            .fetch(&path)
+            .expect("fetch remains safe under recursive local/global/environment settings");
     }
 
     #[test]
