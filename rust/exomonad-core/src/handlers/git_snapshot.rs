@@ -1,6 +1,6 @@
 //! Lossless parsing and read-only observation of Git worktree entries.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -31,12 +31,14 @@ pub(crate) struct IndexEntry {
     pub(crate) stage: u8,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum GitlinkObservation {
     Missing,
     Uninitialized,
     InitializedDirectory,
     InitializedFile,
+    InitializedClean { head_oid: Vec<u8> },
+    InitializedDirty,
     UnsupportedContents,
 }
 
@@ -76,6 +78,10 @@ impl GitEntrySnapshot {
         &self.entries
     }
 
+    pub(crate) fn entries_mut(&mut self) -> &mut BTreeMap<Vec<u8>, GitPathEntry> {
+        &mut self.entries
+    }
+
     pub(crate) fn with_paths_from(&self, earlier: &Self) -> Self {
         let mut merged = self.clone();
         for path in earlier.entries.keys() {
@@ -91,6 +97,89 @@ impl GitEntrySnapshot {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn validate_reference_boundaries(&self) -> Result<(), String> {
+        for (path, entry) in &self.entries {
+            if !entry.is_gitlink() {
+                continue;
+            }
+            validate_gitlink_identity(path, entry)?;
+            match entry.gitlink_observation.as_ref() {
+                Some(GitlinkObservation::Missing | GitlinkObservation::Uninitialized) => {}
+                Some(GitlinkObservation::InitializedClean { head_oid }) => {
+                    let expected = entry.head.as_ref().map(|head| head.object_id.as_slice());
+                    if expected != Some(head_oid.as_slice()) {
+                        return Err(format!(
+                            "reference gitlink {} has a divergent nested HEAD; align it with the recorded parent pointer in its assigned scope",
+                            escape_path(path)
+                        ));
+                    }
+                }
+                Some(GitlinkObservation::InitializedDirty) => {
+                    return Err(format!(
+                        "reference gitlink {} has nested tracked or untracked changes; resolve them in an explicitly assigned scope",
+                        escape_path(path)
+                    ));
+                }
+                Some(
+                    GitlinkObservation::InitializedDirectory | GitlinkObservation::InitializedFile,
+                ) => {
+                    return Err(format!(
+                        "reference gitlink {} has not completed read-only identity inspection",
+                        escape_path(path)
+                    ));
+                }
+                Some(GitlinkObservation::UnsupportedContents) => {
+                    return Err(format!(
+                        "reference gitlink {} has an unsupported local type or state; inspect it without modifying the reference",
+                        escape_path(path)
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "reference gitlink {} has no observed local state; retry inspection",
+                        escape_path(path)
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn allowed_workspace_paths(
+        &self,
+        changed_paths: &BTreeSet<Vec<u8>>,
+    ) -> Result<Vec<Vec<u8>>, String> {
+        self.validate_reference_boundaries()?;
+        let references = self
+            .entries
+            .iter()
+            .filter_map(|(path, entry)| entry.is_gitlink().then_some(path.as_slice()))
+            .collect::<Vec<_>>();
+        let mut allowed = Vec::new();
+        for path in changed_paths {
+            if let Some(reference) = references
+                .iter()
+                .copied()
+                .find(|reference| path.as_slice() == *reference || is_path_beneath(path, reference))
+            {
+                if path.as_slice() == reference {
+                    // Git can report an absent or uninitialized gitlink as a
+                    // worktree deletion. The validated parent/index identity
+                    // and reference observation make this a no-op, not an
+                    // ordinary path that the parent may stage.
+                    continue;
+                }
+                return Err(format!(
+                    "changed path {} is inside reference gitlink {}; parent handoff cannot stage or commit it",
+                    escape_path(path),
+                    escape_path(reference)
+                ));
+            }
+            allowed.push(path.clone());
+        }
+        Ok(allowed)
     }
 }
 
@@ -170,6 +259,41 @@ pub(crate) fn observe_gitlink(root: &Path, path: &[u8]) -> Result<GitlinkObserva
     } else {
         Ok(GitlinkObservation::UnsupportedContents)
     }
+}
+
+fn validate_gitlink_identity(path: &[u8], entry: &GitPathEntry) -> Result<(), String> {
+    let label = escape_path(path);
+    let Some(head) = entry.head.as_ref() else {
+        return Err(format!(
+            "new reference gitlink {label} has no accepted parent-tree pointer; an explicit writable assignment is required"
+        ));
+    };
+    if head.mode != 0o160000 || head.object_type != b"commit" {
+        return Err(format!(
+            "reference path {label} changed its parent-tree entry type; restore the accepted gitlink or authorize a scoped update"
+        ));
+    }
+    if entry.index.len() != 1
+        || entry.index[0].stage != 0
+        || entry.index[0].mode != 0o160000
+        || entry.index[0].object_id != head.object_id
+    {
+        return Err(format!(
+            "reference gitlink {label} has a staged pointer or type change; do not include it in the parent handoff commit"
+        ));
+    }
+    Ok(())
+}
+
+fn is_path_beneath(path: &[u8], reference: &[u8]) -> bool {
+    path.len() > reference.len() && path.starts_with(reference) && path[reference.len()] == b'/'
+}
+
+fn escape_path(path: &[u8]) -> String {
+    path.iter()
+        .flat_map(|byte| std::ascii::escape_default(*byte))
+        .map(char::from)
+        .collect()
 }
 
 fn empty_directory(path: &Path) -> Result<bool, String> {
