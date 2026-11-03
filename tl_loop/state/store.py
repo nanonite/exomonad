@@ -2169,6 +2169,19 @@ def _encode_slice(slice_id: str, value: SliceInput) -> dict[str, object]:
             record["dispatch_route_reconciliation_source"] = (
                 value.dispatch_route_reconciliation_source
             )
+        for key, route_value in (
+            ("dispatch_role", value.dispatch_role),
+            ("dispatch_effort", value.dispatch_effort),
+            (
+                "dispatch_route_configuration_fingerprint",
+                value.dispatch_route_configuration_fingerprint,
+            ),
+            ("dispatch_route_policy_fingerprint", value.dispatch_route_policy_fingerprint),
+            ("dispatch_route_manifest_digest", value.dispatch_route_manifest_digest),
+            ("dispatch_route_fingerprint", value.dispatch_route_fingerprint),
+        ):
+            if route_value is not None:
+                record[key] = route_value
         if value.dispatch_retry_attempt:
             record["dispatch_retry_attempt"] = value.dispatch_retry_attempt
         if value.dispatch_next_attempt_at is not None:
@@ -3459,6 +3472,18 @@ def _decode_slice(value: dict[str, object]) -> SliceState:
         dispatch_route_reconciliation_source=cast(
             str | None, value.get("dispatch_route_reconciliation_source")
         ),
+        dispatch_role=cast(str | None, value.get("dispatch_role")),
+        dispatch_effort=cast(str | None, value.get("dispatch_effort")),
+        dispatch_route_configuration_fingerprint=cast(
+            str | None, value.get("dispatch_route_configuration_fingerprint")
+        ),
+        dispatch_route_policy_fingerprint=cast(
+            str | None, value.get("dispatch_route_policy_fingerprint")
+        ),
+        dispatch_route_manifest_digest=cast(
+            str | None, value.get("dispatch_route_manifest_digest")
+        ),
+        dispatch_route_fingerprint=cast(str | None, value.get("dispatch_route_fingerprint")),
         dispatch_retry_attempt=cast(int, value.get("dispatch_retry_attempt", 0)),
         dispatch_next_attempt_at=cast(float | None, value.get("dispatch_next_attempt_at")),
         dispatch_retry_for_attempt=cast(int, value.get("dispatch_retry_for_attempt", 0)),

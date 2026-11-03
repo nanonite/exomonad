@@ -525,8 +525,12 @@ def _run_controller(args: argparse.Namespace) -> TLRunResult:
         policy=policy,
         capabilities=capabilities,
         catalog=catalog,
+        requested_model=os.environ.get("EXOMONAD_WORKER_MODEL"),
         tl_model_choice=tl_model_choice,
         worker_effort_level=os.environ.get("EXOMONAD_WORKER_EFFORT_LEVEL"),
+        role_route_configuration_fingerprint=os.environ.get(
+            "EXOMONAD_ROLE_ROUTE_CONFIG_FINGERPRINT"
+        ),
         dispatch_retry_limit=getattr(args, "dispatch_retry_limit", DEFAULT_RETRY_LIMIT),
         dispatch_retry_base_delay_seconds=_dispatch_retry_base_delay(args),
         dispatch_retry_max_delay_seconds=getattr(

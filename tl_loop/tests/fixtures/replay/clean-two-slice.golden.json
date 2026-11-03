@@ -1,7 +1,4 @@
 {
-  "repository_identity": {
-    "remote_url": "https://forge.example.com/org/repo.git"
-  },
   "budgets": {
     "ledger": {
       "charges": [
@@ -38,10 +35,10 @@
       "wall_seconds": 0
     }
   },
+  "current_order": 1,
   "events": {
     "last_consumed_offset": 5
   },
-  "current_order": 1,
   "fsm": {
     "phase": "tl_done",
     "waiting": []
@@ -80,11 +77,13 @@
     "validated_base_sha": null
   },
   "ordered_stages": [],
+  "repository_identity": {
+    "remote_url": "https://forge.example.com/org/repo.git"
+  },
   "reviewer_max_rounds": 5,
   "reviewer_max_rounds_source": "policy_file",
   "revision": 19,
   "run_id": "<run-id>",
-  "state_version": 2,
   "slices": {
     "leaf-a": {
       "agent_type": "codex/gpt-luna",
@@ -98,6 +97,10 @@
       "dispatch_intent_id": "<intent-id>",
       "dispatch_invocation_id": "leaf-a-invocation-1",
       "dispatch_last_boundary": "agent.spawned",
+      "dispatch_role": "worker",
+      "dispatch_route_fingerprint": "sha256:v1:649365b50784d5c8a7d47ac7d512a7908ea33214fb3cc9717bd77b882d12aa20",
+      "dispatch_route_manifest_digest": "092cbd2772470e4f65b069bf431d329658af2ed107effcaa05f2744c5a1f33d4",
+      "dispatch_route_policy_fingerprint": "sha256:v1:df66b3fdae692d43bfad0dd620d8b2eb90b5f15f9b449d19f58da4cf5421f237",
       "dispatch_started_at": "<timestamp>",
       "id": "leaf-a",
       "model": "gpt-luna",
@@ -106,7 +109,7 @@
       ],
       "pr_number": null,
       "repair_attempts": 0,
-      "review_findings": {},
+      "resolved_harness": "codex/gpt-luna",
       "review_contract": {
         "acceptance_criteria": [
           "Run-state test plan: just tl-loop-test",
@@ -116,6 +119,7 @@
         ],
         "digest": "8b8f11362e3aa144fc0dc4777705bc3d431b7dc47d65e1334ea365432051ff3b"
       },
+      "review_findings": {},
       "reviewed_head": null,
       "reviewer_attempt": {},
       "status": "spawned",
@@ -125,8 +129,7 @@
         "just tl-loop-test"
       ],
       "verdict": null,
-      "worktree": null,
-      "resolved_harness": "codex/gpt-luna"
+      "worktree": null
     },
     "worker-a": {
       "agent_type": "codex/gpt-luna",
@@ -140,6 +143,10 @@
       "dispatch_intent_id": "<intent-id>",
       "dispatch_invocation_id": "worker-a-invocation-1",
       "dispatch_last_boundary": "agent.spawned",
+      "dispatch_role": "worker",
+      "dispatch_route_fingerprint": "sha256:v1:649365b50784d5c8a7d47ac7d512a7908ea33214fb3cc9717bd77b882d12aa20",
+      "dispatch_route_manifest_digest": "092cbd2772470e4f65b069bf431d329658af2ed107effcaa05f2744c5a1f33d4",
+      "dispatch_route_policy_fingerprint": "sha256:v1:df66b3fdae692d43bfad0dd620d8b2eb90b5f15f9b449d19f58da4cf5421f237",
       "dispatch_started_at": "<timestamp>",
       "id": "worker-a",
       "model": "gpt-luna",
@@ -148,6 +155,7 @@
       ],
       "pr_number": null,
       "repair_attempts": 0,
+      "resolved_harness": "codex/gpt-luna",
       "review_findings": {},
       "reviewed_head": null,
       "reviewer_attempt": {},
@@ -158,9 +166,9 @@
         "controller"
       ],
       "verdict": null,
-      "worktree": null,
-      "resolved_harness": "codex/gpt-luna"
+      "worktree": null
     }
   },
+  "state_version": 2,
   "version": 5
 }

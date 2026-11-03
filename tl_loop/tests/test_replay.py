@@ -328,6 +328,18 @@ def _restart_execution_projection(state: dict[str, object]) -> dict[str, object]
         for value in slices.values():
             if isinstance(value, dict):
                 value.pop("reconciliation", None)
+                # This fixture replays pre-route-binding child events. They cannot
+                # establish the new optional route metadata, so compare the
+                # historical execution state independently of that later contract.
+                for key in (
+                    "dispatch_role",
+                    "dispatch_effort",
+                    "dispatch_route_configuration_fingerprint",
+                    "dispatch_route_policy_fingerprint",
+                    "dispatch_route_manifest_digest",
+                    "dispatch_route_fingerprint",
+                ):
+                    value.pop(key, None)
     return projected
 
 

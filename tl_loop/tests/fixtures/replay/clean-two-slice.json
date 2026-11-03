@@ -142,6 +142,10 @@
           "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
           "model": "gpt-luna",
+          "role": "worker",
+          "route_fingerprint": "sha256:v1:649365b50784d5c8a7d47ac7d512a7908ea33214fb3cc9717bd77b882d12aa20",
+          "route_manifest_digest": "092cbd2772470e4f65b069bf431d329658af2ed107effcaa05f2744c5a1f33d4",
+          "route_policy_fingerprint": "sha256:v1:df66b3fdae692d43bfad0dd620d8b2eb90b5f15f9b449d19f58da4cf5421f237",
           "slice_id": "worker-a",
           "started_at": "<timestamp>"
         },
@@ -161,6 +165,10 @@
           "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
           "model": "gpt-luna",
+          "role": "worker",
+          "route_fingerprint": "sha256:v1:649365b50784d5c8a7d47ac7d512a7908ea33214fb3cc9717bd77b882d12aa20",
+          "route_manifest_digest": "092cbd2772470e4f65b069bf431d329658af2ed107effcaa05f2744c5a1f33d4",
+          "route_policy_fingerprint": "sha256:v1:df66b3fdae692d43bfad0dd620d8b2eb90b5f15f9b449d19f58da4cf5421f237",
           "slice_id": "worker-a",
           "started_at": "<timestamp>"
         },
@@ -173,9 +181,14 @@
       "operation": "spawn_worker",
       "arguments": {
         "agent_type": "codex",
+        "harness": "codex/gpt-luna",
         "intent_id": "<intent-id>",
         "model": "gpt-luna",
         "name": "worker-a",
+        "role": "worker",
+        "route_fingerprint": "sha256:v1:649365b50784d5c8a7d47ac7d512a7908ea33214fb3cc9717bd77b882d12aa20",
+        "route_manifest_digest": "092cbd2772470e4f65b069bf431d329658af2ed107effcaa05f2744c5a1f33d4",
+        "route_policy_fingerprint": "sha256:v1:df66b3fdae692d43bfad0dd620d8b2eb90b5f15f9b449d19f58da4cf5421f237",
         "task": "inspect the repository",
         "force": false,
         "include_dead": false,
@@ -193,6 +206,10 @@
           "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
           "model": "gpt-luna",
+          "role": "worker",
+          "route_fingerprint": "sha256:v1:649365b50784d5c8a7d47ac7d512a7908ea33214fb3cc9717bd77b882d12aa20",
+          "route_manifest_digest": "092cbd2772470e4f65b069bf431d329658af2ed107effcaa05f2744c5a1f33d4",
+          "route_policy_fingerprint": "sha256:v1:df66b3fdae692d43bfad0dd620d8b2eb90b5f15f9b449d19f58da4cf5421f237",
           "slice_id": "worker-a",
           "started_at": "<timestamp>"
         },
@@ -212,6 +229,10 @@
           "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
           "model": "gpt-luna",
+          "role": "worker",
+          "route_fingerprint": "sha256:v1:649365b50784d5c8a7d47ac7d512a7908ea33214fb3cc9717bd77b882d12aa20",
+          "route_manifest_digest": "092cbd2772470e4f65b069bf431d329658af2ed107effcaa05f2744c5a1f33d4",
+          "route_policy_fingerprint": "sha256:v1:df66b3fdae692d43bfad0dd620d8b2eb90b5f15f9b449d19f58da4cf5421f237",
           "slice_id": "leaf-a",
           "started_at": "<timestamp>"
         },
@@ -231,6 +252,10 @@
           "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
           "model": "gpt-luna",
+          "role": "worker",
+          "route_fingerprint": "sha256:v1:649365b50784d5c8a7d47ac7d512a7908ea33214fb3cc9717bd77b882d12aa20",
+          "route_manifest_digest": "092cbd2772470e4f65b069bf431d329658af2ed107effcaa05f2744c5a1f33d4",
+          "route_policy_fingerprint": "sha256:v1:df66b3fdae692d43bfad0dd620d8b2eb90b5f15f9b449d19f58da4cf5421f237",
           "slice_id": "leaf-a",
           "started_at": "<timestamp>"
         },
@@ -246,10 +271,15 @@
         "boundary": [
           "src/leaf.py"
         ],
+        "harness": "codex/gpt-luna",
         "intent_id": "<intent-id>",
         "model": "gpt-luna",
         "name": "leaf-a",
         "read_first": [],
+        "role": "worker",
+        "route_fingerprint": "sha256:v1:649365b50784d5c8a7d47ac7d512a7908ea33214fb3cc9717bd77b882d12aa20",
+        "route_manifest_digest": "092cbd2772470e4f65b069bf431d329658af2ed107effcaa05f2744c5a1f33d4",
+        "route_policy_fingerprint": "sha256:v1:df66b3fdae692d43bfad0dd620d8b2eb90b5f15f9b449d19f58da4cf5421f237",
         "steps": [],
         "task": "implement the requested change",
         "verify": [
@@ -271,6 +301,10 @@
           "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
           "model": "gpt-luna",
+          "role": "worker",
+          "route_fingerprint": "sha256:v1:649365b50784d5c8a7d47ac7d512a7908ea33214fb3cc9717bd77b882d12aa20",
+          "route_manifest_digest": "092cbd2772470e4f65b069bf431d329658af2ed107effcaa05f2744c5a1f33d4",
+          "route_policy_fingerprint": "sha256:v1:df66b3fdae692d43bfad0dd620d8b2eb90b5f15f9b449d19f58da4cf5421f237",
           "slice_id": "leaf-a",
           "started_at": "<timestamp>"
         },
@@ -332,6 +366,10 @@
           "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
           "model": "gpt-luna",
+          "role": "worker",
+          "route_fingerprint": "sha256:v1:649365b50784d5c8a7d47ac7d512a7908ea33214fb3cc9717bd77b882d12aa20",
+          "route_manifest_digest": "092cbd2772470e4f65b069bf431d329658af2ed107effcaa05f2744c5a1f33d4",
+          "route_policy_fingerprint": "sha256:v1:df66b3fdae692d43bfad0dd620d8b2eb90b5f15f9b449d19f58da4cf5421f237",
           "slice_id": "worker-a",
           "started_at": "<timestamp>"
         },
@@ -394,6 +432,10 @@
           "harness": "codex/gpt-luna",
           "intent_id": "<intent-id>",
           "model": "gpt-luna",
+          "role": "worker",
+          "route_fingerprint": "sha256:v1:649365b50784d5c8a7d47ac7d512a7908ea33214fb3cc9717bd77b882d12aa20",
+          "route_manifest_digest": "092cbd2772470e4f65b069bf431d329658af2ed107effcaa05f2744c5a1f33d4",
+          "route_policy_fingerprint": "sha256:v1:df66b3fdae692d43bfad0dd620d8b2eb90b5f15f9b449d19f58da4cf5421f237",
           "slice_id": "leaf-a",
           "started_at": "<timestamp>"
         },
@@ -420,10 +462,10 @@
       "operation": "root_branch_finalize",
       "arguments": {
         "branch": "main",
+        "working_dir": ".",
         "force": false,
         "include_dead": false,
-        "sweep": false,
-        "working_dir": "."
+        "sweep": false
       }
     },
     {

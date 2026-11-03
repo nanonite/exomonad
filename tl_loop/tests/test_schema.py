@@ -22,6 +22,60 @@ def test_valid_run_state_document_is_accepted() -> None:
     validate(_valid_document())
 
 
+def test_dispatch_route_provenance_requires_a_valid_bound_route() -> None:
+    document = _valid_document()
+    _slice(document, "slice-a").update(
+        {
+            "dispatch_role": "worker",
+            "dispatch_effort": "xhigh",
+            "dispatch_route_configuration_fingerprint": "sha256:v1:" + "1" * 64,
+            "dispatch_route_policy_fingerprint": "sha256:v1:" + "2" * 64,
+            "dispatch_route_manifest_digest": "3" * 64,
+            "dispatch_route_fingerprint": "sha256:v1:" + "4" * 64,
+        }
+    )
+    validate(document)
+
+
+def test_dispatch_route_provenance_rejects_partial_unbound_metadata() -> None:
+    document = _valid_document()
+    _slice(document, "slice-a")["dispatch_role"] = "worker"
+
+    _assert_rejected(document, "dispatch_route_fingerprint")
+
+
+@pytest.mark.parametrize(
+    "field,value,diagnostic",
+    [
+        ("dispatch_role", "reviewer", "dispatch_role"),
+        ("dispatch_effort", "extreme", "dispatch_effort"),
+        ("dispatch_route_configuration_fingerprint", "not-a-digest", "configuration_fingerprint"),
+        ("dispatch_route_policy_fingerprint", "not-a-digest", "policy_fingerprint"),
+        ("dispatch_route_manifest_digest", "not-a-digest", "manifest_digest"),
+        ("dispatch_route_fingerprint", "not-a-digest", "route_fingerprint"),
+    ],
+)
+def test_dispatch_route_provenance_rejects_invalid_coordinates(
+    field: str,
+    value: str,
+    diagnostic: str,
+) -> None:
+    document = _valid_document()
+    _slice(document, "slice-a").update(
+        {
+            "dispatch_role": "worker",
+            "dispatch_effort": "xhigh",
+            "dispatch_route_configuration_fingerprint": "sha256:v1:" + "1" * 64,
+            "dispatch_route_policy_fingerprint": "sha256:v1:" + "2" * 64,
+            "dispatch_route_manifest_digest": "3" * 64,
+            "dispatch_route_fingerprint": "sha256:v1:" + "4" * 64,
+            field: value,
+        }
+    )
+
+    _assert_rejected(document, diagnostic)
+
+
 def test_reconciliation_can_retain_selected_remote_coordinate() -> None:
     document = _valid_document()
     _slice(document, "slice-a")["reconciliation"] = {

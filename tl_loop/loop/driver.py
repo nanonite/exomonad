@@ -867,6 +867,12 @@ class DispatchAttempt:
     #: Authorized reason a retry may use the current role policy instead.
     route_reconciliation_source: str | None = None
     attempt: int = 0
+    role: str | None = None
+    effort: str | None = None
+    route_configuration_fingerprint: str | None = None
+    route_policy_fingerprint: str | None = None
+    route_manifest_digest: str | None = None
+    route_fingerprint: str | None = None
     controller_epoch: str | None = None
     #: The per-slice dispatch attempt counter under the current controller epoch.
     #:
@@ -890,6 +896,12 @@ class DispatchAttempt:
         harness: str,
         agent_type: str,
         model: str | None,
+        role: str | None = None,
+        effort: str | None = None,
+        route_configuration_fingerprint: str | None = None,
+        route_policy_fingerprint: str | None = None,
+        route_manifest_digest: str | None = None,
+        route_fingerprint: str | None = None,
         requested_harness: str | None = None,
         route_reconciliation_source: str | None = None,
     ) -> DispatchAttempt:
@@ -910,6 +922,14 @@ class DispatchAttempt:
             harness=harness,
             agent_type=agent_type,
             model=model,
+            role=role or self.role,
+            effort=effort or self.effort,
+            route_configuration_fingerprint=(
+                route_configuration_fingerprint or self.route_configuration_fingerprint
+            ),
+            route_policy_fingerprint=(route_policy_fingerprint or self.route_policy_fingerprint),
+            route_manifest_digest=route_manifest_digest or self.route_manifest_digest,
+            route_fingerprint=route_fingerprint or self.route_fingerprint,
             requested_harness=self.requested_harness or requested_harness,
             route_reconciliation_source=(
                 self.route_reconciliation_source or route_reconciliation_source
@@ -952,6 +972,12 @@ class DispatchAttempt:
             harness=slice_state.resolved_harness or slice_state.agent_type or "",
             agent_type=slice_state.agent_type or "",
             model=slice_state.model,
+            role=slice_state.dispatch_role,
+            effort=slice_state.dispatch_effort,
+            route_configuration_fingerprint=slice_state.dispatch_route_configuration_fingerprint,
+            route_policy_fingerprint=slice_state.dispatch_route_policy_fingerprint,
+            route_manifest_digest=slice_state.dispatch_route_manifest_digest,
+            route_fingerprint=slice_state.dispatch_route_fingerprint,
             requested_harness=slice_state.requested_harness,
             route_reconciliation_source=slice_state.dispatch_route_reconciliation_source,
             attempt=max(1, slice_state.attempts),
@@ -1323,6 +1349,7 @@ class TLLoopConfig:
     catalog: ModelCatalog | None = None
     requested_model: str | None = None
     worker_effort_level: str | None = None
+    role_route_configuration_fingerprint: str | None = None
     role: str = "worker"
     review_policy_path: str | Path | None = None
     review_clock: Callable[[], datetime] | None = None
@@ -4709,6 +4736,72 @@ class _BlockedLeafResumeProof(NamedTuple):
     route_authorization_digest: str | None = None
     accepted_spawn_event_seq: int | None = None
     blocker_event_seq: int | None = None
+    route_fields: Mapping[str, object] | None = None
+
+
+def _route_fields_for_blocked_resume(
+    current: SliceState,
+    state: RunState,
+    config: TLLoopConfig,
+) -> tuple[Mapping[str, object] | None, str | None]:
+    harness = current.resolved_harness or current.requested_harness
+    if not harness:
+        return None, "blocked-leaf checkpoint has no accepted resolved harness route"
+    try:
+        route = parse_harness_identifier(harness)
+    except ValueError:
+        return None, "blocked-leaf checkpoint has an invalid resolved harness route"
+    agent_type = current.agent_type or route.agent_type
+    model = current.model if current.model is not None else route.model
+    if agent_type != route.agent_type:
+        return None, "blocked-leaf checkpoint runtime conflicts with its resolved harness"
+    if config.policy is not None:
+        role_policy = config.policy.roles.get(config.role)
+        if role_policy is None or harness not in role_policy.allow:
+            return None, "blocked-leaf route is no longer allowed by the accepted role policy"
+    recorded_config = current.dispatch_route_configuration_fingerprint
+    configured = config.role_route_configuration_fingerprint
+    if recorded_config is not None and configured is not None and recorded_config != configured:
+        return None, "blocked-leaf route configuration changed since the accepted dispatch"
+    if current.dispatch_route_fingerprint is not None:
+        metadata = _dispatch_route_fields(
+            config,
+            state,
+            harness=harness,
+            agent_type=agent_type,
+            model=model,
+            choice=None,
+        )
+        if any(
+            current_value != metadata[metadata_key]
+            for current_value, metadata_key in (
+                (current.dispatch_role, "role"),
+                (current.dispatch_effort, "effort"),
+                (recorded_config, "route_configuration_fingerprint"),
+                (current.dispatch_route_policy_fingerprint, "route_policy_fingerprint"),
+                (current.dispatch_route_manifest_digest, "route_manifest_digest"),
+                (current.dispatch_route_fingerprint, "route_fingerprint"),
+            )
+        ):
+            return (
+                None,
+                "blocked-leaf route does not match current configuration or accepted policy",
+            )
+    else:
+        metadata = _dispatch_route_fields(
+            config,
+            state,
+            harness=harness,
+            agent_type=agent_type,
+            model=model,
+            choice=None,
+        )
+    return {
+        "harness": harness,
+        "agent_type": agent_type,
+        "model": model,
+        **metadata,
+    }, None
 
 
 class _TerminalOwnerRecoveryProof(NamedTuple):
@@ -4820,6 +4913,10 @@ def _blocked_leaf_resume_proof(
         proof = _resolve_blocked_leaf_owner(state, config, store, leaf, current)
     except BlockedLeafOwnerError as error:
         return None, str(error)
+    route_fields, route_error = _route_fields_for_blocked_resume(current, state, config)
+    if route_error is not None:
+        return None, route_error
+    proof = proof._replace(route_fields=route_fields)
     checkpoint_worktree = Path(current.worktree) if current.worktree is not None else None
     if checkpoint_worktree is not None and not checkpoint_worktree.is_absolute():
         checkpoint_worktree = Path(config.project_root or store.root_dir) / checkpoint_worktree
@@ -4909,6 +5006,12 @@ def _resolve_blocked_leaf_owner(
             )
         if entry.get("status") == "rejected":
             raise BlockedLeafOwnerError("the exact blocked-leaf resume request was rejected")
+        if entry.get("status") in {"intended", "unknown"} and not isinstance(
+            args.get("route_fingerprint"), str
+        ):
+            raise BlockedLeafOwnerError(
+                "unresolved legacy blocked-leaf resume lacks a route binding; reconcile its outcome before retry"
+            )
         if (
             not isinstance(args.get("owner_agent_name"), str)
             or type(args.get("prior_generation")) is not int
@@ -5417,6 +5520,19 @@ def _terminal_owner_recovery_proof(
         route_authorization_digest=route_digest,
         accepted_spawn_event_seq=spawn_event_seq,
         blocker_event_seq=blocker_event_seq,
+        route_fields={
+            "harness": choice.harness,
+            "agent_type": route.agent_type,
+            "model": desired_model,
+            **_dispatch_route_fields(
+                config,
+                state,
+                harness=choice.harness,
+                agent_type=route.agent_type,
+                model=desired_model,
+                choice=choice,
+            ),
+        },
     )
     successor_adoption_authorization = None
     if confirmed_resume:
@@ -6190,6 +6306,9 @@ def _resume_approved_blocked_leaf(
             "resume_blocked_leaf", proof.leaf.name, initial_arguments, True
         )
         initial_entry = journal.existing(initial_intent)
+        attempt = _blocked_leaf_dispatch_attempt(
+            initial_arguments, proof.current, proof.route_fields
+        )
     except (ActionJournalError, KeyError, TypeError, ValueError, OSError) as error:
         return _hold_owner_resume(
             state,
@@ -6274,7 +6393,6 @@ def _resume_approved_blocked_leaf(
                 )
             if existing is None or status == "not_dispatched":
                 journal.append(intent)
-            attempt = _blocked_leaf_dispatch_attempt(arguments, proof.current)
             dispatch_intended = _record_controller_event(
                 proof.leaf.name,
                 "tl.dispatch_intended",
@@ -6367,6 +6485,15 @@ def _resume_approved_blocked_leaf(
                     expected_worktree_fingerprint=proof.owner.worktree_fingerprint,
                     task=proof.leaf.task,
                     human_approved=True,
+                    agent_type=attempt.agent_type,
+                    model=attempt.model,
+                    role=attempt.role,
+                    harness=attempt.harness,
+                    effort=attempt.effort,
+                    route_configuration_fingerprint=attempt.route_configuration_fingerprint,
+                    route_policy_fingerprint=attempt.route_policy_fingerprint,
+                    route_manifest_digest=attempt.route_manifest_digest,
+                    route_fingerprint=attempt.route_fingerprint,
                 )
             except Exception as error:  # noqa: BLE001 - journal and safely retry exact owner intent
                 journal.mark_unknown(intent, error)
@@ -6402,7 +6529,7 @@ def _resume_approved_blocked_leaf(
                 "blocked-leaf resume response does not match the persisted owner successor",
             )
         invocation_id, runtime, model, effort = successor
-        attempt = _blocked_leaf_dispatch_attempt(arguments, proof.current).routed(
+        attempt = attempt.routed(
             harness=f"{runtime}/{model}" if model else runtime,
             agent_type=runtime,
             model=model,
@@ -6468,6 +6595,8 @@ def _blocked_leaf_resume_action_arguments(
 ) -> Mapping[str, object]:
     if proof.action_arguments is not None:
         return proof.action_arguments
+    if proof.route_fields is None:
+        raise TLLoopError("blocked-leaf resume has no validated role route")
     arguments: dict[str, object] = {
         "chainlink_issue_id": proof.owner.issue_id,
         "expected_invocation_id": proof.owner.prior_invocation_id,
@@ -6492,6 +6621,7 @@ def _blocked_leaf_resume_action_arguments(
         "route_reconciliation_source": proof.route_reconciliation_source,
         "requested_harness": proof.current.requested_harness,
     }
+    arguments.update(proof.route_fields)
     if proof.recovery_mode == "terminal_provider_failure":
         if (
             proof.desired_harness is None
@@ -6572,7 +6702,9 @@ def _terminal_invocation_digest(invocation: Mapping[str, object]) -> str:
 
 
 def _blocked_leaf_dispatch_attempt(
-    arguments: Mapping[str, object], current: SliceState
+    arguments: Mapping[str, object],
+    current: SliceState,
+    route_fields: Mapping[str, object] | None = None,
 ) -> DispatchAttempt:
     route_source = arguments.get("route_reconciliation_source", "proven_preexecution_retry")
     if (
@@ -6580,13 +6712,31 @@ def _blocked_leaf_dispatch_attempt(
         or route_source not in DISPATCH_ROUTE_RECONCILIATION_SOURCES
     ):
         raise TLLoopError("blocked-leaf dispatch route reconciliation source is invalid")
+    fields = (
+        arguments
+        if isinstance(arguments.get("route_fingerprint"), str)
+        else route_fields or arguments
+    )
+    harness = fields.get("harness")
+    agent_type = fields.get("agent_type")
+    model = fields.get("model")
     return DispatchAttempt(
         intent_id=cast(str, arguments["dispatch_intent_id"]),
         started_at=float(arguments["dispatch_started_at"]),
-        harness="",
+        harness=harness if isinstance(harness, str) else "",
+        agent_type=agent_type if isinstance(agent_type, str) else "",
+        model=model if isinstance(model, str) else None,
         requested_harness=current.requested_harness,
         route_reconciliation_source=route_source,
         attempt=int(arguments["dispatch_attempt"]),
+        role=cast(str | None, fields.get("role")),
+        effort=cast(str | None, fields.get("effort")),
+        route_configuration_fingerprint=cast(
+            str | None, fields.get("route_configuration_fingerprint")
+        ),
+        route_policy_fingerprint=cast(str | None, fields.get("route_policy_fingerprint")),
+        route_manifest_digest=cast(str | None, fields.get("route_manifest_digest")),
+        route_fingerprint=cast(str | None, fields.get("route_fingerprint")),
         controller_epoch=cast(str | None, arguments.get("controller_epoch")),
         dispatch_generation=int(arguments["dispatch_generation"]),
         ledger_floor=int(arguments["dispatch_ledger_floor"]),
@@ -6641,10 +6791,20 @@ def _validated_blocked_resume_result(
         return None
     observed_model = _optional_nonempty_text(identity.get("model"))
     observed_effort = _optional_nonempty_text(identity.get("effort"))
-    if proof.recovery_mode == "terminal_provider_failure" and (
-        runtime != proof.desired_agent_type
-        or observed_model != proof.desired_model
-        or observed_effort != proof.desired_effort
+    expected_route = proof.route_fields
+    expected_agent_type = (
+        expected_route.get("agent_type") if isinstance(expected_route, Mapping) else None
+    ) or proof.desired_agent_type
+    expected_model = (
+        expected_route.get("model") if isinstance(expected_route, Mapping) else None
+    ) or proof.desired_model
+    expected_effort = (
+        expected_route.get("effort") if isinstance(expected_route, Mapping) else None
+    ) or proof.desired_effort
+    if (
+        runtime != expected_agent_type
+        or observed_model != expected_model
+        or observed_effort != expected_effort
     ):
         return None
     return (
@@ -6689,6 +6849,7 @@ def _checkpoint_blocked_leaf_successor(
         attempts=attempt.attempt,
         dispatch_uses_current_role_configuration=True,
         dispatch_route_reconciliation_source=attempt.route_reconciliation_source,
+        **_dispatch_route_state_fields(attempt),
         dispatch_intent_id=proof.intent_id,
         dispatch_started_at=attempt.started_at,
         dispatch_last_boundary="spawn_request_accepted",
@@ -16173,9 +16334,45 @@ def _dispatch_payload(
         payload["requested_harness"] = attempt.requested_harness
     if attempt.route_reconciliation_source is not None:
         payload["route_reconciliation_source"] = attempt.route_reconciliation_source
-    if attempt.model:
+    if attempt.model or attempt.route_fingerprint is not None:
         payload["model"] = attempt.model
+    if attempt.route_fingerprint is not None:
+        for name, value in (
+            ("role", attempt.role),
+            ("effort", attempt.effort),
+            ("route_configuration_fingerprint", attempt.route_configuration_fingerprint),
+            ("route_policy_fingerprint", attempt.route_policy_fingerprint),
+            ("route_manifest_digest", attempt.route_manifest_digest),
+            ("route_fingerprint", attempt.route_fingerprint),
+        ):
+            payload[name] = value
     return payload
+
+
+def _dispatch_route_state_fields(attempt: DispatchAttempt) -> dict[str, str | None]:
+    return {
+        "dispatch_role": attempt.role,
+        "dispatch_effort": attempt.effort,
+        "dispatch_route_configuration_fingerprint": attempt.route_configuration_fingerprint,
+        "dispatch_route_policy_fingerprint": attempt.route_policy_fingerprint,
+        "dispatch_route_manifest_digest": attempt.route_manifest_digest,
+        "dispatch_route_fingerprint": attempt.route_fingerprint,
+    }
+
+
+def _dispatch_tool_route_arguments(attempt: DispatchAttempt) -> dict[str, str]:
+    values = {
+        "harness": attempt.harness,
+        "agent_type": attempt.agent_type,
+        "model": attempt.model,
+        "role": attempt.role,
+        "effort": attempt.effort,
+        "route_configuration_fingerprint": attempt.route_configuration_fingerprint,
+        "route_policy_fingerprint": attempt.route_policy_fingerprint,
+        "route_manifest_digest": attempt.route_manifest_digest,
+        "route_fingerprint": attempt.route_fingerprint,
+    }
+    return {name: value for name, value in values.items() if isinstance(value, str) and value}
 
 
 def _dispatch_retry_payload(
@@ -16427,6 +16624,17 @@ def _restore_dispatch_from_confirmation(
     )
     if choice_error is not None:
         return state, "hold", choice_error
+    route_state_fields, route_error = _confirmed_spawn_route_state_fields(
+        event,
+        config,
+        state,
+        resolved_harness,
+        agent_type,
+        model,
+        choice,
+    )
+    if route_error is not None:
+        return state, "hold", route_error
     journal_error = _reconcile_spawn_journal_from_confirmation(
         effects_log,
         slice_id,
@@ -16453,6 +16661,7 @@ def _restore_dispatch_from_confirmation(
             model,
             resolved_harness,
             choice,
+            route_state_fields,
             store,
         )
     except (OSError, ValueError, TimeoutError) as error:
@@ -16504,6 +16713,68 @@ def _recovered_spawn_choice(
     return choice, None
 
 
+def _confirmed_spawn_route_state_fields(
+    event: EventEnvelope,
+    config: TLLoopConfig,
+    state: RunState,
+    harness: str,
+    agent_type: str,
+    model: str | None,
+    choice: HarnessChoice | None,
+) -> tuple[dict[str, str | None], str | None]:
+    """Restore route provenance only when the confirmation carried the full binding."""
+    route_keys = {
+        "role",
+        "effort",
+        "route_configuration_fingerprint",
+        "route_policy_fingerprint",
+        "route_manifest_digest",
+        "route_fingerprint",
+    }
+    present_route_keys = route_keys & event.data.keys()
+    if not present_route_keys:
+        return {}, None
+    if present_route_keys != route_keys:
+        return {}, "spawn confirmation carries incomplete role route provenance"
+    expected = _dispatch_route_fields(
+        config,
+        state,
+        harness=harness,
+        agent_type=agent_type,
+        model=model,
+        choice=choice,
+    )
+    event_fields = {
+        "role": event.data.get("role"),
+        "effort": event.data.get("effort"),
+        "route_configuration_fingerprint": event.data.get("route_configuration_fingerprint"),
+        "route_policy_fingerprint": event.data.get("route_policy_fingerprint"),
+        "route_manifest_digest": event.data.get("route_manifest_digest"),
+        "route_fingerprint": event.data.get("route_fingerprint"),
+    }
+    expected_fields = expected
+    if (
+        any(key not in event.data for key in event_fields)
+        or event.data.get("harness") != harness
+        or event.data.get("agent_type") != agent_type
+        or event.data.get("model") != model
+        or event_fields != expected_fields
+    ):
+        return {}, "spawn confirmation role route conflicts with current policy or manifest"
+    return {
+        "dispatch_role": cast(str | None, event_fields["role"]),
+        "dispatch_effort": cast(str | None, event_fields["effort"]),
+        "dispatch_route_configuration_fingerprint": cast(
+            str | None, event_fields["route_configuration_fingerprint"]
+        ),
+        "dispatch_route_policy_fingerprint": cast(
+            str | None, event_fields["route_policy_fingerprint"]
+        ),
+        "dispatch_route_manifest_digest": cast(str | None, event_fields["route_manifest_digest"]),
+        "dispatch_route_fingerprint": cast(str | None, event_fields["route_fingerprint"]),
+    }, None
+
+
 def _selected_spawn_model(
     choice: HarnessChoice,
     route: HarnessRoute,
@@ -16547,6 +16818,7 @@ def _persist_restored_dispatch(
     model: str | None,
     resolved_harness: str,
     choice: HarnessChoice | None,
+    route_state_fields: Mapping[str, str | None],
     store: RunStore,
 ) -> RunState:
     def update(document: dict[str, object]) -> dict[str, object]:
@@ -16562,6 +16834,7 @@ def _persist_restored_dispatch(
             resolved_harness,
             RECOVERED_DISPATCH_LEDGER_FLOOR,
             state.controller_epoch,
+            route_state_fields,
         )
 
     if choice is not None and not _spawn_charge_already_recorded(state, current, choice):
@@ -16575,6 +16848,7 @@ def _persist_restored_dispatch(
         model=model,
         resolved_harness=resolved_harness,
         branch=branch,
+        **route_state_fields,
         dispatch_intent_id=intent_id,
         dispatch_started_at=started_at,
         dispatch_last_boundary="dispatch_intended",
@@ -16609,6 +16883,7 @@ def _record_restored_dispatch_document(
     resolved_harness: str,
     ledger_floor: int,
     controller_epoch: str | None,
+    route_state_fields: Mapping[str, str | None],
 ) -> dict[str, object]:
     slices = document.get("slices")
     if not isinstance(slices, dict) or not isinstance(slices.get(slice_id), dict):
@@ -16634,6 +16909,7 @@ def _record_restored_dispatch_document(
             "dispatch_invocation_id": None,
             "dispatch_authoritative_event_seq": None,
             "park_cause": None,
+            **{key: value for key, value in route_state_fields.items() if value is not None},
         }
     )
     return document
@@ -17233,14 +17509,16 @@ def _dispatch_children(
         state = store.load()
         _record_spawn_request(worker.name, attempt, config, effects, effects_log)
         runtime_name = config.dispatch_names.get(worker.name, worker.name)
-        worker_args: dict[str, object] = {"name": runtime_name, "task": worker.task}
+        worker_args: dict[str, object] = {
+            "name": runtime_name,
+            "task": worker.task,
+            "intent_id": attempt.intent_id,
+        }
         # The resolved route is authoritative. A plan request reaches the wire
         # only because the selector honored it, so a slice can never be
         # dispatched with an unvalidated plan value when policy resolved a
         # different harness.
-        agent_type, model = _spawn_route(attempt)
-        _optional_argument(worker_args, "agent_type", agent_type)
-        _optional_argument(worker_args, "model", model)
+        worker_args.update(_dispatch_tool_route_arguments(attempt))
         try:
             result = _invoke(
                 "spawn_worker",
@@ -17248,7 +17526,7 @@ def _dispatch_children(
                 worker_args,
                 config.active,
                 live,
-                _worker_call(worker, agent_type, model, attempt.intent_id, runtime_name),
+                _worker_call(worker, attempt, runtime_name),
                 effects_log,
                 raise_on_failure=False,
             )
@@ -17282,9 +17560,7 @@ def _dispatch_children(
         runtime_name = config.dispatch_names.get(leaf.name, leaf.name)
         leaf_args: dict[str, object] = {"name": runtime_name, "task": leaf.task}
         _optional_argument(leaf_args, "intent_id", attempt.intent_id)
-        agent_type, model = _spawn_route(attempt)
-        _optional_argument(leaf_args, "agent_type", agent_type)
-        _optional_argument(leaf_args, "model", model)
+        leaf_args.update(_dispatch_tool_route_arguments(attempt))
         for name, value in (
             ("boundary", leaf.boundary),
             ("read_first", leaf.read_first),
@@ -17301,7 +17577,7 @@ def _dispatch_children(
                 leaf_args,
                 config.active,
                 live,
-                _leaf_call(leaf, agent_type, model, attempt.intent_id, runtime_name),
+                _leaf_call(leaf, attempt, runtime_name),
                 effects_log,
                 raise_on_failure=False,
             )
@@ -24934,6 +25210,74 @@ def _selection_refusal(
     )
 
 
+def _route_fingerprint(payload: Mapping[str, object], domain: str) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    digest = hashlib.sha256(domain.encode() + bytes([0]) + encoded).hexdigest()
+    return f"sha256:v1:{digest}"
+
+
+def _dispatch_route_fields(
+    config: TLLoopConfig,
+    state: RunState,
+    *,
+    harness: str,
+    agent_type: str,
+    model: str | None,
+    choice: HarnessChoice | None,
+) -> dict[str, str | None]:
+    """Bind one worker route to its accepted runtime config, policy and plan."""
+    role = config.role.strip().lower()
+    if role in {"dev", "dev-leaf", "dev_leaf", "leaf", "teammate"}:
+        role = "worker"
+    if role != "worker":
+        raise TLLoopError(f"worker dispatch cannot use runtime role {config.role!r}")
+    effort = config.worker_effort_level
+    if effort is not None and effort not in WORKER_EFFORT_LEVELS:
+        raise TLLoopError("selected worker effort is unsupported")
+    manifest_digest = state.plan_manifest.digest if state.plan_manifest is not None else None
+    policy_fingerprint = None
+    if config.policy is not None:
+        role_policy = config.policy.roles.get(config.role)
+        if role_policy is None:
+            raise TLLoopError(f"accepted harness policy has no {config.role!r} role")
+        policy_record = {
+            "role": config.role,
+            "allow": list(role_policy.allow),
+            "cost_rank": dict(sorted(role_policy.cost_rank.items())),
+            "token_budget": role_policy.token_budget,
+            "per_harness_budget": dict(sorted(role_policy.per_harness_budget.items())),
+            "escalate_after_attempts": role_policy.escalate_after_attempts,
+            "task_timeout_seconds": role_policy.task_timeout_seconds,
+            "task_timeout_configured": role_policy.task_timeout_configured,
+            "selected_route": {
+                "harness": harness,
+                "agent_type": agent_type,
+                "model": model,
+            },
+            "plan_manifest_digest": manifest_digest,
+        }
+        policy_fingerprint = _route_fingerprint(policy_record, "exomonad-role-policy-v1")
+    configuration_fingerprint = config.role_route_configuration_fingerprint
+    route_record = {
+        "role": role,
+        "harness": harness,
+        "agent_type": agent_type,
+        "model": model,
+        "effort": effort,
+        "configuration_fingerprint": configuration_fingerprint,
+        "policy_fingerprint": policy_fingerprint,
+        "manifest_digest": manifest_digest,
+    }
+    return {
+        "role": role,
+        "effort": effort,
+        "route_configuration_fingerprint": configuration_fingerprint,
+        "route_policy_fingerprint": policy_fingerprint,
+        "route_manifest_digest": manifest_digest,
+        "route_fingerprint": _route_fingerprint(route_record, "exomonad-role-route-v1"),
+    }
+
+
 def _prepare_spawn(
     name: str,
     state: RunState,
@@ -24962,6 +25306,19 @@ def _prepare_spawn(
                 model=direct.model,
                 requested_harness=current.requested_harness,
             )
+            intent = intent.routed(
+                harness=intent.harness,
+                agent_type=intent.agent_type,
+                model=intent.model,
+                **_dispatch_route_fields(
+                    config,
+                    state,
+                    harness=intent.harness,
+                    agent_type=intent.agent_type,
+                    model=intent.model,
+                    choice=None,
+                ),
+            )
         updated = slice_transition(current, SliceStatusChanged(SliceStatus.DISPATCHING))
         updated = replace(
             updated,
@@ -24981,6 +25338,7 @@ def _prepare_spawn(
             dispatch_invocation_id=None,
             dispatch_authoritative_event_seq=None,
             park_cause=None,
+            **_dispatch_route_state_fields(intent),
         )
         state = store.checkpoint(
             state.fsm,
@@ -25055,6 +25413,14 @@ def _prepare_spawn(
         harness=choice.harness,
         agent_type=route.agent_type,
         model=model_id,
+        **_dispatch_route_fields(
+            config,
+            state,
+            harness=choice.harness,
+            agent_type=route.agent_type,
+            model=model_id,
+            choice=choice,
+        ),
         requested_harness=slice_state.requested_harness,
         route_reconciliation_source=(
             "proven_preexecution_retry"
@@ -25088,6 +25454,11 @@ def _prepare_spawn(
                 "dispatch_error": None,
                 "dispatch_error_code": None,
                 "dispatch_route_reconciliation_source": intent.route_reconciliation_source,
+                **{
+                    key: value
+                    for key, value in _dispatch_route_state_fields(intent).items()
+                    if value is not None
+                },
                 "dispatch_ledger_floor": intent.ledger_floor,
                 "dispatch_generation": intent.dispatch_generation,
                 "dispatch_next_attempt_at": None,
@@ -25189,18 +25560,23 @@ def _controller_epoch(root_dir: Path, run_id: str, parent_generation_id: str | N
 
 def _worker_call(
     task: WorkerTask,
-    selected_agent_type: str | None,
-    selected_model: str | None,
-    intent_id: str | None,
+    attempt: DispatchAttempt,
     runtime_name: str | None = None,
 ) -> Callable[[EffectClient], ToolResult]:
     def invoke(client: EffectClient) -> ToolResult:
         return client.spawn_worker(
             name=runtime_name or task.name,
             task=task.task,
-            intent_id=intent_id,
-            agent_type=selected_agent_type or task.agent_type,
-            model=selected_model,
+            intent_id=attempt.intent_id,
+            agent_type=attempt.agent_type or task.agent_type,
+            model=attempt.model,
+            role=attempt.role,
+            harness=attempt.harness,
+            effort=attempt.effort,
+            route_configuration_fingerprint=attempt.route_configuration_fingerprint,
+            route_policy_fingerprint=attempt.route_policy_fingerprint,
+            route_manifest_digest=attempt.route_manifest_digest,
+            route_fingerprint=attempt.route_fingerprint,
         )
 
     return invoke
@@ -25208,18 +25584,23 @@ def _worker_call(
 
 def _leaf_call(
     task: LeafTask,
-    selected_agent_type: str | None,
-    selected_model: str | None,
-    intent_id: str | None,
+    attempt: DispatchAttempt,
     runtime_name: str | None = None,
 ) -> Callable[[EffectClient], ToolResult]:
     def invoke(client: EffectClient) -> ToolResult:
         return client.spawn_leaf(
             name=runtime_name or task.name,
             task=task.task,
-            intent_id=intent_id,
-            agent_type=selected_agent_type or task.agent_type,
-            model=selected_model,
+            intent_id=attempt.intent_id,
+            agent_type=attempt.agent_type or task.agent_type,
+            model=attempt.model,
+            role=attempt.role,
+            harness=attempt.harness,
+            effort=attempt.effort,
+            route_configuration_fingerprint=attempt.route_configuration_fingerprint,
+            route_policy_fingerprint=attempt.route_policy_fingerprint,
+            route_manifest_digest=attempt.route_manifest_digest,
+            route_fingerprint=attempt.route_fingerprint,
             boundary=task.boundary,
             context=task.context,
             read_first=task.read_first,

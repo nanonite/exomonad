@@ -4899,6 +4899,10 @@ fn agent_configuration_environment(config: &Config) -> Result<String> {
         crate::config::REVIEWER_EFFORT_SOURCE_ENV,
         effort_route_source(config.reviewer_effort_level.source)
     ));
+    parts.push(format!(
+        "EXOMONAD_ROLE_ROUTE_CONFIG_FINGERPRINT={}",
+        shell_escape::escape(config.routing_configuration_fingerprint().into())
+    ));
     Ok(format!(" {}", parts.join(" ")))
 }
 
@@ -12637,6 +12641,12 @@ mod tests {
         assert!(environment.contains("EXOMONAD_WORKER_EFFORT_LEVEL=xhigh"));
         assert!(environment.contains("EXOMONAD_REVIEWER_MODEL='openai/reviewer model'"));
         assert!(environment.contains("EXOMONAD_REVIEWER_EFFORT_LEVEL=low"));
+        let expected_route_fingerprint =
+            shell_escape::escape(config.routing_configuration_fingerprint().into());
+        assert!(environment.contains(&format!(
+            "EXOMONAD_ROLE_ROUTE_CONFIG_FINGERPRINT={}",
+            expected_route_fingerprint
+        )));
         assert!(command.contains("EXOMONAD_ROOT_AGENT_TYPE_SOURCE=project_config"));
         assert!(command.contains("EXOMONAD_SPAWN_AGENT_TYPE_SOURCE=project_config"));
         assert!(command.contains("EXOMONAD_REVIEWER_AGENT_TYPE=opencode"));

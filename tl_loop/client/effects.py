@@ -199,6 +199,13 @@ class EffectClient:
         intent_id: str | None = None,
         agent_type: str | None = None,
         model: str | None = None,
+        role: str | None = None,
+        harness: str | None = None,
+        effort: str | None = None,
+        route_configuration_fingerprint: str | None = None,
+        route_policy_fingerprint: str | None = None,
+        route_manifest_digest: str | None = None,
+        route_fingerprint: str | None = None,
         boundary: StringList | None = None,
         context: str | None = None,
         read_first: StringList | None = None,
@@ -209,6 +216,16 @@ class EffectClient:
         _put(arguments, "intent_id", intent_id)
         _put(arguments, "agent_type", agent_type)
         _put(arguments, "model", model)
+        _put_role_route(
+            arguments,
+            role=role,
+            harness=harness,
+            effort=effort,
+            route_configuration_fingerprint=route_configuration_fingerprint,
+            route_policy_fingerprint=route_policy_fingerprint,
+            route_manifest_digest=route_manifest_digest,
+            route_fingerprint=route_fingerprint,
+        )
         _put_list(arguments, "boundary", boundary)
         _put(arguments, "context", context)
         _put_list(arguments, "read_first", read_first)
@@ -224,11 +241,28 @@ class EffectClient:
         intent_id: str | None = None,
         agent_type: str | None = None,
         model: str | None = None,
+        role: str | None = None,
+        harness: str | None = None,
+        effort: str | None = None,
+        route_configuration_fingerprint: str | None = None,
+        route_policy_fingerprint: str | None = None,
+        route_manifest_digest: str | None = None,
+        route_fingerprint: str | None = None,
     ) -> ToolResult:
         arguments: JsonObject = {"name": name, "task": task}
         _put(arguments, "intent_id", intent_id)
         _put(arguments, "agent_type", agent_type)
         _put(arguments, "model", model)
+        _put_role_route(
+            arguments,
+            role=role,
+            harness=harness,
+            effort=effort,
+            route_configuration_fingerprint=route_configuration_fingerprint,
+            route_policy_fingerprint=route_policy_fingerprint,
+            route_manifest_digest=route_manifest_digest,
+            route_fingerprint=route_fingerprint,
+        )
         return self._call("spawn_worker", arguments)
 
     def spawn_reviewer(
@@ -301,18 +335,40 @@ class EffectClient:
         expected_worktree_fingerprint: str,
         task: str,
         human_approved: bool,
+        agent_type: str | None = None,
+        model: str | None = None,
+        role: str | None = None,
+        harness: str | None = None,
+        effort: str | None = None,
+        route_configuration_fingerprint: str | None = None,
+        route_policy_fingerprint: str | None = None,
+        route_manifest_digest: str | None = None,
+        route_fingerprint: str | None = None,
     ) -> ToolResult:
         """Resume one approved leaf in its existing owner and worktree."""
+        arguments: JsonObject = {
+            "chainlink_issue_id": chainlink_issue_id,
+            "expected_invocation_id": expected_invocation_id,
+            "expected_branch": expected_branch,
+            "expected_worktree_fingerprint": expected_worktree_fingerprint,
+            "task": task,
+            "human_approved": human_approved,
+        }
+        _put(arguments, "agent_type", agent_type)
+        _put(arguments, "model", model)
+        _put_role_route(
+            arguments,
+            role=role,
+            harness=harness,
+            effort=effort,
+            route_configuration_fingerprint=route_configuration_fingerprint,
+            route_policy_fingerprint=route_policy_fingerprint,
+            route_manifest_digest=route_manifest_digest,
+            route_fingerprint=route_fingerprint,
+        )
         return self._call(
             "resume_blocked_leaf",
-            {
-                "chainlink_issue_id": chainlink_issue_id,
-                "expected_invocation_id": expected_invocation_id,
-                "expected_branch": expected_branch,
-                "expected_worktree_fingerprint": expected_worktree_fingerprint,
-                "task": task,
-                "human_approved": human_approved,
-            },
+            arguments,
         )
 
     def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
@@ -884,6 +940,26 @@ class EffectClient:
 def _put(arguments: JsonObject, key: str, value: JsonValue | None) -> None:
     if value is not None:
         arguments[key] = value
+
+
+def _put_role_route(
+    arguments: JsonObject,
+    *,
+    role: str | None,
+    harness: str | None,
+    effort: str | None,
+    route_configuration_fingerprint: str | None,
+    route_policy_fingerprint: str | None,
+    route_manifest_digest: str | None,
+    route_fingerprint: str | None,
+) -> None:
+    _put(arguments, "role", role)
+    _put(arguments, "harness", harness)
+    _put(arguments, "effort", effort)
+    _put(arguments, "route_configuration_fingerprint", route_configuration_fingerprint)
+    _put(arguments, "route_policy_fingerprint", route_policy_fingerprint)
+    _put(arguments, "route_manifest_digest", route_manifest_digest)
+    _put(arguments, "route_fingerprint", route_fingerprint)
 
 
 def _put_list(arguments: JsonObject, key: str, value: StringList | None) -> None:

@@ -301,6 +301,8 @@ def test_run_passes_time_budgets_to_constructors(tmp_path: Path, monkeypatch) ->
     captured: dict[str, dict[str, object]] = {}
     monkeypatch.setenv("EXOMONAD_AGENT_ID", "root-controller")
     monkeypatch.setenv("EXOMONAD_WORKER_EFFORT_LEVEL", "xhigh")
+    monkeypatch.setenv("EXOMONAD_WORKER_MODEL", "gpt-6-luna")
+    monkeypatch.setenv("EXOMONAD_ROLE_ROUTE_CONFIG_FINGERPRINT", "sha256:v1:" + "4" * 64)
 
     class EmptySource:
         def start(self) -> EmptySource:
@@ -368,6 +370,10 @@ def test_run_passes_time_budgets_to_constructors(tmp_path: Path, monkeypatch) ->
     assert captured["tlloop_config"]["task_timeout_source"] == "project"
     assert captured["tlloop_config"]["agent_id"] == "root-controller"
     assert captured["tlloop_config"]["worker_effort_level"] == "xhigh"
+    assert captured["tlloop_config"]["requested_model"] == "gpt-6-luna"
+    assert captured["tlloop_config"]["role_route_configuration_fingerprint"] == (
+        "sha256:v1:" + "4" * 64
+    )
     assert captured["tlloop_config"]["enable_reviewer_spawn"] is True
     # The operator's dispatch-retry budget reaches the controller verbatim.
     assert captured["tlloop_config"]["dispatch_retry_limit"] == 7

@@ -643,6 +643,12 @@ SLICE_KEYS = frozenset(
         "dispatch_error_code",
         "dispatch_uses_current_role_configuration",
         "dispatch_route_reconciliation_source",
+        "dispatch_role",
+        "dispatch_effort",
+        "dispatch_route_configuration_fingerprint",
+        "dispatch_route_policy_fingerprint",
+        "dispatch_route_manifest_digest",
+        "dispatch_route_fingerprint",
         "dispatch_retry_attempt",
         "dispatch_next_attempt_at",
         "dispatch_retry_for_attempt",
@@ -919,6 +925,12 @@ class SliceState:
     dispatch_error_code: str | None = None
     dispatch_uses_current_role_configuration: bool = False
     dispatch_route_reconciliation_source: str | None = None
+    dispatch_role: str | None = None
+    dispatch_effort: str | None = None
+    dispatch_route_configuration_fingerprint: str | None = None
+    dispatch_route_policy_fingerprint: str | None = None
+    dispatch_route_manifest_digest: str | None = None
+    dispatch_route_fingerprint: str | None = None
     dispatch_retry_attempt: int = 0
     dispatch_next_attempt_at: float | None = None
     dispatch_retry_for_attempt: int = 0
@@ -1617,6 +1629,75 @@ def _slice_map(value: object, errors: list[tuple[str, str]]) -> dict[str, dict[s
     return result
 
 
+def _dispatch_route_binding(
+    value: Mapping[str, object],
+    path: str,
+    errors: list[tuple[str, str]],
+) -> None:
+    fingerprint = value.get("dispatch_route_fingerprint")
+    if fingerprint is None:
+        if any(
+            value.get(key) is not None
+            for key in (
+                "dispatch_role",
+                "dispatch_effort",
+                "dispatch_route_configuration_fingerprint",
+                "dispatch_route_policy_fingerprint",
+                "dispatch_route_manifest_digest",
+            )
+        ):
+            errors.append(
+                (
+                    f"{path}.dispatch_route_fingerprint",
+                    "is required when route provenance is present",
+                )
+            )
+        return
+    if value.get("dispatch_role") != "worker":
+        errors.append(
+            (f"{path}.dispatch_role", "must be worker when a route fingerprint is present")
+        )
+    if not _versioned_sha256(fingerprint):
+        errors.append((f"{path}.dispatch_route_fingerprint", "must be a versioned SHA-256 digest"))
+    policy_fingerprint = value.get("dispatch_route_policy_fingerprint")
+    if policy_fingerprint is not None and not _versioned_sha256(policy_fingerprint):
+        errors.append(
+            (f"{path}.dispatch_route_policy_fingerprint", "must be a versioned SHA-256 digest")
+        )
+    configuration_fingerprint = value.get("dispatch_route_configuration_fingerprint")
+    if configuration_fingerprint is not None and not _versioned_sha256(configuration_fingerprint):
+        errors.append(
+            (
+                f"{path}.dispatch_route_configuration_fingerprint",
+                "must be a versioned SHA-256 digest",
+            )
+        )
+    manifest_digest = value.get("dispatch_route_manifest_digest")
+    if manifest_digest is not None and not _raw_sha256(manifest_digest):
+        errors.append(
+            (f"{path}.dispatch_route_manifest_digest", "must be a lowercase SHA-256 digest")
+        )
+    effort = value.get("dispatch_effort")
+    if effort is not None and effort not in {"low", "medium", "high", "xhigh", "max"}:
+        errors.append((f"{path}.dispatch_effort", "must be a supported worker effort"))
+
+
+def _versioned_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("sha256:v1:")
+        and _raw_sha256(value.removeprefix("sha256:v1:"))
+    )
+
+
+def _raw_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def _validate_slice(
     slice_id: str,
     value: dict[str, object],
@@ -1683,6 +1764,16 @@ def _validate_slice(
     if "dispatch_uses_current_role_configuration" in value:
         _boolean(value, "dispatch_uses_current_role_configuration", path, errors)
     _nullable_string(value, "dispatch_route_reconciliation_source", path, errors)
+    for key in (
+        "dispatch_role",
+        "dispatch_effort",
+        "dispatch_route_configuration_fingerprint",
+        "dispatch_route_policy_fingerprint",
+        "dispatch_route_manifest_digest",
+        "dispatch_route_fingerprint",
+    ):
+        _nullable_string(value, key, path, errors)
+    _dispatch_route_binding(value, path, errors)
     route_source = value.get("dispatch_route_reconciliation_source")
     if (
         route_source is not None

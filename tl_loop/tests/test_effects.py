@@ -231,6 +231,56 @@ def test_merge_pr_emits_compare_and_swap_evidence() -> None:
     ]
 
 
+def test_role_route_is_carried_by_spawn_and_blocked_resume_arguments() -> None:
+    transport = RecordingTransport()
+    route = {
+        "role": "worker",
+        "effort": "xhigh",
+        "route_configuration_fingerprint": "config-fingerprint",
+        "route_policy_fingerprint": "policy-fingerprint",
+        "route_manifest_digest": "sha256:manifest",
+        "route_fingerprint": "sha256:route",
+    }
+    client = EffectClient(transport)
+
+    client.spawn_leaf(
+        name="leaf",
+        task="task",
+        agent_type="codex",
+        model="gpt-6-luna",
+        **route,
+    )
+    client.spawn_worker(
+        name="worker",
+        task="task",
+        agent_type="codex",
+        model="gpt-6-luna",
+        **route,
+    )
+    client.resume_blocked_leaf(
+        chainlink_issue_id=814,
+        expected_invocation_id="prior-invocation",
+        expected_branch="main.leaf",
+        expected_worktree_fingerprint="sha256:worktree",
+        task="resume task",
+        human_approved=True,
+        agent_type="codex",
+        model="gpt-6-luna",
+        **route,
+    )
+
+    assert [arguments["role"] for _, arguments in transport.calls] == ["worker"] * 3
+    assert [arguments["model"] for _, arguments in transport.calls] == ["gpt-6-luna"] * 3
+    assert [arguments["effort"] for _, arguments in transport.calls] == ["xhigh"] * 3
+    assert all(
+        arguments["route_fingerprint"] == "sha256:route"
+        and arguments["route_policy_fingerprint"] == "policy-fingerprint"
+        and arguments["route_manifest_digest"] == "sha256:manifest"
+        and arguments["route_configuration_fingerprint"] == "config-fingerprint"
+        for _, arguments in transport.calls
+    )
+
+
 def _load_schemas() -> dict[str, JsonObject]:
     raw = cast(JsonObject, json.loads(FIXTURE.read_text(encoding="utf-8")))
     tools = raw.get("tools")
