@@ -119,6 +119,7 @@ class RecordingTransport:
     code: str | None = None
     project_root: Path | None = None
     refusal_run_seq: int = 7
+    route_response_override: dict[str, Any] | None = None
 
     def call_tool(
         self,
@@ -133,10 +134,19 @@ class RecordingTransport:
             if len(self.spawns) <= self.refusals:
                 self._record_refusal(arguments.get("intent_id"))
                 return {"success": False, "error": "spawn request rejected"}
-            return {
-                "success": True,
-                "result": {"agent_id": f"{SLICE}-opencode", "invocation_id": "inv-1"},
+            result: dict[str, Any] = {
+                "agent_id": f"{SLICE}-opencode",
+                "invocation_id": "inv-1",
             }
+            role_route = arguments.get("role_route")
+            if isinstance(role_route, dict):
+                result["role_route"] = self.route_response_override or role_route
+                result["invocation_runtime"] = role_route.get("agent_type")
+                result["invocation_trigger"] = "spawn"
+            response_result: dict[str, Any] = result
+            if tool_name == "spawn_worker":
+                response_result = {"spawned": [result], "errors": []}
+            return {"success": True, "result": response_result}
         if tool_name == "emit_controller_event":
             self.events.append(dict(arguments))
             return {"success": True, "result": {"event_id": "controller-event"}}
@@ -197,6 +207,7 @@ def _config(root: Path, clock: ScriptedClock, *, policy: bool) -> TLLoopConfig:
         ledger_run_id=RUN_ID,
         root_dir=root,
         run_id=RUN_ID,
+        role_route_configuration_fingerprint="sha256:v1:" + "a" * 64,
     )
 
 
@@ -404,6 +415,31 @@ def test_every_spawn_path_persists_the_same_dispatch_boundary(tmp_path: Path) ->
     assert policy.payloads["tl.dispatch_intended"]["harness"] == HARNESS
     assert direct.slice_state.agent_type is None
     assert direct.payloads["tl.dispatch_intended"].get("harness") is None
+
+
+def test_route_bound_spawn_receipt_mismatch_holds_without_retry_or_gate(tmp_path: Path) -> None:
+    root = tmp_path / "route-receipt-mismatch"
+    store = _store(root)
+    clock = ScriptedClock()
+    transport = RecordingTransport(
+        project_root=root,
+        route_response_override={"agent_type": "opencode"},
+    )
+
+    state = _dispatch_pass(store, root, transport, clock, policy=True)
+    current = state.slices[SLICE]
+
+    assert current.status is SliceStatus.DISPATCH_UNCONFIRMED
+    assert current.dispatch_last_boundary == "spawn_outcome_ambiguous"
+    assert current.dispatch_intent_id is not None
+    assert current.attempts == 1
+    assert current.dispatch_error_code == "agent.role_route.receipt_unverified"
+    assert not state.gates
+    assert len(transport.spawns) == 1
+
+    repeated = _dispatch_pass(store, root, transport, clock, policy=True)
+    assert repeated.slices[SLICE] == current
+    assert len(transport.spawns) == 1
 
 
 @pytest.mark.parametrize("policy", [False, True], ids=["direct", "policy"])

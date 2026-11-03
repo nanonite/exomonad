@@ -809,6 +809,7 @@ impl EffectHandler for MockAgentHandler {
                     fresh: true,
                     ready: true,
                     outcome: "started".into(),
+                    role_route: None,
                 });
                 Ok(SpawnLeafSubtreeResponse {
                     agent: Some(agent),
@@ -835,7 +836,12 @@ impl EffectHandler for MockAgentHandler {
                     pane_id: "%42".into(),
                     ..Default::default()
                 };
-                Ok(SpawnWorkerResponse { agent: Some(agent) }.encode_to_vec())
+                Ok(SpawnWorkerResponse {
+                    agent: Some(agent),
+                    role_route: None,
+                    invocation: None,
+                }
+                .encode_to_vec())
             }
             "agent.close_self" => {
                 MOCK_AGENT_CLOSE_SELF_CALLS.fetch_add(1, Ordering::SeqCst);

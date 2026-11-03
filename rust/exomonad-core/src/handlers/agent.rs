@@ -16,8 +16,8 @@ use crate::services::agent_control::{
     finish_invocation_and_tombstone, read_invocation, slugify, AgentControlService, AgentIdentity,
     AgentIdentityRecord, AgentInfo, AgentType as ServiceAgentType, ClaudeSpawnFlags,
     ConfiguredRuntimeRoute, InvocationFinishResult, InvocationRecord, InvocationStatus,
-    RecoveryAuthorization, RecoveryInvocationLineage, SpawnLeafOptions, SpawnOptions,
-    SpawnSubtreeOptions, SpawnWorkerOptions, Topology, DIRTY_TL_SPAWN_PREFLIGHT_CODE,
+    RecoveryAuthorization, RecoveryInvocationLineage, RoleRouteProvenance, SpawnLeafOptions,
+    SpawnOptions, SpawnSubtreeOptions, SpawnWorkerOptions, Topology, DIRTY_TL_SPAWN_PREFLIGHT_CODE,
 };
 use crate::services::configured_tl_preflight_runtime_paths;
 use crate::services::continuation::composer::{prefix_task, resume_pr_prefix};
@@ -71,8 +71,19 @@ struct BlockedResumeAdoption<'a> {
     request: &'a SpawnLeafSubtreeRequest,
     invocation: &'a InvocationRecord,
     route: &'a ConfiguredRuntimeRoute,
+    role_route: Option<&'a RoleRouteProvenance>,
     intent_id: &'a str,
     context: &'a crate::effects::EffectContext,
+}
+
+struct RoleRouteValidation<'a> {
+    expected_scope: &'a str,
+    allowed_roles: &'a [&'a str],
+    requested_type: AgentType,
+    requested_model: Option<&'a str>,
+    requested_role: Option<&'a str>,
+    host_intent_id: Option<&'a str>,
+    caller: &'a AgentName,
 }
 
 impl<
@@ -93,6 +104,154 @@ impl<
 {
     pub fn new(service: Arc<AgentControlService<C>>, ctx: Arc<C>) -> Self {
         Self { service, ctx }
+    }
+
+    async fn accepted_role_route(
+        &self,
+        request: Option<&RoleRoute>,
+        validation: RoleRouteValidation<'_>,
+    ) -> EffectResult<Option<RoleRouteProvenance>> {
+        let RoleRouteValidation {
+            expected_scope,
+            allowed_roles,
+            requested_type,
+            requested_model,
+            requested_role,
+            host_intent_id,
+            caller,
+        } = validation;
+        let Some(route) = request else {
+            if host_intent_id.is_some_and(|intent| !intent.trim().is_empty())
+                && self
+                    .service
+                    .role_route_configuration_fingerprint()
+                    .is_some()
+            {
+                return Err(EffectError::invalid_input(
+                    "controller dispatch requires its accepted role route",
+                ));
+            }
+            return Ok(None);
+        };
+        let route_agent_type =
+            convert_agent_type(AgentType::try_from(route.agent_type).map_err(|_| {
+                EffectError::invalid_input("role route has an unknown agent type")
+            })?)?;
+        let route_model = non_empty(route.model.clone());
+        let route_effort = non_empty(route.effort.clone());
+        if route.role.trim().is_empty()
+            || !allowed_roles.contains(&route.role.as_str())
+            || route.scope_id != expected_scope
+            || route.dispatch_intent_id.trim().is_empty()
+            || route.configuration_fingerprint.trim().is_empty()
+            || route.route_fingerprint.trim().is_empty()
+            || route.harness != route_harness_label(route_agent_type, route_model.as_deref())
+        {
+            return Err(EffectError::invalid_input(
+                "role route is incomplete or conflicts with the declared scope",
+            ));
+        }
+        if requested_type != AgentType::Unspecified
+            && convert_agent_type(requested_type)? != route_agent_type
+        {
+            return Err(EffectError::invalid_input(
+                "top-level agent_type conflicts with the accepted role route",
+            ));
+        }
+        if requested_model.is_some_and(|model| Some(model) != route_model.as_deref()) {
+            return Err(EffectError::invalid_input(
+                "top-level model conflicts with the accepted role route",
+            ));
+        }
+        if requested_role.is_some_and(|role| role != route.role) {
+            return Err(EffectError::invalid_input(
+                "top-level role conflicts with the accepted role route",
+            ));
+        }
+        if host_intent_id.is_some_and(|intent| intent != route.dispatch_intent_id) {
+            return Err(EffectError::invalid_input(
+                "role route dispatch intent does not match the launch intent",
+            ));
+        }
+        if self
+            .service
+            .role_route_configuration_fingerprint()
+            .is_none_or(|accepted| accepted != route.configuration_fingerprint)
+        {
+            return Err(EffectError::invalid_input(
+                "role route configuration is stale or was not accepted by this server",
+            ));
+        }
+        self.validate_role_route_dispatch_event(route, caller)
+            .await?;
+        Ok(Some(RoleRouteProvenance {
+            role: route.role.clone(),
+            harness: route.harness.clone(),
+            agent_type: route_agent_type,
+            model: route_model,
+            effort: route_effort,
+            configuration_fingerprint: route.configuration_fingerprint.clone(),
+            policy_fingerprint: non_empty(route.policy_fingerprint.clone()),
+            manifest_digest: non_empty(route.manifest_digest.clone()),
+            route_fingerprint: route.route_fingerprint.clone(),
+            dispatch_intent_id: route.dispatch_intent_id.clone(),
+            scope_id: route.scope_id.clone(),
+        }))
+    }
+
+    async fn validate_role_route_dispatch_event(
+        &self,
+        route: &RoleRoute,
+        caller: &AgentName,
+    ) -> EffectResult<()> {
+        let log = self.ctx.event_log().ok_or_else(|| {
+            EffectError::invalid_input("role route requires durable dispatch history")
+        })?;
+        let matching = log
+            .ledger()
+            .read_events()
+            .effect_err("agent")?
+            .into_iter()
+            .filter(|record| {
+                record.event.event_type == "tl.dispatch_intended"
+                    && record.event.data["intent_id"].as_str()
+                        == Some(route.dispatch_intent_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        let [record] = matching.as_slice() else {
+            return Err(EffectError::invalid_input(
+                "role route dispatch authorization is missing or ambiguous",
+            ));
+        };
+        let data = &record.event.data;
+        let event_text = |key: &str| data.get(key).and_then(serde_json::Value::as_str);
+        let route_type = AgentType::try_from(route.agent_type)
+            .map_err(|_| EffectError::invalid_input("role route has an unknown agent type"))?;
+        let route_model = (!route.model.is_empty()).then_some(route.model.as_str());
+        let route_effort = (!route.effort.is_empty()).then_some(route.effort.as_str());
+        let route_policy =
+            (!route.policy_fingerprint.is_empty()).then_some(route.policy_fingerprint.as_str());
+        let route_manifest =
+            (!route.manifest_digest.is_empty()).then_some(route.manifest_digest.as_str());
+        if record.event.agent_id.as_deref() != Some(caller.as_str())
+            || event_text("boundary") != Some("dispatch_intended")
+            || event_text("slice_id") != Some(route.scope_id.as_str())
+            || event_text("role") != Some(route.role.as_str())
+            || event_text("harness") != Some(route.harness.as_str())
+            || event_text("agent_type") != Some(proto_agent_type_label(route_type))
+            || event_text("model") != route_model
+            || event_text("effort") != route_effort
+            || event_text("route_configuration_fingerprint")
+                != Some(route.configuration_fingerprint.as_str())
+            || event_text("route_policy_fingerprint") != route_policy
+            || event_text("route_manifest_digest") != route_manifest
+            || event_text("route_fingerprint") != Some(route.route_fingerprint.as_str())
+        {
+            return Err(EffectError::invalid_input(
+                "role route conflicts with its durable dispatch authorization",
+            ));
+        }
+        Ok(())
     }
 
     /// Auto-register a spawned child in the SupervisorRegistry.
@@ -1233,19 +1392,40 @@ impl<
         req: SpawnWorkerRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnWorkerResponse> {
+        let requested_agent_type = req.agent_type();
+        let requested_model = non_empty(req.model.clone());
+        let role_route = self
+            .accepted_role_route(
+                req.role_route.as_ref(),
+                RoleRouteValidation {
+                    expected_scope: &req.name,
+                    allowed_roles: &["worker"],
+                    requested_type: requested_agent_type,
+                    requested_model: requested_model.as_deref(),
+                    requested_role: None,
+                    host_intent_id: Some(req.intent_id.as_str()),
+                    caller: &ctx.agent_name,
+                },
+            )
+            .await?;
         self.ensure_tl_spawn_preflight_for_child(ctx, &req.name, &req.intent_id)
             .await?;
         let default_type = self.service.default_spawn_agent_type();
-        let requested_agent_type = req.agent_type();
-        let effective_agent_type =
-            convert_agent_type_or_default(requested_agent_type, default_type)?;
-        let requested_model = non_empty(req.model.clone());
-        let model = self.service.effective_model_for(
-            effective_agent_type,
-            "worker",
-            requested_model.as_deref(),
-        );
-        let effort = self.service.effective_effort_for("worker", None);
+        let effective_agent_type = match role_route.as_ref() {
+            Some(route) => route.agent_type,
+            None => convert_agent_type_or_default(requested_agent_type, default_type)?,
+        };
+        let (model, effort) = match role_route.as_ref() {
+            Some(route) => (route.model.clone(), route.effort.clone()),
+            None => (
+                self.service.effective_model_for(
+                    effective_agent_type,
+                    "worker",
+                    requested_model.as_deref(),
+                ),
+                self.service.effective_effort_for("worker", None),
+            ),
+        };
         self.enforce_harness_switch_policy(
             ctx,
             "spawn_worker",
@@ -1267,7 +1447,9 @@ impl<
                 .expect("validated string input is non-empty"),
             prompt: req.prompt.clone(),
             agent_type: effective_agent_type,
-            model: requested_model,
+            model: model.clone(),
+            effort: effort.clone(),
+            role_route: role_route.clone(),
             claude_flags: claude_spawn_flags(
                 req.permission_mode.clone(),
                 req.allowed_tools.clone(),
@@ -1372,8 +1554,37 @@ impl<
             ),
         );
 
+        let invocation = read_invocation(
+            &self
+                .ctx
+                .project_dir()
+                .join(".exo/agents")
+                .join(result.agent_name.as_str()),
+        )
+        .await
+        .effect_err("agent")?;
+        let invocation = invocation.ok_or_else(|| {
+            EffectError::invalid_input("spawn_worker completed without a durable invocation")
+        })?;
+        validate_invocation_role_route(&invocation, role_route.as_ref(), "spawn_worker")?;
+        let invocation_dir = self
+            .ctx
+            .project_dir()
+            .join(".exo/agents")
+            .join(result.agent_name.as_str());
+        let ready = self.service.routing_liveness(&invocation_dir).await == Some(true);
+        let invocation_handoff = invocation_handoff_to_proto(
+            &invocation,
+            invocation.branch.as_deref().unwrap_or_default(),
+            true,
+            ready,
+            if ready { "started" } else { "exited_early" },
+        );
+        let persisted_route = invocation.role_route.as_ref();
         Ok(SpawnWorkerResponse {
             agent: Some(agent_info),
+            role_route: persisted_route.map(role_route_provenance_to_proto),
+            invocation: Some(invocation_handoff),
         })
     }
 
@@ -1924,6 +2135,8 @@ impl<
             invocation_pr_number: None,
             recovery_lineage: None,
             model: None,
+            effort: None,
+            role_route: None,
         };
         info!(
             chainlink_issue_id = issue_id,
@@ -2388,18 +2601,41 @@ impl<
                 "branch_name is required for an ordinary spawn",
             ));
         }
+        let requested_agent_type = req.agent_type();
+        let requested_model = non_empty(req.model.clone());
+        let requested_role = non_empty(req.role.clone());
+        let role_route = self
+            .accepted_role_route(
+                req.role_route.as_ref(),
+                RoleRouteValidation {
+                    expected_scope: &req.branch_name,
+                    allowed_roles: &["dev", "dev_leaf", "worker"],
+                    requested_type: requested_agent_type,
+                    requested_model: requested_model.as_deref(),
+                    requested_role: requested_role.as_deref(),
+                    host_intent_id: Some(req.intent_id.as_str()),
+                    caller: &ctx.agent_name,
+                },
+            )
+            .await?;
         self.ensure_tl_spawn_preflight_for_child(ctx, &req.branch_name, &req.intent_id)
             .await?;
         let default_type = self.service.default_spawn_agent_type();
-        let requested_agent_type = req.agent_type();
-        let effective_agent_type =
-            convert_agent_type_or_default(requested_agent_type, default_type)?;
-        let model = self.service.effective_model_for(
-            effective_agent_type,
-            "dev",
-            non_empty(req.model.clone()).as_deref(),
-        );
-        let effort = self.service.effective_effort_for("dev", None);
+        let effective_agent_type = match role_route.as_ref() {
+            Some(route) => route.agent_type,
+            None => convert_agent_type_or_default(requested_agent_type, default_type)?,
+        };
+        let (model, effort) = match role_route.as_ref() {
+            Some(route) => (route.model.clone(), route.effort.clone()),
+            None => (
+                self.service.effective_model_for(
+                    effective_agent_type,
+                    "dev",
+                    requested_model.as_deref(),
+                ),
+                self.service.effective_effort_for("dev", None),
+            ),
+        };
         self.enforce_harness_switch_policy(
             ctx,
             "spawn_leaf_subtree",
@@ -2409,6 +2645,10 @@ impl<
             model.clone(),
             effort.clone(),
         )?;
+        let effective_role = role_route
+            .as_ref()
+            .map(|route| route.role.clone())
+            .or(requested_role);
         info!(
             requested_agent_type = proto_agent_type_label(requested_agent_type),
             default_agent_type = default_type.suffix(),
@@ -2419,9 +2659,11 @@ impl<
         let options = SpawnLeafOptions {
             task: req.task.clone(),
             branch_name: req.branch_name.clone(),
-            role: non_empty(req.role.clone()).map(crate::domain::Role::new),
+            role: effective_role.map(crate::domain::Role::new),
             agent_type: effective_agent_type,
-            model: non_empty(req.model.clone()),
+            model: model.clone(),
+            effort: effort.clone(),
+            role_route: role_route.clone(),
             claude_flags: claude_spawn_flags(
                 req.permission_mode.clone(),
                 req.allowed_tools.clone(),
@@ -2537,9 +2779,26 @@ impl<
             ),
         );
 
+        let invocation_dir = self
+            .ctx
+            .project_dir()
+            .join(".exo/agents")
+            .join(result.agent_name.as_str());
+        let invocation = read_invocation(&invocation_dir)
+            .await
+            .effect_err("agent")?
+            .ok_or_else(|| {
+                EffectError::invalid_input(
+                    "spawn_leaf_subtree completed without a durable invocation",
+                )
+            })?;
+        validate_invocation_role_route(&invocation, role_route.as_ref(), "spawn_leaf_subtree")?;
+        let invocation_handoff =
+            invocation_handoff_to_proto(&invocation, &result.branch_name, true, true, "started");
+
         Ok(SpawnLeafSubtreeResponse {
             agent: Some(agent_info),
-            invocation: None,
+            invocation: Some(invocation_handoff),
         })
     }
 
@@ -3350,6 +3609,8 @@ impl<
             invocation_pr_number: Some(req.resume_pr_number),
             recovery_lineage: None,
             model: desired_model.clone(),
+            effort: desired_route.effort.clone(),
+            role_route: None,
         };
         let mut options = options;
         options.recovery_lineage = Some(RecoveryInvocationLineage {
@@ -3656,11 +3917,16 @@ impl<
         ensure_chainlink_issue_open(self.ctx.project_dir(), req.blocked_issue_id)
             .await
             .map_err(EffectError::invalid_input)?;
-        let desired_route = self.service.configured_runtime_route("dev");
-        let desired_agent_type = desired_route.agent_type;
-        let desired_model = desired_route.model.clone();
-        let desired_effort = desired_route.effort.clone();
-
+        if req.role_route.is_none()
+            && self
+                .service
+                .role_route_configuration_fingerprint()
+                .is_some()
+        {
+            return Err(EffectError::invalid_input(
+                "blocked-leaf controller recovery requires its accepted role route",
+            ));
+        }
         let records = self.ctx.agent_resolver().all().await;
         let mut owners = Vec::new();
         for record in records {
@@ -3690,6 +3956,31 @@ impl<
             ));
         }
         let parked_slice_id = owner.slice_id.as_deref().unwrap_or(owner.slug.as_str());
+        let role_route = self
+            .accepted_role_route(
+                req.role_route.as_ref(),
+                RoleRouteValidation {
+                    expected_scope: parked_slice_id,
+                    allowed_roles: &["dev", "dev_leaf", "worker"],
+                    requested_type: AgentType::Unspecified,
+                    requested_model: None,
+                    requested_role: None,
+                    host_intent_id: None,
+                    caller: &ctx.agent_name,
+                },
+            )
+            .await?;
+        let desired_route = role_route
+            .as_ref()
+            .map(|route| ConfiguredRuntimeRoute {
+                agent_type: route.agent_type,
+                model: route.model.clone(),
+                effort: route.effort.clone(),
+            })
+            .unwrap_or_else(|| self.service.configured_runtime_route("dev"));
+        let desired_agent_type = desired_route.agent_type;
+        let desired_model = desired_route.model.clone();
+        let desired_effort = desired_route.effort.clone();
         let parked_event_seen = self
             .ctx
             .event_log()
@@ -3766,6 +4057,7 @@ impl<
                     request: req,
                     invocation: &invocation,
                     route: &desired_route,
+                    role_route: role_route.as_ref(),
                     intent_id: &intent_id,
                     context: ctx,
                 })
@@ -3882,7 +4174,12 @@ impl<
                 req.blocked_issue_id
             ),
             branch_name: owner.slug.to_string(),
-            role: Some(crate::domain::Role::dev()),
+            role: Some(crate::domain::Role::new(
+                role_route
+                    .as_ref()
+                    .map(|route| route.role.clone())
+                    .unwrap_or_else(|| "dev".to_string()),
+            )),
             agent_type: desired_agent_type,
             claude_flags: ClaudeSpawnFlags::default(),
             standalone_repo: false,
@@ -3898,6 +4195,8 @@ impl<
                 authorization_source: RecoveryAuthorization::HumanApproved,
             }),
             model: desired_model.clone(),
+            effort: desired_effort.clone(),
+            role_route: role_route.clone(),
         };
         self.ensure_tl_spawn_preflight_for_child(ctx, owner.agent_name.as_str(), &req.intent_id)
             .await?;
@@ -3931,6 +4230,7 @@ impl<
             || fresh_invocation.runtime != desired_agent_type
             || fresh_invocation.model.as_deref() != desired_model.as_deref()
             || fresh_invocation.effort.as_deref() != desired_effort.as_deref()
+            || fresh_invocation.role_route != role_route
             || fresh_invocation.branch.as_deref() != Some(req.expected_branch.as_str())
             || fresh_invocation.worktree.as_deref()
                 != Some(owner.working_dir.to_string_lossy().as_ref())
@@ -4012,6 +4312,7 @@ impl<
             request: req,
             invocation,
             route,
+            role_route,
             intent_id,
             context: ctx,
         } = adoption;
@@ -4022,7 +4323,8 @@ impl<
             invocation.prior_invocation_id.as_deref() == Some(req.expected_invocation_id.as_str());
         let route_matches = invocation.runtime == desired_agent_type
             && invocation.model.as_deref() == desired_model
-            && invocation.effort.as_deref() == desired_effort;
+            && invocation.effort.as_deref() == desired_effort
+            && invocation.role_route.as_ref() == role_route;
         let execution_matches = invocation.is_live()
             && invocation.trigger
                 == crate::services::agent_control::InvocationTrigger::ResumeBlocked
@@ -5585,6 +5887,60 @@ fn invocation_handoff_to_proto(
         fresh,
         ready,
         outcome: outcome.to_string(),
+        role_route: invocation
+            .role_route
+            .as_ref()
+            .map(role_route_provenance_to_proto),
+    }
+}
+
+fn role_route_provenance_to_proto(route: &RoleRouteProvenance) -> RoleRoute {
+    RoleRoute {
+        role: route.role.clone(),
+        harness: route.harness.clone(),
+        agent_type: service_agent_type_to_proto(route.agent_type),
+        model: route.model.clone().unwrap_or_default(),
+        effort: route.effort.clone().unwrap_or_default(),
+        configuration_fingerprint: route.configuration_fingerprint.clone(),
+        policy_fingerprint: route.policy_fingerprint.clone().unwrap_or_default(),
+        manifest_digest: route.manifest_digest.clone().unwrap_or_default(),
+        route_fingerprint: route.route_fingerprint.clone(),
+        dispatch_intent_id: route.dispatch_intent_id.clone(),
+        scope_id: route.scope_id.clone(),
+    }
+}
+
+fn validate_invocation_role_route(
+    invocation: &InvocationRecord,
+    accepted: Option<&RoleRouteProvenance>,
+    operation: &str,
+) -> EffectResult<()> {
+    let Some(route) = accepted else {
+        return Ok(());
+    };
+    if invocation.role_route.as_ref() != Some(route)
+        || invocation.runtime != route.agent_type
+        || invocation.model != route.model
+        || invocation.effort != route.effort
+    {
+        return Err(EffectError::invalid_input(format!(
+            "{operation} invocation does not preserve the accepted role route (provenance_match={}, runtime={}/{}, model={:?}/{:?}, effort={:?}/{:?})",
+            invocation.role_route.as_ref() == Some(route),
+            invocation.runtime.suffix(),
+            route.agent_type.suffix(),
+            invocation.model,
+            route.model,
+            invocation.effort,
+            route.effort,
+        )));
+    }
+    Ok(())
+}
+
+fn route_harness_label(agent_type: ServiceAgentType, model: Option<&str>) -> String {
+    match model {
+        Some(model) => format!("{}/{}", agent_type.suffix(), model),
+        None => agent_type.suffix().to_string(),
     }
 }
 
@@ -5998,6 +6354,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: Some("opencode-go/deepseek-v4.1-flash".to_string()),
             effort: Some("high".to_string()),
+            role_route: None,
             ledger_owned: true,
             slice_id: Some(SLICE.to_string()),
         };
@@ -6031,6 +6388,7 @@ mod tests {
             pr_number: Some(PR_NUMBER),
             head_sha: Some(head_sha.clone()),
             model: Some("gpt-6-luna".to_string()),
+            role_route: None,
             effort: Some("xhigh".to_string()),
             prior_invocation_id: Some(PRIOR.to_string()),
             recovery_round: 1,
@@ -6065,6 +6423,7 @@ mod tests {
             head_sha: Some(head_sha.clone()),
             model: owner.model.clone(),
             effort: owner.effort.clone(),
+            role_route: None,
             prior_invocation_id: None,
             recovery_round: 0,
             authorization_source: None,
@@ -6832,6 +7191,7 @@ mod tests {
                 topology: Topology::WorktreePerAgent,
                 model: None,
                 effort: None,
+                role_route: None,
                 ledger_owned: true,
                 slice_id: Some("issue-814".to_string()),
             })
@@ -6982,6 +7342,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: true,
             slice_id: identity_slice_id.map(str::to_owned),
         };
@@ -7287,6 +7648,7 @@ mod tests {
             agent_type: AgentType::Codex as i32,
             intent_id: "intent-live-handler".to_string(),
             model: String::new(),
+            role_route: None,
         };
 
         let response = handler
@@ -7689,6 +8051,8 @@ mod tests {
             invocation_pr_number: Some(104),
             recovery_lineage: None,
             model: None,
+            effort: None,
+            role_route: None,
         };
         let composed = with_resume_task(options.clone(), Some("continuation"));
 
@@ -7734,6 +8098,7 @@ mod tests {
             head_sha: Some("abc123".to_string()),
             model: Some("gpt-5.6-luna".to_string()),
             effort: Some("xhigh".to_string()),
+            role_route: None,
             generation: 2,
             runtime_agent_id: None,
             slice_id: None,
@@ -7773,6 +8138,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: Some("opencode-go/deepseek-v4.1-flash".to_string()),
             effort: Some("high".to_string()),
+            role_route: None,
             ledger_owned: true,
             slice_id: Some("issue-814".to_string()),
         };
@@ -7803,6 +8169,7 @@ mod tests {
             exit_reason: None,
             exit_classification: None,
             stderr_tail: None,
+            role_route: None,
         };
 
         assert!(configured_route_changed(

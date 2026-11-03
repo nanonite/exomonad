@@ -31,6 +31,7 @@ from tl_loop.state.store import RunStore
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "replay"
 POLICY_ROOT = Path(__file__).parent / "fixtures"
 REPLAY_REVIEW_NOW = datetime(2026, 8, 11, 17, 20, tzinfo=UTC)
+REPLAY_ROLE_ROUTE_CONFIGURATION_FINGERPRINT = "sha256:v1:" + "3" * 64
 
 
 RecordedEventSource = ReplayEventSource
@@ -156,6 +157,24 @@ class RecordingTransport:
                     "ancestry_proof": f"ancestor:{pushed}->{pushed}",
                 },
             }
+        if tool_name in {"spawn_worker", "spawn_leaf"}:
+            route = arguments.get("role_route")
+            if not isinstance(route, Mapping):
+                return {"success": True, "result": None}
+            owner = str(arguments.get("name", "replay-agent"))
+            receipt: JsonObject = {
+                "agent_id": owner,
+                "invocation_id": f"{owner}-invocation-1",
+                "role_route": dict(route),
+                "invocation_runtime": route.get("agent_type"),
+                "invocation_trigger": "spawn",
+            }
+            result: JsonObject = (
+                {"spawned": [receipt], "errors": []}
+                if tool_name == "spawn_worker"
+                else receipt
+            )
+            return {"success": True, "result": result}
         if tool_name == "root_branch_finalize":
             branch = arguments.get("branch")
             head = "root-head"
@@ -218,6 +237,7 @@ def replay_fixture(
     live_ledger: bool = False,
     capture_initial_events: bool | None = None,
     allow_truncated: bool = False,
+    role_route_configuration_fingerprint: str | None = REPLAY_ROLE_ROUTE_CONFIGURATION_FINGERPRINT,
     child_event_transform: Callable[[list[Mapping[str, object]]], Sequence[Mapping[str, object]]]
     | None = None,
 ) -> ReplayResult:
@@ -297,6 +317,7 @@ def replay_fixture(
         ledger_run_id=run_id if journal else None,
         repository_identity=_repository_identity(spec.get("repository_identity"))
         or RepositoryIdentity("https://forge.example.com/org/repo.git"),
+        role_route_configuration_fingerprint=role_route_configuration_fingerprint,
         session_mode=session_mode,
     )
     run_result = None

@@ -3818,6 +3818,7 @@ mod tests {
                 topology: crate::services::agent_control::Topology::WorktreePerAgent,
                 model: None,
                 effort: None,
+                role_route: None,
                 ledger_owned: true,
                 slice_id: None,
             })
@@ -5921,6 +5922,7 @@ mod tests {
                 topology: crate::services::agent_control::Topology::WorktreePerAgent,
                 model: None,
                 effort: None,
+                role_route: None,
                 ledger_owned: false,
                 slice_id: None,
             })

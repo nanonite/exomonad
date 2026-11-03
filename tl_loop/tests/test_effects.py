@@ -236,6 +236,7 @@ def test_role_route_is_carried_by_spawn_and_blocked_resume_arguments() -> None:
     route = {
         "role": "worker",
         "effort": "xhigh",
+        "harness": "codex/gpt-6-luna",
         "route_configuration_fingerprint": "config-fingerprint",
         "route_policy_fingerprint": "policy-fingerprint",
         "route_manifest_digest": "sha256:manifest",
@@ -246,15 +247,19 @@ def test_role_route_is_carried_by_spawn_and_blocked_resume_arguments() -> None:
     client.spawn_leaf(
         name="leaf",
         task="task",
+        intent_id="leaf-dispatch",
         agent_type="codex",
         model="gpt-6-luna",
+        route_scope_id="leaf",
         **route,
     )
     client.spawn_worker(
         name="worker",
         task="task",
+        intent_id="worker-dispatch",
         agent_type="codex",
         model="gpt-6-luna",
+        route_scope_id="worker",
         **route,
     )
     client.resume_blocked_leaf(
@@ -266,19 +271,42 @@ def test_role_route_is_carried_by_spawn_and_blocked_resume_arguments() -> None:
         human_approved=True,
         agent_type="codex",
         model="gpt-6-luna",
+        route_dispatch_intent_id="resume-dispatch",
+        route_scope_id="resume-leaf",
         **route,
     )
 
-    assert [arguments["role"] for _, arguments in transport.calls] == ["worker"] * 3
-    assert [arguments["model"] for _, arguments in transport.calls] == ["gpt-6-luna"] * 3
-    assert [arguments["effort"] for _, arguments in transport.calls] == ["xhigh"] * 3
+    route_objects = [arguments["role_route"] for _, arguments in transport.calls]
+    assert [route["role"] for route in route_objects] == ["worker"] * 3
+    assert [route["model"] for route in route_objects] == ["gpt-6-luna"] * 3
+    assert [route["effort"] for route in route_objects] == ["xhigh"] * 3
+    assert [route["scope_id"] for route in route_objects] == ["leaf", "worker", "resume-leaf"]
+    assert [route["dispatch_intent_id"] for route in route_objects] == [
+        "leaf-dispatch",
+        "worker-dispatch",
+        "resume-dispatch",
+    ]
     assert all(
-        arguments["route_fingerprint"] == "sha256:route"
-        and arguments["route_policy_fingerprint"] == "policy-fingerprint"
-        and arguments["route_manifest_digest"] == "sha256:manifest"
-        and arguments["route_configuration_fingerprint"] == "config-fingerprint"
-        for _, arguments in transport.calls
+        route["route_fingerprint"] == "sha256:route"
+        and route["policy_fingerprint"] == "policy-fingerprint"
+        and route["manifest_digest"] == "sha256:manifest"
+        and route["configuration_fingerprint"] == "config-fingerprint"
+        for route in route_objects
     )
+    assert all("role" not in arguments for _, arguments in transport.calls)
+
+
+def test_unbound_harness_overrides_do_not_claim_controller_route_provenance() -> None:
+    transport = RecordingTransport()
+    client = EffectClient(transport)
+
+    client.spawn_leaf(name="leaf", task="task", agent_type="codex", model="gpt-test")
+    client.spawn_worker(name="worker", task="task", agent_type="codex", model="gpt-test")
+
+    for _, arguments in transport.calls:
+        assert arguments["agent_type"] == "codex"
+        assert arguments["model"] == "gpt-test"
+        assert "role_route" not in arguments
 
 
 def _load_schemas() -> dict[str, JsonObject]:

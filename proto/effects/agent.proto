@@ -20,6 +20,23 @@ enum AgentType {
   AGENT_TYPE_CODEX = 5;
 }
 
+// Accepted role-route identity transported with a controller launch request.
+// dispatch_intent_id references the durable tl.dispatch_intended event; it is
+// not an agent launch intent and is distinct from the host-owned resume intent.
+message RoleRoute {
+  string role = 1;
+  string harness = 2;
+  AgentType agent_type = 3;
+  string model = 4;
+  string effort = 5;
+  string configuration_fingerprint = 6;
+  string policy_fingerprint = 7;
+  string manifest_digest = 8;
+  string route_fingerprint = 9;
+  string dispatch_intent_id = 10;
+  string scope_id = 11;
+}
+
 // Topology of the workspace.
 enum WorkspaceTopology {
   WORKSPACE_TOPOLOGY_UNSPECIFIED = 0;
@@ -280,10 +297,16 @@ message SpawnWorkerRequest {
   string intent_id = 7;
   // Optional per-spawn model override, separate from the agent type.
   string model = 8;
+  // Controller-selected route bound to a durable dispatch-intended event.
+  RoleRoute role_route = 9;
 }
 
 message SpawnWorkerResponse {
   AgentInfo agent = 1;
+  // Route accepted and used by the host for this launch.
+  RoleRoute role_route = 2;
+  // Current invocation and exact owned target accepted for this launch.
+  InvocationHandoff invocation = 3;
 }
 
 message Permissions {
@@ -524,6 +547,8 @@ message SpawnLeafSubtreeRequest {
   string expected_branch = 18;
   string expected_worktree_fingerprint = 19;
   bool human_approved = 20;
+  // Controller-selected route; blocked resume keeps intent_id host-owned.
+  RoleRoute role_route = 21;
 }
 
 message SpawnLeafSubtreeResponse {
@@ -553,6 +578,8 @@ message InvocationHandoff {
   bool ready = 8;
   // started, already_running, startup_failed, or exited_early.
   string outcome = 9;
+  // Exact selected route associated with the invocation, when route-bound.
+  RoleRoute role_route = 10;
 }
 
 

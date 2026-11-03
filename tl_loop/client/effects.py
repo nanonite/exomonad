@@ -206,6 +206,7 @@ class EffectClient:
         route_policy_fingerprint: str | None = None,
         route_manifest_digest: str | None = None,
         route_fingerprint: str | None = None,
+        route_scope_id: str | None = None,
         boundary: StringList | None = None,
         context: str | None = None,
         read_first: StringList | None = None,
@@ -220,11 +221,15 @@ class EffectClient:
             arguments,
             role=role,
             harness=harness,
+            agent_type=agent_type,
+            model=model,
             effort=effort,
             route_configuration_fingerprint=route_configuration_fingerprint,
             route_policy_fingerprint=route_policy_fingerprint,
             route_manifest_digest=route_manifest_digest,
             route_fingerprint=route_fingerprint,
+            dispatch_intent_id=intent_id,
+            scope_id=route_scope_id,
         )
         _put_list(arguments, "boundary", boundary)
         _put(arguments, "context", context)
@@ -248,6 +253,7 @@ class EffectClient:
         route_policy_fingerprint: str | None = None,
         route_manifest_digest: str | None = None,
         route_fingerprint: str | None = None,
+        route_scope_id: str | None = None,
     ) -> ToolResult:
         arguments: JsonObject = {"name": name, "task": task}
         _put(arguments, "intent_id", intent_id)
@@ -257,11 +263,15 @@ class EffectClient:
             arguments,
             role=role,
             harness=harness,
+            agent_type=agent_type,
+            model=model,
             effort=effort,
             route_configuration_fingerprint=route_configuration_fingerprint,
             route_policy_fingerprint=route_policy_fingerprint,
             route_manifest_digest=route_manifest_digest,
             route_fingerprint=route_fingerprint,
+            dispatch_intent_id=intent_id,
+            scope_id=route_scope_id,
         )
         return self._call("spawn_worker", arguments)
 
@@ -344,6 +354,8 @@ class EffectClient:
         route_policy_fingerprint: str | None = None,
         route_manifest_digest: str | None = None,
         route_fingerprint: str | None = None,
+        route_dispatch_intent_id: str | None = None,
+        route_scope_id: str | None = None,
     ) -> ToolResult:
         """Resume one approved leaf in its existing owner and worktree."""
         arguments: JsonObject = {
@@ -354,17 +366,19 @@ class EffectClient:
             "task": task,
             "human_approved": human_approved,
         }
-        _put(arguments, "agent_type", agent_type)
-        _put(arguments, "model", model)
         _put_role_route(
             arguments,
             role=role,
             harness=harness,
+            agent_type=agent_type,
+            model=model,
             effort=effort,
             route_configuration_fingerprint=route_configuration_fingerprint,
             route_policy_fingerprint=route_policy_fingerprint,
             route_manifest_digest=route_manifest_digest,
             route_fingerprint=route_fingerprint,
+            dispatch_intent_id=route_dispatch_intent_id,
+            scope_id=route_scope_id,
         )
         return self._call(
             "resume_blocked_leaf",
@@ -947,19 +961,40 @@ def _put_role_route(
     *,
     role: str | None,
     harness: str | None,
+    agent_type: str | None,
+    model: str | None,
     effort: str | None,
     route_configuration_fingerprint: str | None,
     route_policy_fingerprint: str | None,
     route_manifest_digest: str | None,
     route_fingerprint: str | None,
+    dispatch_intent_id: str | None,
+    scope_id: str | None,
 ) -> None:
-    _put(arguments, "role", role)
-    _put(arguments, "harness", harness)
-    _put(arguments, "effort", effort)
-    _put(arguments, "route_configuration_fingerprint", route_configuration_fingerprint)
-    _put(arguments, "route_policy_fingerprint", route_policy_fingerprint)
-    _put(arguments, "route_manifest_digest", route_manifest_digest)
-    _put(arguments, "route_fingerprint", route_fingerprint)
+    values = {
+        "role": role,
+        "harness": harness,
+        "agent_type": agent_type,
+        "model": model,
+        "effort": effort,
+        "configuration_fingerprint": route_configuration_fingerprint,
+        "policy_fingerprint": route_policy_fingerprint,
+        "manifest_digest": route_manifest_digest,
+        "route_fingerprint": route_fingerprint,
+        "dispatch_intent_id": dispatch_intent_id,
+        "scope_id": scope_id,
+    }
+    route = {name: value for name, value in values.items() if isinstance(value, str) and value}
+    required = {
+        "role",
+        "harness",
+        "configuration_fingerprint",
+        "route_fingerprint",
+        "dispatch_intent_id",
+        "scope_id",
+    }
+    if required <= route.keys():
+        arguments["role_route"] = route
 
 
 def _put_list(arguments: JsonObject, key: str, value: StringList | None) -> None:

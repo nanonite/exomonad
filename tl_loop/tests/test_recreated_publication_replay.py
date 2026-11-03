@@ -127,6 +127,7 @@ def _replay(root: Path, transform: Any) -> ReplayResult:
         journal=True,
         production_clock=True,
         allow_truncated=True,
+        role_route_configuration_fingerprint=None,
         child_event_transform=transform,
     )
 

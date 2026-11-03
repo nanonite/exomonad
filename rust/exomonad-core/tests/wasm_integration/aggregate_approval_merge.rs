@@ -529,6 +529,7 @@ fn owner_identity(
         topology: Topology::SharedDir,
         model: None,
         effort: None,
+        role_route: None,
         ledger_owned: true,
         slice_id: slice_id.map(str::to_string),
     }

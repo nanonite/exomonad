@@ -9604,14 +9604,15 @@ def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> 
     spawn_worker_call = next(
         arguments for name, arguments in transport.calls if name == "spawn_worker"
     )
+    worker_route = spawn_worker_call["role_route"]
     assert spawn_worker_call["agent_type"] == "codex"
     assert spawn_worker_call["model"] == "gpt-5.5"
-    assert spawn_worker_call["role"] == "worker"
-    assert spawn_worker_call["effort"] == "xhigh"
-    assert spawn_worker_call["route_configuration_fingerprint"] == "sha256:v1:" + "1" * 64
-    assert spawn_worker_call["route_manifest_digest"] == result.final_state.plan_manifest.digest
-    assert spawn_worker_call["route_policy_fingerprint"].startswith("sha256:v1:")
-    assert spawn_worker_call["route_fingerprint"].startswith("sha256:v1:")
+    assert worker_route["role"] == "worker"
+    assert worker_route["effort"] == "xhigh"
+    assert worker_route["configuration_fingerprint"] == "sha256:v1:" + "1" * 64
+    assert worker_route["manifest_digest"] == result.final_state.plan_manifest.digest
+    assert worker_route["policy_fingerprint"].startswith("sha256:v1:")
+    assert worker_route["route_fingerprint"].startswith("sha256:v1:")
     assert result.final_state.budgets.role_reserved == {"worker": 500}
     assert result.final_state.budgets.harness_reserved == {"codex/gpt-luna": 500}
     assert result.final_state.slices["worker-a"].model == "gpt-5.5"
@@ -9622,34 +9623,33 @@ def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> 
     assert worker_state.dispatch_route_manifest_digest == result.final_state.plan_manifest.digest
     assert (
         worker_state.dispatch_route_policy_fingerprint
-        == spawn_worker_call["route_policy_fingerprint"]
+        == worker_route["policy_fingerprint"]
     )
-    assert worker_state.dispatch_route_fingerprint == spawn_worker_call["route_fingerprint"]
+    assert worker_state.dispatch_route_fingerprint == worker_route["route_fingerprint"]
     worker_intent = next(intent for intent in result.effects if intent.operation == "spawn_worker")
-    assert worker_intent.arguments == spawn_worker_call
+    assert worker_intent.arguments["name"] == spawn_worker_call["name"]
+    assert worker_intent.arguments["task"] == spawn_worker_call["task"]
+    assert worker_intent.arguments["intent_id"] == spawn_worker_call["intent_id"]
+    assert worker_intent.arguments["route_fingerprint"] == worker_route["route_fingerprint"]
     reloaded_worker = RunStore("selector-run", tmp_path).load().slices["worker-a"]
     assert (
         DispatchAttempt.recorded_for(reloaded_worker, None).route_fingerprint
-        == (spawn_worker_call["route_fingerprint"])
+        == worker_route["route_fingerprint"]
     )
     leaf_call = next(arguments for name, arguments in transport.calls if name == "spawn_leaf")
-    assert all(
-        leaf_call[key] == spawn_worker_call[key]
-        for key in (
-            "harness",
-            "agent_type",
-            "model",
-            "role",
-            "effort",
-            "route_configuration_fingerprint",
-            "route_policy_fingerprint",
-            "route_manifest_digest",
-            "route_fingerprint",
-        )
-    )
+    leaf_route = leaf_call["role_route"]
+    assert leaf_route["harness"] == worker_route["harness"]
+    assert leaf_route["agent_type"] == worker_route["agent_type"]
+    assert leaf_route["model"] == worker_route["model"]
+    assert leaf_route["role"] == worker_route["role"]
+    assert leaf_route["effort"] == worker_route["effort"]
+    assert leaf_route["configuration_fingerprint"] == worker_route["configuration_fingerprint"]
+    assert leaf_route["policy_fingerprint"] == worker_route["policy_fingerprint"]
+    assert leaf_route["manifest_digest"] == worker_route["manifest_digest"]
+    assert leaf_route["route_fingerprint"] == worker_route["route_fingerprint"]
     assert (
         result.final_state.slices["leaf-a"].dispatch_route_fingerprint
-        == leaf_call["route_fingerprint"]
+        == leaf_route["route_fingerprint"]
     )
     assert result.final_state.fsm.phase is TLPhase.TLDone
 
@@ -9694,16 +9694,33 @@ def test_policy_selected_worker_route_survives_dispatch_journal_and_restart(
     )
 
     call = next(arguments for name, arguments in transport.calls if name == "spawn_worker")
-    assert call["harness"] == "codex/gpt-6-luna"
+    route = call["role_route"]
+    assert route["harness"] == "codex/gpt-6-luna"
     assert call["agent_type"] == "codex"
     assert call["model"] == "gpt-6-luna"
-    assert call["role"] == "worker" and call["effort"] == "xhigh"
-    assert call["route_configuration_fingerprint"] == "sha256:v1:" + "3" * 64
-    assert call["route_policy_fingerprint"].startswith("sha256:v1:")
-    assert call["route_manifest_digest"] == result.final_state.plan_manifest.digest
-    assert call["route_fingerprint"].startswith("sha256:v1:")
+    assert route["role"] == "worker" and route["effort"] == "xhigh"
+    assert route["configuration_fingerprint"] == "sha256:v1:" + "3" * 64
+    assert route["policy_fingerprint"].startswith("sha256:v1:")
+    assert route["manifest_digest"] == result.final_state.plan_manifest.digest
+    assert route["route_fingerprint"].startswith("sha256:v1:")
     action = next(intent for intent in result.effects if intent.operation == "spawn_worker")
-    assert action.arguments == call
+    action_arguments = action.arguments
+    assert action_arguments["name"] == call["name"]
+    assert action_arguments["task"] == call["task"]
+    assert action_arguments["intent_id"] == call["intent_id"]
+    assert route == {
+        "role": action_arguments["role"],
+        "harness": action_arguments["harness"],
+        "agent_type": action_arguments["agent_type"],
+        "model": action_arguments["model"],
+        "effort": action_arguments["effort"],
+        "configuration_fingerprint": action_arguments["route_configuration_fingerprint"],
+        "policy_fingerprint": action_arguments["route_policy_fingerprint"],
+        "manifest_digest": action_arguments["route_manifest_digest"],
+        "route_fingerprint": action_arguments["route_fingerprint"],
+        "dispatch_intent_id": action_arguments["intent_id"],
+        "scope_id": action_arguments["route_scope_id"],
+    }
     persisted = RunStore("route-restart-run", tmp_path).load().slices["worker-a"]
     restored_attempt = DispatchAttempt.recorded_for(persisted, None)
     assert (restored_attempt.harness, restored_attempt.model, restored_attempt.effort) == (
@@ -9711,26 +9728,26 @@ def test_policy_selected_worker_route_survives_dispatch_journal_and_restart(
         "gpt-6-luna",
         "xhigh",
     )
-    assert restored_attempt.route_fingerprint == call["route_fingerprint"]
+    assert restored_attempt.route_fingerprint == route["route_fingerprint"]
     event_payload = next(
         arguments["payload"]
         for name, arguments in transport.calls
         if name == "emit_controller_event" and arguments["event_type"] == "tl.dispatch_intended"
     )
-    assert event_payload["route_fingerprint"] == call["route_fingerprint"]
+    assert event_payload["route_fingerprint"] == route["route_fingerprint"]
     assert event_payload["effort"] == "xhigh"
     event = SimpleNamespace(data=event_payload)
     recovered_fields, error = driver_module._confirmed_spawn_route_state_fields(
         event,
         config,
         result.final_state,
-        call["harness"],
+        route["harness"],
         call["agent_type"],
         call["model"],
         None,
     )
     assert error is None
-    assert recovered_fields["dispatch_route_fingerprint"] == call["route_fingerprint"]
+    assert recovered_fields["dispatch_route_fingerprint"] == route["route_fingerprint"]
     conflicting_event = SimpleNamespace(
         data={**event_payload, "route_fingerprint": "sha256:v1:" + "5" * 64}
     )
@@ -9738,7 +9755,7 @@ def test_policy_selected_worker_route_survives_dispatch_journal_and_restart(
         conflicting_event,
         config,
         result.final_state,
-        call["harness"],
+        route["harness"],
         call["agent_type"],
         call["model"],
         None,
@@ -19192,6 +19209,7 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
                             "agent_type": "opencode",
                             "branch_name": branch,
                             "worktree_path": str(worktree),
+                            "role_route": dict(arguments["role_route"]),
                         },
                         "invocation": {
                             "invocation_id": "opencode-successor-invocation",
@@ -19253,28 +19271,31 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
         index for index, (name, _) in enumerate(transport.calls) if name == "resume_blocked_leaf"
     )
     resume_arguments = transport.calls[resume_index][1]
-    assert resume_arguments["role"] == "worker"
-    assert resume_arguments["harness"] == "opencode/opencode-go/deepseek-v4.1-flash"
-    assert resume_arguments["agent_type"] == "opencode"
-    assert resume_arguments["model"] == "opencode-go/deepseek-v4.1-flash"
-    assert resume_arguments["effort"] == "high"
-    assert resume_arguments["route_configuration_fingerprint"] == "sha256:v1:" + "4" * 64
-    assert resume_arguments["route_manifest_digest"] == manifest.digest
-    assert resume_arguments["route_fingerprint"].startswith("sha256:v1:")
+    route_arguments = resume_arguments["role_route"]
+    assert route_arguments["role"] == "worker"
+    assert route_arguments["harness"] == "opencode/opencode-go/deepseek-v4.1-flash"
+    assert route_arguments["agent_type"] == "opencode"
+    assert route_arguments["model"] == "opencode-go/deepseek-v4.1-flash"
+    assert route_arguments["effort"] == "high"
+    assert route_arguments["configuration_fingerprint"] == "sha256:v1:" + "4" * 64
+    assert route_arguments["manifest_digest"] == manifest.digest
+    assert route_arguments["route_fingerprint"].startswith("sha256:v1:")
     resume_entry = journal.entries_for("resume_blocked_leaf", slice_id)[0]
     journal_arguments = resume_entry["arguments"]
-    for key in (
-        "role",
-        "harness",
-        "agent_type",
-        "model",
-        "effort",
-        "route_configuration_fingerprint",
-        "route_policy_fingerprint",
-        "route_manifest_digest",
-        "route_fingerprint",
+    for journal_key, response_key in (
+        ("role", "role"),
+        ("harness", "harness"),
+        ("agent_type", "agent_type"),
+        ("model", "model"),
+        ("effort", "effort"),
+        ("route_configuration_fingerprint", "configuration_fingerprint"),
+        ("route_policy_fingerprint", "policy_fingerprint"),
+        ("route_manifest_digest", "manifest_digest"),
+        ("route_fingerprint", "route_fingerprint"),
     ):
-        assert journal_arguments.get(key) == resume_arguments.get(key)
+        assert journal_arguments.get(journal_key) == route_arguments.get(response_key)
+    assert journal_arguments["dispatch_intent_id"] == route_arguments["dispatch_intent_id"]
+    assert resume_entry["target"] == route_arguments["scope_id"]
     first_attempt_handoffs = [index for index in handoff_indexes if index < resume_index]
     assert len(first_attempt_handoffs) == 2
     assert [transport.calls[index][1].get("apply") for index in first_attempt_handoffs] == [
@@ -19295,7 +19316,7 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
     assert resumed.dispatch_effort == "high"
     assert resumed.dispatch_route_configuration_fingerprint == "sha256:v1:" + "4" * 64
     assert resumed.dispatch_route_manifest_digest == manifest.digest
-    assert resumed.dispatch_route_fingerprint == resume_arguments["route_fingerprint"]
+    assert resumed.dispatch_route_fingerprint == route_arguments["route_fingerprint"]
     assert len(observed_resume_intents) == (2 if response_lost else 1)
     assert resumed.dispatch_intent_id == observed_resume_intents[0]
     assert resumed.branch == branch
@@ -19918,6 +19939,9 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
                         "agent_type": "codex",
                         "branch_name": identity["birth_branch"],
                         "worktree_path": identity["working_dir"],
+                        "role_route": driver_module._blocked_resume_role_route_response(
+                            terminal_proof.resume
+                        ),
                     },
                     "invocation": {
                         "invocation_id": successor_id,
@@ -20289,6 +20313,9 @@ def test_terminal_provider_recovery_authorizes_effort_only_route_change(
                     "agent_type": "codex",
                     "branch_name": proof.resume.owner.branch,
                     "worktree_path": str(proof.resume.owner.worktree),
+                    "role_route": driver_module._blocked_resume_role_route_response(
+                        proof.resume
+                    ),
                 },
                 "invocation": {
                     "invocation_id": "effort-only-successor",
@@ -20991,6 +21018,9 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
                             "agent_type": "codex",
                             "branch_name": owner.branch,
                             "worktree_path": str(owner.worktree),
+                            "role_route": driver_module._blocked_resume_role_route_response(
+                                terminal.resume
+                            ),
                         },
                         "invocation": {
                             "invocation_id": successor_id,
@@ -21032,22 +21062,25 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
     transport_arguments = next(
         arguments for name, arguments in transport.calls if name == "resume_blocked_leaf"
     )
-    assert transport_arguments["harness"] == "codex/gpt-6-luna"
-    assert transport_arguments["model"] == "gpt-6-luna"
-    assert transport_arguments["effort"] == "xhigh"
-    assert transport_arguments["route_fingerprint"] == leaf.dispatch_route_fingerprint
-    for key in (
-        "role",
-        "harness",
-        "agent_type",
-        "model",
-        "effort",
-        "route_configuration_fingerprint",
-        "route_policy_fingerprint",
-        "route_manifest_digest",
-        "route_fingerprint",
+    transport_route = transport_arguments["role_route"]
+    assert transport_route["harness"] == "codex/gpt-6-luna"
+    assert transport_route["model"] == "gpt-6-luna"
+    assert transport_route["effort"] == "xhigh"
+    assert transport_route["route_fingerprint"] == leaf.dispatch_route_fingerprint
+    for route_key, journal_key in (
+        ("role", "role"),
+        ("harness", "harness"),
+        ("agent_type", "agent_type"),
+        ("model", "model"),
+        ("effort", "effort"),
+        ("configuration_fingerprint", "route_configuration_fingerprint"),
+        ("policy_fingerprint", "route_policy_fingerprint"),
+        ("manifest_digest", "route_manifest_digest"),
+        ("route_fingerprint", "route_fingerprint"),
+        ("dispatch_intent_id", "dispatch_intent_id"),
     ):
-        assert transport_arguments[key] == resume_arguments[key]
+        assert transport_route[route_key] == resume_arguments[journal_key]
+    assert transport_route["scope_id"] == plan.leaves[0].name
     assert (
         journal.entries_for("resume_blocked_leaf", plan.leaves[0].name)[0]["status"] == "confirmed"
     )
@@ -21156,6 +21189,9 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
                         "agent_type": "codex",
                         "branch_name": owner.branch,
                         "worktree_path": str(owner.worktree),
+                        "role_route": driver_module._blocked_resume_role_route_response(
+                            terminal.resume
+                        ),
                     },
                     "invocation": {
                         "invocation_id": successor_id,

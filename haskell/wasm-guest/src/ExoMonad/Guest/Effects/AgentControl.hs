@@ -27,6 +27,7 @@ module ExoMonad.Guest.Effects.AgentControl
 
     -- * Types
     AgentType (..),
+    RoleRoute (..),
     SpawnResult (..),
     PermissionFlags (..),
     defaultPermFlags,
@@ -93,9 +94,43 @@ instance JsonSchema AgentType where
         "enum" .= (["claude", "shoal", "opencode", "codex"] :: [Text])
       ]
 
+-- | Accepted route identity carried across the guest/host boundary.
+data RoleRoute = RoleRoute
+  { roleRouteRole :: Text,
+    roleRouteHarness :: Text,
+    roleRouteAgentType :: Maybe AgentType,
+    roleRouteModel :: Maybe Text,
+    roleRouteEffort :: Maybe Text,
+    roleRouteConfigurationFingerprint :: Maybe Text,
+    roleRoutePolicyFingerprint :: Maybe Text,
+    roleRouteManifestDigest :: Maybe Text,
+    roleRouteFingerprint :: Maybe Text,
+    roleRouteDispatchIntentId :: Maybe Text,
+    roleRouteScopeId :: Maybe Text
+  }
+  deriving (Show, Eq, Generic)
+
+instance FromJSON RoleRoute where
+  parseJSON = withObject "RoleRoute" $ \value ->
+    RoleRoute
+      <$> value .: "role"
+      <*> value .: "harness"
+      <*> value .:? "agent_type"
+      <*> value .:? "model"
+      <*> value .:? "effort"
+      <*> value .:? "configuration_fingerprint"
+      <*> value .:? "policy_fingerprint"
+      <*> value .:? "manifest_digest"
+      <*> value .:? "route_fingerprint"
+      <*> value .:? "dispatch_intent_id"
+      <*> value .:? "scope_id"
+
+instance JsonSchema RoleRoute
+
 -- | Result of spawning an agent.
 data SpawnResult = SpawnResult
-  { worktreePath :: Text,
+  { agentId :: Maybe Text,
+    worktreePath :: Text,
     branchName :: Text,
     tabName :: Text,
     issueTitle :: Text,
@@ -108,14 +143,16 @@ data SpawnResult = SpawnResult
     routingTargetId :: Maybe Text,
     invocationFresh :: Maybe Bool,
     invocationReady :: Maybe Bool,
-    invocationOutcome :: Maybe Text
+    invocationOutcome :: Maybe Text,
+    roleRouteEvidence :: Maybe Value
   }
   deriving (Show, Eq, Generic)
 
 instance FromJSON SpawnResult where
   parseJSON = withObject "SpawnResult" $ \v ->
     SpawnResult
-      <$> v .: "worktree_path"
+      <$> v .:? "agent_id"
+      <*> v .: "worktree_path"
       <*> v .: "branch_name"
       <*> v .: "tab_name"
       <*> v .: "issue_title"
@@ -129,10 +166,12 @@ instance FromJSON SpawnResult where
       <*> v .:? "invocation_fresh"
       <*> v .:? "invocation_ready"
       <*> v .:? "invocation_outcome"
+      <*> v .:? "role_route"
 
 instance ToJSON SpawnResult where
   toJSON
     ( SpawnResult
+        agentId
         w
         b
         t
@@ -147,9 +186,11 @@ instance ToJSON SpawnResult where
         invocationFresh
         invocationReady
         invocationOutcome
+        roleRouteEvidence
       ) =
       object
         [ "worktree_path" .= w,
+          "agent_id" .= agentId,
           "branch_name" .= b,
           "tab_name" .= t,
           "issue_title" .= i,
@@ -162,7 +203,8 @@ instance ToJSON SpawnResult where
           "routing_target_id" .= routingTargetId,
           "invocation_fresh" .= invocationFresh,
           "invocation_ready" .= invocationReady,
-          "invocation_outcome" .= invocationOutcome
+          "invocation_outcome" .= invocationOutcome,
+          "role_route" .= roleRouteEvidence
         ]
 
 -- ============================================================================
@@ -203,6 +245,7 @@ data SpawnLeafSubtreeConfig = SpawnLeafSubtreeConfig
     slcRole :: Maybe Text,
     slcAgentType :: Maybe AgentType,
     slcModel :: Maybe Text,
+    slcRoleRoute :: Maybe RoleRoute,
     slcPerms :: PermissionFlags,
     slcStandaloneRepo :: Bool,
     slcAllowedDirs :: [Text],
@@ -231,6 +274,7 @@ data SpawnWorkerConfig = SpawnWorkerConfig
     swcIntentId :: Maybe Text,
     swcAgentType :: Maybe AgentType,
     swcModel :: Maybe Text,
+    swcRoleRoute :: Maybe RoleRoute,
     swcPerms :: PermissionFlags
   }
   deriving (Show, Eq, Generic)
@@ -310,7 +354,8 @@ runAgentControlSuspend = interpret $ \case
               PA.spawnLeafSubtreeRequestExpectedInvocationId = fromText (fromMaybe "" (slcExpectedInvocationId cfg)),
               PA.spawnLeafSubtreeRequestExpectedBranch = fromText (fromMaybe "" (slcExpectedBranch cfg)),
               PA.spawnLeafSubtreeRequestExpectedWorktreeFingerprint = fromText (fromMaybe "" (slcExpectedWorktreeFingerprint cfg)),
-              PA.spawnLeafSubtreeRequestHumanApproved = slcHumanApproved cfg
+              PA.spawnLeafSubtreeRequestHumanApproved = slcHumanApproved cfg,
+              PA.spawnLeafSubtreeRequestRoleRoute = roleRouteToProto <$> slcRoleRoute cfg
             }
     result <- suspendEffect @Agent.AgentSpawnLeafSubtree req
     pure $ case result of
@@ -340,7 +385,8 @@ runAgentControlSuspend = interpret $ \case
               PA.spawnLeafSubtreeRequestExpectedInvocationId = fromText "",
               PA.spawnLeafSubtreeRequestExpectedBranch = fromText "",
               PA.spawnLeafSubtreeRequestExpectedWorktreeFingerprint = fromText "",
-              PA.spawnLeafSubtreeRequestHumanApproved = False
+              PA.spawnLeafSubtreeRequestHumanApproved = False,
+              PA.spawnLeafSubtreeRequestRoleRoute = Nothing
             }
     result <- suspendEffect @Agent.AgentSpawnLeafSubtree req
     pure $ case result of
@@ -376,14 +422,21 @@ runAgentControlSuspend = interpret $ \case
               PA.spawnWorkerRequestDisallowedTools = V.fromList (map fromText (disallowedTools (swcPerms cfg))),
               PA.spawnWorkerRequestAgentType = Enumerated (Right (maybe PA.AgentTypeAGENT_TYPE_UNSPECIFIED toProtoAgentType (swcAgentType cfg))),
               PA.spawnWorkerRequestIntentId = fromText (fromMaybe "" (swcIntentId cfg)),
-              PA.spawnWorkerRequestModel = fromText (fromMaybe "" (swcModel cfg))
+              PA.spawnWorkerRequestModel = fromText (fromMaybe "" (swcModel cfg)),
+              PA.spawnWorkerRequestRoleRoute = roleRouteToProto <$> swcRoleRoute cfg
             }
     result <- suspendEffect @Agent.AgentSpawnWorker req
     pure $ case result of
       Left err -> Left err
       Right resp -> case PA.spawnWorkerResponseAgent resp of
         Nothing -> Left (EffectError (Just (EffectErrorKindInvalidInput (InvalidInput "SpawnWorker succeeded but no agent info returned"))))
-        Just info -> Right (protoAgentInfoToSpawnResult info)
+        Just info ->
+          let result =
+                (protoAgentInfoToSpawnResult info)
+                  { roleRouteEvidence = roleRouteToJson <$> PA.spawnWorkerResponseRoleRoute resp
+                  }
+           in Right
+                (applyInvocationHandoff result (PA.spawnWorkerResponseInvocation resp))
   CloseWorkerPaneC pane -> do
     let req =
           PA.CloseWorkerPaneRequest
@@ -402,6 +455,48 @@ toProtoAgentType Shoal = PA.AgentTypeAGENT_TYPE_SHOAL
 toProtoAgentType OpenCode = PA.AgentTypeAGENT_TYPE_OPENCODE
 toProtoAgentType Codex = PA.AgentTypeAGENT_TYPE_CODEX
 
+roleRouteToProto :: RoleRoute -> PA.RoleRoute
+roleRouteToProto route =
+  PA.RoleRoute
+    { PA.roleRouteRole = fromText (roleRouteRole route),
+      PA.roleRouteHarness = fromText (roleRouteHarness route),
+      PA.roleRouteAgentType = Enumerated (Right (maybe PA.AgentTypeAGENT_TYPE_UNSPECIFIED toProtoAgentType (roleRouteAgentType route))),
+      PA.roleRouteModel = fromText (fromMaybe "" (roleRouteModel route)),
+      PA.roleRouteEffort = fromText (fromMaybe "" (roleRouteEffort route)),
+      PA.roleRouteConfigurationFingerprint = fromText (fromMaybe "" (roleRouteConfigurationFingerprint route)),
+      PA.roleRoutePolicyFingerprint = fromText (fromMaybe "" (roleRoutePolicyFingerprint route)),
+      PA.roleRouteManifestDigest = fromText (fromMaybe "" (roleRouteManifestDigest route)),
+      PA.roleRouteRouteFingerprint = fromText (fromMaybe "" (roleRouteFingerprint route)),
+      PA.roleRouteDispatchIntentId = fromText (fromMaybe "" (roleRouteDispatchIntentId route)),
+      PA.roleRouteScopeId = fromText (fromMaybe "" (roleRouteScopeId route))
+    }
+
+roleRouteToJson :: PA.RoleRoute -> Value
+roleRouteToJson route =
+  object
+    [ "role" .= toText (PA.roleRouteRole route),
+      "harness" .= toText (PA.roleRouteHarness route),
+      "agent_type" .= protoAgentTypeLabel (PA.roleRouteAgentType route),
+      "model" .= optionalText (PA.roleRouteModel route),
+      "effort" .= optionalText (PA.roleRouteEffort route),
+      "configuration_fingerprint" .= optionalText (PA.roleRouteConfigurationFingerprint route),
+      "policy_fingerprint" .= optionalText (PA.roleRoutePolicyFingerprint route),
+      "manifest_digest" .= optionalText (PA.roleRouteManifestDigest route),
+      "route_fingerprint" .= optionalText (PA.roleRouteRouteFingerprint route),
+      "dispatch_intent_id" .= optionalText (PA.roleRouteDispatchIntentId route),
+      "scope_id" .= optionalText (PA.roleRouteScopeId route)
+    ]
+  where
+    optionalText value =
+      let text = toText value
+       in if T.null text then Aeson.Null else Aeson.String text
+
+protoAgentTypeLabel :: Enumerated PA.AgentType -> Value
+protoAgentTypeLabel (Enumerated (Right PA.AgentTypeAGENT_TYPE_CLAUDE)) = Aeson.String "claude"
+protoAgentTypeLabel (Enumerated (Right PA.AgentTypeAGENT_TYPE_OPENCODE)) = Aeson.String "opencode"
+protoAgentTypeLabel (Enumerated (Right PA.AgentTypeAGENT_TYPE_CODEX)) = Aeson.String "codex"
+protoAgentTypeLabel _ = Aeson.Null
+
 agentTypeLabel :: AgentType -> Text
 agentTypeLabel Claude = "claude"
 agentTypeLabel Retired = "retired"
@@ -419,7 +514,10 @@ permissionsToProto perms =
 protoAgentInfoToSpawnResult :: PA.AgentInfo -> SpawnResult
 protoAgentInfoToSpawnResult info =
   SpawnResult
-    { worktreePath = toText (PA.agentInfoWorktreePath info),
+    { agentId =
+        let value = toText (PA.agentInfoId info)
+         in if T.null value then Nothing else Just value,
+      worktreePath = toText (PA.agentInfoWorktreePath info),
       branchName = toText (PA.agentInfoBranchName info),
       tabName = toText (PA.agentInfoMuxWindow info),
       issueTitle = toText (PA.agentInfoIssue info),
@@ -440,7 +538,8 @@ protoAgentInfoToSpawnResult info =
       routingTargetId = Nothing,
       invocationFresh = Nothing,
       invocationReady = Nothing,
-      invocationOutcome = Nothing
+      invocationOutcome = Nothing,
+      roleRouteEvidence = Nothing
     }
 
 applyInvocationHandoff :: SpawnResult -> Maybe PA.InvocationHandoff -> SpawnResult
@@ -454,7 +553,8 @@ applyInvocationHandoff result (Just handoff) =
       routingTargetId = Just (toText (PA.invocationHandoffTargetId handoff)),
       invocationFresh = Just (PA.invocationHandoffFresh handoff),
       invocationReady = Just (PA.invocationHandoffReady handoff),
-      invocationOutcome = Just (toText (PA.invocationHandoffOutcome handoff))
+      invocationOutcome = Just (toText (PA.invocationHandoffOutcome handoff)),
+      roleRouteEvidence = fmap roleRouteToJson (PA.invocationHandoffRoleRoute handoff)
     }
 
 resumeHandoffError :: Text -> EffectError

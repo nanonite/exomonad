@@ -28,7 +28,8 @@ resumeBlockedLeafTests =
                   rblExpectedBranch = "main.leaf",
                   rblExpectedWorktreeFingerprint = "sha256:abc",
                   rblTask = "Continue the blocked assignment",
-                  rblHumanApproved = True
+                  rblHumanApproved = True,
+                  rblRoleRoute = Nothing
                 }
         (decode "{\"chainlink_issue_id\":949,\"expected_invocation_id\":\"invocation-1\",\"expected_branch\":\"main.leaf\",\"expected_worktree_fingerprint\":\"sha256:abc\",\"task\":\"Continue the blocked assignment\",\"human_approved\":true}" :: Maybe ResumeBlockedLeafArgs)
           @=? Just args,
@@ -43,7 +44,8 @@ resumeBlockedLeafTests =
             "expected_branch",
             "expected_worktree_fingerprint",
             "task",
-            "human_approved"
+            "human_approved",
+            "role_route"
           ]
         KeyMap.member "agent_type" properties @?= False
         KeyMap.member "branch_name" properties @?= False,

@@ -1770,6 +1770,7 @@ impl<
                 topology: Topology::WorktreePerAgent,
                 model: model.clone(),
                 effort: effort.clone(),
+                role_route: None,
                 ledger_owned: false,
                 slice_id: None,
             };
@@ -2102,8 +2103,17 @@ impl<
             persist_dispatch_intent(self.project_dir(), &agent_name, intent_id).await?;
 
             let role = crate::domain::Role::worker();
-            let model = self.effective_model_for(agent_type, role.as_str(), options.model.as_deref());
-            let effort = self.effective_effort_for(role.as_str(), None);
+            let (model, effort) = match options.role_route.as_ref() {
+                Some(route) => (route.model.clone(), route.effort.clone()),
+                None => (
+                    self.effective_model_for(
+                        agent_type,
+                        role.as_str(),
+                        options.model.as_deref(),
+                    ),
+                    self.effective_effort_for(role.as_str(), options.effort.as_deref()),
+                ),
+            };
             let parent_bb = self.effective_birth_branch(Some(&ctx.birth_branch));
             let session_branch = BranchName::try_from_str(parent_bb.as_str()).expect("validated string input is non-empty");
             let mut env_vars = self.common_spawn_env(&agent_name, &session_branch, &role);
@@ -2134,7 +2144,7 @@ impl<
                         agent_name.as_str(),
                         "worker",
                         &self.extra_mcp_servers,
-                        None,
+                        effort.as_deref(),
                         &role_context,
                     );
                     let opencode_json_path = agent_config_dir.join("opencode.json");
@@ -2144,11 +2154,15 @@ impl<
                     info!(path = %opencode_json_path.display(), agent_name = %agent_name, "Wrote worker opencode.json and plugin to agent config dir");
                 }
                 AgentType::Codex => {
-                    self.write_codex_config_files(
+                    self.write_codex_config_files_with_effort(
                         &agent_config_dir,
                         &role,
                         &agent_name,
-                        model.as_deref(),
+                        RoleRouteLaunchSettings {
+                            model: model.as_deref(),
+                            effort: effort.as_deref(),
+                            route_bound: options.role_route.is_some(),
+                        },
                         &self.extra_mcp_servers,
                     )
                     .await?;
@@ -2176,6 +2190,8 @@ impl<
                 Some(&caller_tab),
                 Some(&options.claude_flags),
                 model.as_deref(),
+                effort.as_deref(),
+                options.role_route.is_none(),
             )
               .await?;
               let pane_id_string = pane_id.as_str().to_string();
@@ -2189,17 +2205,42 @@ impl<
                     .context("generated agent slug was empty")?,
                 agent_type,
                 birth_branch: parent_bb.clone(),
-                parent_branch: parent_bb,
+                parent_branch: parent_bb.clone(),
                 working_dir: ctx.working_dir.clone(),
                 display_name: display_name.clone(),
                 topology: Topology::SharedDir,
                       model: model.clone(),
                       effort: effort.clone(),
+                      role_route: options.role_route.clone(),
                   ledger_owned: false,
                 slice_id: Some(options.name.to_string()),
             };
-            self.finalize_spawn(&agent_name, routing, Some(identity_record))
-                .await?;
+            let identity_context = super::InvocationIdentityContext {
+                runtime_agent_id: Some(agent_name.to_string()),
+                slice_id: Some(options.name.to_string()),
+                branch: Some(parent_bb.to_string()),
+                worktree: Some(ctx.working_dir.to_string_lossy().into_owned()),
+            };
+            self.finalize_spawn_with_invocation(
+                &agent_name,
+                routing,
+                Some(identity_record),
+                super::InvocationMetadata {
+                    runtime: agent_type,
+                    trigger: super::InvocationTrigger::Spawn,
+                    pr_number: None,
+                    head_sha: None,
+                    model: model.clone(),
+                    effort: effort.clone(),
+                    identity: Some(identity_context),
+                    recovery_lineage: None,
+                    expected_live_invocation_id: None,
+                    mode: super::InvocationMode::OneShot,
+                    role_route: options.role_route.clone(),
+                },
+                false,
+            )
+            .await?;
 
             self.emit_agent_started(&agent_name)?;
 
@@ -2541,6 +2582,7 @@ impl<
                 topology: Topology::WorktreePerAgent,
                       model: model.clone(),
                       effort: effort.clone(),
+                      role_route: None,
                   ledger_owned: false,
                 slice_id: Some(options.branch_name.clone()),
             };
@@ -2568,6 +2610,7 @@ impl<
                     expected_live_invocation_id: None,
                     identity: None,
                     mode: InvocationMode::from_role(options.role.as_ref().map(|role| role.as_str())),
+                    role_route: None,
                 },
                 false,
             )
@@ -2941,9 +2984,20 @@ impl<
 
             let default_dev = crate::domain::Role::dev();
             let role = options.role.as_ref().unwrap_or(&default_dev);
-            let model = self.effective_model_for(agent_type, role.as_str(), options.model.as_deref());
-            let effort = self.effective_effort_for(role.as_str(), None);
-            let identity_model = if options.expected_agent_name.is_some() {
+            let (model, effort) = match options.role_route.as_ref() {
+                Some(route) => (route.model.clone(), route.effort.clone()),
+                None => (
+                    self.effective_model_for(
+                        agent_type,
+                        role.as_str(),
+                        options.model.as_deref(),
+                    ),
+                    self.effective_effort_for(role.as_str(), options.effort.as_deref()),
+                ),
+            };
+            let identity_model = if options.role_route.is_some()
+                || options.expected_agent_name.is_some()
+            {
                 model.clone()
             } else {
                 existing_identity_record
@@ -2952,7 +3006,9 @@ impl<
                     .or_else(|| prior_identity.as_ref().and_then(|record| record.model.clone()))
                     .or_else(|| model.clone())
             };
-            let identity_effort = if options.expected_agent_name.is_some() {
+            let identity_effort = if options.role_route.is_some()
+                || options.expected_agent_name.is_some()
+            {
                 effort.clone()
             } else {
                 existing_identity_record
@@ -2962,8 +3018,18 @@ impl<
                     .or_else(|| effort.clone())
             };
             let mut env_vars = self.common_spawn_env(&agent_name, &branch_name, role);
-            self.write_agent_mcp_config(effective_project_dir, &worktree_path, agent_type, role)
-                .await?;
+            self.write_agent_mcp_config_with_route(
+                effective_project_dir,
+                &worktree_path,
+                agent_type,
+                role,
+                RoleRouteLaunchSettings {
+                    model: model.as_deref(),
+                    effort: effort.as_deref(),
+                    route_bound: options.role_route.is_some(),
+                },
+            )
+            .await?;
 
             // The branch head this spawn settled on is what a PR is matched
             // against, so it is read from git rather than taken on trust. A
@@ -3082,6 +3148,11 @@ impl<
                 topology: Topology::WorktreePerAgent,
                 model: identity_model.clone(),
                 effort: identity_effort.clone(),
+                role_route: options
+                    .role_route
+                    .clone()
+                    .or_else(|| existing_identity_record.as_ref()?.role_route.clone())
+                    .or_else(|| prior_identity.as_ref()?.role_route.clone()),
                 ledger_owned: prior_identity
                     .as_ref()
                     .is_some_and(|record| record.ledger_owned),
@@ -3115,6 +3186,7 @@ impl<
                       expected_live_invocation_id: None,
                       identity: None,
                       mode: InvocationMode::from_role(options.role.as_ref().map(|role| role.as_str())),
+                      role_route: options.role_route.clone(),
                   },
                 false,
             )
@@ -4826,6 +4898,8 @@ mod tests {
                 invocation_pr_number: None,
                 recovery_lineage: None,
                 model: None,
+                effort: None,
+                role_route: None,
             }
         }
 
@@ -5767,6 +5841,8 @@ mod tests {
             expected_agent_name: None,
             invocation_pr_number: None,
             recovery_lineage: None,
+            effort: None,
+            role_route: None,
         };
         let birth_branch = BirthBranch::try_from_str("main").unwrap();
         let error = service

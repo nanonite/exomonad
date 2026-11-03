@@ -1282,6 +1282,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: false,
             slice_id: None,
         };
@@ -1341,6 +1342,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: false,
             slice_id: None,
         };
@@ -1390,6 +1392,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: false,
             slice_id: None,
         };

@@ -143,6 +143,7 @@ data SpawnLeafSubtreeArgs = SpawnLeafSubtreeArgs
     slsIntentId :: Maybe Text,
     slsAgentType :: Maybe AC.AgentType,
     slsModel :: Maybe Text,
+    slsRoleRoute :: Maybe AC.RoleRoute,
     slsPermissionMode :: Maybe Text,
     slsAllowedTools :: Maybe [Text],
     slsDisallowedTools :: Maybe [Text],
@@ -164,6 +165,7 @@ instance FromJSON SpawnLeafSubtreeArgs where
       <*> v .:? "intent_id"
       <*> v .:? "agent_type"
       <*> v .:? "model"
+      <*> v .:? "role_route"
       <*> v .:? "permission_mode"
       <*> v .:? "allowed_tools"
       <*> v .:? "disallowed_tools"
@@ -188,6 +190,7 @@ spawnLeafSubtreeSchema =
       ("intent_id", "Controller dispatch intent identifier used to correlate agent.spawned confirmation."),
       ("agent_type", "Agent type for the leaf: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
       ("model", "Optional model override, separate from agent_type."),
+      ("role_route", "Controller-authorized role, harness, model, effort, and configuration provenance for this launch."),
       ("permission_mode", "Permission mode for the agent. Omit for --dangerously-skip-permissions."),
       ("allowed_tools", "Tool patterns to allow. Omit for no restriction."),
       ("disallowed_tools", "Tool patterns to disallow. Omit for no restriction."),
@@ -228,6 +231,7 @@ spawnLeafSubtreeCore args = do
                 AC.slcRole = Nothing,
                 AC.slcAgentType = slsAgentType args,
                 AC.slcModel = slsModel args,
+                AC.slcRoleRoute = slsRoleRoute args,
                 AC.slcPerms = perms,
                 AC.slcStandaloneRepo = standaloneRepo,
                 AC.slcAllowedDirs = fromMaybe [] (slsAllowedDirs args),
@@ -284,6 +288,7 @@ data WorkerSpec = WorkerSpec
     wsType :: Maybe WorkerType,
     wsAgentType :: Maybe AC.AgentType,
     wsModel :: Maybe Text,
+    wsRoleRoute :: Maybe AC.RoleRoute,
     wsPermissionMode :: Maybe Text,
     wsAllowedTools :: Maybe [Text],
     wsDisallowedTools :: Maybe [Text]
@@ -310,6 +315,7 @@ instance JsonSchema WorkerSpec where
           ("type", "Worker type: 'implementation' (default) or 'research'. Research workers are read-only — they explore, search, and report findings via notify_parent."),
           ("agent_type", "Agent type for the worker: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
           ("model", "Optional model override, separate from agent_type."),
+          ("role_route", "Controller-authorized role, harness, model, effort, and configuration provenance for this launch."),
           ("permission_mode", "Permission mode for the agent. Omit for --dangerously-skip-permissions."),
           ("allowed_tools", "Tool patterns to allow. Omit for no restriction."),
           ("disallowed_tools", "Tool patterns to disallow. Omit for no restriction.")
@@ -334,6 +340,7 @@ instance FromJSON WorkerSpec where
       <*> v .:? "type"
       <*> v .:? "agent_type"
       <*> v .:? "model"
+      <*> v .:? "role_route"
       <*> v .:? "permission_mode"
       <*> v .:? "allowed_tools"
       <*> v .:? "disallowed_tools"
@@ -397,6 +404,7 @@ spawnWorkerSpecCore spec = do
             AC.swcIntentId = wsIntentId spec,
             AC.swcAgentType = wsAgentType spec,
             AC.swcModel = wsModel spec,
+            AC.swcRoleRoute = wsRoleRoute spec,
             AC.swcPerms = perms
           }
   AC.spawnWorker cfg
@@ -421,6 +429,7 @@ data SpawnLeafArgs = SpawnLeafArgs
     slIntentId :: Maybe Text,
     slAgentType :: Maybe AC.AgentType,
     slModel :: Maybe Text,
+    slRoleRoute :: Maybe AC.RoleRoute,
     slReadFirst :: Maybe [Text],
     slSteps :: Maybe [Text],
     slVerify :: Maybe [Text],
@@ -437,6 +446,7 @@ instance FromJSON SpawnLeafArgs where
       <*> v .:? "intent_id"
       <*> v .:? "agent_type"
       <*> v .:? "model"
+      <*> v .:? "role_route"
       <*> v .:? "read_first"
       <*> v .:? "steps"
       <*> v .:? "verify"
@@ -453,6 +463,7 @@ spawnLeafSchema =
       ("task", "What to build. Combined with steps/verify/boundary into structured spec"),
       ("intent_id", "Controller dispatch intent identifier used to correlate agent.spawned confirmation."),
       ("agent_type", "Agent type for the leaf: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
+      ("role_route", "Controller-authorized role, harness, model, effort, and configuration provenance for this launch."),
       ("steps", "Numbered implementation steps with code snippets and exact file paths"),
       ("verify", "Exact verification commands (e.g., 'cargo test --workspace')"),
       ("boundary", "DO NOT rules for known failure modes"),
@@ -469,6 +480,7 @@ spawnLeafCore args = do
             slsIntentId = slIntentId args,
             slsAgentType = slAgentType args,
             slsModel = slModel args,
+            slsRoleRoute = slRoleRoute args,
             slsPermissionMode = Nothing,
             slsAllowedTools = Nothing,
             slsDisallowedTools = Nothing,
@@ -502,6 +514,7 @@ buildLeafTask args =
             wsType = Nothing,
             wsAgentType = Nothing,
             wsModel = slModel args,
+            wsRoleRoute = slRoleRoute args,
             wsPermissionMode = Nothing,
             wsAllowedTools = Nothing,
             wsDisallowedTools = Nothing
@@ -519,7 +532,8 @@ data SpawnWorkerToolArgs = SpawnWorkerToolArgs
     swtTask :: Text,
     swtIntentId :: Maybe Text,
     swtAgentType :: Maybe AC.AgentType,
-    swtModel :: Maybe Text
+    swtModel :: Maybe Text,
+    swtRoleRoute :: Maybe AC.RoleRoute
   }
   deriving (Show, Eq, Generic)
 
@@ -531,6 +545,7 @@ instance FromJSON SpawnWorkerToolArgs where
       <*> v .:? "intent_id"
       <*> v .:? "agent_type"
       <*> v .:? "model"
+      <*> v .:? "role_route"
 
 spawnWorkerToolDescription :: Text
 spawnWorkerToolDescription = "Spawn an ephemeral worker in a tmux pane. The worker runs in YOUR directory on YOUR branch \x2014 no isolation, no PR, so the TL worktree must be clean before spawning. Commit the scaffold or discard throwaway output before retrying. Workers are sequential per TL tab; wait for the active worker handoff before spawning another worker, or use spawn_leaf for parallel PR work. Agent type defaults to the server config; pass agent_type only when this worker needs a specific supported runtime. PREFER WORKERS OVER DOING WORK YOURSELF \x2014 worker tokens cost far less than TL tokens. Put everything in the task string: context, instructions, file paths, anti-patterns. Workers send results via notify_parent. Claude Code parents should create a team using TeamCreate before spawning Claude Code workers. After spawning, return immediately."
@@ -542,7 +557,8 @@ spawnWorkerToolSchema =
       ("task", "The full prompt. Everything the worker needs in one string"),
       ("intent_id", "Controller dispatch intent identifier used to correlate agent.spawned confirmation."),
       ("agent_type", "Agent type for the worker: 'claude', 'opencode', or 'codex'. Omit to use the server default."),
-      ("model", "Optional model override, separate from agent_type.")
+      ("model", "Optional model override, separate from agent_type."),
+      ("role_route", "Controller-authorized role, harness, model, effort, and configuration provenance for this launch.")
     ]
 
 spawnWorkerToolCore :: SpawnWorkerToolArgs -> Eff Effects MCPCallOutput
@@ -565,6 +581,7 @@ spawnWorkerToolCore args = do
             wsType = Nothing,
             wsAgentType = swtAgentType args,
             wsModel = swtModel args,
+            wsRoleRoute = swtRoleRoute args,
             wsPermissionMode = Nothing,
             wsAllowedTools = Nothing,
             wsDisallowedTools = Nothing

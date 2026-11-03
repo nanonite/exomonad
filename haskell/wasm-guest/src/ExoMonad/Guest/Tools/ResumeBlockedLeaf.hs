@@ -16,7 +16,7 @@ module ExoMonad.Guest.Tools.ResumeBlockedLeaf
 where
 
 import Control.Monad.Freer (Eff)
-import Data.Aeson (FromJSON (..), object, withObject, (.:), (.=))
+import Data.Aeson (FromJSON (..), object, withObject, (.:), (.:?), (.=))
 import Data.Aeson qualified as Aeson
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -41,7 +41,8 @@ data ResumeBlockedLeafArgs = ResumeBlockedLeafArgs
     rblExpectedBranch :: Text,
     rblExpectedWorktreeFingerprint :: Text,
     rblTask :: Text,
-    rblHumanApproved :: Bool
+    rblHumanApproved :: Bool,
+    rblRoleRoute :: Maybe AC.RoleRoute
   }
   deriving (Show, Eq, Generic)
 
@@ -54,6 +55,7 @@ instance FromJSON ResumeBlockedLeafArgs where
       <*> value .: "expected_worktree_fingerprint"
       <*> value .: "task"
       <*> value .: "human_approved"
+      <*> value .:? "role_route"
 
 resumeBlockedLeafDescription :: Text
 resumeBlockedLeafDescription =
@@ -67,7 +69,8 @@ resumeBlockedLeafSchema =
       ("expected_branch", "Exact owner branch identity from the blocked handoff"),
       ("expected_worktree_fingerprint", "SHA-256 fingerprint of the preserved worktree status"),
       ("task", "Complete continuation task and human guidance"),
-      ("human_approved", "Explicit operator approval for this same-owner resume")
+      ("human_approved", "Explicit operator approval for this same-owner resume"),
+      ("role_route", "Controller-authorized worker route tied to the durable dispatch intent")
     ]
 
 resumeBlockedLeafCore :: ResumeBlockedLeafArgs -> Eff Effects (Either SpawnToolFailure Aeson.Value)
@@ -90,6 +93,7 @@ resumeBlockedLeafCore args
               AC.slcRole = Nothing,
               AC.slcAgentType = Nothing,
               AC.slcModel = Nothing,
+              AC.slcRoleRoute = rblRoleRoute args,
               AC.slcPerms = AC.defaultPermFlags,
               AC.slcStandaloneRepo = False,
               AC.slcAllowedDirs = [],

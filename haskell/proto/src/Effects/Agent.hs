@@ -115,6 +115,354 @@ instance (HsJSONPB.FromJSON AgentType) where
 
 instance (HsProtobuf.Finite AgentType)
 
+data RoleRoute
+  = RoleRoute
+  { roleRouteRole :: Hs.Text,
+    roleRouteHarness :: Hs.Text,
+    roleRouteAgentType :: (HsProtobuf.Enumerated Effects.Agent.AgentType),
+    roleRouteModel :: Hs.Text,
+    roleRouteEffort :: Hs.Text,
+    roleRouteConfigurationFingerprint :: Hs.Text,
+    roleRoutePolicyFingerprint :: Hs.Text,
+    roleRouteManifestDigest :: Hs.Text,
+    roleRouteRouteFingerprint :: Hs.Text,
+    roleRouteDispatchIntentId :: Hs.Text,
+    roleRouteScopeId :: Hs.Text
+  }
+  deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
+
+instance (Hs.NFData RoleRoute)
+
+instance (HsProtobuf.Named RoleRoute) where
+  nameOf _ = Hs.fromString "RoleRoute"
+
+instance (HsProtobuf.HasDefault RoleRoute)
+
+instance (HsProtobuf.Message RoleRoute) where
+  encodeMessage
+    _
+    RoleRoute
+      { roleRouteRole,
+        roleRouteHarness,
+        roleRouteAgentType,
+        roleRouteModel,
+        roleRouteEffort,
+        roleRouteConfigurationFingerprint,
+        roleRoutePolicyFingerprint,
+        roleRouteManifestDigest,
+        roleRouteRouteFingerprint,
+        roleRouteDispatchIntentId,
+        roleRouteScopeId
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( Hs.mappend
+                ( Hs.mappend
+                    ( Hs.mappend
+                        ( Hs.mappend
+                            ( Hs.mappend
+                                ( Hs.mappend
+                                    ( Hs.mappend
+                                        ( Hs.mappend
+                                            ( HsProtobuf.encodeMessageField
+                                                (HsProtobuf.FieldNumber 1)
+                                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                    roleRouteRole
+                                                )
+                                            )
+                                            ( HsProtobuf.encodeMessageField
+                                                (HsProtobuf.FieldNumber 2)
+                                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                    roleRouteHarness
+                                                )
+                                            )
+                                        )
+                                        ( HsProtobuf.encodeMessageField
+                                            (HsProtobuf.FieldNumber 3)
+                                            roleRouteAgentType
+                                        )
+                                    )
+                                    ( HsProtobuf.encodeMessageField
+                                        (HsProtobuf.FieldNumber 4)
+                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                            roleRouteModel
+                                        )
+                                    )
+                                )
+                                ( HsProtobuf.encodeMessageField
+                                    (HsProtobuf.FieldNumber 5)
+                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                        roleRouteEffort
+                                    )
+                                )
+                            )
+                            ( HsProtobuf.encodeMessageField
+                                (HsProtobuf.FieldNumber 6)
+                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                    roleRouteConfigurationFingerprint
+                                )
+                            )
+                        )
+                        ( HsProtobuf.encodeMessageField
+                            (HsProtobuf.FieldNumber 7)
+                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                roleRoutePolicyFingerprint
+                            )
+                        )
+                    )
+                    ( HsProtobuf.encodeMessageField
+                        (HsProtobuf.FieldNumber 8)
+                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                            roleRouteManifestDigest
+                        )
+                    )
+                )
+                ( HsProtobuf.encodeMessageField
+                    (HsProtobuf.FieldNumber 9)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        roleRouteRouteFingerprint
+                    )
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 10)
+                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                    roleRouteDispatchIntentId
+                )
+            )
+        )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 11)
+            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                roleRouteScopeId
+            )
+        )
+  decodeMessage _ =
+    Hs.pure RoleRoute
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 1)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+      <*> HsProtobuf.at
+        HsProtobuf.decodeMessageField
+        (HsProtobuf.FieldNumber 3)
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 4)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 5)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 6)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 7)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 8)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 9)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 10)
+              )
+          )
+      <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 11)
+              )
+          )
+  dotProto _ =
+    [ HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 1)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "role")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "harness")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        ( HsProtobufAST.Prim
+            (HsProtobufAST.Named (HsProtobufAST.Single "AgentType"))
+        )
+        (HsProtobufAST.Single "agent_type")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 4)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "model")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 5)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "effort")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 6)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "configuration_fingerprint")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 7)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "policy_fingerprint")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 8)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "manifest_digest")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 9)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "route_fingerprint")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 10)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "dispatch_intent_id")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 11)
+        (HsProtobufAST.Prim HsProtobufAST.String)
+        (HsProtobufAST.Single "scope_id")
+        []
+        ""
+    ]
+
+instance (HsJSONPB.ToJSONPB RoleRoute) where
+  toJSONPB (RoleRoute f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11) =
+    HsJSONPB.object
+      [ "role" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
+        "harness"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "agent_type" .= f3,
+        "model" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+        "effort" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+        "configuration_fingerprint"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
+        "policy_fingerprint"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+        "manifest_digest"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+        "route_fingerprint"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9),
+        "dispatch_intent_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f10),
+        "scope_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f11)
+      ]
+  toEncodingPB (RoleRoute f1 f2 f3 f4 f5 f6 f7 f8 f9 f10 f11) =
+    HsJSONPB.pairs
+      [ "role" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
+        "harness"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
+        "agent_type" .= f3,
+        "model" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f4),
+        "effort" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f5),
+        "configuration_fingerprint"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f6),
+        "policy_fingerprint"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
+        "manifest_digest"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+        "route_fingerprint"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9),
+        "dispatch_intent_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f10),
+        "scope_id"
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f11)
+      ]
+
+instance (HsJSONPB.FromJSONPB RoleRoute) where
+  parseJSONPB =
+    HsJSONPB.withObject
+      "RoleRoute"
+      ( \obj ->
+          Hs.pure RoleRoute
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "role")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "harness")
+                )
+            <*> obj .: "agent_type"
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "model")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "effort")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "configuration_fingerprint")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "policy_fingerprint")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "manifest_digest")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "route_fingerprint")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "dispatch_intent_id")
+                )
+            <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
+                    (obj .: "scope_id")
+                )
+      )
+
+instance (HsJSONPB.ToJSON RoleRoute) where
+  toJSON = HsJSONPB.toAesonValue
+  toEncoding = HsJSONPB.toAesonEncoding
+
+instance (HsJSONPB.FromJSON RoleRoute) where
+  parseJSON = HsJSONPB.parseJSONPB
+
 data WorkspaceTopology
   = WorkspaceTopologyWORKSPACE_TOPOLOGY_UNSPECIFIED
   | WorkspaceTopologyWORKSPACE_TOPOLOGY_WORKTREE_PER_AGENT
@@ -3283,7 +3631,8 @@ data SpawnWorkerRequest
     spawnWorkerRequestDisallowedTools :: (Hs.Vector Hs.Text),
     spawnWorkerRequestAgentType :: (HsProtobuf.Enumerated Effects.Agent.AgentType),
     spawnWorkerRequestIntentId :: Hs.Text,
-    spawnWorkerRequestModel :: Hs.Text
+    spawnWorkerRequestModel :: Hs.Text,
+    spawnWorkerRequestRoleRoute :: (Hs.Maybe Effects.Agent.RoleRoute)
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -3305,7 +3654,8 @@ instance (HsProtobuf.Message SpawnWorkerRequest) where
         spawnWorkerRequestDisallowedTools,
         spawnWorkerRequestAgentType,
         spawnWorkerRequestIntentId,
-        spawnWorkerRequestModel
+        spawnWorkerRequestModel,
+        spawnWorkerRequestRoleRoute
       } =
       Hs.mappend
         ( Hs.mappend
@@ -3314,62 +3664,73 @@ instance (HsProtobuf.Message SpawnWorkerRequest) where
                     ( Hs.mappend
                         ( Hs.mappend
                             ( Hs.mappend
-                                ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 1)
-                                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                        spawnWorkerRequestName
+                                ( Hs.mappend
+                                    ( HsProtobuf.encodeMessageField
+                                        (HsProtobuf.FieldNumber 1)
+                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                            spawnWorkerRequestName
+                                        )
+                                    )
+                                    ( HsProtobuf.encodeMessageField
+                                        (HsProtobuf.FieldNumber 2)
+                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                            spawnWorkerRequestPrompt
+                                        )
                                     )
                                 )
                                 ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 2)
+                                    (HsProtobuf.FieldNumber 3)
                                     ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                        spawnWorkerRequestPrompt
+                                        spawnWorkerRequestPermissionMode
                                     )
                                 )
                             )
                             ( HsProtobuf.encodeMessageField
-                                (HsProtobuf.FieldNumber 3)
-                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                    spawnWorkerRequestPermissionMode
+                                (HsProtobuf.FieldNumber 4)
+                                ( ( Hs.coerce
+                                      @(Hs.Vector Hs.Text)
+                                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                                  )
+                                    spawnWorkerRequestAllowedTools
                                 )
                             )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 4)
+                            (HsProtobuf.FieldNumber 5)
                             ( ( Hs.coerce
                                   @(Hs.Vector Hs.Text)
                                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
                               )
-                                spawnWorkerRequestAllowedTools
+                                spawnWorkerRequestDisallowedTools
                             )
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 5)
-                        ( ( Hs.coerce
-                              @(Hs.Vector Hs.Text)
-                              @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-                          )
-                            spawnWorkerRequestDisallowedTools
-                        )
+                        (HsProtobuf.FieldNumber 6)
+                        spawnWorkerRequestAgentType
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 6)
-                    spawnWorkerRequestAgentType
+                    (HsProtobuf.FieldNumber 7)
+                    ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                        spawnWorkerRequestIntentId
+                    )
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 7)
+                (HsProtobuf.FieldNumber 8)
                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                    spawnWorkerRequestIntentId
+                    spawnWorkerRequestModel
                 )
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 8)
-            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                spawnWorkerRequestModel
+            (HsProtobuf.FieldNumber 9)
+            ( ( Hs.coerce
+                  @(Hs.Maybe Effects.Agent.RoleRoute)
+                  @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+              )
+                spawnWorkerRequestRoleRoute
             )
         )
   decodeMessage _ =
@@ -3425,6 +3786,15 @@ instance (HsProtobuf.Message SpawnWorkerRequest) where
                   (HsProtobuf.FieldNumber 8)
               )
           )
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+                @(Hs.Maybe Effects.Agent.RoleRoute)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 9)
+              )
+          )
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -3475,11 +3845,19 @@ instance (HsProtobuf.Message SpawnWorkerRequest) where
         (HsProtobufAST.Prim HsProtobufAST.String)
         (HsProtobufAST.Single "model")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 9)
+        ( HsProtobufAST.Prim
+            (HsProtobufAST.Named (HsProtobufAST.Single "RoleRoute"))
+        )
+        (HsProtobufAST.Single "role_route")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB SpawnWorkerRequest) where
-  toJSONPB (SpawnWorkerRequest f1 f2 f3 f4 f5 f6 f7 f8) =
+  toJSONPB (SpawnWorkerRequest f1 f2 f3 f4 f5 f6 f7 f8 f9) =
     HsJSONPB.object
       [ "name" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
         "prompt" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
@@ -3502,9 +3880,16 @@ instance (HsJSONPB.ToJSONPB SpawnWorkerRequest) where
         "agent_type" .= f6,
         "intent_id"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
-        "model" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8)
+        "model" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+        "role_route"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Agent.RoleRoute)
+                   @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+               )
+                 f9
+             )
       ]
-  toEncodingPB (SpawnWorkerRequest f1 f2 f3 f4 f5 f6 f7 f8) =
+  toEncodingPB (SpawnWorkerRequest f1 f2 f3 f4 f5 f6 f7 f8 f9) =
     HsJSONPB.pairs
       [ "name" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
         "prompt" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f2),
@@ -3527,7 +3912,14 @@ instance (HsJSONPB.ToJSONPB SpawnWorkerRequest) where
         "agent_type" .= f6,
         "intent_id"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f7),
-        "model" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8)
+        "model" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f8),
+        "role_route"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Agent.RoleRoute)
+                   @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+               )
+                 f9
+             )
       ]
 
 instance (HsJSONPB.FromJSONPB SpawnWorkerRequest) where
@@ -3564,6 +3956,12 @@ instance (HsJSONPB.FromJSONPB SpawnWorkerRequest) where
             <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
                     (obj .: "model")
                 )
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+                      @(Hs.Maybe Effects.Agent.RoleRoute)
+                  )
+                    (obj .: "role_route")
+                )
       )
 
 instance (HsJSONPB.ToJSON SpawnWorkerRequest) where
@@ -3573,8 +3971,12 @@ instance (HsJSONPB.ToJSON SpawnWorkerRequest) where
 instance (HsJSONPB.FromJSON SpawnWorkerRequest) where
   parseJSON = HsJSONPB.parseJSONPB
 
-newtype SpawnWorkerResponse
-  = SpawnWorkerResponse {spawnWorkerResponseAgent :: (Hs.Maybe Effects.Agent.AgentInfo)}
+data SpawnWorkerResponse
+  = SpawnWorkerResponse
+  { spawnWorkerResponseAgent :: (Hs.Maybe Effects.Agent.AgentInfo),
+    spawnWorkerResponseRoleRoute :: (Hs.Maybe Effects.Agent.RoleRoute),
+    spawnWorkerResponseInvocation :: (Hs.Maybe Effects.Agent.InvocationHandoff)
+  }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
 instance (Hs.NFData SpawnWorkerResponse)
@@ -3585,16 +3987,43 @@ instance (HsProtobuf.Named SpawnWorkerResponse) where
 instance (HsProtobuf.HasDefault SpawnWorkerResponse)
 
 instance (HsProtobuf.Message SpawnWorkerResponse) where
-  encodeMessage _ SpawnWorkerResponse {spawnWorkerResponseAgent} =
-    ( HsProtobuf.encodeMessageField
-        (HsProtobuf.FieldNumber 1)
-        ( ( Hs.coerce
-              @(Hs.Maybe Effects.Agent.AgentInfo)
-              @(HsProtobuf.Nested Effects.Agent.AgentInfo)
-          )
-            spawnWorkerResponseAgent
+  encodeMessage
+    _
+    SpawnWorkerResponse
+      { spawnWorkerResponseAgent,
+        spawnWorkerResponseRoleRoute,
+        spawnWorkerResponseInvocation
+      } =
+      Hs.mappend
+        ( Hs.mappend
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 1)
+                ( ( Hs.coerce
+                      @(Hs.Maybe Effects.Agent.AgentInfo)
+                      @(HsProtobuf.Nested Effects.Agent.AgentInfo)
+                  )
+                    spawnWorkerResponseAgent
+                )
+            )
+            ( HsProtobuf.encodeMessageField
+                (HsProtobuf.FieldNumber 2)
+                ( ( Hs.coerce
+                      @(Hs.Maybe Effects.Agent.RoleRoute)
+                      @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+                  )
+                    spawnWorkerResponseRoleRoute
+                )
+            )
         )
-    )
+        ( HsProtobuf.encodeMessageField
+            (HsProtobuf.FieldNumber 3)
+            ( ( Hs.coerce
+                  @(Hs.Maybe Effects.Agent.InvocationHandoff)
+                  @(HsProtobuf.Nested Effects.Agent.InvocationHandoff)
+              )
+                spawnWorkerResponseInvocation
+            )
+        )
   decodeMessage _ =
     Hs.pure SpawnWorkerResponse
       <*> ( ( HsProtobuf.coerceOver
@@ -3606,6 +4035,24 @@ instance (HsProtobuf.Message SpawnWorkerResponse) where
                   (HsProtobuf.FieldNumber 1)
               )
           )
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+                @(Hs.Maybe Effects.Agent.RoleRoute)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 2)
+              )
+          )
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.Nested Effects.Agent.InvocationHandoff)
+                @(Hs.Maybe Effects.Agent.InvocationHandoff)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 3)
+              )
+          )
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -3614,11 +4061,27 @@ instance (HsProtobuf.Message SpawnWorkerResponse) where
         )
         (HsProtobufAST.Single "agent")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 2)
+        ( HsProtobufAST.Prim
+            (HsProtobufAST.Named (HsProtobufAST.Single "RoleRoute"))
+        )
+        (HsProtobufAST.Single "role_route")
+        []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 3)
+        ( HsProtobufAST.Prim
+            (HsProtobufAST.Named (HsProtobufAST.Single "InvocationHandoff"))
+        )
+        (HsProtobufAST.Single "invocation")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB SpawnWorkerResponse) where
-  toJSONPB (SpawnWorkerResponse f1) =
+  toJSONPB (SpawnWorkerResponse f1 f2 f3) =
     HsJSONPB.object
       [ "agent"
           .= ( ( Hs.coerce
@@ -3626,9 +4089,23 @@ instance (HsJSONPB.ToJSONPB SpawnWorkerResponse) where
                    @(HsProtobuf.Nested Effects.Agent.AgentInfo)
                )
                  f1
+             ),
+        "role_route"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Agent.RoleRoute)
+                   @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+               )
+                 f2
+             ),
+        "invocation"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Agent.InvocationHandoff)
+                   @(HsProtobuf.Nested Effects.Agent.InvocationHandoff)
+               )
+                 f3
              )
       ]
-  toEncodingPB (SpawnWorkerResponse f1) =
+  toEncodingPB (SpawnWorkerResponse f1 f2 f3) =
     HsJSONPB.pairs
       [ "agent"
           .= ( ( Hs.coerce
@@ -3636,6 +4113,20 @@ instance (HsJSONPB.ToJSONPB SpawnWorkerResponse) where
                    @(HsProtobuf.Nested Effects.Agent.AgentInfo)
                )
                  f1
+             ),
+        "role_route"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Agent.RoleRoute)
+                   @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+               )
+                 f2
+             ),
+        "invocation"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Agent.InvocationHandoff)
+                   @(HsProtobuf.Nested Effects.Agent.InvocationHandoff)
+               )
+                 f3
              )
       ]
 
@@ -3650,6 +4141,18 @@ instance (HsJSONPB.FromJSONPB SpawnWorkerResponse) where
                       @(Hs.Maybe Effects.Agent.AgentInfo)
                   )
                     (obj .: "agent")
+                )
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+                      @(Hs.Maybe Effects.Agent.RoleRoute)
+                  )
+                    (obj .: "role_route")
+                )
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.Nested Effects.Agent.InvocationHandoff)
+                      @(Hs.Maybe Effects.Agent.InvocationHandoff)
+                  )
+                    (obj .: "invocation")
                 )
       )
 
@@ -6855,7 +7358,8 @@ data SpawnLeafSubtreeRequest
     spawnLeafSubtreeRequestExpectedInvocationId :: Hs.Text,
     spawnLeafSubtreeRequestExpectedBranch :: Hs.Text,
     spawnLeafSubtreeRequestExpectedWorktreeFingerprint :: Hs.Text,
-    spawnLeafSubtreeRequestHumanApproved :: Hs.Bool
+    spawnLeafSubtreeRequestHumanApproved :: Hs.Bool,
+    spawnLeafSubtreeRequestRoleRoute :: (Hs.Maybe Effects.Agent.RoleRoute)
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -6887,7 +7391,8 @@ instance (HsProtobuf.Message SpawnLeafSubtreeRequest) where
         spawnLeafSubtreeRequestExpectedInvocationId,
         spawnLeafSubtreeRequestExpectedBranch,
         spawnLeafSubtreeRequestExpectedWorktreeFingerprint,
-        spawnLeafSubtreeRequestHumanApproved
+        spawnLeafSubtreeRequestHumanApproved,
+        spawnLeafSubtreeRequestRoleRoute
       } =
       Hs.mappend
         ( Hs.mappend
@@ -6906,137 +7411,151 @@ instance (HsProtobuf.Message SpawnLeafSubtreeRequest) where
                                                             ( Hs.mappend
                                                                 ( Hs.mappend
                                                                     ( Hs.mappend
-                                                                        ( HsProtobuf.encodeMessageField
-                                                                            (HsProtobuf.FieldNumber 1)
-                                                                            ( ( Hs.coerce
-                                                                                  @Hs.Text
-                                                                                  @(HsProtobuf.String Hs.Text)
-                                                                              )
-                                                                                spawnLeafSubtreeRequestTask
+                                                                        ( Hs.mappend
+                                                                            ( HsProtobuf.encodeMessageField
+                                                                                (HsProtobuf.FieldNumber 1)
+                                                                                ( ( Hs.coerce
+                                                                                      @Hs.Text
+                                                                                      @(HsProtobuf.String Hs.Text)
+                                                                                  )
+                                                                                    spawnLeafSubtreeRequestTask
+                                                                                )
+                                                                            )
+                                                                            ( HsProtobuf.encodeMessageField
+                                                                                (HsProtobuf.FieldNumber 2)
+                                                                                ( ( Hs.coerce
+                                                                                      @Hs.Text
+                                                                                      @(HsProtobuf.String Hs.Text)
+                                                                                  )
+                                                                                    spawnLeafSubtreeRequestBranchName
+                                                                                )
                                                                             )
                                                                         )
                                                                         ( HsProtobuf.encodeMessageField
-                                                                            (HsProtobuf.FieldNumber 2)
+                                                                            (HsProtobuf.FieldNumber 3)
                                                                             ( ( Hs.coerce
                                                                                   @Hs.Text
                                                                                   @(HsProtobuf.String Hs.Text)
                                                                               )
-                                                                                spawnLeafSubtreeRequestBranchName
+                                                                                spawnLeafSubtreeRequestRole
                                                                             )
                                                                         )
                                                                     )
                                                                     ( HsProtobuf.encodeMessageField
-                                                                        (HsProtobuf.FieldNumber 3)
-                                                                        ( ( Hs.coerce
-                                                                              @Hs.Text
-                                                                              @(HsProtobuf.String Hs.Text)
-                                                                          )
-                                                                            spawnLeafSubtreeRequestRole
-                                                                        )
+                                                                        (HsProtobuf.FieldNumber 4)
+                                                                        spawnLeafSubtreeRequestAgentType
                                                                     )
                                                                 )
                                                                 ( HsProtobuf.encodeMessageField
-                                                                    (HsProtobuf.FieldNumber 4)
-                                                                    spawnLeafSubtreeRequestAgentType
+                                                                    (HsProtobuf.FieldNumber 5)
+                                                                    ( ( Hs.coerce
+                                                                          @Hs.Text
+                                                                          @(HsProtobuf.String Hs.Text)
+                                                                      )
+                                                                        spawnLeafSubtreeRequestPermissionMode
+                                                                    )
                                                                 )
                                                             )
                                                             ( HsProtobuf.encodeMessageField
-                                                                (HsProtobuf.FieldNumber 5)
-                                                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                                                    spawnLeafSubtreeRequestPermissionMode
+                                                                (HsProtobuf.FieldNumber 6)
+                                                                ( ( Hs.coerce
+                                                                      @(Hs.Vector Hs.Text)
+                                                                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                                                                  )
+                                                                    spawnLeafSubtreeRequestAllowedTools
                                                                 )
                                                             )
                                                         )
                                                         ( HsProtobuf.encodeMessageField
-                                                            (HsProtobuf.FieldNumber 6)
+                                                            (HsProtobuf.FieldNumber 7)
                                                             ( ( Hs.coerce
                                                                   @(Hs.Vector Hs.Text)
                                                                   @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
                                                               )
-                                                                spawnLeafSubtreeRequestAllowedTools
+                                                                spawnLeafSubtreeRequestDisallowedTools
                                                             )
                                                         )
                                                     )
                                                     ( HsProtobuf.encodeMessageField
-                                                        (HsProtobuf.FieldNumber 7)
-                                                        ( ( Hs.coerce
-                                                              @(Hs.Vector Hs.Text)
-                                                              @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-                                                          )
-                                                            spawnLeafSubtreeRequestDisallowedTools
-                                                        )
+                                                        (HsProtobuf.FieldNumber 10)
+                                                        spawnLeafSubtreeRequestStandaloneRepo
                                                     )
                                                 )
                                                 ( HsProtobuf.encodeMessageField
-                                                    (HsProtobuf.FieldNumber 10)
-                                                    spawnLeafSubtreeRequestStandaloneRepo
+                                                    (HsProtobuf.FieldNumber 11)
+                                                    ( ( Hs.coerce
+                                                          @(Hs.Vector Hs.Text)
+                                                          @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
+                                                      )
+                                                        spawnLeafSubtreeRequestAllowedDirs
+                                                    )
                                                 )
                                             )
                                             ( HsProtobuf.encodeMessageField
-                                                (HsProtobuf.FieldNumber 11)
-                                                ( ( Hs.coerce
-                                                      @(Hs.Vector Hs.Text)
-                                                      @(HsProtobuf.UnpackedVec (HsProtobuf.String Hs.Text))
-                                                  )
-                                                    spawnLeafSubtreeRequestAllowedDirs
-                                                )
+                                                (HsProtobuf.FieldNumber 12)
+                                                spawnLeafSubtreeRequestResumePrNumber
                                             )
                                         )
                                         ( HsProtobuf.encodeMessageField
-                                            (HsProtobuf.FieldNumber 12)
-                                            spawnLeafSubtreeRequestResumePrNumber
+                                            (HsProtobuf.FieldNumber 13)
+                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                spawnLeafSubtreeRequestExpectedHeadSha
+                                            )
                                         )
                                     )
                                     ( HsProtobuf.encodeMessageField
-                                        (HsProtobuf.FieldNumber 13)
+                                        (HsProtobuf.FieldNumber 14)
                                         ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                            spawnLeafSubtreeRequestExpectedHeadSha
+                                            spawnLeafSubtreeRequestIntentId
                                         )
                                     )
                                 )
                                 ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 14)
+                                    (HsProtobuf.FieldNumber 15)
                                     ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                        spawnLeafSubtreeRequestIntentId
+                                        spawnLeafSubtreeRequestModel
                                     )
                                 )
                             )
                             ( HsProtobuf.encodeMessageField
-                                (HsProtobuf.FieldNumber 15)
-                                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                    spawnLeafSubtreeRequestModel
-                                )
+                                (HsProtobuf.FieldNumber 16)
+                                spawnLeafSubtreeRequestBlockedIssueId
                             )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 16)
-                            spawnLeafSubtreeRequestBlockedIssueId
+                            (HsProtobuf.FieldNumber 17)
+                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                spawnLeafSubtreeRequestExpectedInvocationId
+                            )
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 17)
+                        (HsProtobuf.FieldNumber 18)
                         ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                            spawnLeafSubtreeRequestExpectedInvocationId
+                            spawnLeafSubtreeRequestExpectedBranch
                         )
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 18)
+                    (HsProtobuf.FieldNumber 19)
                     ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                        spawnLeafSubtreeRequestExpectedBranch
+                        spawnLeafSubtreeRequestExpectedWorktreeFingerprint
                     )
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 19)
-                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                    spawnLeafSubtreeRequestExpectedWorktreeFingerprint
-                )
+                (HsProtobuf.FieldNumber 20)
+                spawnLeafSubtreeRequestHumanApproved
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 20)
-            spawnLeafSubtreeRequestHumanApproved
+            (HsProtobuf.FieldNumber 21)
+            ( ( Hs.coerce
+                  @(Hs.Maybe Effects.Agent.RoleRoute)
+                  @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+              )
+                spawnLeafSubtreeRequestRoleRoute
+            )
         )
   decodeMessage _ =
     Hs.pure SpawnLeafSubtreeRequest
@@ -7142,6 +7661,15 @@ instance (HsProtobuf.Message SpawnLeafSubtreeRequest) where
       <*> HsProtobuf.at
         HsProtobuf.decodeMessageField
         (HsProtobuf.FieldNumber 20)
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+                @(Hs.Maybe Effects.Agent.RoleRoute)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 21)
+              )
+          )
   dotProto _ =
     [ HsProtobufAST.DotProtoField
         (HsProtobuf.FieldNumber 1)
@@ -7252,6 +7780,14 @@ instance (HsProtobuf.Message SpawnLeafSubtreeRequest) where
         (HsProtobufAST.Prim HsProtobufAST.Bool)
         (HsProtobufAST.Single "human_approved")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 21)
+        ( HsProtobufAST.Prim
+            (HsProtobufAST.Named (HsProtobufAST.Single "RoleRoute"))
+        )
+        (HsProtobufAST.Single "role_route")
+        []
         ""
     ]
 
@@ -7276,6 +7812,7 @@ instance (HsJSONPB.ToJSONPB SpawnLeafSubtreeRequest) where
         f18
         f19
         f20
+        f21
       ) =
       HsJSONPB.object
         [ "task" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -7320,7 +7857,14 @@ instance (HsJSONPB.ToJSONPB SpawnLeafSubtreeRequest) where
             .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f18),
           "expected_worktree_fingerprint"
             .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f19),
-          "human_approved" .= f20
+          "human_approved" .= f20,
+          "role_route"
+            .= ( ( Hs.coerce
+                     @(Hs.Maybe Effects.Agent.RoleRoute)
+                     @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+                 )
+                   f21
+               )
         ]
   toEncodingPB
     ( SpawnLeafSubtreeRequest
@@ -7342,6 +7886,7 @@ instance (HsJSONPB.ToJSONPB SpawnLeafSubtreeRequest) where
         f18
         f19
         f20
+        f21
       ) =
       HsJSONPB.pairs
         [ "task" .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -7386,7 +7931,14 @@ instance (HsJSONPB.ToJSONPB SpawnLeafSubtreeRequest) where
             .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f18),
           "expected_worktree_fingerprint"
             .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f19),
-          "human_approved" .= f20
+          "human_approved" .= f20,
+          "role_route"
+            .= ( ( Hs.coerce
+                     @(Hs.Maybe Effects.Agent.RoleRoute)
+                     @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+                 )
+                   f21
+               )
         ]
 
 instance (HsJSONPB.FromJSONPB SpawnLeafSubtreeRequest) where
@@ -7448,6 +8000,12 @@ instance (HsJSONPB.FromJSONPB SpawnLeafSubtreeRequest) where
                     (obj .: "expected_worktree_fingerprint")
                 )
             <*> obj .: "human_approved"
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+                      @(Hs.Maybe Effects.Agent.RoleRoute)
+                  )
+                    (obj .: "role_route")
+                )
       )
 
 instance (HsJSONPB.ToJSON SpawnLeafSubtreeRequest) where
@@ -7609,7 +8167,8 @@ data InvocationHandoff
     invocationHandoffTargetId :: Hs.Text,
     invocationHandoffFresh :: Hs.Bool,
     invocationHandoffReady :: Hs.Bool,
-    invocationHandoffOutcome :: Hs.Text
+    invocationHandoffOutcome :: Hs.Text,
+    invocationHandoffRoleRoute :: (Hs.Maybe Effects.Agent.RoleRoute)
   }
   deriving (Hs.Show, Hs.Eq, Hs.Ord, Hs.Generic)
 
@@ -7632,7 +8191,8 @@ instance (HsProtobuf.Message InvocationHandoff) where
         invocationHandoffTargetId,
         invocationHandoffFresh,
         invocationHandoffReady,
-        invocationHandoffOutcome
+        invocationHandoffOutcome,
+        invocationHandoffRoleRoute
       } =
       Hs.mappend
         ( Hs.mappend
@@ -7642,61 +8202,72 @@ instance (HsProtobuf.Message InvocationHandoff) where
                         ( Hs.mappend
                             ( Hs.mappend
                                 ( Hs.mappend
-                                    ( HsProtobuf.encodeMessageField
-                                        (HsProtobuf.FieldNumber 1)
-                                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                            invocationHandoffInvocationId
+                                    ( Hs.mappend
+                                        ( HsProtobuf.encodeMessageField
+                                            (HsProtobuf.FieldNumber 1)
+                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                invocationHandoffInvocationId
+                                            )
+                                        )
+                                        ( HsProtobuf.encodeMessageField
+                                            (HsProtobuf.FieldNumber 2)
+                                            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                                                invocationHandoffTrigger
+                                            )
                                         )
                                     )
                                     ( HsProtobuf.encodeMessageField
-                                        (HsProtobuf.FieldNumber 2)
+                                        (HsProtobuf.FieldNumber 3)
                                         ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                            invocationHandoffTrigger
+                                            invocationHandoffRuntime
                                         )
                                     )
                                 )
                                 ( HsProtobuf.encodeMessageField
-                                    (HsProtobuf.FieldNumber 3)
+                                    (HsProtobuf.FieldNumber 4)
                                     ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                        invocationHandoffRuntime
+                                        invocationHandoffBranchName
                                     )
                                 )
                             )
                             ( HsProtobuf.encodeMessageField
-                                (HsProtobuf.FieldNumber 4)
+                                (HsProtobuf.FieldNumber 5)
                                 ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                    invocationHandoffBranchName
+                                    invocationHandoffTargetType
                                 )
                             )
                         )
                         ( HsProtobuf.encodeMessageField
-                            (HsProtobuf.FieldNumber 5)
+                            (HsProtobuf.FieldNumber 6)
                             ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                                invocationHandoffTargetType
+                                invocationHandoffTargetId
                             )
                         )
                     )
                     ( HsProtobuf.encodeMessageField
-                        (HsProtobuf.FieldNumber 6)
-                        ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                            invocationHandoffTargetId
-                        )
+                        (HsProtobuf.FieldNumber 7)
+                        invocationHandoffFresh
                     )
                 )
                 ( HsProtobuf.encodeMessageField
-                    (HsProtobuf.FieldNumber 7)
-                    invocationHandoffFresh
+                    (HsProtobuf.FieldNumber 8)
+                    invocationHandoffReady
                 )
             )
             ( HsProtobuf.encodeMessageField
-                (HsProtobuf.FieldNumber 8)
-                invocationHandoffReady
+                (HsProtobuf.FieldNumber 9)
+                ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
+                    invocationHandoffOutcome
+                )
             )
         )
         ( HsProtobuf.encodeMessageField
-            (HsProtobuf.FieldNumber 9)
-            ( (Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text))
-                invocationHandoffOutcome
+            (HsProtobuf.FieldNumber 10)
+            ( ( Hs.coerce
+                  @(Hs.Maybe Effects.Agent.RoleRoute)
+                  @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+              )
+                invocationHandoffRoleRoute
             )
         )
   decodeMessage _ =
@@ -7747,6 +8318,15 @@ instance (HsProtobuf.Message InvocationHandoff) where
               ( HsProtobuf.at
                   HsProtobuf.decodeMessageField
                   (HsProtobuf.FieldNumber 9)
+              )
+          )
+      <*> ( ( HsProtobuf.coerceOver
+                @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+                @(Hs.Maybe Effects.Agent.RoleRoute)
+            )
+              ( HsProtobuf.at
+                  HsProtobuf.decodeMessageField
+                  (HsProtobuf.FieldNumber 10)
               )
           )
   dotProto _ =
@@ -7803,11 +8383,19 @@ instance (HsProtobuf.Message InvocationHandoff) where
         (HsProtobufAST.Prim HsProtobufAST.String)
         (HsProtobufAST.Single "outcome")
         []
+        "",
+      HsProtobufAST.DotProtoField
+        (HsProtobuf.FieldNumber 10)
+        ( HsProtobufAST.Prim
+            (HsProtobufAST.Named (HsProtobufAST.Single "RoleRoute"))
+        )
+        (HsProtobufAST.Single "role_route")
+        []
         ""
     ]
 
 instance (HsJSONPB.ToJSONPB InvocationHandoff) where
-  toJSONPB (InvocationHandoff f1 f2 f3 f4 f5 f6 f7 f8 f9) =
+  toJSONPB (InvocationHandoff f1 f2 f3 f4 f5 f6 f7 f8 f9 f10) =
     HsJSONPB.object
       [ "invocation_id"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -7824,9 +8412,16 @@ instance (HsJSONPB.ToJSONPB InvocationHandoff) where
         "fresh" .= f7,
         "ready" .= f8,
         "outcome"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9)
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9),
+        "role_route"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Agent.RoleRoute)
+                   @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+               )
+                 f10
+             )
       ]
-  toEncodingPB (InvocationHandoff f1 f2 f3 f4 f5 f6 f7 f8 f9) =
+  toEncodingPB (InvocationHandoff f1 f2 f3 f4 f5 f6 f7 f8 f9 f10) =
     HsJSONPB.pairs
       [ "invocation_id"
           .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f1),
@@ -7843,7 +8438,14 @@ instance (HsJSONPB.ToJSONPB InvocationHandoff) where
         "fresh" .= f7,
         "ready" .= f8,
         "outcome"
-          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9)
+          .= ((Hs.coerce @Hs.Text @(HsProtobuf.String Hs.Text)) f9),
+        "role_route"
+          .= ( ( Hs.coerce
+                   @(Hs.Maybe Effects.Agent.RoleRoute)
+                   @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+               )
+                 f10
+             )
       ]
 
 instance (HsJSONPB.FromJSONPB InvocationHandoff) where
@@ -7874,6 +8476,12 @@ instance (HsJSONPB.FromJSONPB InvocationHandoff) where
             <*> obj .: "ready"
             <*> ( (HsProtobuf.coerceOver @(HsProtobuf.String Hs.Text) @Hs.Text)
                     (obj .: "outcome")
+                )
+            <*> ( ( HsProtobuf.coerceOver
+                      @(HsProtobuf.Nested Effects.Agent.RoleRoute)
+                      @(Hs.Maybe Effects.Agent.RoleRoute)
+                  )
+                    (obj .: "role_route")
                 )
       )
 

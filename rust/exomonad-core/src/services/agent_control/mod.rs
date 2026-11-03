@@ -37,7 +37,7 @@ pub use invocation::{
     start_invocation_with_provenance_and_context_and_mode, InvocationExitContext,
     InvocationFinishResult, InvocationIdentityContext, InvocationMetadata, InvocationMode,
     InvocationRecord, InvocationStatus, InvocationTrigger, RecoveryAuthorization,
-    RecoveryInvocationLineage, INVOCATION_FILENAME,
+    RecoveryInvocationLineage, RoleRouteProvenance, INVOCATION_FILENAME,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +107,13 @@ pub(crate) const INVOCATION_MONITOR_INTERVAL: Duration = Duration::from_millis(2
 pub(crate) const LAST_ACTIVITY_FILE: &str = "last_activity_at";
 pub(crate) const DIRTY_TL_SPAWN_PREFLIGHT_CODE: &str = "agent.spawn_precondition.dirty_worktree";
 const MAX_INVOCATION_STDERR_TAIL_BYTES: usize = 4096;
+
+#[derive(Clone, Copy)]
+pub(crate) struct RoleRouteLaunchSettings<'a> {
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    pub route_bound: bool,
+}
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct InvocationMonitorKey {
@@ -886,6 +893,12 @@ pub struct SpawnWorkerOptions {
     /// Optional model override, separate from the agent type.
     #[serde(default)]
     pub model: Option<String>,
+    /// Role-specific reasoning effort for this invocation.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Exact selected role route, authenticated by the dispatch ledger.
+    #[serde(default)]
+    pub role_route: Option<RoleRouteProvenance>,
     /// Claude-specific permission flags (ignored for non-Claude agents).
     #[serde(default)]
     pub claude_flags: ClaudeSpawnFlags,
@@ -943,6 +956,12 @@ pub struct SpawnLeafOptions {
     /// Optional model override, separate from the agent type.
     #[serde(default)]
     pub model: Option<String>,
+    /// Effort passed to the selected harness, not inferred from machine defaults.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Exact selected role route, authenticated by the dispatch ledger.
+    #[serde(default)]
+    pub role_route: Option<RoleRouteProvenance>,
     /// Claude-specific permission flags (ignored for other harnesses).
     #[serde(default)]
     pub claude_flags: ClaudeSpawnFlags,
@@ -1219,6 +1238,8 @@ pub struct AgentControlService<C> {
     pub(crate) reviewer_effort: Option<String>,
     /// Context file paths injected into the reviewer's task (e.g. CLAUDE.md, reviewer rules).
     pub(crate) reviewer_context: Vec<String>,
+    /// Role-routing configuration accepted by this server process.
+    pub(crate) role_route_configuration_fingerprint: Option<String>,
     /// Forgejo environment sourced from loaded config, overriding stale parent process env.
     pub(crate) forgejo_spawn_env: Option<ForgejoSpawnEnv>,
 }
@@ -1266,6 +1287,7 @@ impl<
             reviewer_model: None,
             reviewer_effort: None,
             reviewer_context: vec![],
+            role_route_configuration_fingerprint: None,
             forgejo_spawn_env: None,
         }
     }
@@ -1311,6 +1333,16 @@ impl<
     pub fn with_spawn_agent_type(mut self, agent_type: AgentType) -> Self {
         self.spawn_agent_type = agent_type;
         self
+    }
+
+    /// Bind incoming route proofs to the configuration loaded by serve.
+    pub fn with_role_route_configuration_fingerprint(mut self, fingerprint: String) -> Self {
+        self.role_route_configuration_fingerprint = Some(fingerprint);
+        self
+    }
+
+    pub(crate) fn role_route_configuration_fingerprint(&self) -> Option<&str> {
+        self.role_route_configuration_fingerprint.as_deref()
     }
 
     /// Get the configured default agent type for spawned workers/teammates.
@@ -1511,6 +1543,7 @@ impl<
     ///
     /// Creates the agent's config directory, writes routing info, and registers
     /// identity with the resolver if available.
+    #[cfg(test)]
     pub(crate) async fn finalize_spawn(
         &self,
         agent_name: &AgentName,
@@ -1559,6 +1592,7 @@ impl<
                 recovery_lineage: None,
                 expected_live_invocation_id: None,
                 mode,
+                role_route: None,
             },
             false,
         )
@@ -1737,6 +1771,7 @@ impl<
                 metadata.mode,
                 invocation_id,
                 metadata.expected_live_invocation_id.as_deref(),
+                metadata.role_route,
             )
             .await?;
         for adoption in adoptions {
@@ -2467,6 +2502,7 @@ mod tests {
             topology: Topology::SharedDir,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: false,
             slice_id: None,
         };

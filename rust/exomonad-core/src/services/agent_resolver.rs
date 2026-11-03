@@ -5,7 +5,7 @@
 //! Consumers read from the resolver — no re-derivation, no suffix stripping, no fallbacks.
 
 use crate::domain::{AgentName, BirthBranch, Slug};
-use crate::services::agent_control::{AgentType, InvocationTrigger, Topology};
+use crate::services::agent_control::{AgentType, InvocationTrigger, RoleRouteProvenance, Topology};
 use crate::services::event_log::EventLog;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,9 @@ pub struct AgentIdentityRecord {
     /// Effort selected for the owner invocation, when configured.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Accepted controller route bound to the owner, when launched by a TL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_route: Option<RoleRouteProvenance>,
     /// Whether this branch is owned by the ledger-backed TL loop rather than an interactive agent.
     #[serde(default)]
     pub ledger_owned: bool,
@@ -572,6 +575,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: false,
             slice_id: None,
         }
@@ -591,6 +595,7 @@ mod tests {
             topology: Topology::SharedDir,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: false,
             slice_id: None,
         }

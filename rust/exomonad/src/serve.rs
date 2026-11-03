@@ -785,6 +785,7 @@ async fn provision_ordered_sub_tl(
         topology: exomonad_core::services::agent_control::Topology::WorktreePerAgent,
         model: None,
         effort: None,
+        role_route: None,
         ledger_owned: true,
         slice_id: body.slice_id,
     };
@@ -2003,7 +2004,8 @@ Run `exomonad recompile` first to build it.",
 
     let mut agent_control =
         exomonad_core::services::agent_control::AgentControlService::new(services.clone())
-            .with_wasm_name(wasm_name.clone());
+            .with_wasm_name(wasm_name.clone())
+            .with_role_route_configuration_fingerprint(config.routing_configuration_fingerprint());
     let worktree_base = config.worktree_base.clone();
     agent_control = agent_control.with_worktree_base(worktree_base.clone());
     agent_control =

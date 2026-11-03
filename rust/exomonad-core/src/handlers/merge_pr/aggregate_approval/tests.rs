@@ -242,6 +242,7 @@ impl Fixture {
                 topology: Topology::SharedDir,
                 model: None,
                 effort: None,
+                role_route: None,
                 ledger_owned: true,
                 slice_id: None,
             })
@@ -388,6 +389,7 @@ async fn accepts_python_produced_nested_scope_with_distinct_run_and_manifest_ids
             topology: Topology::SharedDir,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: true,
             slice_id: Some(parent_scope_id.to_string()),
         })

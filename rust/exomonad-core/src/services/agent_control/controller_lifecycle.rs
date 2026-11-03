@@ -1063,6 +1063,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned,
             slice_id: slice_id.map(ToOwned::to_owned),
         }

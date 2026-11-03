@@ -810,6 +810,7 @@ impl<
                 recovery_lineage: invocation_plan.recovery_lineage,
                 expected_live_invocation_id: invocation_plan.expected_live_invocation_id,
                 mode: InvocationMode::Interactive,
+                role_route: None,
             },
             true,
         )
@@ -1598,6 +1599,7 @@ impl<
             role,
             model_override,
             effort_override,
+            true,
         );
         self.new_tmux_window_with_command(name, cwd, &full_command)
             .await
@@ -1635,8 +1637,14 @@ impl<
         env_vars: &HashMap<String, String>,
         cwd: &Path,
     ) -> String {
-        let model = self.effective_model_for(agent_type, role, options.model.as_deref());
-        let effort = self.effective_effort_for(role, None);
+        let (model, effort) = if options.role_route.is_some() {
+            (options.model.clone(), options.effort.clone())
+        } else {
+            (
+                self.effective_model_for(agent_type, role, options.model.as_deref()),
+                self.effective_effort_for(role, options.effort.as_deref()),
+            )
+        };
         self.build_launch_command(
             agent_type,
             prompt_file,
@@ -1647,6 +1655,7 @@ impl<
             Some(role),
             model.as_deref(),
             effort.as_deref(),
+            options.role_route.is_none(),
         )
     }
 
@@ -1664,8 +1673,15 @@ impl<
         role: Option<&str>,
         model_override: Option<&str>,
         effort_override: Option<&str>,
+        use_role_defaults: bool,
     ) -> String {
-        let model = model_override.or_else(|| self.default_model_for_spawn(agent_type, role));
+        let model = model_override.or_else(|| {
+            if use_role_defaults {
+                self.default_model_for_spawn(agent_type, role)
+            } else {
+                None
+            }
+        });
         Self::build_agent_command_with_effort(
             agent_type,
             prompt_file,
@@ -1675,7 +1691,11 @@ impl<
             claude_flags,
             self.yolo,
             model,
-            effort_override.or_else(|| self.default_effort_for_spawn(role)),
+            if use_role_defaults {
+                effort_override.or_else(|| self.default_effort_for_spawn(role))
+            } else {
+                effort_override
+            },
             super::InvocationMode::from_role(role),
         )
     }
@@ -1807,6 +1827,8 @@ impl<
         parent_window_name: Option<&str>,
         claude_flags: Option<&ClaudeSpawnFlags>,
         model_override: Option<&str>,
+        effort_override: Option<&str>,
+        use_role_defaults: bool,
     ) -> Result<super::tmux_ipc::PaneId> {
         let _dispatch = self
             .acquire_dispatch_permit("start a worker in a tmux pane")
@@ -1819,9 +1841,15 @@ impl<
             None => None,
         };
 
-        let model = model_override.or_else(|| match agent_type {
-            AgentType::OpenCode | AgentType::Codex => self.spawn_agent_model(),
-            _ => None,
+        let model = model_override.or_else(|| {
+            if use_role_defaults {
+                match agent_type {
+                    AgentType::OpenCode | AgentType::Codex => self.spawn_agent_model(),
+                    _ => None,
+                }
+            } else {
+                None
+            }
         });
         let full_command = Self::build_agent_command_with_effort(
             agent_type,
@@ -1832,7 +1860,11 @@ impl<
             claude_flags,
             self.yolo,
             model,
-            self.effort_for_role("worker"),
+            if use_role_defaults {
+                effort_override.or_else(|| self.effort_for_role("worker"))
+            } else {
+                effort_override
+            },
             super::InvocationMode::OneShot,
         );
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
@@ -1903,6 +1935,28 @@ impl<
         agent_type: AgentType,
         role: &crate::domain::Role,
     ) -> Result<()> {
+        self.write_agent_mcp_config_with_route(
+            _effective_dir,
+            agent_dir,
+            agent_type,
+            role,
+            RoleRouteLaunchSettings {
+                model: None,
+                effort: None,
+                route_bound: false,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn write_agent_mcp_config_with_route(
+        &self,
+        _effective_dir: &Path,
+        agent_dir: &Path,
+        agent_type: AgentType,
+        role: &crate::domain::Role,
+        route_settings: RoleRouteLaunchSettings<'_>,
+    ) -> Result<()> {
         let agent_name = agent_dir
             .file_name()
             .and_then(|n| n.to_str())
@@ -1935,7 +1989,13 @@ impl<
                     role.as_str(),
                     &self.extra_mcp_servers,
                     &role_context,
-                    self.effort_for_role(role.as_str()),
+                    if route_settings.route_bound {
+                        route_settings.effort
+                    } else {
+                        route_settings
+                            .effort
+                            .or_else(|| self.effort_for_role(role.as_str()))
+                    },
                 );
                 fs::write(
                     agent_dir.join("opencode.json"),
@@ -1946,17 +2006,26 @@ impl<
                 info!(agent_dir = %agent_dir.display(), role = %role.as_str(), "Wrote opencode.json and plugin for OpenCode agent");
             }
             AgentType::Codex => {
-                let model = if role.as_str() == "reviewer" {
-                    self.reviewer_model.as_deref()
+                let model = if route_settings.route_bound {
+                    route_settings.model
                 } else {
-                    self.spawn_agent_model()
+                    route_settings.model.or_else(|| {
+                        if role.as_str() == "reviewer" {
+                            self.reviewer_model.as_deref()
+                        } else {
+                            self.spawn_agent_model()
+                        }
+                    })
                 };
-                self.write_codex_config_files(
+                self.write_codex_config_files_with_effort(
                     agent_dir,
                     role,
                     &AgentName::try_from_str(agent_name)
                         .expect("validated string input is non-empty"),
-                    model,
+                    RoleRouteLaunchSettings {
+                        model,
+                        ..route_settings
+                    },
                     &self.extra_mcp_servers,
                 )
                 .await?;
@@ -1972,12 +2041,35 @@ impl<
     /// installs the matching hook trust. Nothing else may write a Codex config:
     /// a config written outside the lifecycle has no trust state, so Codex
     /// fires "3 hooks need review" on first tool use.
+    #[cfg(test)]
     pub(crate) async fn write_codex_config_files(
         &self,
         dir: &Path,
         role: &crate::domain::Role,
         agent_name: &AgentName,
         model: Option<&str>,
+        extra_mcp_servers: &HashMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        self.write_codex_config_files_with_effort(
+            dir,
+            role,
+            agent_name,
+            RoleRouteLaunchSettings {
+                model,
+                effort: None,
+                route_bound: false,
+            },
+            extra_mcp_servers,
+        )
+        .await
+    }
+
+    pub(crate) async fn write_codex_config_files_with_effort(
+        &self,
+        dir: &Path,
+        role: &crate::domain::Role,
+        agent_name: &AgentName,
+        route_settings: RoleRouteLaunchSettings<'_>,
         extra_mcp_servers: &HashMap<String, serde_json::Value>,
     ) -> Result<()> {
         let role_context = self.runtime_role_context(role)?;
@@ -1987,8 +2079,14 @@ impl<
             agent_name: agent_name.as_str(),
             role: role.as_str(),
             role_context: Some(&role_context),
-            model,
-            effort: self.effort_for_role(role.as_str()),
+            model: route_settings.model,
+            effort: if route_settings.route_bound {
+                route_settings.effort
+            } else {
+                route_settings
+                    .effort
+                    .or_else(|| self.effort_for_role(role.as_str()))
+            },
             extra_mcp_servers,
             exomonad_binary: &exomonad_binary,
         };
@@ -2576,6 +2674,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: true,
             slice_id: Some("ordered-child".to_string()),
         };
@@ -2778,6 +2877,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: true,
             slice_id: Some("ordered-child".to_string()),
         };
@@ -2912,6 +3012,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: true,
             slice_id: Some("ordered-child".to_string()),
         };
@@ -3366,6 +3467,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: true,
             slice_id: Some("ordered-child".to_string()),
         };
@@ -3635,6 +3737,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: true,
             slice_id: Some("ordered-child".to_string()),
         };
@@ -3782,6 +3885,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: true,
             slice_id: Some("ordered-child".to_string()),
         };
@@ -4013,6 +4117,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: true,
             slice_id: Some("root".to_string()),
         };
@@ -4081,6 +4186,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: true,
             slice_id: Some("ordered-child".to_string()),
         };
@@ -4218,6 +4324,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: true,
             slice_id: Some("ordered-reuse".to_string()),
         };
@@ -4309,6 +4416,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: true,
             slice_id: Some("ordered-published".to_string()),
         };
@@ -4449,6 +4557,7 @@ mod tests {
             topology: Topology::WorktreePerAgent,
             model: None,
             effort: None,
+            role_route: None,
             ledger_owned: true,
             slice_id: Some("ordered-uncertain".to_string()),
         };
@@ -4537,6 +4646,8 @@ mod tests {
             expected_agent_name: None,
             invocation_pr_number: None,
             recovery_lineage: None,
+            effort: None,
+            role_route: None,
         };
         let command = service.leaf_launch_command(
             AgentType::OpenCode,

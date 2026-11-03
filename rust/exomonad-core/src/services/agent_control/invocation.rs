@@ -51,7 +51,8 @@ pub enum InvocationMode {
 impl InvocationMode {
     pub fn from_role(role: Option<&str>) -> Self {
         match role {
-            Some("dev") | Some("reviewer") | Some("worker") => Self::OneShot,
+            Some("dev") | Some("dev_leaf") | Some("dev-leaf") | Some("reviewer")
+            | Some("worker") => Self::OneShot,
             _ => Self::Interactive,
         }
     }
@@ -63,7 +64,7 @@ mod mode_tests {
 
     #[test]
     fn mode_is_role_scoped() {
-        for role in ["dev", "reviewer", "worker"] {
+        for role in ["dev", "dev_leaf", "dev-leaf", "reviewer", "worker"] {
             assert_eq!(
                 InvocationMode::from_role(Some(role)),
                 InvocationMode::OneShot
@@ -103,6 +104,23 @@ pub struct InvocationMetadata {
     pub recovery_lineage: Option<RecoveryInvocationLineage>,
     pub expected_live_invocation_id: Option<String>,
     pub mode: InvocationMode,
+    pub role_route: Option<RoleRouteProvenance>,
+}
+
+/// Accepted controller route persisted with the invocation that used it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoleRouteProvenance {
+    pub role: String,
+    pub harness: String,
+    pub agent_type: AgentType,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub configuration_fingerprint: String,
+    pub policy_fingerprint: Option<String>,
+    pub manifest_digest: Option<String>,
+    pub route_fingerprint: String,
+    pub dispatch_intent_id: String,
+    pub scope_id: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -203,6 +221,8 @@ pub struct InvocationRecord {
     pub exit_classification: Option<String>,
     #[serde(default)]
     pub stderr_tail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_route: Option<RoleRouteProvenance>,
 }
 
 impl InvocationRecord {
@@ -629,6 +649,7 @@ async fn start_invocation_with_context(
         exit_reason: None,
         exit_classification: None,
         stderr_tail: None,
+        role_route: None,
         prior_invocation_id: None,
         recovery_round: 0,
         authorization_source: None,
@@ -761,6 +782,7 @@ pub async fn start_invocation_with_provenance_and_context_and_mode_with_id(
         mode,
         invocation_id,
         None,
+        None,
     )
     .await
 }
@@ -780,6 +802,7 @@ pub async fn start_invocation_with_provenance_and_context_and_mode_with_id_guard
     mode: InvocationMode,
     invocation_id: String,
     expected_live_invocation_id: Option<&str>,
+    role_route: Option<RoleRouteProvenance>,
 ) -> Result<InvocationRecord> {
     if invocation_id.trim().is_empty() {
         return Err(anyhow::anyhow!("invocation ID must not be empty"));
@@ -875,6 +898,7 @@ pub async fn start_invocation_with_provenance_and_context_and_mode_with_id_guard
         exit_reason: None,
         exit_classification: None,
         stderr_tail: None,
+        role_route,
     };
     write_atomic(agent_dir, &record).await?;
     #[cfg(test)]

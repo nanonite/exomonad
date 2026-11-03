@@ -6494,6 +6494,8 @@ def _resume_approved_blocked_leaf(
                     route_policy_fingerprint=attempt.route_policy_fingerprint,
                     route_manifest_digest=attempt.route_manifest_digest,
                     route_fingerprint=attempt.route_fingerprint,
+                    route_dispatch_intent_id=attempt.intent_id,
+                    route_scope_id=proof.leaf.name,
                 )
             except Exception as error:  # noqa: BLE001 - journal and safely retry exact owner intent
                 journal.mark_unknown(intent, error)
@@ -6801,6 +6803,20 @@ def _validated_blocked_resume_result(
     expected_effort = (
         expected_route.get("effort") if isinstance(expected_route, Mapping) else None
     ) or proof.desired_effort
+    expected_role_route = _blocked_resume_role_route_response(proof)
+    observed_role_route = agent.get("role_route")
+    if expected_role_route is not None and (
+        not isinstance(observed_role_route, Mapping)
+        or {key: value for key, value in observed_role_route.items() if value is not None}
+        != expected_role_route
+    ):
+        LOGGER.warning(
+            "blocked-leaf resume route receipt mismatch slice=%s expected=%r observed=%r",
+            proof.leaf.name,
+            expected_role_route,
+            observed_role_route,
+        )
+        return None
     if (
         runtime != expected_agent_type
         or observed_model != expected_model
@@ -6813,6 +6829,28 @@ def _validated_blocked_resume_result(
         observed_model,
         observed_effort,
     )
+
+
+def _blocked_resume_role_route_response(
+    proof: _BlockedLeafResumeProof,
+) -> dict[str, object] | None:
+    fields = proof.route_fields
+    if not isinstance(fields, Mapping):
+        return None
+    values = {
+        "role": fields.get("role"),
+        "harness": fields.get("harness"),
+        "agent_type": fields.get("agent_type"),
+        "model": fields.get("model"),
+        "effort": fields.get("effort"),
+        "configuration_fingerprint": fields.get("route_configuration_fingerprint"),
+        "policy_fingerprint": fields.get("route_policy_fingerprint"),
+        "manifest_digest": fields.get("route_manifest_digest"),
+        "route_fingerprint": fields.get("route_fingerprint"),
+        "dispatch_intent_id": proof.intent_id,
+        "scope_id": proof.leaf.name,
+    }
+    return {key: value for key, value in values.items() if value is not None}
 
 
 def _optional_nonempty_text(value: object) -> str | None:
@@ -13525,6 +13563,19 @@ def _record_dispatch_result(
             effects_log,
             code=_dispatch_failure_code(store, config, attempt),
         )
+    route_receipt_error = _dispatch_route_receipt_error(slice_id, attempt, result)
+    if config.active and route_receipt_error is not None:
+        return _record_ambiguous_dispatch_outcome(
+            store,
+            state,
+            slice_id,
+            attempt,
+            route_receipt_error,
+            "agent.role_route.receipt_unverified",
+            config,
+            effects,
+            effects_log,
+        )
     boundary = "spawn_request_accepted" if result is not None else "spawn_not_executed"
     current = state.slices[slice_id]
     updated = slice_transition(current, SliceStatusChanged(SliceStatus.DISPATCH_UNCONFIRMED))
@@ -16360,7 +16411,7 @@ def _dispatch_route_state_fields(attempt: DispatchAttempt) -> dict[str, str | No
     }
 
 
-def _dispatch_tool_route_arguments(attempt: DispatchAttempt) -> dict[str, str]:
+def _dispatch_tool_route_arguments(attempt: DispatchAttempt, scope_id: str) -> dict[str, str]:
     values = {
         "harness": attempt.harness,
         "agent_type": attempt.agent_type,
@@ -16371,8 +16422,65 @@ def _dispatch_tool_route_arguments(attempt: DispatchAttempt) -> dict[str, str]:
         "route_policy_fingerprint": attempt.route_policy_fingerprint,
         "route_manifest_digest": attempt.route_manifest_digest,
         "route_fingerprint": attempt.route_fingerprint,
+        "route_scope_id": scope_id,
     }
     return {name: value for name, value in values.items() if isinstance(value, str) and value}
+
+
+def _dispatch_route_receipt_error(
+    slice_id: str,
+    attempt: DispatchAttempt,
+    result: ToolResult | None,
+) -> str | None:
+    """Require the compiled spawn response to echo the route and invocation it used."""
+    if attempt.route_fingerprint is None:
+        return None
+    if result is None or result.success is not True or not isinstance(result.result, Mapping):
+        return "route-bound spawn has no successful typed invocation receipt"
+    expected = _dispatch_tool_route_arguments(attempt, slice_id)
+    receipt = _spawn_receipt_payload(result.result)
+    if receipt is None:
+        return "route-bound spawn response omitted its unique owner receipt"
+    response_route = receipt.get("role_route")
+    if not isinstance(response_route, Mapping):
+        return "route-bound spawn response omitted its accepted role-route receipt"
+    observed = {key: value for key, value in response_route.items() if value is not None}
+    expected_response = {
+        "role": expected.get("role"),
+        "harness": expected.get("harness"),
+        "agent_type": expected.get("agent_type"),
+        "model": expected.get("model"),
+        "effort": expected.get("effort"),
+        "configuration_fingerprint": expected.get("route_configuration_fingerprint"),
+        "policy_fingerprint": expected.get("route_policy_fingerprint"),
+        "manifest_digest": expected.get("route_manifest_digest"),
+        "route_fingerprint": expected.get("route_fingerprint"),
+        "dispatch_intent_id": attempt.intent_id,
+        "scope_id": slice_id,
+    }
+    expected_response = {key: value for key, value in expected_response.items() if value is not None}
+    if observed != expected_response:
+        return "route-bound spawn response conflicts with the accepted role-route receipt"
+    invocation_id = receipt.get("invocation_id")
+    if not isinstance(invocation_id, str) or not invocation_id.strip():
+        return "route-bound spawn response omitted its durable invocation identity"
+    if (
+        receipt.get("invocation_runtime") != expected.get("agent_type")
+        or receipt.get("invocation_trigger") != "spawn"
+    ):
+        return "route-bound spawn response invocation conflicts with the accepted runtime route"
+    return None
+
+
+def _spawn_receipt_payload(result: Mapping[str, object]) -> Mapping[str, object] | None:
+    """Select the one host receipt in either leaf or worker tool output."""
+    if isinstance(result.get("role_route"), Mapping):
+        return result
+    spawned = result.get("spawned")
+    if not isinstance(spawned, list) or len(spawned) != 1:
+        return None
+    receipt = spawned[0]
+    return receipt if isinstance(receipt, Mapping) else None
 
 
 def _dispatch_retry_payload(
@@ -17351,8 +17459,11 @@ def _is_spawn_confirmation_event(event: EventEnvelope) -> bool:
 def _spawn_agent_id(result: ToolResult | None) -> str | None:
     if result is None or not isinstance(result.result, Mapping):
         return None
+    receipt = _spawn_receipt_payload(result.result)
+    if receipt is None:
+        receipt = result.result
     for key in ("agent_id", "id", "child_agent"):
-        value = result.result.get(key)
+        value = receipt.get(key)
         if isinstance(value, str) and value:
             return value
     return None
@@ -17361,10 +17472,13 @@ def _spawn_agent_id(result: ToolResult | None) -> str | None:
 def _spawn_invocation_id(result: ToolResult | None) -> str | None:
     if result is None or not isinstance(result.result, Mapping):
         return None
-    value = result.result.get("invocation_id")
+    receipt = _spawn_receipt_payload(result.result)
+    if receipt is None:
+        receipt = result.result
+    value = receipt.get("invocation_id")
     if isinstance(value, str) and value:
         return value
-    nested = result.result.get("invocation")
+    nested = receipt.get("invocation")
     if isinstance(nested, Mapping):
         value = nested.get("invocation_id")
         if isinstance(value, str) and value:
@@ -17518,7 +17632,7 @@ def _dispatch_children(
         # only because the selector honored it, so a slice can never be
         # dispatched with an unvalidated plan value when policy resolved a
         # different harness.
-        worker_args.update(_dispatch_tool_route_arguments(attempt))
+        worker_args.update(_dispatch_tool_route_arguments(attempt, worker.name))
         try:
             result = _invoke(
                 "spawn_worker",
@@ -17560,7 +17674,7 @@ def _dispatch_children(
         runtime_name = config.dispatch_names.get(leaf.name, leaf.name)
         leaf_args: dict[str, object] = {"name": runtime_name, "task": leaf.task}
         _optional_argument(leaf_args, "intent_id", attempt.intent_id)
-        leaf_args.update(_dispatch_tool_route_arguments(attempt))
+        leaf_args.update(_dispatch_tool_route_arguments(attempt, leaf.name))
         for name, value in (
             ("boundary", leaf.boundary),
             ("read_first", leaf.read_first),
@@ -25577,6 +25691,7 @@ def _worker_call(
             route_policy_fingerprint=attempt.route_policy_fingerprint,
             route_manifest_digest=attempt.route_manifest_digest,
             route_fingerprint=attempt.route_fingerprint,
+            route_scope_id=task.name,
         )
 
     return invoke
@@ -25601,6 +25716,7 @@ def _leaf_call(
             route_policy_fingerprint=attempt.route_policy_fingerprint,
             route_manifest_digest=attempt.route_manifest_digest,
             route_fingerprint=attempt.route_fingerprint,
+            route_scope_id=task.name,
             boundary=task.boundary,
             context=task.context,
             read_first=task.read_first,

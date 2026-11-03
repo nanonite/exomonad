@@ -64,6 +64,7 @@ fn identity(topology: Topology) -> AgentIdentityRecord {
         topology,
         model: None,
         effort: None,
+        role_route: None,
         ledger_owned: false,
         slice_id: Some("1069".to_string()),
     }

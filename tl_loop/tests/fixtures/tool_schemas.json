@@ -18,6 +18,24 @@
             "description": "Optional model override, separate from agent_type.",
             "type": "string"
           },
+          "role_route": {
+            "description": "Accepted controller role, harness, model, effort, and provenance binding.",
+            "properties": {
+              "agent_type": {"enum": ["claude", "shoal", "opencode", "codex"], "type": "string"},
+              "configuration_fingerprint": {"type": "string"},
+              "dispatch_intent_id": {"type": "string"},
+              "effort": {"type": "string"},
+              "harness": {"type": "string"},
+              "manifest_digest": {"type": "string"},
+              "model": {"type": "string"},
+              "policy_fingerprint": {"type": "string"},
+              "role": {"type": "string"},
+              "route_fingerprint": {"type": "string"},
+              "scope_id": {"type": "string"}
+            },
+            "required": ["role", "harness"],
+            "type": "object"
+          },
           "boundary": {
             "description": "DO NOT rules for known failure modes",
             "items": {
@@ -88,6 +106,24 @@
           "model": {
             "description": "Optional model override, separate from agent_type.",
             "type": "string"
+          },
+          "role_route": {
+            "description": "Accepted controller role, harness, model, effort, and provenance binding.",
+            "properties": {
+              "agent_type": {"enum": ["claude", "shoal", "opencode", "codex"], "type": "string"},
+              "configuration_fingerprint": {"type": "string"},
+              "dispatch_intent_id": {"type": "string"},
+              "effort": {"type": "string"},
+              "harness": {"type": "string"},
+              "manifest_digest": {"type": "string"},
+              "model": {"type": "string"},
+              "policy_fingerprint": {"type": "string"},
+              "role": {"type": "string"},
+              "route_fingerprint": {"type": "string"},
+              "scope_id": {"type": "string"}
+            },
+            "required": ["role", "harness"],
+            "type": "object"
           },
           "name": {
             "description": "Worker name (pane title, messaging identity)",
@@ -300,6 +336,24 @@
           "human_approved": {
             "description": "Whether the leaf's durable human recovery gate was approved.",
             "type": "boolean"
+          },
+          "role_route": {
+            "description": "Accepted controller role, harness, model, effort, and provenance binding.",
+            "properties": {
+              "agent_type": {"enum": ["claude", "shoal", "opencode", "codex"], "type": "string"},
+              "configuration_fingerprint": {"type": "string"},
+              "dispatch_intent_id": {"type": "string"},
+              "effort": {"type": "string"},
+              "harness": {"type": "string"},
+              "manifest_digest": {"type": "string"},
+              "model": {"type": "string"},
+              "policy_fingerprint": {"type": "string"},
+              "role": {"type": "string"},
+              "route_fingerprint": {"type": "string"},
+              "scope_id": {"type": "string"}
+            },
+            "required": ["role", "harness"],
+            "type": "object"
           }
         },
         "required": [
