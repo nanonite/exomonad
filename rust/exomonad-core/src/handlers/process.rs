@@ -1070,6 +1070,115 @@ mod tests {
             original_oid
         );
 
+        std::fs::write(nested.join("alias-target.txt"), "must remain untracked\n").unwrap();
+        let parent_index_before_alias_refusals = std::fs::read(root.join(".git/index")).unwrap();
+        let reference_index_before_alias_refusals =
+            std::fs::read(nested.join(".git/index")).unwrap();
+        let reference_head_before_alias_refusals =
+            String::from_utf8(run_git_fixture_output(&nested, &["rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim()
+                .to_string();
+        let reference_refs_before_alias_refusals =
+            run_git_fixture_output(&nested, &["show-ref"]).stdout;
+
+        for (key, value) in [
+            ("alias.redirect-chain", "redirect-final"),
+            ("alias.redirect-final", "-C tools/reference add -A"),
+            (
+                "alias.redirect-git-dir",
+                "--git-dir tools/reference/.git add -A",
+            ),
+            (
+                "alias.redirect-work-tree",
+                "--work-tree tools/reference add -A",
+            ),
+            (
+                "alias.redirect-core-worktree",
+                "-c core.worktree=tools/reference add -A",
+            ),
+            (
+                "alias.redirect-config-env",
+                "--config-env=core.worktree=REFERENCE_WORKTREE add -A",
+            ),
+        ] {
+            assert_git_fixture_succeeded(
+                run_git_fixture_output(&root, &["config", "--local", key, value]),
+                &["config", "--local", key, value],
+            );
+        }
+        let redirections = [
+            (
+                vec![
+                    "-c".into(),
+                    "alias.redirect-c=-C tools/reference add -A".into(),
+                    "redirect-c".into(),
+                ],
+                std::collections::HashMap::new(),
+            ),
+            (
+                vec!["redirect-git-dir".into()],
+                std::collections::HashMap::new(),
+            ),
+            (
+                vec!["redirect-work-tree".into()],
+                std::collections::HashMap::new(),
+            ),
+            (
+                vec!["redirect-core-worktree".into()],
+                std::collections::HashMap::new(),
+            ),
+            (
+                vec!["redirect-config-env".into()],
+                std::collections::HashMap::from([(
+                    "REFERENCE_WORKTREE".into(),
+                    "tools/reference".into(),
+                )]),
+            ),
+            (
+                vec!["redirect-chain".into()],
+                std::collections::HashMap::new(),
+            ),
+        ];
+        for (args, env) in redirections {
+            let error = handler
+                .run(
+                    RunRequest {
+                        command: "git".into(),
+                        args,
+                        working_dir: ".".into(),
+                        env,
+                        timeout_ms: 5_000,
+                    },
+                    &test_ctx_at(&root),
+                )
+                .await
+                .expect_err("an alias must not redirect Git outside its assigned worktree");
+            assert!(error.to_string().contains("Git path overrides"));
+            assert_eq!(
+                std::fs::read(root.join(".git/index")).unwrap(),
+                parent_index_before_alias_refusals
+            );
+            assert_eq!(
+                std::fs::read(nested.join(".git/index")).unwrap(),
+                reference_index_before_alias_refusals
+            );
+        }
+        assert_eq!(
+            String::from_utf8(run_git_fixture_output(&nested, &["rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim(),
+            reference_head_before_alias_refusals
+        );
+        assert_eq!(
+            run_git_fixture_output(&nested, &["show-ref"]).stdout,
+            reference_refs_before_alias_refusals
+        );
+        assert_eq!(
+            std::fs::read(nested.join("alias-target.txt")).unwrap(),
+            b"must remain untracked\n"
+        );
+
         assert_git_fixture_succeeded(
             run_git_fixture_output(
                 &root,

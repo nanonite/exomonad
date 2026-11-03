@@ -1,7 +1,8 @@
 //! Mutation leases and durable audit records for direct Git process effects.
 
 use super::git_process_policy::{
-    is_git_commit, prepare_git_command, validate_gitlink_index_identity,
+    command_overrides_git_target, is_git_commit, prepare_git_command,
+    validate_gitlink_index_identity,
 };
 use super::process_supervision::{GitProcessAudit, ProcessRunOutput};
 use crate::effects::{EffectError, EffectResult};
@@ -403,65 +404,6 @@ fn git_identity_unavailable() -> EffectError {
     EffectError::custom(
         "git_mutation_unavailable",
         "managed Git process repository identity could not be verified before spawn",
-    )
-}
-
-fn command_overrides_git_target(args: &[String]) -> bool {
-    let mut index = 0;
-    while let Some(argument) = args.get(index).map(String::as_str) {
-        if is_target_override(argument) || config_option_overrides_worktree(argument) {
-            return true;
-        }
-        if (argument == "-c" || argument == "--config-env")
-            && args
-                .get(index + 1)
-                .is_some_and(|value| is_worktree_config_assignment(value))
-        {
-            return true;
-        }
-        if !argument.starts_with('-') {
-            return false;
-        }
-        index += usize::from(global_option_takes_value(argument));
-        index += 1;
-    }
-    false
-}
-
-fn is_target_override(argument: &str) -> bool {
-    argument == "-C"
-        || argument.starts_with("-C")
-        || argument == "--git-dir"
-        || argument.starts_with("--git-dir=")
-        || argument == "--work-tree"
-        || argument.starts_with("--work-tree=")
-}
-
-fn config_option_overrides_worktree(argument: &str) -> bool {
-    if let Some(value) = argument.strip_prefix("--config-env=") {
-        return is_worktree_config_assignment(value);
-    }
-    argument
-        .strip_prefix("-c")
-        .filter(|value| !value.is_empty())
-        .is_some_and(is_worktree_config_assignment)
-}
-
-fn is_worktree_config_assignment(value: &str) -> bool {
-    value
-        .split_once('=')
-        .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("core.worktree"))
-}
-
-fn global_option_takes_value(argument: &str) -> bool {
-    matches!(
-        argument,
-        "-c" | "--config-env"
-            | "--namespace"
-            | "--super-prefix"
-            | "--git-dir"
-            | "--work-tree"
-            | "-C"
     )
 }
 

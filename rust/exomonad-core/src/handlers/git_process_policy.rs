@@ -25,8 +25,60 @@ pub(crate) fn prepare_git_command(
     request_env: &HashMap<String, String>,
 ) -> EffectResult<Vec<String>> {
     let resolved = resolve_git_aliases(args, directory, request_env)?;
+    if command_overrides_git_target(&resolved) {
+        return Err(alias_refusal(
+            "Git path overrides introduced by a Git alias are not allowed; use working_dir for the assigned target",
+        ));
+    }
     validate_git_command_policy(&resolved, directory, request_env)?;
     protect_reference_mutation(&resolved, directory, request_env)
+}
+
+pub(crate) fn command_overrides_git_target(args: &[String]) -> bool {
+    let mut index = 0;
+    while let Some(argument) = args.get(index).map(String::as_str) {
+        if is_target_override(argument) || config_option_overrides_worktree(argument) {
+            return true;
+        }
+        if (argument == "-c" || argument == "--config-env")
+            && args
+                .get(index + 1)
+                .is_some_and(|value| is_worktree_config_assignment(value))
+        {
+            return true;
+        }
+        if !argument.starts_with('-') {
+            return false;
+        }
+        index += usize::from(global_option_takes_value(argument));
+        index += 1;
+    }
+    false
+}
+
+fn is_target_override(argument: &str) -> bool {
+    argument == "-C"
+        || argument.starts_with("-C")
+        || argument == "--git-dir"
+        || argument.starts_with("--git-dir=")
+        || argument == "--work-tree"
+        || argument.starts_with("--work-tree=")
+}
+
+fn config_option_overrides_worktree(argument: &str) -> bool {
+    if let Some(value) = argument.strip_prefix("--config-env=") {
+        return is_worktree_config_assignment(value);
+    }
+    argument
+        .strip_prefix("-c")
+        .filter(|value| !value.is_empty())
+        .is_some_and(is_worktree_config_assignment)
+}
+
+fn is_worktree_config_assignment(value: &str) -> bool {
+    value
+        .split_once('=')
+        .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("core.worktree"))
 }
 
 fn validate_git_command_policy(
