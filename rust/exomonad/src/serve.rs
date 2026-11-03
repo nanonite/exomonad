@@ -37,6 +37,20 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, instrument, warn, Instrument};
 
+fn resolve_worker_runtime_route(
+    config: &Config,
+    inherited_model: impl FnOnce() -> Result<Option<String>>,
+) -> Result<exomonad::config::ResolvedRoleRoute> {
+    let overrides = exomonad::config::RoleRouteOverrides::default();
+    let configured = config.resolve_role_route("worker", None, &overrides, None)?;
+    if configured.model.is_some()
+        || configured.agent_type != exomonad_core::services::agent_control::AgentType::Codex
+    {
+        return Ok(configured);
+    }
+    config.resolve_role_route("worker", None, &overrides, inherited_model()?)
+}
+
 /// The pid a `.exo/server.pid` record names, if it names one.
 fn recorded_server_pid(server_pid_path: &StdPath) -> Option<i32> {
     let record = std::fs::read_to_string(server_pid_path).ok()?;
@@ -1996,20 +2010,21 @@ Run `exomonad recompile` first to build it.",
         agent_control.with_birth_branch(resolve_agent_birth_branch(&worktree_base, "root").await?);
     agent_control = agent_control.with_tmux_session(config.tmux_session.clone());
     agent_control = agent_control.with_yolo(config.yolo);
-    agent_control = agent_control.with_spawn_agent_type(config.spawn_agent_type);
-    let worker_model = match config.spawn_agent_type {
-        exomonad_core::services::agent_control::AgentType::Codex => {
-            crate::codex_model::configured_model()?
-        }
-        _ => config.opencode.worker_model.clone(),
-    };
-    agent_control = agent_control.with_spawn_agent_model(worker_model);
+    let worker_route = resolve_worker_runtime_route(&config, crate::codex_model::configured_model)?;
+    let reviewer_route = config.resolve_role_route(
+        "reviewer",
+        None,
+        &exomonad::config::RoleRouteOverrides::default(),
+        None,
+    )?;
+    agent_control = agent_control.with_spawn_agent_type(worker_route.agent_type);
+    agent_control = agent_control.with_spawn_agent_model(worker_route.model.clone());
     agent_control =
-        agent_control.with_spawn_agent_effort(Some(config.worker_effort_level.level.to_string()));
+        agent_control.with_spawn_agent_effort(Some(worker_route.effort.level.to_string()));
     agent_control =
-        agent_control.with_reviewer_effort(Some(config.reviewer_effort_level.level.to_string()));
-    agent_control = agent_control.with_reviewer_agent_type(config.reviewer.agent_type);
-    agent_control = agent_control.with_reviewer_model(config.reviewer.model.clone());
+        agent_control.with_reviewer_effort(Some(reviewer_route.effort.level.to_string()));
+    agent_control = agent_control.with_reviewer_agent_type(reviewer_route.agent_type);
+    agent_control = agent_control.with_reviewer_model(reviewer_route.model.clone());
     agent_control = agent_control.with_reviewer_context(config.reviewer.context.clone());
     agent_control = agent_control
         .with_extra_mcp_servers(serialize_extra_mcp_servers(&config.extra_mcp_servers));
@@ -2398,11 +2413,57 @@ mod tests {
     use super::*;
     use exomonad_core::mcp::tools::MCPCallOutput;
     use exomonad_core::services::InboxMessageRecord;
+    use std::cell::Cell;
 
     fn stub_project() -> tempfile::TempDir {
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(project.path().join(".exo")).unwrap();
         project
+    }
+
+    #[test]
+    fn serve_keeps_configured_worker_route_ahead_of_codex_host_default() {
+        let project = stub_project();
+        std::fs::write(
+            project.path().join(".exo/config.toml"),
+            "spawn_agent_type = 'codex'\nworker_model = 'gpt-6-luna'\nworker_effort_level = 'xhigh'\n",
+        )
+        .unwrap();
+        let config = Config::discover_from(project.path(), &|_| None).unwrap();
+        let default_queried = Cell::new(false);
+        let route = resolve_worker_runtime_route(&config, || {
+            default_queried.set(true);
+            Ok(Some("gpt-6.1-sol".to_string()))
+        })
+        .unwrap();
+
+        assert_eq!(route.model.as_deref(), Some("gpt-6-luna"));
+        assert_eq!(route.effort.level, crate::config::EffortLevel::XHigh);
+        assert_eq!(
+            route.model_source,
+            crate::config::RouteValueSource::ProjectConfig
+        );
+        assert!(!default_queried.get());
+    }
+
+    #[test]
+    fn serve_marks_codex_host_model_as_inherited_only_when_role_model_is_unset() {
+        let project = stub_project();
+        std::fs::write(
+            project.path().join(".exo/config.toml"),
+            "spawn_agent_type = 'codex'\nworker_effort_level = 'high'\n",
+        )
+        .unwrap();
+        let config = Config::discover_from(project.path(), &|_| None).unwrap();
+        let route =
+            resolve_worker_runtime_route(&config, || Ok(Some("gpt-6.1-sol".to_string()))).unwrap();
+
+        assert_eq!(route.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(
+            route.model_source,
+            crate::config::RouteValueSource::HarnessDefault
+        );
+        assert_eq!(route.effort.level, crate::config::EffortLevel::High);
     }
 
     #[tokio::test]

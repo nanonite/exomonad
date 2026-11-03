@@ -138,7 +138,7 @@ enum Commands {
         /// inherited by forked TLs, leaves, ephemeral workers, and companions.
         #[arg(long)]
         worker: Option<String>,
-        /// Model for spawned workers with --worker=opencode.
+        /// Model for spawned workers for any supported worker harness.
         #[arg(long)]
         worker_model: Option<String>,
         /// Effort inherited by forked TLs, leaves, ephemeral workers, and companions.

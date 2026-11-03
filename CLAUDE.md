@@ -312,11 +312,12 @@ shell_command = "nix develop" # environment wrapper for TL tab + server
 #   tmux_session = "exomonad"
 wasm_dir = ".exo/wasm"       # project-local (default), override for shared installs
 wasm_name = "devswarm"       # auto-detected from .exo/roles/ if exactly one role exists
-model = "sonnet"             # legacy root-model compatibility; ignored by the programmatic TL
+model = "sonnet"             # explicit TL model when configured; accepted task policy may select another allowed model
 root_agent_type = "claude"   # legacy compatibility; init always starts the Python TL controller
 spawn_agent_type = "codex"   # default harness for workers, leaves, and companions
-# Worker/reviewer CLI flags override their values. Root TL effort is ignored.
-tl_effort_level = "medium"   # legacy compatibility; not used by the controller
+worker_model = "gpt-6-luna"  # optional model override for Codex, Claude Code, or OpenCode workers
+# Role-specific effort defaults; a controller-selected route can override them.
+tl_effort_level = "medium"   # TL/subTL inference route
 worker_effort_level = "medium"
 poll_interval = 60           # optional — GitHub poll cycle in seconds (default: 60)
 # TL loop operational timeouts (seconds). Lifecycle progress is driven by authoritative events.
@@ -339,7 +340,9 @@ forgejo_webhook_secret = "shared-secret"           # optional — webhook signat
 type = "http"
 url = "http://localhost:8080"
 
-# Opencode agent configuration.
+# OpenCode-specific compatibility configuration. These model fields apply only
+# when the corresponding route uses OpenCode; generic `model`/`worker_model`
+# settings take precedence for their roles.
 [opencode]
 use_embedded_key = true  # true = use embedded key in opencode binary, false = use OPENROUTER_API_KEY
 # tl_model/worker_model accept OpenCode model IDs; CLI effort uses the
@@ -366,9 +369,14 @@ model = "haiku"                # optional — passed as --model flag to companio
 
 Gemini is retired; old configurations fail closed with: `agent_type 'gemini' is retired; use 'codex' (model: the top-level \`model\` in your Codex config, or EXOMONAD_CODEX_MODEL). See CLAUDE.md Configuration.` The message names no model on purpose: every model probed against a ChatGPT-account Codex login is refused the same way, so only the account knows which ones run. `exomonad new` resolves the model its harness policy names from your Codex config and refuses to scaffold when it cannot.
 
-**Role-specific harness and effort:** `--tl`, `--worker`, and `--reviewer` select the
-root, worker/companion, and reviewer harnesses independently. Effort precedence is
-CLI flag > local config > global config > medium default. Worker effort is inherited
+**Role-specific harness, model, and effort:** `--worker` and `--reviewer` select
+their harnesses independently; `--worker-model` applies to Codex, Claude Code,
+and OpenCode. TL, worker/dev-leaf, and reviewer routes remain separate. An explicit
+CLI route wins, then the accepted task-policy selection, then the role's configured
+route, then an inherited harness default when no model was selected. A policy-selected
+model is never replaced by the machine-wide Codex model. Effort precedence is CLI
+flag > accepted policy > explicit environment > local config > project config > medium
+default. Worker effort is inherited
 by forked TLs, leaves, ephemeral workers, and companions. OpenCode receives the
 resolved level as its model `--variant`; Codex receives the resolved level as
 `model_reasoning_effort` in its rendered config, while Shoal alone logs that effort is

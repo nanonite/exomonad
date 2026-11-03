@@ -2701,15 +2701,23 @@ fn append_init_invocation_log(
         "session_mode": mode.as_str(),
         "resolved": {
             "root_agent_type": agent_type_str(config.root_agent_type),
+            "root_agent_type_source": config.root_agent_type_source,
             "spawn_agent_type": agent_type_str(config.spawn_agent_type),
+            "spawn_agent_type_source": config.spawn_agent_type_source,
             "reviewer_agent_type": agent_type_str(config.reviewer.agent_type),
+            "reviewer_agent_type_source": config.reviewer_agent_type_source,
             "root_model": config.model.as_deref(),
+            "root_model_source": config.model_source,
+            "worker_model": config.worker_model.as_deref(),
+            "worker_model_source": config.worker_model_source,
             "opencode_tl_model": config.opencode.tl_model.as_deref(),
             "opencode_worker_model": config.opencode.worker_model.as_deref(),
             "reviewer_model": config.reviewer.model.as_deref(),
+            "reviewer_model_source": config.reviewer_model_source,
             "tl_effort": config.tl_effort_level,
             "worker_effort": config.worker_effort_level,
             "reviewer_effort": config.reviewer_effort_level,
+            "role_route_config_fingerprint": config.routing_configuration_fingerprint(),
         }
     });
     let mut file = std::fs::OpenOptions::new()
@@ -4821,25 +4829,44 @@ async fn verify_first_window_codex_home(window: &str, expected: Option<&str>) ->
     first_window_codex_home_verdict(expected, Some(&observed))
 }
 
-fn agent_configuration_environment(config: &Config) -> String {
+fn agent_configuration_environment(config: &Config) -> Result<String> {
     let mut parts = Vec::new();
-    if let Some(model) = &config.opencode.tl_model {
+    let defaults = crate::config::RoleRouteOverrides::default();
+    let tl_route = config.resolve_role_route("tl", None, &defaults, None)?;
+    let worker_route = config.resolve_role_route("worker", None, &defaults, None)?;
+    let reviewer_route = config.resolve_role_route("reviewer", None, &defaults, None)?;
+    if let Some(model) = tl_route.model {
         parts.push(format!(
             "EXOMONAD_TL_MODEL={}",
-            shell_escape::escape(model.clone().into())
+            shell_escape::escape(model.into())
+        ));
+        parts.push(format!(
+            "{}={}",
+            crate::config::TL_MODEL_SOURCE_ENV,
+            tl_route.model_source.as_str()
         ));
     }
-    if let Some(model) = &config.opencode.worker_model {
+    if let Some(model) = worker_route.model {
         parts.push(format!(
             "EXOMONAD_WORKER_MODEL={}",
-            shell_escape::escape(model.clone().into())
+            shell_escape::escape(model.into())
+        ));
+        parts.push(format!(
+            "{}={}",
+            crate::config::WORKER_MODEL_SOURCE_ENV,
+            worker_route.model_source.as_str()
         ));
     }
-    if let Some(model) = &config.reviewer.model {
+    if let Some(model) = reviewer_route.model {
         parts.push(format!(
             "{}={}",
             REVIEWER_MODEL_ENV,
-            shell_escape::escape(model.clone().into())
+            shell_escape::escape(model.into())
+        ));
+        parts.push(format!(
+            "{}={}",
+            crate::config::REVIEWER_MODEL_SOURCE_ENV,
+            reviewer_route.model_source.as_str()
         ));
     }
     parts.push(format!(
@@ -4847,7 +4874,42 @@ fn agent_configuration_environment(config: &Config) -> String {
         REVIEWER_EFFORT_ENV,
         shell_escape::escape(config.reviewer_effort_level.level.to_string().into())
     ));
-    format!(" {}", parts.join(" "))
+    parts.push(format!(
+        "{}={}",
+        crate::config::TL_EFFORT_ENV,
+        shell_escape::escape(config.tl_effort_level.level.to_string().into())
+    ));
+    parts.push(format!(
+        "{}={}",
+        crate::config::TL_EFFORT_SOURCE_ENV,
+        effort_route_source(config.tl_effort_level.source)
+    ));
+    parts.push(format!(
+        "{}={}",
+        crate::config::WORKER_EFFORT_ENV,
+        shell_escape::escape(config.worker_effort_level.level.to_string().into())
+    ));
+    parts.push(format!(
+        "{}={}",
+        crate::config::WORKER_EFFORT_SOURCE_ENV,
+        effort_route_source(config.worker_effort_level.source)
+    ));
+    parts.push(format!(
+        "{}={}",
+        crate::config::REVIEWER_EFFORT_SOURCE_ENV,
+        effort_route_source(config.reviewer_effort_level.source)
+    ));
+    Ok(format!(" {}", parts.join(" ")))
+}
+
+fn effort_route_source(source: crate::config::EffortSource) -> &'static str {
+    match source {
+        crate::config::EffortSource::Cli => "cli",
+        crate::config::EffortSource::Environment => "environment",
+        crate::config::EffortSource::Policy => "policy",
+        crate::config::EffortSource::Config => "config",
+        crate::config::EffortSource::Default => "default",
+    }
 }
 
 fn ensure_harness_capability(cwd: &Path) -> Result<()> {
@@ -5440,8 +5502,8 @@ fn tl_controller_wrapper_command(cwd: &Path, controller: &str) -> String {
     )
 }
 
-fn server_command(session: &str, config: &Config, verbose: bool) -> String {
-    let model_env = agent_configuration_environment(config);
+fn server_command(session: &str, config: &Config, verbose: bool) -> Result<String> {
+    let model_env = agent_configuration_environment(config)?;
     let verbose_prefix = if verbose {
         "RUST_LOG=info EXOMONAD_HOOK_TRACE=1 EXOMONAD_CHAINLINK_TRACE=1 "
     } else {
@@ -5453,16 +5515,19 @@ fn server_command(session: &str, config: &Config, verbose: bool) -> String {
             .to_string()
             .into(),
     );
-    format!(
-        "{}EXOMONAD_TMUX_SESSION={} EXOMONAD_ROOT_AGENT_TYPE={} EXOMONAD_SPAWN_AGENT_TYPE={} EXOMONAD_REVIEWER_AGENT_TYPE={}{} {} serve",
+    Ok(format!(
+        "{}EXOMONAD_TMUX_SESSION={} EXOMONAD_ROOT_AGENT_TYPE={} EXOMONAD_ROOT_AGENT_TYPE_SOURCE={} EXOMONAD_SPAWN_AGENT_TYPE={} EXOMONAD_SPAWN_AGENT_TYPE_SOURCE={} EXOMONAD_REVIEWER_AGENT_TYPE={} EXOMONAD_REVIEWER_AGENT_TYPE_SOURCE={}{} {} serve",
         verbose_prefix,
         session,
         agent_type_str(config.root_agent_type),
+        config.root_agent_type_source.as_str(),
         agent_type_str(config.spawn_agent_type),
+        config.spawn_agent_type_source.as_str(),
         agent_type_str(config.reviewer.agent_type),
+        config.reviewer_agent_type_source.as_str(),
         model_env,
         binary,
-    )
+    ))
 }
 
 fn root_has_approved_ordered_recovery(value: &Value) -> bool {
@@ -5724,7 +5789,7 @@ async fn launch_server_recovery(
             "Server",
             project_dir,
             shell,
-            &server_command(session, config, verbose),
+            &server_command(session, config, verbose)?,
         )
         .await?;
     ipc.set_window_remain_on_exit(&server_window, true).await?;
@@ -7255,25 +7320,22 @@ pub async fn run(
     }
 
     // CLI flags override config
-    if let Some(ref worker_type) = worker {
-        config.spawn_agent_type = parse_agent_type(worker_type)?;
-    }
-    if let Some(m) = worker_model {
-        if config.spawn_agent_type == AgentType::OpenCode {
-            config.opencode.worker_model = Some(m);
-        }
-    }
-    if let Some(level) = worker_effort_level {
-        config.worker_effort_level = ResolvedEffort::from_cli(level);
-    }
+    apply_worker_route_overrides(
+        &mut config,
+        worker.as_deref(),
+        worker_model,
+        worker_effort_level,
+    )?;
     if let Some(level) = reviewer_effort_level {
         config.reviewer_effort_level = ResolvedEffort::from_cli(level);
     }
     if let Some(ref reviewer_type) = reviewer {
         config.reviewer.agent_type = parse_agent_type(reviewer_type)?;
+        config.reviewer_agent_type_source = crate::config::RouteValueSource::Cli;
     }
     if let Some(m) = reviewer_model {
         config.reviewer.model = Some(m);
+        config.reviewer_model_source = crate::config::RouteValueSource::Cli;
     }
     if openrouter {
         config.openrouter.enabled = true;
@@ -7292,13 +7354,15 @@ pub async fn run(
     log_ignored_effort("tl", config.root_agent_type, &tl_effort);
     log_ignored_effort("worker", config.spawn_agent_type, &worker_effort);
     log_ignored_effort("reviewer", config.reviewer.agent_type, &reviewer_effort);
-    if config.spawn_agent_type == AgentType::OpenCode {
-        if let Some(m) = config.opencode.worker_model.as_deref() {
-            validate_opencode_model(m, Some(&worker_effort)).await?;
-        }
-    } else if config.spawn_agent_type == AgentType::Codex {
-        if let Some(m) = config.opencode.worker_model.as_deref() {
-            validate_codex_model(m, Some(&worker_effort)).await?;
+    let worker_route = config.resolve_role_route(
+        "worker",
+        None,
+        &crate::config::RoleRouteOverrides::default(),
+        None,
+    )?;
+    if worker_route.agent_type == AgentType::OpenCode {
+        if let Some(model) = worker_route.model.as_deref() {
+            validate_opencode_model(model, Some(&worker_effort)).await?;
         }
     }
     validate_reviewer_model_for_harness(
@@ -7308,12 +7372,18 @@ pub async fn run(
     )
     .await?;
 
-    let root_model = None::<&str>;
-    let worker_model = if config.spawn_agent_type == AgentType::OpenCode {
-        config.opencode.worker_model.as_deref()
-    } else {
-        None
-    };
+    let root_route = config.resolve_role_route(
+        "tl",
+        None,
+        &crate::config::RoleRouteOverrides::default(),
+        None,
+    )?;
+    let worker_route = config.resolve_role_route(
+        "worker",
+        None,
+        &crate::config::RoleRouteOverrides::default(),
+        None,
+    )?;
     let init_argv = redact_init_argv(std::env::args().collect::<Vec<_>>());
     if let Err(e) = append_init_invocation_log(&cwd, &config, &init_argv, mode) {
         warn!(error = %e, "Failed to append init invocation log");
@@ -7322,8 +7392,10 @@ pub async fn run(
             root_agent_type = agent_type_str(config.root_agent_type),
             spawn_agent_type = agent_type_str(config.spawn_agent_type),
             reviewer_agent_type = agent_type_str(config.reviewer.agent_type),
-            root_model = ?root_model,
-            worker_model = ?worker_model,
+            root_model = ?root_route.model,
+            root_model_source = ?root_route.model_source,
+            worker_model = ?worker_route.model,
+            worker_model_source = ?worker_route.model_source,
             reviewer_model = ?config.reviewer.model,
             tl_effort = %config.tl_effort_level.level,
             tl_effort_source = %config.tl_effort_level.source,
@@ -7854,7 +7926,7 @@ pub async fn run(
 
     prepare_server_socket_for_start(&cwd)?;
 
-    let serve_cmd = server_command(&session, &config, verbose);
+    let serve_cmd = server_command(&session, &config, verbose)?;
     let send_status = std::process::Command::new("tmux")
         .args([
             "send-keys",
@@ -8845,7 +8917,7 @@ fn report_observability_health(project_dir: &Path) {
 
 /// Parse agent type from CLI string.
 fn parse_agent_type(s: &str) -> Result<AgentType> {
-    let value = s.to_lowercase();
+    let value = s.trim().to_lowercase();
     if value == ["ge", "mini"].concat() {
         anyhow::bail!(
             "{}",
@@ -8862,6 +8934,30 @@ fn parse_agent_type(s: &str) -> Result<AgentType> {
             s
         ),
     }
+}
+
+fn apply_worker_route_overrides(
+    config: &mut Config,
+    worker_harness: Option<&str>,
+    worker_model: Option<String>,
+    worker_effort: Option<EffortLevel>,
+) -> Result<()> {
+    if let Some(harness) = worker_harness {
+        config.spawn_agent_type = parse_agent_type(harness)?;
+        config.spawn_agent_type_source = crate::config::RouteValueSource::Cli;
+    }
+    if let Some(model) = worker_model {
+        let model = model.trim().to_string();
+        if model.is_empty() {
+            anyhow::bail!("--worker-model must contain a non-empty model identifier");
+        }
+        config.worker_model = Some(model);
+        config.worker_model_source = crate::config::RouteValueSource::Cli;
+    }
+    if let Some(effort) = worker_effort {
+        config.worker_effort_level = ResolvedEffort::from_cli(effort);
+    }
+    Ok(())
 }
 
 fn agent_type_str(t: AgentType) -> &'static str {
@@ -12478,22 +12574,113 @@ mod tests {
     #[test]
     fn agent_configuration_environment_propagates_reviewer_settings() {
         let mut config = Config::default();
+        config.root_agent_type = AgentType::OpenCode;
+        config.opencode_tl_model_source = crate::config::RouteValueSource::ProjectConfig;
+        config.spawn_agent_type = AgentType::OpenCode;
+        config.opencode_worker_model_source = crate::config::RouteValueSource::ProjectConfig;
         config.opencode.tl_model = Some("opencode/tl model".to_string());
         config.opencode.worker_model = Some("opencode/worker".to_string());
         config.reviewer.model = Some("openai/reviewer model".to_string());
+        config.reviewer_model_source = crate::config::RouteValueSource::ProjectConfig;
         config.reviewer_effort_level = ResolvedEffort::from_cli(EffortLevel::XHigh);
+        config.worker_effort_level = ResolvedEffort::from_cli(EffortLevel::High);
 
-        let environment = agent_configuration_environment(&config);
+        let environment = agent_configuration_environment(&config).unwrap();
 
         assert!(environment.contains("EXOMONAD_TL_MODEL='opencode/tl model'"));
+        assert!(environment.contains("EXOMONAD_TL_MODEL_SOURCE=project_config"));
         assert!(environment.contains("EXOMONAD_WORKER_MODEL=opencode/worker"));
+        assert!(environment.contains("EXOMONAD_WORKER_MODEL_SOURCE=project_config"));
         assert!(environment.contains("EXOMONAD_REVIEWER_MODEL='openai/reviewer model'"));
+        assert!(environment.contains("EXOMONAD_REVIEWER_MODEL_SOURCE=project_config"));
         assert!(environment.contains("EXOMONAD_REVIEWER_EFFORT_LEVEL=xhigh"));
+        assert!(environment.contains("EXOMONAD_WORKER_EFFORT_LEVEL=high"));
 
         config.reviewer.model = None;
-        let default_environment = agent_configuration_environment(&config);
+        let default_environment = agent_configuration_environment(&config).unwrap();
         assert!(!default_environment.contains(REVIEWER_MODEL_ENV));
         assert!(default_environment.contains("EXOMONAD_REVIEWER_EFFORT_LEVEL=xhigh"));
+    }
+
+    #[test]
+    fn agent_configuration_environment_propagates_generic_models_for_codex_and_claude() {
+        let mut config = Config::default();
+        config.root_agent_type = AgentType::Claude;
+        config.model = Some("claude-tl-model".to_string());
+        config.spawn_agent_type = AgentType::Codex;
+        config.worker_model = Some("gpt-6-luna".to_string());
+        config.worker_model_source = crate::config::RouteValueSource::Cli;
+
+        let environment = agent_configuration_environment(&config).unwrap();
+        assert!(environment.contains("EXOMONAD_TL_MODEL=claude-tl-model"));
+        assert!(environment.contains("EXOMONAD_WORKER_MODEL=gpt-6-luna"));
+        assert!(environment.contains("EXOMONAD_WORKER_MODEL_SOURCE=cli"));
+    }
+
+    #[test]
+    fn init_serializes_routes_loaded_from_project_configuration() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".exo")).unwrap();
+        std::fs::write(
+            project.path().join(".exo/config.toml"),
+            "root_agent_type = 'claude'\nmodel = 'claude-sonnet-4-6'\ntl_effort_level = 'high'\nspawn_agent_type = 'codex'\nworker_model = 'gpt-6-luna'\nworker_effort_level = 'xhigh'\n[reviewer]\nagent_type = 'opencode'\nmodel = 'openai/reviewer model'\neffort_level = 'low'\n",
+        )
+        .unwrap();
+
+        let config = Config::discover_from(project.path(), &|_| None).unwrap();
+        let environment = agent_configuration_environment(&config).unwrap();
+        let command = server_command("route-test", &config, false).unwrap();
+
+        assert!(environment.contains("EXOMONAD_TL_MODEL=claude-sonnet-4-6"));
+        assert!(environment.contains("EXOMONAD_TL_EFFORT_LEVEL=high"));
+        assert!(environment.contains("EXOMONAD_WORKER_MODEL=gpt-6-luna"));
+        assert!(environment.contains("EXOMONAD_WORKER_EFFORT_LEVEL=xhigh"));
+        assert!(environment.contains("EXOMONAD_REVIEWER_MODEL='openai/reviewer model'"));
+        assert!(environment.contains("EXOMONAD_REVIEWER_EFFORT_LEVEL=low"));
+        assert!(command.contains("EXOMONAD_ROOT_AGENT_TYPE_SOURCE=project_config"));
+        assert!(command.contains("EXOMONAD_SPAWN_AGENT_TYPE_SOURCE=project_config"));
+        assert!(command.contains("EXOMONAD_REVIEWER_AGENT_TYPE=opencode"));
+        assert!(command.contains("EXOMONAD_REVIEWER_AGENT_TYPE_SOURCE=project_config"));
+    }
+
+    #[test]
+    fn worker_model_cli_override_applies_to_every_supported_harness() {
+        for (harness, expected) in [
+            ("codex", AgentType::Codex),
+            ("claude-code", AgentType::Claude),
+            ("opencode", AgentType::OpenCode),
+        ] {
+            let mut config = Config::default();
+            apply_worker_route_overrides(
+                &mut config,
+                Some(harness),
+                Some("selected-model".to_string()),
+                Some(EffortLevel::XHigh),
+            )
+            .unwrap();
+            let route = config
+                .resolve_role_route(
+                    "dev-leaf",
+                    None,
+                    &crate::config::RoleRouteOverrides::default(),
+                    Some("host-default-model".to_string()),
+                )
+                .unwrap();
+            assert_eq!(route.agent_type, expected);
+            assert_eq!(route.model.as_deref(), Some("selected-model"));
+            assert_eq!(route.model_source, crate::config::RouteValueSource::Cli);
+            assert_eq!(route.effort.level, EffortLevel::XHigh);
+            assert_eq!(route.effort.source, crate::config::EffortSource::Cli);
+        }
+    }
+
+    #[test]
+    fn worker_model_cli_rejects_an_empty_route_instead_of_dropping_it() {
+        let mut config = Config::default();
+        let error =
+            apply_worker_route_overrides(&mut config, Some("codex"), Some("  ".to_string()), None)
+                .unwrap_err();
+        assert!(error.to_string().contains("--worker-model"));
     }
 
     #[test]
@@ -13471,10 +13658,12 @@ mod tests {
             ..Default::default()
         };
 
-        let command = server_command("workspace", &config, false);
+        let command = server_command("workspace", &config, false).unwrap();
         assert!(command.contains("EXOMONAD_TMUX_SESSION=workspace"));
         assert!(command.contains("EXOMONAD_ROOT_AGENT_TYPE=claude"));
+        assert!(command.contains("EXOMONAD_ROOT_AGENT_TYPE_SOURCE=default"));
         assert!(command.contains("EXOMONAD_SPAWN_AGENT_TYPE=opencode"));
+        assert!(command.contains("EXOMONAD_SPAWN_AGENT_TYPE_SOURCE=default"));
         assert!(command.contains("EXOMONAD_REVIEWER_AGENT_TYPE=codex"));
         assert!(command.ends_with("/exomonad serve"));
     }
