@@ -6181,6 +6181,43 @@ def _resume_approved_blocked_leaf(
         return state
     if not config.active or not isinstance(effects, EffectClient):
         return state
+    try:
+        journal = effects_log if isinstance(effects_log, EffectJournal) else None
+        if journal is None:
+            raise ActionJournalError("blocked-leaf resume requires a durable action journal")
+        initial_arguments = _blocked_leaf_resume_action_arguments(proof, state)
+        initial_intent = EffectIntent(
+            "resume_blocked_leaf", proof.leaf.name, initial_arguments, True
+        )
+        initial_entry = journal.existing(initial_intent)
+    except (ActionJournalError, KeyError, TypeError, ValueError, OSError) as error:
+        return _hold_owner_resume(
+            state,
+            proof,
+            config,
+            effects,
+            store,
+            effects_log,
+            f"blocked-leaf resume journal could not be checked: {type(error).__name__}",
+        )
+    if (
+        initial_entry is None or initial_entry.get("status") not in {"confirmed", "rejected"}
+    ) and not _reference_verification_ready(
+        proof.leaf.name,
+        proof.leaf.reference_verification_requirements,
+        state,
+        config,
+        store,
+    ):
+        return _hold_owner_resume(
+            state,
+            proof,
+            config,
+            effects,
+            store,
+            effects_log,
+            "required reference verification is missing, failed, stale, or the source is not clean; no new owner resume was issued",
+        )
     handoff_error = _prepare_scope_handoff(proof.leaf, state, config, effects, store, effects_log)
     if handoff_error is not None:
         return _hold_owner_resume(
@@ -6219,7 +6256,24 @@ def _resume_approved_blocked_leaf(
         if status == "confirmed" or status == "rejected":
             result = journal.replay(existing)
         else:
-            journal.append(intent)
+            if not _reference_verification_ready(
+                proof.leaf.name,
+                proof.leaf.reference_verification_requirements,
+                state,
+                config,
+                store,
+            ):
+                return _hold_owner_resume(
+                    state,
+                    proof,
+                    config,
+                    effects,
+                    store,
+                    effects_log,
+                    "required reference verification changed before owner resume; no new owner resume was issued",
+                )
+            if existing is None or status == "not_dispatched":
+                journal.append(intent)
             attempt = _blocked_leaf_dispatch_attempt(arguments, proof.current)
             dispatch_intended = _record_controller_event(
                 proof.leaf.name,
@@ -6243,7 +6297,7 @@ def _resume_approved_blocked_leaf(
                 and spawn_requested is not None
                 and spawn_requested.success is True
             ):
-                journal.mark_not_dispatched(intent)
+                _mark_unlaunched_resume_intent(journal, intent, existing)
                 return _hold_owner_resume(
                     state,
                     proof,
@@ -6259,7 +6313,7 @@ def _resume_approved_blocked_leaf(
                     plan, fresh_state, config, store
                 )
                 if fresh_terminal is None:
-                    journal.mark_not_dispatched(intent)
+                    _mark_unlaunched_resume_intent(journal, intent, existing)
                     return _hold_terminal_owner_recovery(
                         fresh_state,
                         proof.leaf,
@@ -6268,6 +6322,42 @@ def _resume_approved_blocked_leaf(
                         store,
                         effects_log,
                         proof_reason or "terminal-owner authorization changed before dispatch",
+                    )
+                if not _reference_verification_ready(
+                    proof.leaf.name,
+                    proof.leaf.reference_verification_requirements,
+                    fresh_state,
+                    config,
+                    store,
+                ):
+                    _mark_unlaunched_resume_intent(journal, intent, existing)
+                    return _hold_terminal_owner_recovery(
+                        fresh_state,
+                        proof.leaf,
+                        config,
+                        effects,
+                        store,
+                        effects_log,
+                        "required reference verification changed at the owner-resume boundary; no new owner resume was issued",
+                    )
+            else:
+                fresh_state = store.load()
+                if not _reference_verification_ready(
+                    proof.leaf.name,
+                    proof.leaf.reference_verification_requirements,
+                    fresh_state,
+                    config,
+                    store,
+                ):
+                    _mark_unlaunched_resume_intent(journal, intent, existing)
+                    return _hold_owner_resume(
+                        fresh_state,
+                        proof,
+                        config,
+                        effects,
+                        store,
+                        effects_log,
+                        "required reference verification changed at the owner-resume boundary; no new owner resume was issued",
                     )
             try:
                 result = effects.resume_blocked_leaf(
@@ -6443,6 +6533,16 @@ def _blocked_leaf_resume_action_arguments(
             }
         )
     return arguments
+
+
+def _mark_unlaunched_resume_intent(
+    journal: EffectJournal,
+    intent: EffectIntent,
+    existing: Mapping[str, object] | None,
+) -> None:
+    """Retire only an attempt proven not to have reached the host boundary."""
+    if existing is None or existing.get("status") == "not_dispatched":
+        journal.mark_not_dispatched(intent)
 
 
 def _terminal_invocation_digest(invocation: Mapping[str, object]) -> str:
@@ -17079,9 +17179,21 @@ def _reference_verification_ready(
             "reference verification blocks %s: accepted manifest is unavailable", task_name
         )
         return False
+    references_by_path: dict[str, ReferenceVerificationRequirement] = {}
+    for requirement in required:
+        existing = references_by_path.get(requirement.path)
+        if existing is not None and existing.remote_url != requirement.remote_url:
+            LOGGER.warning(
+                "reference verification blocks %s: accepted declarations conflict on identity at %s",
+                task_name,
+                requirement.path,
+            )
+            return False
+        references_by_path.setdefault(requirement.path, requirement)
     workspace = config.worktree or config.project_root
     observations = tuple(
-        observe_reference_project(workspace, requirement) for requirement in required
+        observe_reference_project(workspace, requirement)
+        for requirement in references_by_path.values()
     )
     decision = assess_reference_verification(
         required,

@@ -12,6 +12,7 @@ import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, cast
@@ -131,6 +132,14 @@ from tl_loop.state.plan_manifest import ManifestNode, PlanManifest, build_plan_m
 from tl_loop.state.plan_reconciliation import analyze_plan_reconciliation
 from tl_loop.state.plan_reconciliation_apply import apply_plan_reconciliation
 from tl_loop.state.plan_revision_apply import apply_plan_revision
+from tl_loop.state.reference_verification import (
+    ReferenceSourceState,
+    ReferenceVerificationEvidence,
+    ReferenceVerificationRequirement,
+    VerificationKind,
+    VerificationOutcome,
+    VerificationProvenance,
+)
 from tl_loop.state.schema import (
     SCHEMA_VERSION,
     ActionKind,
@@ -19127,6 +19136,108 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
     assert journal.entries_for("resume_blocked_leaf", slice_id)[0]["status"] == "confirmed"
 
 
+def _seed_terminal_reference_project(
+    worktree: Path,
+    requirement: ReferenceVerificationRequirement,
+) -> str:
+    """Create one real local Git reference matching a terminal-owner requirement."""
+    source = worktree.parent / "terminal-reference-source"
+    source.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(source)], check=True)
+    for key, value in (
+        ("user.name", "Reference Fixture"),
+        ("user.email", "reference@example.invalid"),
+    ):
+        subprocess.run(["git", "-C", str(source), "config", key, value], check=True)
+    (source / "source.txt").write_text("reference source\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(source), "add", "source.txt"], check=True)
+    subprocess.run(["git", "-C", str(source), "commit", "-q", "-m", "reference source"], check=True)
+    commit = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    worktree.mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main.substitution-model-kani-stage", str(worktree)],
+        check=True,
+    )
+    for key, value in (
+        ("user.name", "Controller Fixture"),
+        ("user.email", "controller@example.invalid"),
+    ):
+        subprocess.run(["git", "-C", str(worktree), "config", key, value], check=True)
+    reference = worktree / requirement.path
+    reference.parent.mkdir(parents=True)
+    subprocess.run(
+        ["git", "-C", str(worktree), "clone", "-q", "--local", str(source), str(reference)],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(reference), "remote", "set-url", "origin", requirement.remote_url],
+        check=True,
+    )
+    (worktree / ".gitmodules").write_text(
+        f'[submodule "reference"]\n\tpath = {requirement.path}\n\turl = {requirement.remote_url}\n',
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(worktree), "add", ".gitmodules"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(worktree),
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{commit},{requirement.path}",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(worktree), "commit", "-q", "-m", "record reference"], check=True
+    )
+    return commit
+
+
+def _terminal_reference_requirement() -> ReferenceVerificationRequirement:
+    return ReferenceVerificationRequirement(
+        "tools/llmlift",
+        "https://forge.example.invalid/org/llmlift.git",
+        VerificationKind.TEST,
+        "cargo test -p llmlift",
+        True,
+    )
+
+
+def _record_terminal_reference_evidence(
+    store: RunStore,
+    requirement: ReferenceVerificationRequirement,
+    commit: str,
+    *,
+    outcome: VerificationOutcome = VerificationOutcome.PASSED,
+    source_state: ReferenceSourceState = ReferenceSourceState.CLEAN,
+) -> None:
+    manifest = store.load().plan_manifest
+    assert manifest is not None
+    evidence = ReferenceVerificationEvidence.create(
+        run_id=store.run_id,
+        scope_id=manifest.scope_id,
+        path=requirement.path,
+        remote_url=requirement.remote_url,
+        commit_sha=commit,
+        source_state=source_state,
+        kind=requirement.kind,
+        command=requirement.command,
+        outcome=outcome,
+        provenance=VerificationProvenance.controller("reference-test-invocation"),
+        recorded_at=datetime(2026, 11, 2, tzinfo=UTC),
+    )
+    assert store.record_reference_verification(evidence)
+
+
 def _seed_terminal_provider_failure_leaf(
     tmp_path: Path,
     *,
@@ -19134,6 +19245,7 @@ def _seed_terminal_provider_failure_leaf(
     prior_model: str = "opencode-go/deepseek-v4.1-flash",
     prior_effort: str = "high",
     controller_invocation_id: str = "accepted-kani-controller-invocation",
+    reference_requirements: tuple[ReferenceVerificationRequirement, ...] = (),
 ) -> tuple[WorkPlan, TLLoopConfig, RunStore, Path, str, str]:
     """Build the retained accepted-launch / terminal-provider-failure shape."""
     run_id = "substitution-model-kani-stage"
@@ -19165,6 +19277,9 @@ def _seed_terminal_provider_failure_leaf(
                     "agent_type": f"{prior_runtime}/{prior_model}",
                     "boundary": ["crates/beast-rs-core/tests/kani_f64_substitution_model.rs"],
                     "verify": ["cargo kani -p beast-rs-core --tests"],
+                    "reference_verification_requirements": [
+                        item.to_document() for item in reference_requirements
+                    ],
                 }
             ]
         }
@@ -19237,6 +19352,8 @@ def _seed_terminal_provider_failure_leaf(
     )
     store = RunStore(run_id, root_dir)
     store.set_plan_manifest(manifest)
+    if reference_requirements:
+        _seed_terminal_reference_project(controller_worktree, reference_requirements[0])
     planned_state = store.load()
     node = next(item for item in manifest.nodes if item.name == slice_id)
     store.checkpoint(
@@ -19533,9 +19650,20 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
     tmp_path: Path,
 ) -> None:
     """A confirmed terminal launch can migrate only after exact recovery proof."""
+    reference_requirement = _terminal_reference_requirement()
     plan, config, store, owner_dir, owner_name, prior_invocation_id = (
-        _seed_terminal_provider_failure_leaf(tmp_path)
+        _seed_terminal_provider_failure_leaf(
+            tmp_path,
+            reference_requirements=(reference_requirement,),
+        )
     )
+    reference_commit = subprocess.run(
+        ["git", "-C", str(config.worktree / reference_requirement.path), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _record_terminal_reference_evidence(store, reference_requirement, reference_commit)
     cancel_event = threading.Event()
     config = replace(config, cancel_event=cancel_event)
     successor_id = "codex-terminal-failure-successor"
@@ -19686,6 +19814,80 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
     assert (
         Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
     ).read_bytes() == original_ledger
+
+    repeated_transport = RecordingTransport()
+    repeated = driver_module._resume_terminal_owner_failure(
+        plan,
+        store.load(),
+        config,
+        EffectClient(repeated_transport),
+        store,
+        EffectJournal(store.run_id, store.run_dir / "action-journal.json"),
+    )
+    assert repeated.slices[plan.leaves[0].name] == resumed
+    assert not any(name == "resume_blocked_leaf" for name, _ in repeated_transport.calls)
+
+
+@pytest.mark.parametrize("scenario", ("missing", "failed", "stale", "dirty"))
+def test_terminal_owner_resume_requires_current_reference_evidence(
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    requirement = _terminal_reference_requirement()
+    plan, config, store, _owner_dir, owner_name, prior_invocation_id = (
+        _seed_terminal_provider_failure_leaf(
+            tmp_path,
+            reference_requirements=(requirement,),
+        )
+    )
+    reference = config.worktree / requirement.path
+    commit = subprocess.run(
+        ["git", "-C", str(reference), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if scenario != "missing":
+        evidence_commit = "0" * 40 if scenario == "stale" else commit
+        outcome = VerificationOutcome.FAILED if scenario == "failed" else VerificationOutcome.PASSED
+        _record_terminal_reference_evidence(
+            store,
+            requirement,
+            evidence_commit,
+            outcome=outcome,
+        )
+    if scenario == "dirty":
+        (reference / "source.txt").write_text("dirty source\n", encoding="utf-8")
+    gate_name = driver_module._terminal_owner_recovery_gate_name(plan.leaves[0].name)
+    store.set_gate(gate_name, GateStatus.PENDING)
+    transport = RecordingTransport()
+    original_spawn = EffectJournal(store.run_id, store.run_dir / "action-journal.json").entries_for(
+        "spawn_leaf", plan.leaves[0].name
+    )
+
+    result = driver_module._resume_terminal_owner_failure(
+        plan,
+        store.load(),
+        config,
+        EffectClient(transport),
+        store,
+        EffectJournal(store.run_id, store.run_dir / "action-journal.json"),
+    )
+
+    leaf = result.slices[plan.leaves[0].name]
+    assert not any(name == "resume_blocked_leaf" for name, _ in transport.calls)
+    assert not any(name == "prepare_scope_handoff" for name, _ in transport.calls)
+    assert leaf.status is SliceStatus.SPAWNED
+    assert leaf.dispatch_agent_id == owner_name
+    assert leaf.dispatch_invocation_id == prior_invocation_id
+    assert leaf.dispatch_error_code is None
+    assert not any(gate.name.startswith("tl-dispatch-failed-") for gate in result.gates)
+    assert (
+        EffectJournal(store.run_id, store.run_dir / "action-journal.json").entries_for(
+            "spawn_leaf", plan.leaves[0].name
+        )
+        == original_spawn
+    )
 
 
 def test_startup_preserves_rejected_terminal_owner_recovery_gate(
@@ -20527,14 +20729,29 @@ def test_terminal_provider_recovery_holds_unproven_or_conflicting_evidence(
 def test_terminal_provider_recovery_adopts_response_lost_successor_once(
     tmp_path: Path,
 ) -> None:
+    reference_requirement = _terminal_reference_requirement()
     plan, config, store, owner_dir, owner_name, prior_invocation_id = (
         _seed_terminal_provider_failure_leaf(
             tmp_path,
             prior_runtime="codex",
             prior_model="gpt-6-luna",
             prior_effort="high",
+            reference_requirements=(reference_requirement,),
         )
     )
+    reference_commit = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(config.worktree / reference_requirement.path),
+            "rev-parse",
+            "HEAD",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _record_terminal_reference_evidence(store, reference_requirement, reference_commit)
     state = store.load()
     terminal, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
     assert terminal is not None and reason is None
@@ -20654,9 +20871,26 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
     monkeypatch: pytest.MonkeyPatch,
     legacy_adoption_audit: bool,
 ) -> None:
+    reference_requirement = _terminal_reference_requirement()
     plan, config, store, owner_dir, owner_name, prior_invocation_id = (
-        _seed_terminal_provider_failure_leaf(tmp_path)
+        _seed_terminal_provider_failure_leaf(
+            tmp_path,
+            reference_requirements=(reference_requirement,),
+        )
     )
+    reference_commit = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(config.worktree / reference_requirement.path),
+            "rev-parse",
+            "HEAD",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _record_terminal_reference_evidence(store, reference_requirement, reference_commit)
     state = store.load()
     terminal, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
     assert terminal is not None and reason is None
@@ -20764,6 +20998,21 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
     assert interrupted.dispatch_invocation_id == prior_invocation_id
     assert (
         interrupted.recovery is not None and interrupted.recovery.phase is RecoveryPhase.HUMAN_GATE
+    )
+
+    # Once the exact host result is durable, changed current identity evidence
+    # must not cause the confirmed resume effect to be sent a second time.
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(config.worktree / reference_requirement.path),
+            "remote",
+            "set-url",
+            "origin",
+            "https://forge.example.invalid/org/changed.git",
+        ],
+        check=True,
     )
 
     confirmed_before_rejection = json.dumps(journal_entry[0], sort_keys=True, separators=(",", ":"))

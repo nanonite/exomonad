@@ -134,6 +134,7 @@ def _run_git(project: Path, *arguments: str) -> tuple[int, bytes] | None:
     environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
     try:
         result = subprocess.run(
             ["git", "-C", str(project), *arguments],

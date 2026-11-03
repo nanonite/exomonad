@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import subprocess
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from tl_loop.client.effects import EffectClient
 from tl_loop.loop import driver as driver_module
@@ -90,6 +93,12 @@ def _plan(*, required: bool = True) -> WorkPlan:
     requirement = ReferenceVerificationRequirement(
         "tools/llmlift", REMOTE, VerificationKind.TEST, DECLARED_COMMAND, required
     )
+    return _plan_for_requirements((requirement,))
+
+
+def _plan_for_requirements(
+    requirements: tuple[ReferenceVerificationRequirement, ...],
+) -> WorkPlan:
     return WorkPlan.from_mapping(
         {
             "leaves": [
@@ -97,10 +106,37 @@ def _plan(*, required: bool = True) -> WorkPlan:
                     "name": "leaf",
                     "task": "work on the declared assignment",
                     "chainlink_issue_id": None,
-                    "reference_verification_requirements": [requirement.to_document()],
+                    "reference_verification_requirements": [
+                        requirement.to_document() for requirement in requirements
+                    ],
                 }
             ]
         }
+    )
+
+
+def _evidence(
+    store: RunStore,
+    requirement: ReferenceVerificationRequirement,
+    commit: str,
+    *,
+    outcome: VerificationOutcome = VerificationOutcome.PASSED,
+    source_state: ReferenceSourceState = ReferenceSourceState.CLEAN,
+) -> ReferenceVerificationEvidence:
+    manifest = store.load().plan_manifest
+    assert manifest is not None
+    return ReferenceVerificationEvidence.create(
+        run_id=store.run_id,
+        scope_id=manifest.scope_id,
+        path=requirement.path,
+        remote_url=requirement.remote_url,
+        commit_sha=commit,
+        source_state=source_state,
+        kind=requirement.kind,
+        command=requirement.command,
+        outcome=outcome,
+        provenance=VerificationProvenance.controller("verification-invocation"),
+        recorded_at=datetime(2026, 11, 2, tzinfo=UTC),
     )
 
 
@@ -234,6 +270,97 @@ def test_optional_reference_verification_does_not_gate_unrelated_work(tmp_path: 
 
     assert result.slices["leaf"].status.value == "dispatch_unconfirmed"
     assert len([call for call in effects.calls if call[0] == "spawn_leaf"]) == 1
+
+
+def test_required_build_and_test_share_one_reference_observation(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    commit = _workspace_with_reference(workspace)
+    requirements = (
+        ReferenceVerificationRequirement(
+            "tools/llmlift", REMOTE, VerificationKind.BUILD, "cargo build", True
+        ),
+        ReferenceVerificationRequirement(
+            "tools/llmlift", REMOTE, VerificationKind.TEST, "cargo test", True
+        ),
+    )
+    plan = _plan_for_requirements(requirements)
+    store = _store_for_plan(plan, workspace, tmp_path / "state", "reference-build-test")
+    for requirement in requirements:
+        assert store.record_reference_verification(_evidence(store, requirement, commit))
+
+    effects = RecordingEffects()
+    result = _dispatch_once(plan, store, workspace, effects)
+
+    assert result.slices["leaf"].status.value == "dispatch_unconfirmed"
+    assert len([call for call in effects.calls if call[0] == "spawn_leaf"]) == 1
+
+
+@pytest.mark.parametrize(
+    "scenario", ("missing_one", "failed", "stale", "dirty", "conflicting_identity")
+)
+def test_required_build_and_test_need_independent_current_evidence(
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    commit = _workspace_with_reference(workspace)
+    test_remote = "https://forge.example.invalid/org/other-llmlift.git"
+    requirements = (
+        ReferenceVerificationRequirement(
+            "tools/llmlift", REMOTE, VerificationKind.BUILD, "cargo build", True
+        ),
+        ReferenceVerificationRequirement(
+            "tools/llmlift",
+            test_remote if scenario == "conflicting_identity" else REMOTE,
+            VerificationKind.TEST,
+            "cargo test",
+            True,
+        ),
+    )
+    plan = _plan_for_requirements(requirements)
+    store = _store_for_plan(plan, workspace, tmp_path / "state", f"reference-{scenario}")
+    assert store.record_reference_verification(_evidence(store, requirements[0], commit))
+    if scenario != "missing_one":
+        test_commit = "0" * 40 if scenario == "stale" else commit
+        test_outcome = (
+            VerificationOutcome.FAILED if scenario == "failed" else VerificationOutcome.PASSED
+        )
+        assert store.record_reference_verification(
+            _evidence(
+                store,
+                requirements[1],
+                test_commit,
+                outcome=test_outcome,
+            )
+        )
+    if scenario == "dirty":
+        source = workspace / "tools" / "llmlift" / "source.txt"
+        source.write_text("modified after verification\n", encoding="utf-8")
+
+    effects = RecordingEffects()
+    result = _dispatch_once(plan, store, workspace, effects)
+
+    assert result.slices["leaf"].status.value == "pending"
+    assert not [call for call in effects.calls if call[0] == "spawn_leaf"]
+
+
+def test_reference_observation_does_not_refresh_project_index(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    _workspace_with_reference(workspace)
+    requirement = ReferenceVerificationRequirement(
+        "tools/llmlift", REMOTE, VerificationKind.TEST, DECLARED_COMMAND, True
+    )
+    project = workspace / "tools" / "llmlift"
+    index = project / ".git" / "index"
+    indexed_before = index.read_bytes()
+    source = project / "source.txt"
+    stat = source.stat()
+    os.utime(source, (stat.st_atime, stat.st_mtime + 10))
+
+    observation = driver_module.observe_reference_project(workspace, requirement)
+
+    assert observation.source_state is ReferenceSourceState.CLEAN
+    assert index.read_bytes() == indexed_before
 
 
 def test_required_reference_verification_holds_ordered_subtl_before_handoff_or_provision(
