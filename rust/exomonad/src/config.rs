@@ -4,10 +4,27 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 use exomonad_core::services::{normalize_tl_preflight_runtime_path, AgentType};
 use exomonad_core::Role;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
+use tracing::{debug, warn};
 
 pub const REVIEWER_MAX_ROUNDS_ENV: &str = "EXOMONAD_REVIEWER_MAX_ROUNDS";
 pub const REVIEWER_MODEL_ENV: &str = "EXOMONAD_REVIEWER_MODEL";
 pub const REVIEWER_EFFORT_ENV: &str = "EXOMONAD_REVIEWER_EFFORT_LEVEL";
+pub const TL_EFFORT_ENV: &str = "EXOMONAD_TL_EFFORT_LEVEL";
+pub const WORKER_EFFORT_ENV: &str = "EXOMONAD_WORKER_EFFORT_LEVEL";
+pub const TL_MODEL_ENV: &str = "EXOMONAD_TL_MODEL";
+pub const WORKER_MODEL_ENV: &str = "EXOMONAD_WORKER_MODEL";
+pub const TL_MODEL_SOURCE_ENV: &str = "EXOMONAD_TL_MODEL_SOURCE";
+pub const WORKER_MODEL_SOURCE_ENV: &str = "EXOMONAD_WORKER_MODEL_SOURCE";
+pub const REVIEWER_MODEL_SOURCE_ENV: &str = "EXOMONAD_REVIEWER_MODEL_SOURCE";
+pub const TL_EFFORT_SOURCE_ENV: &str = "EXOMONAD_TL_EFFORT_SOURCE";
+pub const WORKER_EFFORT_SOURCE_ENV: &str = "EXOMONAD_WORKER_EFFORT_SOURCE";
+pub const REVIEWER_EFFORT_SOURCE_ENV: &str = "EXOMONAD_REVIEWER_EFFORT_SOURCE";
+pub const ROOT_AGENT_SOURCE_ENV: &str = "EXOMONAD_ROOT_AGENT_TYPE_SOURCE";
+pub const WORKER_AGENT_SOURCE_ENV: &str = "EXOMONAD_SPAWN_AGENT_TYPE_SOURCE";
+pub const REVIEWER_AGENT_SOURCE_ENV: &str = "EXOMONAD_REVIEWER_AGENT_TYPE_SOURCE";
 pub use exomonad_core::services::TL_PREFLIGHT_RUNTIME_PATHS_ENV;
 pub const DEFAULT_TL_TRANSPORT_TIMEOUT_SECONDS: f64 = 10.0;
 pub const DEFAULT_TL_ACTIVE_TAIL_TIMEOUT_SECONDS: f64 = 30.0;
@@ -75,7 +92,7 @@ fn validate_preflight_runtime_paths(paths: &[String]) -> Result<()> {
 }
 
 fn parse_agent_type_env(s: &str) -> Option<AgentType> {
-    match s.to_lowercase().as_str() {
+    match s.trim().to_ascii_lowercase().as_str() {
         "claude" | "claude-code" => Some(AgentType::Claude),
         "opencode" | "opencode-cli" => Some(AgentType::OpenCode),
         "codex" => Some(AgentType::Codex),
@@ -84,39 +101,243 @@ fn parse_agent_type_env(s: &str) -> Option<AgentType> {
     }
 }
 
-fn resolve_spawn_agent_type(
-    environment: Option<&str>,
-    local: Option<AgentType>,
-    global: Option<AgentType>,
-) -> AgentType {
-    environment
-        .and_then(parse_agent_type_env)
-        .or(local)
-        .or(global)
-        .unwrap_or_default()
+fn parse_agent_type_override(name: &str, value: &str) -> Result<AgentType> {
+    parse_agent_type_env(value).ok_or_else(|| anyhow::anyhow!("invalid {name} value `{value}`"))
 }
 
-fn parse_effort_level_env(value: &str) -> Result<Option<EffortLevel>> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(None);
-    }
+fn present_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
 
+fn resolve_agent_type_value(
+    environment: Option<String>,
+    environment_source: Option<String>,
+    primary: Option<AgentType>,
+    primary_source: RouteValueSource,
+    secondary: Option<AgentType>,
+    secondary_source: RouteValueSource,
+    default: AgentType,
+    environment_name: &str,
+) -> Result<(AgentType, RouteValueSource)> {
+    if let Some(value) = present_value(environment) {
+        let source =
+            parse_route_source_hint(environment_source)?.unwrap_or(RouteValueSource::Environment);
+        return Ok((parse_agent_type_override(environment_name, &value)?, source));
+    }
+    if let Some(value) = primary {
+        return Ok((value, primary_source));
+    }
+    if let Some(value) = secondary {
+        return Ok((value, secondary_source));
+    }
+    Ok((default, RouteValueSource::Default))
+}
+
+fn parse_effort_override(name: &str, value: Option<String>) -> Result<Option<EffortLevel>> {
+    let Some(value) = present_value(value) else {
+        return Ok(None);
+    };
     let level = match value.to_ascii_lowercase().as_str() {
         "low" => EffortLevel::Low,
         "medium" => EffortLevel::Medium,
         "high" => EffortLevel::High,
         "xhigh" => EffortLevel::XHigh,
         "max" => EffortLevel::Max,
-        _ => return Err(anyhow::anyhow!(
-            "Invalid {REVIEWER_EFFORT_ENV} value `{value}`. Expected low, medium, high, xhigh, or max."
-        )),
+        _ => anyhow::bail!(
+            "invalid {name} value `{value}`; expected low, medium, high, xhigh, or max"
+        ),
     };
     Ok(Some(level))
 }
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use tracing::{debug, warn};
+
+fn resolve_model_value(
+    environment: Option<String>,
+    environment_source: Option<String>,
+    local: Option<String>,
+    project: Option<String>,
+) -> Result<(Option<String>, RouteValueSource)> {
+    if let Some(value) = present_value(environment) {
+        let source =
+            parse_route_source_hint(environment_source)?.unwrap_or(RouteValueSource::Environment);
+        return Ok((Some(value), source));
+    }
+    if let Some(value) = present_value(local) {
+        return Ok((Some(value), RouteValueSource::LocalConfig));
+    }
+    if let Some(value) = present_value(project) {
+        return Ok((Some(value), RouteValueSource::ProjectConfig));
+    }
+    Ok((None, RouteValueSource::Unresolved))
+}
+
+fn resolve_effort_with_environment(
+    environment: Option<EffortLevel>,
+    environment_source: Option<String>,
+    local: Option<EffortLevel>,
+    project: Option<EffortLevel>,
+) -> Result<ResolvedEffort> {
+    Ok(match (environment, local, project) {
+        (Some(level), _, _) => ResolvedEffort {
+            level,
+            source: parse_effort_source_hint(environment_source)?
+                .unwrap_or(EffortSource::Environment),
+        },
+        (None, Some(level), _) | (None, None, Some(level)) => ResolvedEffort {
+            level,
+            source: EffortSource::Config,
+        },
+        (None, None, None) => ResolvedEffort::MEDIUM_DEFAULT,
+    })
+}
+
+fn parse_route_source_hint(value: Option<String>) -> Result<Option<RouteValueSource>> {
+    let Some(value) = present_value(value) else {
+        return Ok(None);
+    };
+    let source = RouteValueSource::parse(&value)?;
+    if source == RouteValueSource::Unresolved {
+        anyhow::bail!("an injected route value cannot have unresolved provenance");
+    }
+    Ok(Some(source))
+}
+
+fn parse_effort_source_hint(value: Option<String>) -> Result<Option<EffortSource>> {
+    parse_route_source_hint(value)?
+        .map(effort_source_from_route_source)
+        .transpose()
+}
+
+fn effort_source_from_route_source(source: RouteValueSource) -> Result<EffortSource> {
+    match source {
+        RouteValueSource::Cli => Ok(EffortSource::Cli),
+        RouteValueSource::Policy => Ok(EffortSource::Policy),
+        RouteValueSource::Environment => Ok(EffortSource::Environment),
+        RouteValueSource::LocalConfig | RouteValueSource::ProjectConfig => Ok(EffortSource::Config),
+        RouteValueSource::Default => Ok(EffortSource::Default),
+        RouteValueSource::HarnessDefault | RouteValueSource::Unresolved => {
+            anyhow::bail!("invalid effort provenance `{}`", source.as_str())
+        }
+    }
+}
+
+/// Canonical route role used by init, serve, and role-policy consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalRole {
+    Tl,
+    Worker,
+    Reviewer,
+}
+
+impl CanonicalRole {
+    /// Resolve supported role aliases without guessing from arbitrary names.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "tl" | "root" | "subtl" | "sub-tl" | "controller" | "judge" => Ok(Self::Tl),
+            "worker" | "dev" | "dev-leaf" | "dev_leaf" | "leaf" | "teammate" => Ok(Self::Worker),
+            "reviewer" | "pr-reviewer" | "pr_reviewer" => Ok(Self::Reviewer),
+            _ => anyhow::bail!("unsupported runtime role `{value}`"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tl => "tl",
+            Self::Worker => "worker",
+            Self::Reviewer => "reviewer",
+        }
+    }
+}
+
+/// Provenance for one resolved role-route field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteValueSource {
+    Cli,
+    Policy,
+    Environment,
+    LocalConfig,
+    ProjectConfig,
+    Default,
+    HarnessDefault,
+    Unresolved,
+}
+
+impl RouteValueSource {
+    pub fn as_str(self) -> &'static str {
+        route_source_name(self)
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "cli" => Ok(Self::Cli),
+            "policy" => Ok(Self::Policy),
+            "environment" => Ok(Self::Environment),
+            "config" => Ok(Self::ProjectConfig),
+            "local_config" => Ok(Self::LocalConfig),
+            "project_config" => Ok(Self::ProjectConfig),
+            "default" => Ok(Self::Default),
+            "harness_default" => Ok(Self::HarnessDefault),
+            "unresolved" => Ok(Self::Unresolved),
+            _ => anyhow::bail!("invalid route provenance `{value}`"),
+        }
+    }
+}
+
+/// A route selected by the accepted task/role policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRouteSelection {
+    pub agent_type: AgentType,
+    pub model: Option<String>,
+    pub effort: Option<EffortLevel>,
+}
+
+impl PolicyRouteSelection {
+    /// Parse one already-selected `harness[/model]` policy identity.
+    pub fn parse(identifier: &str, effort: Option<EffortLevel>) -> Result<Self> {
+        let (harness, model) = identifier
+            .split_once('/')
+            .map_or((identifier, None), |(harness, model)| {
+                (harness, Some(model))
+            });
+        let agent_type = parse_agent_type_override("policy route", harness)?;
+        if matches!(agent_type, AgentType::Process) {
+            anyhow::bail!("policy route cannot select the process harness");
+        }
+        let model = model.map(str::trim).filter(|model| !model.is_empty());
+        if identifier.contains('/') && model.is_none() {
+            anyhow::bail!("policy route `{identifier}` has an empty model identifier");
+        }
+        Ok(Self {
+            agent_type,
+            model: model.map(str::to_string),
+            effort,
+        })
+    }
+}
+
+/// Explicit per-invocation route overrides supplied by the CLI.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoleRouteOverrides {
+    pub agent_type: Option<AgentType>,
+    pub model: Option<String>,
+    pub effort: Option<EffortLevel>,
+}
+
+/// One fully resolved route, including the source of every selected value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResolvedRoleRoute {
+    pub role: CanonicalRole,
+    pub agent_type: AgentType,
+    pub model: Option<String>,
+    pub effort: ResolvedEffort,
+    pub agent_type_source: RouteValueSource,
+    pub model_source: RouteValueSource,
+    pub configuration_fingerprint: String,
+    pub route_fingerprint: String,
+}
 
 /// Longest tmux session name, in characters, that ExoMonad will use.
 ///
@@ -296,6 +517,8 @@ pub struct RawConfig {
     pub spawn_agent_type: Option<AgentType>,
     /// Default effort level for spawned workers and agent companions.
     pub worker_effort_level: Option<EffortLevel>,
+    /// Model for spawned workers and leaves, independent of harness.
+    pub worker_model: Option<String>,
 
     /// Optional flake reference to use when building WASM plugin via nix.
     pub flake_ref: Option<String>,
@@ -414,12 +637,17 @@ pub struct Config {
     pub wasm_dir: PathBuf,
     /// Agent type for the root (TL) tab.
     pub root_agent_type: AgentType,
+    pub root_agent_type_source: RouteValueSource,
     /// Resolved effort level for the root TL.
     pub tl_effort_level: ResolvedEffort,
     /// Agent type for spawned workers/teammates.
     pub spawn_agent_type: AgentType,
+    pub spawn_agent_type_source: RouteValueSource,
     /// Resolved effort level for spawned workers and agent companions.
     pub worker_effort_level: ResolvedEffort,
+    /// Model override for spawned workers, independent of harness.
+    pub worker_model: Option<String>,
+    pub worker_model_source: RouteValueSource,
     /// Resolved effort level for reviewers.
     pub reviewer_effort_level: ResolvedEffort,
     /// Flake reference to use when building WASM plugin via nix.
@@ -441,6 +669,7 @@ pub struct Config {
     pub otlp_endpoint: Option<String>,
     /// Model override for the root TL agent (e.g., "sonnet", "haiku"). Passed as --model flag.
     pub model: Option<String>,
+    pub model_source: RouteValueSource,
 
     /// GitHub poller interval in seconds (default: 60).
     pub poll_interval: Option<u64>,
@@ -477,6 +706,8 @@ pub struct Config {
 
     /// Opencode agent configuration.
     pub opencode: OpencodeConfig,
+    pub opencode_tl_model_source: RouteValueSource,
+    pub opencode_worker_model_source: RouteValueSource,
 
     /// Use OpenCode as the root TL agent instead of Claude.
     pub opencode_as_tl: bool,
@@ -498,6 +729,8 @@ pub struct Config {
 
     /// PR reviewer agent configuration.
     pub reviewer: ReviewerConfig,
+    pub reviewer_agent_type_source: RouteValueSource,
+    pub reviewer_model_source: RouteValueSource,
 }
 
 impl Config {
@@ -510,7 +743,17 @@ impl Config {
     /// 2. config.toml (default_role, project_dir)
     /// 3. Environment defaults
     pub fn discover() -> Result<Self> {
-        let project_root = find_project_root()?;
+        Self::discover_from(&find_project_root()?, &|name| std::env::var(name).ok())
+    }
+
+    /// Resolve configuration from a known project root and an injected environment.
+    /// This is also the production path used by `discover`, with environment access
+    /// isolated here so route precedence can be verified without mutating process state.
+    pub fn discover_from(
+        project_root: &Path,
+        environment: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let project_root = project_root.to_path_buf();
 
         let local_path = project_root.join(LOCAL_CONFIG_PATH);
         let global_path = project_root.join(PROJECT_CONFIG_PATH);
@@ -590,28 +833,42 @@ impl Config {
             })
             .unwrap_or_else(|| project_root.join(".exo/wasm"));
 
-        // Resolve root_agent_type: env > global > local > default (Claude)
-        let root_agent_type = std::env::var("EXOMONAD_ROOT_AGENT_TYPE")
-            .ok()
-            .and_then(|s| parse_agent_type_env(&s))
-            .or(global_raw.root_agent_type)
-            .or(local_raw.root_agent_type)
-            .unwrap_or(AgentType::Claude);
+        // Root harness retains its existing env > project > local precedence.
+        let (root_agent_type, root_agent_type_source) = resolve_agent_type_value(
+            environment("EXOMONAD_ROOT_AGENT_TYPE"),
+            environment(ROOT_AGENT_SOURCE_ENV),
+            global_raw.root_agent_type,
+            RouteValueSource::ProjectConfig,
+            local_raw.root_agent_type,
+            RouteValueSource::LocalConfig,
+            AgentType::Claude,
+            "EXOMONAD_ROOT_AGENT_TYPE",
+        )?;
 
-        // Resolve spawn_agent_type: env > local > global > default (Codex)
-        let spawn_agent_type = resolve_spawn_agent_type(
-            std::env::var("EXOMONAD_SPAWN_AGENT_TYPE").ok().as_deref(),
+        // Worker harness retains its existing env > local > project precedence.
+        let (spawn_agent_type, spawn_agent_type_source) = resolve_agent_type_value(
+            environment("EXOMONAD_SPAWN_AGENT_TYPE"),
+            environment(WORKER_AGENT_SOURCE_ENV),
             local_raw.spawn_agent_type,
+            RouteValueSource::LocalConfig,
             global_raw.spawn_agent_type,
-        );
+            RouteValueSource::ProjectConfig,
+            AgentType::default(),
+            "EXOMONAD_SPAWN_AGENT_TYPE",
+        )?;
 
-        let tl_effort_level =
-            resolve_effort_setting(None, local_raw.tl_effort_level, global_raw.tl_effort_level);
-        let worker_effort_level = resolve_effort_setting(
-            None,
+        let tl_effort_level = resolve_effort_with_environment(
+            parse_effort_override(TL_EFFORT_ENV, environment(TL_EFFORT_ENV))?,
+            environment(TL_EFFORT_SOURCE_ENV),
+            local_raw.tl_effort_level,
+            global_raw.tl_effort_level,
+        )?;
+        let worker_effort_level = resolve_effort_with_environment(
+            parse_effort_override(WORKER_EFFORT_ENV, environment(WORKER_EFFORT_ENV))?,
+            environment(WORKER_EFFORT_SOURCE_ENV),
             local_raw.worker_effort_level,
             global_raw.worker_effort_level,
-        );
+        )?;
 
         // Resolve flake_ref: local > global > fallback to None
         let flake_ref = local_raw.flake_ref.or(global_raw.flake_ref);
@@ -643,8 +900,19 @@ impl Config {
         // Resolve otlp_endpoint: local > global
         let otlp_endpoint = local_raw.otlp_endpoint.or(global_raw.otlp_endpoint);
 
-        // Resolve model: local > global
-        let model = local_raw.model.or(global_raw.model);
+        // Root and worker models are role-scoped and harness-independent.
+        let (model, model_source) = resolve_model_value(
+            environment(TL_MODEL_ENV),
+            environment(TL_MODEL_SOURCE_ENV),
+            local_raw.model,
+            global_raw.model,
+        )?;
+        let (mut worker_model, mut worker_model_source) = resolve_model_value(
+            environment(WORKER_MODEL_ENV),
+            environment(WORKER_MODEL_SOURCE_ENV),
+            local_raw.worker_model,
+            global_raw.worker_model,
+        )?;
 
         // Resolve poll_interval: local > global
         let poll_interval = local_raw.poll_interval.or(global_raw.poll_interval);
@@ -711,19 +979,50 @@ impl Config {
             .or(global_raw.openrouter)
             .unwrap_or_default();
 
-        // Resolve opencode: env > local > global > default
-        let mut opencode = local_raw
+        // Legacy OpenCode-only model fields remain supported as a fallback for
+        // OpenCode routes. Generic role settings above always take precedence.
+        let opencode_tl_model_source = if local_raw
+            .opencode
+            .as_ref()
+            .and_then(|value| value.tl_model.as_ref())
+            .is_some()
+        {
+            RouteValueSource::LocalConfig
+        } else if global_raw
+            .opencode
+            .as_ref()
+            .and_then(|value| value.tl_model.as_ref())
+            .is_some()
+        {
+            RouteValueSource::ProjectConfig
+        } else {
+            RouteValueSource::Unresolved
+        };
+        let opencode_worker_model_source = if local_raw
+            .opencode
+            .as_ref()
+            .and_then(|value| value.worker_model.as_ref())
+            .is_some()
+        {
+            RouteValueSource::LocalConfig
+        } else if global_raw
+            .opencode
+            .as_ref()
+            .and_then(|value| value.worker_model.as_ref())
+            .is_some()
+        {
+            RouteValueSource::ProjectConfig
+        } else {
+            RouteValueSource::Unresolved
+        };
+        let opencode = local_raw
             .opencode
             .or(global_raw.opencode)
             .unwrap_or_default();
-        if let Ok(m) = std::env::var("EXOMONAD_TL_MODEL") {
-            if !m.is_empty() {
-                opencode.tl_model = Some(m);
-            }
-        }
-        if let Ok(m) = std::env::var("EXOMONAD_WORKER_MODEL") {
-            if !m.is_empty() {
-                opencode.worker_model = Some(m);
+        if worker_model.is_none() && spawn_agent_type == AgentType::OpenCode {
+            if let Some(model) = present_value(opencode.worker_model.clone()) {
+                worker_model = Some(model);
+                worker_model_source = opencode_worker_model_source;
             }
         }
 
@@ -743,28 +1042,51 @@ impl Config {
             .or(global_raw.forgejo_webhook_secret);
         let forgejo_ssh_port = local_raw.forgejo_ssh_port.or(global_raw.forgejo_ssh_port);
 
-        // Resolve reviewer: env > local > global > default
+        // Reviewer settings are independent of both TL and worker settings.
+        let reviewer_agent_env = environment("EXOMONAD_REVIEWER_AGENT_TYPE");
+        let (reviewer_agent_type, reviewer_agent_type_source) = resolve_agent_type_value(
+            reviewer_agent_env,
+            environment(REVIEWER_AGENT_SOURCE_ENV),
+            local_raw.reviewer.as_ref().map(|value| value.agent_type),
+            RouteValueSource::LocalConfig,
+            global_raw.reviewer.as_ref().map(|value| value.agent_type),
+            RouteValueSource::ProjectConfig,
+            AgentType::Claude,
+            "EXOMONAD_REVIEWER_AGENT_TYPE",
+        )?;
+        let (reviewer_model, reviewer_model_source) = resolve_model_value(
+            environment(REVIEWER_MODEL_ENV),
+            environment(REVIEWER_MODEL_SOURCE_ENV),
+            local_raw
+                .reviewer
+                .as_ref()
+                .and_then(|value| value.model.clone()),
+            global_raw
+                .reviewer
+                .as_ref()
+                .and_then(|value| value.model.clone()),
+        )?;
+        let reviewer_effort_override =
+            parse_effort_override(REVIEWER_EFFORT_ENV, environment(REVIEWER_EFFORT_ENV))?;
+        let reviewer_effort_level = resolve_effort_with_environment(
+            reviewer_effort_override,
+            environment(REVIEWER_EFFORT_SOURCE_ENV),
+            local_raw
+                .reviewer
+                .as_ref()
+                .and_then(|value| value.effort_level),
+            global_raw
+                .reviewer
+                .as_ref()
+                .and_then(|value| value.effort_level),
+        )?;
         let mut reviewer = local_raw
             .reviewer
             .or(global_raw.reviewer)
             .unwrap_or_default();
-        if let Ok(s) = std::env::var("EXOMONAD_REVIEWER_AGENT_TYPE") {
-            if let Some(agent_type) = parse_agent_type_env(&s) {
-                reviewer.agent_type = agent_type;
-            }
-        }
-        if let Ok(model) = std::env::var(REVIEWER_MODEL_ENV) {
-            if !model.trim().is_empty() {
-                reviewer.model = Some(model);
-            }
-        }
-        let reviewer_effort_override = std::env::var(REVIEWER_EFFORT_ENV)
-            .ok()
-            .map(|value| parse_effort_level_env(&value))
-            .transpose()?
-            .flatten();
-        let reviewer_effort_level =
-            resolve_effort_setting(reviewer_effort_override, reviewer.effort_level, None);
+        reviewer.agent_type = reviewer_agent_type;
+        reviewer.model = reviewer_model;
+        reviewer.effort_level = Some(reviewer_effort_level.level);
 
         Ok(Self {
             project_dir,
@@ -775,9 +1097,13 @@ impl Config {
             shell_command,
             wasm_dir,
             root_agent_type,
+            root_agent_type_source,
             tl_effort_level,
             spawn_agent_type,
+            spawn_agent_type_source,
             worker_effort_level,
+            worker_model,
+            worker_model_source,
             reviewer_effort_level,
             flake_ref,
             wasm_name,
@@ -788,6 +1114,7 @@ impl Config {
             root_command,
             otlp_endpoint,
             model,
+            model_source,
             poll_interval,
             inbox_poke_interval,
             orphan_reconciler_interval_secs,
@@ -800,6 +1127,8 @@ impl Config {
             tl_preflight_runtime_paths,
             openrouter,
             opencode,
+            opencode_tl_model_source,
+            opencode_worker_model_source,
             opencode_as_tl,
             forgejo_url,
             forgejo_token,
@@ -807,6 +1136,8 @@ impl Config {
             forgejo_webhook_secret,
             forgejo_ssh_port,
             reviewer,
+            reviewer_agent_type_source,
+            reviewer_model_source,
         })
     }
 
@@ -822,6 +1153,217 @@ impl Config {
     }
 }
 
+#[cfg(test)]
+mod role_routes_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn discover_config(contents: &str, values: &[(&str, &str)]) -> Config {
+        let temp = tempfile::tempdir().unwrap();
+        let exo = temp.path().join(".exo");
+        std::fs::create_dir_all(&exo).unwrap();
+        std::fs::write(exo.join("config.toml"), contents).unwrap();
+        let values: HashMap<String, String> = values
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        Config::discover_from(temp.path(), &|name| values.get(name).cloned()).unwrap()
+    }
+
+    #[test]
+    fn accepted_task_model_and_effort_beat_host_harness_defaults() {
+        let config = discover_config(
+            "spawn_agent_type = 'codex'\nworker_effort_level = 'medium'\n",
+            &[],
+        );
+        let policy =
+            PolicyRouteSelection::parse("codex/gpt-6-luna", Some(EffortLevel::XHigh)).unwrap();
+        let route = config
+            .resolve_role_route(
+                "dev-leaf",
+                Some(&policy),
+                &RoleRouteOverrides::default(),
+                Some("gpt-6.1-sol".to_string()),
+            )
+            .unwrap();
+
+        assert_eq!(route.role, CanonicalRole::Worker);
+        assert_eq!(route.agent_type, AgentType::Codex);
+        assert_eq!(route.model.as_deref(), Some("gpt-6-luna"));
+        assert_eq!(route.effort.level, EffortLevel::XHigh);
+        assert_eq!(route.model_source, RouteValueSource::Policy);
+        assert_eq!(route.effort.source, EffortSource::Policy);
+        assert!(route.configuration_fingerprint.starts_with("sha256:v1:"));
+        assert!(route.route_fingerprint.starts_with("sha256:v1:"));
+    }
+
+    #[test]
+    fn generic_worker_environment_applies_to_codex_and_effort_has_provenance() {
+        let config = discover_config(
+            "spawn_agent_type = 'codex'\nworker_model = 'gpt-config-model'\nworker_effort_level = 'medium'\n",
+            &[
+                (WORKER_MODEL_ENV, "gpt-env-model"),
+                (WORKER_EFFORT_ENV, "xhigh"),
+            ],
+        );
+        let route = config
+            .resolve_role_route("worker", None, &RoleRouteOverrides::default(), None)
+            .unwrap();
+        assert_eq!(route.model.as_deref(), Some("gpt-env-model"));
+        assert_eq!(route.model_source, RouteValueSource::Environment);
+        assert_eq!(route.effort.level, EffortLevel::XHigh);
+        assert_eq!(route.effort.source, EffortSource::Environment);
+    }
+
+    #[test]
+    fn role_aliases_keep_tl_worker_and_reviewer_routes_independent() {
+        let config = discover_config(
+            "root_agent_type = 'claude'\nmodel = 'claude-tl'\nspawn_agent_type = 'opencode'\nworker_model = 'openai/worker'\nworker_effort_level = 'xhigh'\n[reviewer]\nagent_type = 'codex'\nmodel = 'gpt-reviewer'\neffort_level = 'low'\n",
+            &[],
+        );
+        let defaults = RoleRouteOverrides::default();
+        let tl = config
+            .resolve_role_route("subTL", None, &defaults, None)
+            .unwrap();
+        let worker = config
+            .resolve_role_route("dev-leaf", None, &defaults, None)
+            .unwrap();
+        let reviewer = config
+            .resolve_role_route("pr-reviewer", None, &defaults, None)
+            .unwrap();
+
+        assert_eq!(
+            (tl.agent_type, tl.model.as_deref()),
+            (AgentType::Claude, Some("claude-tl"))
+        );
+        assert_eq!(
+            (worker.agent_type, worker.model.as_deref()),
+            (AgentType::OpenCode, Some("openai/worker"))
+        );
+        assert_eq!(worker.effort.level, EffortLevel::XHigh);
+        assert_eq!(
+            (reviewer.agent_type, reviewer.model.as_deref()),
+            (AgentType::Codex, Some("gpt-reviewer"))
+        );
+        assert_eq!(reviewer.effort.level, EffortLevel::Low);
+        assert_ne!(tl.route_fingerprint, worker.route_fingerprint);
+        assert_ne!(worker.route_fingerprint, reviewer.route_fingerprint);
+    }
+
+    #[test]
+    fn cli_overrides_are_explicit_and_empty_policy_models_are_rejected() {
+        let config = discover_config("spawn_agent_type = 'codex'\n", &[]);
+        let route = config
+            .resolve_role_route(
+                "dev",
+                None,
+                &RoleRouteOverrides {
+                    agent_type: Some(AgentType::Claude),
+                    model: Some("claude-selected".to_string()),
+                    effort: Some(EffortLevel::High),
+                },
+                Some("gpt-host-default".to_string()),
+            )
+            .unwrap();
+        assert_eq!(route.agent_type, AgentType::Claude);
+        assert_eq!(route.model.as_deref(), Some("claude-selected"));
+        assert_eq!(route.agent_type_source, RouteValueSource::Cli);
+        assert_eq!(route.model_source, RouteValueSource::Cli);
+        assert_eq!(route.effort.source, EffortSource::Cli);
+        assert!(PolicyRouteSelection::parse("codex/ ", None).is_err());
+        assert!(config
+            .resolve_role_route(
+                "worker",
+                None,
+                &RoleRouteOverrides {
+                    model: Some("  ".to_string()),
+                    ..RoleRouteOverrides::default()
+                },
+                None,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn route_fingerprints_are_stable_and_change_with_role_configuration() {
+        let first = discover_config("spawn_agent_type = 'codex'\nworker_model = 'gpt-a'\n", &[]);
+        let repeated = discover_config("spawn_agent_type = 'codex'\nworker_model = 'gpt-a'\n", &[]);
+        let changed = discover_config("spawn_agent_type = 'codex'\nworker_model = 'gpt-b'\n", &[]);
+        assert_eq!(
+            first.routing_configuration_fingerprint(),
+            repeated.routing_configuration_fingerprint()
+        );
+        assert_ne!(
+            first.routing_configuration_fingerprint(),
+            changed.routing_configuration_fingerprint()
+        );
+    }
+
+    #[test]
+    fn server_environment_round_trip_preserves_route_provenance_and_fingerprint() {
+        let project = tempfile::tempdir().unwrap();
+        let exo = project.path().join(".exo");
+        std::fs::create_dir_all(&exo).unwrap();
+        std::fs::write(
+            exo.join("config.toml"),
+            "root_agent_type = 'claude'\nmodel = 'claude-tl'\ntl_effort_level = 'high'\nspawn_agent_type = 'codex'\nworker_model = 'gpt-worker'\nworker_effort_level = 'xhigh'\n[reviewer]\nagent_type = 'opencode'\nmodel = 'opencode/review'\neffort_level = 'low'\n",
+        )
+        .unwrap();
+        let original = Config::discover_from(project.path(), &|_| None).unwrap();
+        let environment: HashMap<String, String> = [
+            ("EXOMONAD_ROOT_AGENT_TYPE", "claude"),
+            (ROOT_AGENT_SOURCE_ENV, "project_config"),
+            (TL_MODEL_ENV, "claude-tl"),
+            (TL_MODEL_SOURCE_ENV, "project_config"),
+            (TL_EFFORT_ENV, "high"),
+            (TL_EFFORT_SOURCE_ENV, "config"),
+            ("EXOMONAD_SPAWN_AGENT_TYPE", "codex"),
+            (WORKER_AGENT_SOURCE_ENV, "project_config"),
+            (WORKER_MODEL_ENV, "gpt-worker"),
+            (WORKER_MODEL_SOURCE_ENV, "project_config"),
+            (WORKER_EFFORT_ENV, "xhigh"),
+            (WORKER_EFFORT_SOURCE_ENV, "config"),
+            ("EXOMONAD_REVIEWER_AGENT_TYPE", "opencode"),
+            (REVIEWER_AGENT_SOURCE_ENV, "project_config"),
+            (REVIEWER_MODEL_ENV, "opencode/review"),
+            (REVIEWER_MODEL_SOURCE_ENV, "project_config"),
+            (REVIEWER_EFFORT_ENV, "low"),
+            (REVIEWER_EFFORT_SOURCE_ENV, "config"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let reloaded =
+            Config::discover_from(project.path(), &|key| environment.get(key).cloned()).unwrap();
+
+        assert_eq!(
+            original.routing_configuration_fingerprint(),
+            reloaded.routing_configuration_fingerprint()
+        );
+        for role in ["subtl", "dev-leaf", "reviewer"] {
+            assert_eq!(
+                original
+                    .resolve_role_route(role, None, &RoleRouteOverrides::default(), None)
+                    .unwrap(),
+                reloaded
+                    .resolve_role_route(role, None, &RoleRouteOverrides::default(), None)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_route_environment_is_not_silently_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".exo")).unwrap();
+        let error = Config::discover_from(temp.path(), &|name| {
+            (name == "EXOMONAD_SPAWN_AGENT_TYPE").then(|| "unknown-provider".to_string())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("EXOMONAD_SPAWN_AGENT_TYPE"));
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -833,9 +1375,13 @@ impl Default for Config {
             shell_command: None,
             wasm_dir: PathBuf::from(".exo/wasm"),
             root_agent_type: AgentType::Claude,
+            root_agent_type_source: RouteValueSource::Default,
             tl_effort_level: ResolvedEffort::MEDIUM_DEFAULT,
             spawn_agent_type: AgentType::default(),
+            spawn_agent_type_source: RouteValueSource::Default,
             worker_effort_level: ResolvedEffort::MEDIUM_DEFAULT,
+            worker_model: None,
+            worker_model_source: RouteValueSource::Unresolved,
             reviewer_effort_level: ResolvedEffort::MEDIUM_DEFAULT,
             flake_ref: None,
             wasm_name: "devswarm".to_string(),
@@ -846,6 +1392,7 @@ impl Default for Config {
             root_command: None,
             otlp_endpoint: None,
             model: None,
+            model_source: RouteValueSource::Unresolved,
             poll_interval: None,
             inbox_poke_interval: None,
             orphan_reconciler_interval_secs: None,
@@ -858,6 +1405,8 @@ impl Default for Config {
             tl_preflight_runtime_paths: Vec::new(),
             openrouter: OpenRouterConfig::default(),
             opencode: OpencodeConfig::default(),
+            opencode_tl_model_source: RouteValueSource::Unresolved,
+            opencode_worker_model_source: RouteValueSource::Unresolved,
             opencode_as_tl: false,
             forgejo_url: None,
             forgejo_token: None,
@@ -865,6 +1414,8 @@ impl Default for Config {
             forgejo_webhook_secret: None,
             forgejo_ssh_port: None,
             reviewer: ReviewerConfig::default(),
+            reviewer_agent_type_source: RouteValueSource::Default,
+            reviewer_model_source: RouteValueSource::Unresolved,
         }
     }
 }
@@ -1060,6 +1611,242 @@ impl Config {
                 .iter()
                 .any(|companion| companion.agent_type == Some(AgentType::Codex))
     }
+
+    /// Stable fingerprint of the role-routing configuration, excluding secrets
+    /// and non-routing runtime settings.
+    pub fn routing_configuration_fingerprint(&self) -> String {
+        digest_route_fields([
+            agent_type_name(self.root_agent_type).to_string(),
+            route_source_name(self.root_agent_type_source).to_string(),
+            model_hash_value(self.model.as_deref()),
+            route_source_name(self.model_source).to_string(),
+            model_hash_value(self.opencode.tl_model.as_deref()),
+            route_source_name(self.opencode_tl_model_source).to_string(),
+            self.tl_effort_level.level.to_string(),
+            self.tl_effort_level.source.to_string(),
+            agent_type_name(self.spawn_agent_type).to_string(),
+            route_source_name(self.spawn_agent_type_source).to_string(),
+            model_hash_value(self.worker_model.as_deref()),
+            route_source_name(self.worker_model_source).to_string(),
+            model_hash_value(self.opencode.worker_model.as_deref()),
+            route_source_name(self.opencode_worker_model_source).to_string(),
+            self.worker_effort_level.level.to_string(),
+            self.worker_effort_level.source.to_string(),
+            agent_type_name(self.reviewer.agent_type).to_string(),
+            route_source_name(self.reviewer_agent_type_source).to_string(),
+            model_hash_value(self.reviewer.model.as_deref()),
+            route_source_name(self.reviewer_model_source).to_string(),
+            self.reviewer_effort_level.level.to_string(),
+            self.reviewer_effort_level.source.to_string(),
+        ])
+    }
+
+    /// Resolve one runtime role using CLI overrides, an accepted task-policy
+    /// route, role configuration, and finally an explicitly permitted harness
+    /// default. A policy-selected model always wins over host-wide defaults.
+    pub fn resolve_role_route(
+        &self,
+        role: &str,
+        policy: Option<&PolicyRouteSelection>,
+        overrides: &RoleRouteOverrides,
+        inherited_model: Option<String>,
+    ) -> Result<ResolvedRoleRoute> {
+        let role = CanonicalRole::parse(role)?;
+        validate_optional_model("CLI model override", overrides.model.as_deref())?;
+        if let Some(policy) = policy {
+            validate_optional_model("policy model", policy.model.as_deref())?;
+        }
+        let (base_agent, base_agent_source, base_model, base_model_source, base_effort) =
+            self.configured_route(role);
+        let agent_type = overrides
+            .agent_type
+            .or_else(|| policy.map(|route| route.agent_type))
+            .unwrap_or(base_agent);
+        let agent_type_source = if overrides.agent_type.is_some() {
+            RouteValueSource::Cli
+        } else if policy.is_some() {
+            RouteValueSource::Policy
+        } else {
+            base_agent_source
+        };
+        if let (Some(policy), Some(cli_harness)) = (policy, overrides.agent_type) {
+            if cli_harness != policy.agent_type
+                && policy.model.is_some()
+                && overrides.model.is_none()
+            {
+                anyhow::bail!(
+                    "CLI harness `{}` conflicts with the accepted policy model route for `{}`; supply a matching --model override or resolve the policy conflict",
+                    agent_type_name(cli_harness), role.as_str()
+                );
+            }
+        }
+
+        let (model, model_source) = if let Some(model) = present_value(overrides.model.clone()) {
+            (Some(model), RouteValueSource::Cli)
+        } else if let Some(model) = policy.and_then(|route| present_value(route.model.clone())) {
+            (Some(model), RouteValueSource::Policy)
+        } else if agent_type == base_agent {
+            if let Some(model) = base_model {
+                (Some(model), base_model_source)
+            } else if let Some(model) = present_value(inherited_model) {
+                (Some(model), RouteValueSource::HarnessDefault)
+            } else {
+                (None, RouteValueSource::Unresolved)
+            }
+        } else if let Some(model) = present_value(inherited_model) {
+            (Some(model), RouteValueSource::HarnessDefault)
+        } else {
+            (None, RouteValueSource::Unresolved)
+        };
+        let effort = if let Some(level) = overrides.effort {
+            ResolvedEffort::from_cli(level)
+        } else if let Some(level) = policy.and_then(|route| route.effort) {
+            ResolvedEffort {
+                level,
+                source: EffortSource::Policy,
+            }
+        } else {
+            base_effort
+        };
+        let configuration_fingerprint = self.routing_configuration_fingerprint();
+        let mut route = ResolvedRoleRoute {
+            role,
+            agent_type,
+            model,
+            effort,
+            agent_type_source,
+            model_source,
+            configuration_fingerprint,
+            route_fingerprint: String::new(),
+        };
+        route.route_fingerprint = digest_route_fields([
+            route.role.as_str().to_string(),
+            agent_type_name(route.agent_type).to_string(),
+            model_hash_value(route.model.as_deref()),
+            route.effort.level.to_string(),
+            route.effort.source.to_string(),
+            route_source_name(route.agent_type_source).to_string(),
+            route_source_name(route.model_source).to_string(),
+            route.configuration_fingerprint.clone(),
+        ]);
+        Ok(route)
+    }
+
+    fn configured_route(
+        &self,
+        role: CanonicalRole,
+    ) -> (
+        AgentType,
+        RouteValueSource,
+        Option<String>,
+        RouteValueSource,
+        ResolvedEffort,
+    ) {
+        match role {
+            CanonicalRole::Tl => {
+                let (model, source) = configured_model_for_harness(
+                    self.model.clone(),
+                    self.model_source,
+                    self.opencode.tl_model.clone(),
+                    self.opencode_tl_model_source,
+                    self.root_agent_type,
+                );
+                (
+                    self.root_agent_type,
+                    self.root_agent_type_source,
+                    model,
+                    source,
+                    self.tl_effort_level,
+                )
+            }
+            CanonicalRole::Worker => {
+                let (model, source) = configured_model_for_harness(
+                    self.worker_model.clone(),
+                    self.worker_model_source,
+                    self.opencode.worker_model.clone(),
+                    self.opencode_worker_model_source,
+                    self.spawn_agent_type,
+                );
+                (
+                    self.spawn_agent_type,
+                    self.spawn_agent_type_source,
+                    model,
+                    source,
+                    self.worker_effort_level,
+                )
+            }
+            CanonicalRole::Reviewer => (
+                self.reviewer.agent_type,
+                self.reviewer_agent_type_source,
+                self.reviewer.model.clone(),
+                self.reviewer_model_source,
+                self.reviewer_effort_level,
+            ),
+        }
+    }
+}
+
+fn configured_model_for_harness(
+    model: Option<String>,
+    model_source: RouteValueSource,
+    legacy_model: Option<String>,
+    legacy_source: RouteValueSource,
+    agent_type: AgentType,
+) -> (Option<String>, RouteValueSource) {
+    if let Some(model) = present_value(model) {
+        return (Some(model), model_source);
+    }
+    if agent_type == AgentType::OpenCode {
+        if let Some(model) = present_value(legacy_model) {
+            return (Some(model), legacy_source);
+        }
+    }
+    (None, RouteValueSource::Unresolved)
+}
+
+fn digest_route_fields(fields: impl IntoIterator<Item = String>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"exomonad-role-route-v1");
+    for field in fields {
+        let bytes = field.as_bytes();
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+    format!("sha256:v1:{:x}", digest.finalize())
+}
+
+fn model_hash_value(model: Option<&str>) -> String {
+    model.map_or_else(|| "absent".to_string(), |value| format!("present:{value}"))
+}
+
+fn validate_optional_model(source: &str, model: Option<&str>) -> Result<()> {
+    if model.is_some_and(|value| value.trim().is_empty()) {
+        anyhow::bail!("{source} must be omitted or contain a non-empty model identifier");
+    }
+    Ok(())
+}
+
+fn route_source_name(source: RouteValueSource) -> &'static str {
+    match source {
+        RouteValueSource::Cli => "cli",
+        RouteValueSource::Policy => "policy",
+        RouteValueSource::Environment => "environment",
+        RouteValueSource::LocalConfig => "local_config",
+        RouteValueSource::ProjectConfig => "project_config",
+        RouteValueSource::Default => "default",
+        RouteValueSource::HarnessDefault => "harness_default",
+        RouteValueSource::Unresolved => "unresolved",
+    }
+}
+
+fn agent_type_name(agent_type: AgentType) -> &'static str {
+    match agent_type {
+        AgentType::Claude => "claude",
+        AgentType::Codex => "codex",
+        AgentType::OpenCode => "opencode",
+        AgentType::Shoal => "shoal",
+        AgentType::Process => "process",
+    }
 }
 
 #[cfg(test)]
@@ -1152,7 +1939,20 @@ mod tests {
 
     #[test]
     fn test_spawn_agent_type_defaults_to_codex_when_config_omits_field() {
-        assert_eq!(resolve_spawn_agent_type(None, None, None), AgentType::Codex);
+        assert_eq!(
+            resolve_agent_type_value(
+                None,
+                None,
+                None,
+                RouteValueSource::LocalConfig,
+                None,
+                RouteValueSource::ProjectConfig,
+                AgentType::Codex,
+                "EXOMONAD_SPAWN_AGENT_TYPE",
+            )
+            .unwrap(),
+            (AgentType::Codex, RouteValueSource::Default)
+        );
     }
 
     #[test]
@@ -1547,6 +2347,16 @@ mod tests {
     }
 
     #[test]
+    fn raw_config_parses_harness_independent_worker_model() {
+        let raw: RawConfig = toml::from_str(
+            "spawn_agent_type = 'claude'\nworker_model = 'claude-sonnet'\nworker_effort_level = 'high'\n",
+        )
+        .unwrap();
+        assert_eq!(raw.worker_model.as_deref(), Some("claude-sonnet"));
+        assert_eq!(raw.worker_effort_level, Some(EffortLevel::High));
+    }
+
+    #[test]
     fn test_spawn_agent_type_retired_fails_during_config_load() {
         let retired = ["ge", "mini"].concat();
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1734,6 +2544,8 @@ impl std::fmt::Display for EffortLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum EffortSource {
     Cli,
+    Environment,
+    Policy,
     Config,
     Default,
 }
@@ -1742,6 +2554,8 @@ impl std::fmt::Display for EffortSource {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
             Self::Cli => "cli",
+            Self::Environment => "environment",
+            Self::Policy => "policy",
             Self::Config => "config",
             Self::Default => "default",
         })
@@ -1861,11 +2675,15 @@ mod effort_tests {
     #[test]
     fn reviewer_effort_environment_values_are_strictly_parsed() {
         assert_eq!(
-            super::parse_effort_level_env(" HIGH ").unwrap(),
+            super::parse_effort_override(REVIEWER_EFFORT_ENV, Some(" HIGH ".to_string())).unwrap(),
             Some(EffortLevel::High)
         );
-        assert_eq!(super::parse_effort_level_env(" ").unwrap(), None);
-        let error = super::parse_effort_level_env("turbo").unwrap_err();
+        assert_eq!(
+            super::parse_effort_override(REVIEWER_EFFORT_ENV, Some(" ".to_string())).unwrap(),
+            None
+        );
+        let error = super::parse_effort_override(REVIEWER_EFFORT_ENV, Some("turbo".to_string()))
+            .unwrap_err();
         assert!(error.to_string().contains(REVIEWER_EFFORT_ENV));
     }
 }
