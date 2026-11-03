@@ -47,7 +47,7 @@ impl GitProcessContext {
         validate_git_working_directory(worktree, command_directory, request.environment)?;
         let command_args =
             prepare_git_command(request.args, command_directory, request.environment)?;
-        let commit_index = if is_git_commit(request.args) {
+        let commit_index = if is_git_commit(&command_args) {
             let index = isolated_commit_index(&leases)?;
             validate_gitlink_index_identity(
                 command_directory,

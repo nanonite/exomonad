@@ -2,11 +2,13 @@
 
 use super::git_snapshot::GitEntrySnapshot;
 use crate::effects::{EffectError, EffectResult};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
+use std::sync::OnceLock;
 
 const MAX_GIT_CONFIG_ENV_ITEMS: usize = 128;
+const MAX_GIT_ALIAS_EXPANSIONS: usize = 8;
 
 #[cfg(test)]
 pub(crate) fn validate_git_command(
@@ -22,8 +24,9 @@ pub(crate) fn prepare_git_command(
     directory: &Path,
     request_env: &HashMap<String, String>,
 ) -> EffectResult<Vec<String>> {
-    validate_git_command_policy(args, directory, request_env)?;
-    protect_reference_mutation(args, directory, request_env)
+    let resolved = resolve_git_aliases(args, directory, request_env)?;
+    validate_git_command_policy(&resolved, directory, request_env)?;
+    protect_reference_mutation(&resolved, directory, request_env)
 }
 
 fn validate_git_command_policy(
@@ -135,6 +138,188 @@ pub(crate) fn validate_gitlink_index_identity(
 
 pub(crate) fn is_git_commit(args: &[String]) -> bool {
     git_subcommand(args).is_some_and(|(_, command)| command == "commit")
+}
+
+fn resolve_git_aliases(
+    args: &[String],
+    directory: &Path,
+    request_env: &HashMap<String, String>,
+) -> EffectResult<Vec<String>> {
+    let mut resolved = args.to_vec();
+    let mut seen = HashSet::new();
+    let mut expanded = false;
+    for _ in 0..MAX_GIT_ALIAS_EXPANSIONS {
+        let Some((command_index, command)) = git_subcommand(&resolved) else {
+            return Ok(resolved);
+        };
+        if is_git_builtin(command)? {
+            return Ok(resolved);
+        }
+        if !seen.insert(command.to_string()) {
+            return Err(alias_refusal("Git alias expansion contains a cycle"));
+        }
+        let Some(value) = configured_git_alias(&resolved, command_index, directory, request_env)?
+        else {
+            if expanded {
+                return Err(alias_refusal(
+                    "Git alias resolves to an external or unknown command that cannot be checked",
+                ));
+            }
+            return Ok(resolved);
+        };
+        if value.trim_start().starts_with('!') {
+            return Err(alias_refusal(
+                "shell Git aliases are not allowed through managed process.run",
+            ));
+        }
+        let expansion = split_git_alias(&value)
+            .filter(|tokens| !tokens.is_empty())
+            .ok_or_else(|| alias_refusal("Git alias has an invalid or empty expansion"))?;
+        if expansion[0].starts_with('!') {
+            return Err(alias_refusal(
+                "shell Git aliases are not allowed through managed process.run",
+            ));
+        }
+        let mut replacement = expansion;
+        replacement.extend_from_slice(&resolved[command_index + 1..]);
+        resolved.splice(command_index..=command_index, replacement);
+        expanded = true;
+    }
+    Err(alias_refusal(
+        "Git alias expansion exceeded its bounded depth",
+    ))
+}
+
+fn configured_git_alias(
+    args: &[String],
+    command_index: usize,
+    directory: &Path,
+    request_env: &HashMap<String, String>,
+) -> EffectResult<Option<String>> {
+    let mut command = Command::new("git");
+    append_git_config_options(&mut command, args, command_index);
+    let alias_key = format!("alias.{}", args[command_index]);
+    let output = command
+        .args(["config", "--null", "--get", alias_key.as_str()])
+        .current_dir(directory)
+        .envs(request_env)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_OBJECT_DIRECTORY_RELATIVE")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .output()
+        .map_err(|_| alias_refusal("Git alias configuration could not be inspected"))?;
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        return Err(alias_refusal(
+            "Git alias configuration could not be inspected",
+        ));
+    }
+    let bytes = output.stdout.strip_suffix(&[0]).unwrap_or(&output.stdout);
+    let value = String::from_utf8(bytes.to_vec())
+        .map_err(|_| alias_refusal("Git alias configuration is not valid UTF-8"))?;
+    Ok(Some(value))
+}
+
+fn append_git_config_options(command: &mut Command, args: &[String], command_index: usize) {
+    let mut index = 0;
+    while index < command_index {
+        let argument = args[index].as_str();
+        match argument {
+            "-c" | "--config-env" => {
+                if let Some(value) = args.get(index + 1) {
+                    command.arg(argument).arg(value);
+                }
+                index += 2;
+            }
+            _ if argument.starts_with("--config-env=")
+                || (argument.starts_with("-c") && argument.len() > 2) =>
+            {
+                command.arg(argument);
+                index += 1;
+            }
+            _ => index += 1 + usize::from(global_option_takes_value(argument)),
+        }
+    }
+}
+
+fn is_git_builtin(command: &str) -> EffectResult<bool> {
+    static BUILTINS: OnceLock<Result<HashSet<String>, String>> = OnceLock::new();
+    match BUILTINS.get_or_init(read_git_builtins) {
+        Ok(builtins) => Ok(builtins.contains(command)),
+        Err(reason) => Err(alias_refusal(reason)),
+    }
+}
+
+fn read_git_builtins() -> Result<HashSet<String>, String> {
+    let output = Command::new("git")
+        .arg("--list-cmds=builtins")
+        .output()
+        .map_err(|_| "Git builtin command list could not be inspected".to_string())?;
+    if !output.status.success() {
+        return Err("Git builtin command list could not be inspected".to_string());
+    }
+    let commands = std::str::from_utf8(&output.stdout)
+        .map_err(|_| "Git builtin command list is not valid UTF-8".to_string())?;
+    Ok(commands.lines().map(str::to_string).collect())
+}
+
+fn split_git_alias(value: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut started = false;
+    for character in value.chars() {
+        if character.is_control() {
+            return None;
+        }
+        if escaped {
+            token.push(character);
+            escaped = false;
+            started = true;
+            continue;
+        }
+        if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            started = true;
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            match quote {
+                Some(open) if open == character => quote = None,
+                None => quote = Some(character),
+                _ => token.push(character),
+            }
+            started = true;
+            continue;
+        }
+        if character.is_whitespace() && quote.is_none() {
+            if started {
+                tokens.push(std::mem::take(&mut token));
+                started = false;
+            }
+            continue;
+        }
+        token.push(character);
+        started = true;
+    }
+    if escaped || quote.is_some() {
+        return None;
+    }
+    if started {
+        tokens.push(token);
+    }
+    Some(tokens)
+}
+
+fn alias_refusal(message: &str) -> EffectError {
+    EffectError::custom("git_mutation_unavailable", message)
 }
 
 fn read_gitlink_snapshot(

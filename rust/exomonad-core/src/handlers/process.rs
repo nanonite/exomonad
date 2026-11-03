@@ -919,6 +919,252 @@ mod tests {
         assert_eq!(assigned.exit_code, 0, "{}", assigned.stderr);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_handler_resolves_git_aliases_before_reference_mutation_guards() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        for arguments in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "process alias test"],
+            vec!["config", "user.email", "process-alias@example.invalid"],
+        ] {
+            assert_git_fixture_succeeded(run_git_fixture_output(&root, &arguments), &arguments);
+        }
+        let source = temporary.path().join("reference-source");
+        std::fs::create_dir(&source).unwrap();
+        for arguments in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.name", "reference alias test"],
+            vec!["config", "user.email", "reference-alias@example.invalid"],
+        ] {
+            assert_git_fixture_succeeded(run_git_fixture_output(&source, &arguments), &arguments);
+        }
+        std::fs::write(source.join("reference.txt"), "base\n").unwrap();
+        let add = ["add", "reference.txt"];
+        assert_git_fixture_succeeded(run_git_fixture_output(&source, &add), &add);
+        let commit = ["commit", "-q", "-m", "base"];
+        assert_git_fixture_succeeded(run_git_fixture_output(&source, &commit), &commit);
+        let original_oid =
+            String::from_utf8(run_git_fixture_output(&source, &["rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim()
+                .to_string();
+        let nested = root.join("tools/reference");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        let clone = std::process::Command::new("git")
+            .args(["clone", "-q", "--local"])
+            .arg(&source)
+            .arg(&nested)
+            .output()
+            .unwrap();
+        assert!(
+            clone.status.success(),
+            "{}",
+            String::from_utf8_lossy(&clone.stderr)
+        );
+        std::fs::write(
+            root.join(".gitmodules"),
+            "[submodule \"reference\"]\n\tpath = tools/reference\n\turl = https://example.invalid/reference.git\n",
+        )
+        .unwrap();
+        let add_modules = ["add", ".gitmodules"];
+        assert_git_fixture_succeeded(run_git_fixture_output(&root, &add_modules), &add_modules);
+        let gitlink = format!("160000,{original_oid},tools/reference");
+        assert_git_fixture_succeeded(
+            run_git_fixture_output(&root, &["update-index", "--add", "--cacheinfo", &gitlink]),
+            &["update-index", "--add", "--cacheinfo", &gitlink],
+        );
+        let initial_commit = ["commit", "-q", "-m", "reference"];
+        assert_git_fixture_succeeded(
+            run_git_fixture_output(&root, &initial_commit),
+            &initial_commit,
+        );
+
+        std::fs::write(nested.join("reference.txt"), "advanced\n").unwrap();
+        assert_git_fixture_succeeded(run_git_fixture_output(&nested, &add), &add);
+        assert_git_fixture_succeeded(run_git_fixture_output(&nested, &commit), &commit);
+        let advanced_oid =
+            String::from_utf8(run_git_fixture_output(&nested, &["rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim()
+                .to_string();
+        std::fs::write(root.join("ordinary.txt"), "workspace edit\n").unwrap();
+        let handler = ProcessHandler::with_project_dir(root.clone());
+
+        let staged = handler
+            .run(
+                RunRequest {
+                    command: "git".into(),
+                    args: vec![
+                        "-c".into(),
+                        "alias.stage-all=add -A".into(),
+                        "stage-all".into(),
+                    ],
+                    working_dir: ".".into(),
+                    env: std::collections::HashMap::new(),
+                    timeout_ms: 5_000,
+                },
+                &test_ctx_at(&root),
+            )
+            .await
+            .expect("command-line staging aliases must receive reference exclusions");
+        assert_eq!(staged.exit_code, 0, "{}", staged.stderr);
+        let staged_paths = String::from_utf8(
+            run_git_fixture_output(&root, &["diff", "--cached", "--name-only"]).stdout,
+        )
+        .unwrap();
+        assert!(staged_paths.lines().any(|path| path == "ordinary.txt"));
+        assert!(!staged_paths.lines().any(|path| path == "tools/reference"));
+
+        for (key, value) in [
+            ("alias.stage-chain", "stage-final"),
+            ("alias.stage-final", "add -A"),
+            ("alias.finish", "commit -m tidy"),
+        ] {
+            assert_git_fixture_succeeded(
+                run_git_fixture_output(&root, &["config", "--local", key, value]),
+                &["config", "--local", key, value],
+            );
+        }
+        std::fs::write(root.join("second.txt"), "second workspace edit\n").unwrap();
+        let chained_stage = handler
+            .run(
+                RunRequest {
+                    command: "git".into(),
+                    args: vec!["stage-chain".into()],
+                    working_dir: ".".into(),
+                    env: std::collections::HashMap::new(),
+                    timeout_ms: 5_000,
+                },
+                &test_ctx_at(&root),
+            )
+            .await
+            .expect("repository-configured chained aliases must be resolved");
+        assert_eq!(chained_stage.exit_code, 0, "{}", chained_stage.stderr);
+        let committed = handler
+            .run(
+                RunRequest {
+                    command: "git".into(),
+                    args: vec![
+                        "-c".into(),
+                        "alias.finish-cli=finish".into(),
+                        "finish-cli".into(),
+                    ],
+                    working_dir: ".".into(),
+                    env: std::collections::HashMap::new(),
+                    timeout_ms: 5_000,
+                },
+                &test_ctx_at(&root),
+            )
+            .await
+            .expect("commit aliases must use the isolated reference-validated index");
+        assert_eq!(committed.exit_code, 0, "{}", committed.stderr);
+        assert_eq!(
+            String::from_utf8(
+                run_git_fixture_output(&root, &["rev-parse", "HEAD:tools/reference"]).stdout,
+            )
+            .unwrap()
+            .trim(),
+            original_oid
+        );
+
+        assert_git_fixture_succeeded(
+            run_git_fixture_output(
+                &root,
+                &[
+                    "update-index",
+                    "--cacheinfo",
+                    &format!("160000,{advanced_oid},tools/reference"),
+                ],
+            ),
+            &[
+                "update-index",
+                "--cacheinfo",
+                &format!("160000,{advanced_oid},tools/reference"),
+            ],
+        );
+        let head_before_refusal =
+            String::from_utf8(run_git_fixture_output(&root, &["rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim()
+                .to_string();
+        let refused = handler
+            .run(
+                RunRequest {
+                    command: "git".into(),
+                    args: vec!["finish".into()],
+                    working_dir: ".".into(),
+                    env: std::collections::HashMap::new(),
+                    timeout_ms: 5_000,
+                },
+                &test_ctx_at(&root),
+            )
+            .await
+            .expect_err("pre-staged reference pointer changes must block commit aliases");
+        assert!(refused
+            .to_string()
+            .contains("reference Git mutation refused"));
+        assert_eq!(
+            String::from_utf8(run_git_fixture_output(&root, &["rev-parse", "HEAD"]).stdout)
+                .unwrap()
+                .trim(),
+            head_before_refusal
+        );
+        assert!(String::from_utf8(
+            run_git_fixture_output(&root, &["ls-files", "--stage", "tools/reference"]).stdout,
+        )
+        .unwrap()
+        .contains(&advanced_oid));
+
+        let shell_marker = temporary.path().join("shell-alias-ran");
+        let shell_alias = format!("alias.shell-write=!touch {}", shell_marker.display());
+        let shell_refused = handler
+            .run(
+                RunRequest {
+                    command: "git".into(),
+                    args: vec!["-c".into(), shell_alias, "shell-write".into()],
+                    working_dir: ".".into(),
+                    env: std::collections::HashMap::new(),
+                    timeout_ms: 5_000,
+                },
+                &test_ctx_at(&root),
+            )
+            .await
+            .expect_err("shell aliases must never run through managed Git policy");
+        assert!(shell_refused
+            .to_string()
+            .contains("shell Git aliases are not allowed"));
+        assert!(!shell_marker.exists());
+
+        for (key, value) in [
+            ("alias.cycle-one", "cycle-two"),
+            ("alias.cycle-two", "cycle-one"),
+        ] {
+            assert_git_fixture_succeeded(
+                run_git_fixture_output(&root, &["config", "--local", key, value]),
+                &["config", "--local", key, value],
+            );
+        }
+        let cycle_refused = handler
+            .run(
+                RunRequest {
+                    command: "git".into(),
+                    args: vec!["cycle-one".into()],
+                    working_dir: ".".into(),
+                    env: std::collections::HashMap::new(),
+                    timeout_ms: 5_000,
+                },
+                &test_ctx_at(&root),
+            )
+            .await
+            .expect_err("cyclic aliases must be rejected before Git starts");
+        assert!(cycle_refused
+            .to_string()
+            .contains("alias expansion contains a cycle"));
+    }
+
     #[tokio::test]
     async fn process_handler_keeps_read_only_submodule_and_worktree_inspection_available() {
         let temporary = tempfile::tempdir().unwrap();
