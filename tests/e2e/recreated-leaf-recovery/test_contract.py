@@ -1379,7 +1379,6 @@ LEGACY_TMUX_CALLERS = frozenset(
         "tests/e2e/init-continue/run.py",
         "tests/e2e/ordered-recursive/ordered_recursive.py",
         "tests/e2e/pre-pr-recovery-fsm/run.py",
-        "tests/e2e/task-blocked-human-gate/run.py",
         "tests/e2e/tl-loop-active/active_run.py",
         "tests/e2e/tl-loop-shadow/shadow_companion.py",
     }

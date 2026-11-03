@@ -35,20 +35,24 @@ import os
 import re
 import shutil
 import subprocess
-import time
+import sys
 import tempfile
-import tomllib
-import uuid
+import time
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+import tomllib
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 E2E_DIR = PROJECT_ROOT / "tests" / "e2e"
 LIB_DIR = E2E_DIR / "lib"
 SHARED_HELPER = LIB_DIR / "python-tl.sh"
 JUSTFILE = PROJECT_ROOT / "justfile"
+sys.path.insert(0, str(LIB_DIR))
+
+from e2e_harness import tmuxio
 
 #: The Codex scenarios this migration owns. Each one drove an interactive Codex
 #: root TL before and is now driven by the Python controller's plan.
@@ -408,8 +412,14 @@ def test_codex_trust_assertion_rejects_a_half_written_lifecycle(
     assert check().returncode == 0
 
 
+@dataclass(frozen=True)
+class IsolatedTmuxSession:
+    socket: Path
+    name: str
+
+
 @pytest.fixture
-def tmux_session() -> Iterator[str]:
+def tmux_session() -> Iterator[IsolatedTmuxSession]:
     """A real tmux session, so the propagation assertion is tested for real.
 
     `tmux show-environment` prints `NAME=value`, and prefixes the name with `-`
@@ -419,18 +429,29 @@ def tmux_session() -> Iterator[str]:
     """
     if shutil.which("tmux") is None:
         pytest.skip("tmux is not available")
-    name = f"python-tl-contract-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-    subprocess.run(
-        ["tmux", "new-session", "-d", "-s", name, "-n", "W", "sleep 60"],
-        check=True, capture_output=True,
-    )
-    try:
-        yield name
-    finally:
-        subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
+    with tmuxio.temporary_short_root(prefix="python-tl-contract-") as root:
+        socket = tmuxio.socket_path(root)
+        name = f"python-tl-contract-{os.getpid()}"
+        tmuxio.tmux(
+            socket,
+            "new-session",
+            "-d",
+            "-s",
+            name,
+            "-n",
+            "W",
+            "sleep",
+            "60",
+            check=True,
+        )
+        try:
+            yield IsolatedTmuxSession(socket=socket, name=name)
+        finally:
+            failures = tmuxio.kill_server(socket)
+            assert not failures, "; ".join(failures)
 
 
-def assert_from_inside_a_pane(session: str, *args: object) -> int:
+def assert_from_inside_a_pane(session: IsolatedTmuxSession, *args: object) -> int:
     """Run the helper in a pane of `session` and return its exit code.
 
     A validator is a process companion, so it runs inside a pane. Driving it
@@ -446,11 +467,20 @@ def assert_from_inside_a_pane(session: str, *args: object) -> int:
             encoding="utf-8",
         )
         script.chmod(0o755)
-        subprocess.run(
-            ["tmux", "new-window", "-t", session, "-n", "probe", "-d",
-             "bash", str(script), "e2e_python_tl_assert_session_codex_home",
-             session, *[str(a) for a in args]],
-            check=True, capture_output=True,
+        tmuxio.tmux(
+            session.socket,
+            "new-window",
+            "-t",
+            session.name,
+            "-n",
+            "probe",
+            "-d",
+            "bash",
+            str(script),
+            "e2e_python_tl_assert_session_codex_home",
+            session.name,
+            *[str(a) for a in args],
+            check=True,
         )
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
@@ -461,17 +491,26 @@ def assert_from_inside_a_pane(session: str, *args: object) -> int:
 
 
 def test_session_codex_home_assertion_accepts_a_propagated_value(
-    tmux_session: str,
+    tmux_session: IsolatedTmuxSession,
 ) -> None:
     """The `NAME=value` form tmux actually prints must be accepted."""
     home = "/tmp/python-tl-expected-codex-home"
-    subprocess.run(
-        ["tmux", "set-environment", "-t", tmux_session, "CODEX_HOME", home],
-        check=True, capture_output=True,
+    tmuxio.tmux(
+        tmux_session.socket,
+        "set-environment",
+        "-t",
+        tmux_session.name,
+        "CODEX_HOME",
+        home,
+        check=True,
     )
-    printed = subprocess.run(
-        ["tmux", "show-environment", "-t", tmux_session, "CODEX_HOME"],
-        text=True, capture_output=True, check=True,
+    printed = tmuxio.tmux(
+        tmux_session.socket,
+        "show-environment",
+        "-t",
+        tmux_session.name,
+        "CODEX_HOME",
+        check=True,
     ).stdout.strip()
     assert printed == f"CODEX_HOME={home}", (
         "this test is only meaningful while tmux prints NAME=value"
@@ -479,45 +518,50 @@ def test_session_codex_home_assertion_accepts_a_propagated_value(
     assert assert_from_inside_a_pane(tmux_session, home) == 0
 
 
-def test_session_codex_home_assertion_rejects_an_absent_value(tmux_session: str) -> None:
+def test_session_codex_home_assertion_rejects_an_absent_value(
+    tmux_session: IsolatedTmuxSession,
+) -> None:
     """A session that never received CODEX_HOME must fail, not match vacuously."""
     assert assert_from_inside_a_pane(tmux_session, "/tmp/expected") != 0
 
 
 def test_session_codex_home_assertion_rejects_an_explicitly_unset_value(
-    tmux_session: str,
+    tmux_session: IsolatedTmuxSession,
 ) -> None:
     """tmux marks an unset variable with a leading `-`; that is not a value."""
-    subprocess.run(
-        ["tmux", "set-environment", "-t", tmux_session, "-u", "CODEX_HOME"],
-        check=True, capture_output=True,
+    tmuxio.tmux(
+        tmux_session.socket,
+        "set-environment",
+        "-t",
+        tmux_session.name,
+        "-u",
+        "CODEX_HOME",
+        check=True,
     )
     assert assert_from_inside_a_pane(tmux_session, "/tmp/expected") != 0
 
 
-def test_session_codex_home_assertion_rejects_a_wrong_value(tmux_session: str) -> None:
+def test_session_codex_home_assertion_rejects_a_wrong_value(
+    tmux_session: IsolatedTmuxSession,
+) -> None:
     """A propagated-but-different home is a leak and must fail."""
-    subprocess.run(
-        ["tmux", "set-environment", "-t", tmux_session, "CODEX_HOME", "/tmp/somewhere-else"],
-        check=True, capture_output=True,
+    tmuxio.tmux(
+        tmux_session.socket,
+        "set-environment",
+        "-t",
+        tmux_session.name,
+        "CODEX_HOME",
+        "/tmp/somewhere-else",
+        check=True,
     )
     assert assert_from_inside_a_pane(tmux_session, "/tmp/expected") != 0
 
 
-def test_session_codex_home_assertion_rejects_a_missing_propagation() -> None:
+def test_session_codex_home_assertion_rejects_a_missing_propagation(
+    tmux_session: IsolatedTmuxSession,
+) -> None:
     """A tmux session that never received CODEX_HOME must fail the assertion."""
-    result = subprocess.run(
-        [
-            "bash", "-c",
-            'source "$1"; e2e_python_tl_assert_session_codex_home no-such-session /tmp/codex-home',
-            "bash", str(SHARED_HELPER),
-        ],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert result.returncode != 0
-
+    assert assert_from_inside_a_pane(tmux_session, "/tmp/codex-home") != 0
 
 
 # ---------------------------------------------------------------------------
