@@ -20371,8 +20371,6 @@ def _seed_terminal_provider_failure_leaf(
             "agent_type": prior_runtime,
             "model": prior_model,
             "effort": prior_effort,
-            "branch_name": branch,
-            "worktree_path": str(owner_worktree),
         },
         True,
     )
@@ -20751,6 +20749,387 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
     assert not any(name == "resume_blocked_leaf" for name, _ in repeated_transport.calls)
 
 
+def test_terminal_recovery_reconciles_confirmed_wrong_route_successor_before_current_route(
+    tmp_path: Path,
+) -> None:
+    """A confirmed legacy launch is evidence to reconcile, not current route authority."""
+    plan, config, store, owner_dir, owner_name, original_id = _seed_terminal_provider_failure_leaf(
+        tmp_path
+    )
+    initial, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert initial is not None, reason
+    state = driver_module._persist_terminal_route_authorization(initial, store.load(), store)
+    initial, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
+    assert initial is not None, reason
+
+    # This is the retained legacy action: the controller requested Luna xhigh,
+    # while the host selected Sol xhigh and confirmed that actual invocation.
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    arguments = dict(driver_module._blocked_leaf_resume_action_arguments(initial.resume, state))
+    arguments.pop("route_fingerprint")
+    intent = EffectIntent("resume_blocked_leaf", plan.leaves[0].name, arguments, True)
+    journal.append(intent)
+    successor_id = "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d"
+    result = ToolResult.from_raw(
+        {
+            "success": True,
+            "result": {
+                "chainlink_issue_id": 814,
+                "agent": {
+                    "id": owner_name,
+                    "issue": plan.leaves[0].name,
+                    "intent_id": initial.resume.intent_id,
+                    "agent_type": "codex",
+                    "branch_name": initial.resume.owner.branch,
+                    "worktree_path": str(initial.resume.owner.worktree),
+                },
+                "invocation": {
+                    "invocation_id": successor_id,
+                    "generation": 2,
+                    "trigger": "resume_blocked",
+                    "runtime": "codex",
+                    "ready": True,
+                    "fresh": True,
+                    "outcome": "started",
+                },
+            },
+        }
+    )
+    journal.mark_result(intent, result)
+
+    identity_path = owner_dir / "identity.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    identity.update(
+        {
+            "agent_type": "codex",
+            "model": "gpt-6.1-sol",
+            "effort": "xhigh",
+        }
+    )
+    identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    invocation = {
+        "invocation_id": successor_id,
+        "generation": 2,
+        "status": "exited",
+        "runtime": "codex",
+        "model": "gpt-6.1-sol",
+        "effort": "xhigh",
+        "trigger": "resume_blocked",
+        "branch": initial.resume.owner.branch,
+        "worktree": str(initial.resume.owner.worktree),
+        "slice_id": plan.leaves[0].name,
+        "prior_invocation_id": original_id,
+        "pr_number": None,
+        "head_sha": None,
+        "ended_at": 1792734800,
+        "exit_code": 0,
+        "exit_reason": "one_shot_complete",
+        "exit_classification": "one_shot_complete",
+        "one_shot_complete": True,
+    }
+    (owner_dir / "invocation.json").write_text(json.dumps(invocation), encoding="utf-8")
+    (owner_dir / "dispatch_intent").write_text(initial.resume.intent_id + "\n", encoding="utf-8")
+    (owner_dir / "routing.json").write_text(
+        json.dumps(
+            {
+                "owner_agent_id": owner_name,
+                "owner_invocation_id": successor_id,
+                "owner_generation": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    proof, proof_reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert proof is not None, proof_reason
+    assert proof.resume.owner.prior_invocation_id == successor_id
+    assert proof.resume.owner.generation == 2
+    assert proof.resume.desired_model == "gpt-6-luna"
+    assert proof.resume.desired_effort == "xhigh"
+
+    original_entry = journal.entries_for("resume_blocked_leaf", plan.leaves[0].name)[0]
+    original_result = json.loads(json.dumps(original_entry["result"]))
+    generation_three = "e861f870-65f7-47cb-b75b-0a26dbbde0b7"
+    cancel_event = threading.Event()
+
+    class CurrentRouteTransport(RecordingTransport):
+        def call_tool(self, role, name, tool_name, call_arguments):
+            if tool_name != "resume_blocked_leaf":
+                return super().call_tool(role, name, tool_name, call_arguments)
+            self.calls.append((tool_name, call_arguments))
+            route = call_arguments["role_route"]
+            assert route["harness"] == "codex/gpt-6-luna"
+            assert route["model"] == "gpt-6-luna"
+            assert route["effort"] == "xhigh"
+            assert route["configuration_fingerprint"] == config.role_route_configuration_fingerprint
+            identity.update(
+                {
+                    "agent_type": "codex",
+                    "model": "gpt-6-luna",
+                    "effort": "xhigh",
+                    "role_route": route,
+                }
+            )
+            identity_path.write_text(json.dumps(identity), encoding="utf-8")
+            (owner_dir / "invocation.json").write_text(
+                json.dumps(
+                    {
+                        "invocation_id": generation_three,
+                        "generation": 3,
+                        "status": "running",
+                        "runtime": "codex",
+                        "model": "gpt-6-luna",
+                        "effort": "xhigh",
+                        "trigger": "resume_blocked",
+                        "branch": initial.resume.owner.branch,
+                        "worktree": str(initial.resume.owner.worktree),
+                        "slice_id": plan.leaves[0].name,
+                        "prior_invocation_id": successor_id,
+                        "pr_number": None,
+                        "head_sha": None,
+                        "role_route": route,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (owner_dir / "dispatch_intent").write_text(
+                str(route["dispatch_intent_id"]) + "\n", encoding="utf-8"
+            )
+            (owner_dir / "routing.json").write_text(
+                json.dumps(
+                    {
+                        "owner_agent_id": owner_name,
+                        "owner_invocation_id": generation_three,
+                        "owner_generation": 3,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            cancel_event.set()
+            return {
+                "success": True,
+                "result": {
+                    "chainlink_issue_id": 814,
+                    "agent": {
+                        "id": owner_name,
+                        "issue": plan.leaves[0].name,
+                        "intent_id": route["dispatch_intent_id"],
+                        "agent_type": "codex",
+                        "branch_name": initial.resume.owner.branch,
+                        "worktree_path": str(initial.resume.owner.worktree),
+                        "role_route": route,
+                    },
+                    "invocation": {
+                        "invocation_id": generation_three,
+                        "trigger": "resume_blocked",
+                        "runtime": "codex",
+                        "ready": True,
+                        "fresh": True,
+                        "outcome": "started",
+                        "role_route": route,
+                    },
+                },
+            }
+
+    transport = CurrentRouteTransport()
+    config = replace(config, cancel_event=cancel_event)
+    try:
+        run_tl_loop(
+            config.run_id,
+            plan,
+            SyntheticQueue([]),
+            EffectClient(transport),
+            config=config,
+            root_dir=config.root_dir,
+        )
+    except LoopCancelled:
+        pass
+
+    accepted = store.load().slices[plan.leaves[0].name]
+    assert accepted.dispatch_invocation_id == generation_three
+    assert accepted.dispatch_generation == 3
+    assert accepted.model == "gpt-6-luna"
+    assert accepted.dispatch_effort == "xhigh"
+    assert accepted.dispatch_uses_current_role_configuration is True
+    resume_calls = [call for call in transport.calls if call[0] == "resume_blocked_leaf"]
+    assert len(resume_calls) == 1
+    journal_entries = journal.entries_for("resume_blocked_leaf", plan.leaves[0].name)
+    assert len(journal_entries) == 2
+    assert journal_entries[0] == original_entry
+    assert journal_entries[0]["result"] == original_result
+    assert journal_entries[1]["status"] == "confirmed"
+    assert journal_entries[1]["arguments"]["expected_invocation_id"] == successor_id
+    assert journal_entries[1]["arguments"]["prior_generation"] == 2
+    assert journal_entries[1]["arguments"]["desired_model"] == "gpt-6-luna"
+    assert journal_entries[1]["arguments"]["desired_effort"] == "xhigh"
+
+    repeat_transport = RecordingTransport()
+    repeat = driver_module._resume_terminal_owner_failure(
+        plan,
+        store.load(),
+        config,
+        EffectClient(repeat_transport),
+        store,
+        journal,
+    )
+    assert repeat.slices[plan.leaves[0].name] == accepted
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in repeat_transport.calls)
+
+
+def test_terminal_resume_history_accepts_multiple_stopped_successors_and_route_return(
+    tmp_path: Path,
+) -> None:
+    plan, config, store, owner_dir, owner_name, original_id = _seed_terminal_provider_failure_leaf(
+        tmp_path
+    )
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+    assert proof is not None, reason
+    driver_module._persist_terminal_route_authorization(proof, store.load(), store)
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    identity_path = owner_dir / "identity.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+
+    def record_terminal_resume(
+        current_proof,
+        invocation_id: str,
+        generation: int,
+        predecessor_id: str,
+        model: str,
+        *,
+        legacy: bool,
+    ) -> Mapping[str, object]:
+        arguments = dict(
+            driver_module._blocked_leaf_resume_action_arguments(current_proof.resume, store.load())
+        )
+        route = driver_module._blocked_resume_role_route_response(current_proof.resume)
+        assert route is not None
+        if legacy:
+            arguments.pop("route_fingerprint")
+        intent = EffectIntent("resume_blocked_leaf", plan.leaves[0].name, arguments, True)
+        journal.append(intent)
+        response_route = None if legacy else route
+        result_document: dict[str, object] = {
+            "success": True,
+            "result": {
+                "chainlink_issue_id": 814,
+                "agent": {
+                    "id": owner_name,
+                    "issue": plan.leaves[0].name,
+                    "intent_id": current_proof.resume.intent_id,
+                    "agent_type": "codex",
+                    "branch_name": current_proof.resume.owner.branch,
+                    "worktree_path": str(current_proof.resume.owner.worktree),
+                },
+                "invocation": {
+                    "invocation_id": invocation_id,
+                    "generation": generation,
+                    "trigger": "resume_blocked",
+                    "runtime": "codex",
+                    "model": model,
+                    "effort": "xhigh",
+                    "ready": True,
+                    "fresh": True,
+                    "outcome": "started",
+                },
+            },
+        }
+        if response_route is not None:
+            result_document["result"]["agent"]["role_route"] = response_route
+            result_document["result"]["invocation"]["role_route"] = response_route
+        journal.mark_result(intent, ToolResult.from_raw(result_document))
+        identity.update(
+            {
+                "agent_type": "codex",
+                "model": model,
+                "effort": "xhigh",
+            }
+        )
+        if response_route is not None:
+            identity["role_route"] = response_route
+        else:
+            identity.pop("role_route", None)
+        identity_path.write_text(json.dumps(identity), encoding="utf-8")
+        (owner_dir / "invocation.json").write_text(
+            json.dumps(
+                {
+                    "invocation_id": invocation_id,
+                    "generation": generation,
+                    "status": "exited",
+                    "runtime": "codex",
+                    "model": model,
+                    "effort": "xhigh",
+                    "trigger": "resume_blocked",
+                    "branch": current_proof.resume.owner.branch,
+                    "worktree": str(current_proof.resume.owner.worktree),
+                    "slice_id": plan.leaves[0].name,
+                    "prior_invocation_id": predecessor_id,
+                    "pr_number": None,
+                    "head_sha": None,
+                    "ended_at": 1792734800 + generation,
+                    "exit_code": 0,
+                    "exit_reason": "one_shot_complete",
+                    "exit_classification": "one_shot_complete",
+                    "one_shot_complete": True,
+                    **({"role_route": response_route} if response_route is not None else {}),
+                }
+            ),
+            encoding="utf-8",
+        )
+        (owner_dir / "dispatch_intent").write_text(
+            current_proof.resume.intent_id + "\n", encoding="utf-8"
+        )
+        (owner_dir / "routing.json").write_text(
+            json.dumps(
+                {
+                    "owner_agent_id": owner_name,
+                    "owner_invocation_id": invocation_id,
+                    "owner_generation": generation,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return arguments
+
+    first_args = record_terminal_resume(
+        proof,
+        "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d",
+        2,
+        original_id,
+        "gpt-6.1-sol",
+        legacy=True,
+    )
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+    assert proof is not None, reason
+    assert proof.resume.owner.prior_invocation_id == "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d"
+    driver_module._persist_terminal_route_authorization(proof, store.load(), store)
+    second_args = record_terminal_resume(
+        proof,
+        "e861f870-65f7-47cb-b75b-0a26dbbde0b7",
+        3,
+        "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d",
+        "gpt-6-luna",
+        legacy=False,
+    )
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+
+    assert proof is not None, reason
+    assert proof.resume.owner.prior_invocation_id == "e861f870-65f7-47cb-b75b-0a26dbbde0b7"
+    assert proof.resume.owner.generation == 3
+    assert proof.resume.desired_model == "gpt-6-luna"
+    assert proof.resume.desired_effort == "xhigh"
+    assert proof.route_authorization_supersedes_digest == second_args["route_authorization_digest"]
+    entries = journal.entries_for("resume_blocked_leaf", plan.leaves[0].name)
+    assert len(entries) == 2
+    assert entries[0]["arguments"] == first_args
+    assert entries[1]["arguments"] == second_args
+    assert entries[0]["status"] == entries[1]["status"] == "confirmed"
+
+
 @pytest.mark.parametrize("scenario", ("missing", "failed", "stale", "dirty"))
 def test_terminal_owner_resume_requires_current_reference_evidence(
     tmp_path: Path,
@@ -20930,7 +21309,7 @@ def test_terminal_owner_configuration_change_invalidates_saved_route_authorizati
     )
     persisted = held.slices[leaf.name].recovery.evidence
     assert persisted["configured_route_authorization"] == saved_authorization
-    assert persisted["terminal_owner_recovery_hold"] == (
+    assert persisted["terminal_owner_recovery_hold"].startswith(
         "persisted terminal-owner route authorization conflicts with current configuration"
     )
 
@@ -21371,8 +21750,9 @@ def test_terminal_provider_recovery_authorizes_effort_only_route_change(
     unchanged, unchanged_reason = driver_module._terminal_owner_recovery_proof(
         unchanged_plan, unchanged_store.load(), unchanged_config, unchanged_store
     )
-    assert unchanged is None
-    assert "route and effort do not authorize" in str(unchanged_reason)
+    assert unchanged is not None and unchanged_reason is None
+    assert unchanged.resume.desired_model == "gpt-6-luna"
+    assert unchanged.resume.desired_effort == "xhigh"
 
 
 def test_parent_schedules_terminal_provider_failure_before_human_gate_projection(
@@ -22483,7 +22863,7 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
     adoption_proof, adoption_reason = driver_module._terminal_owner_recovery_proof(
         plan, store.load(), config, store
     )
-    assert adoption_proof is not None and adoption_reason is None
+    assert adoption_proof is not None and adoption_reason is None, adoption_reason
     persisted_adoption_state = driver_module._persist_terminal_route_authorization(
         adoption_proof, store.load(), store
     )
