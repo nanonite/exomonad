@@ -4980,6 +4980,8 @@ def _resolve_blocked_leaf_owner(
     store: RunStore,
     leaf: LeafTask,
     current: SliceState,
+    *,
+    allow_terminal_route_refusal: bool = False,
 ) -> _BlockedLeafResumeProof:
     if config.project_root is None:
         raise BlockedLeafOwnerError("blocked leaf owner lookup requires the project root")
@@ -4988,7 +4990,15 @@ def _resolve_blocked_leaf_owner(
         "resume_blocked_leaf", leaf.name
     )
     if len(entries) > 1:
-        raise BlockedLeafOwnerError("multiple blocked-leaf resume actions require reconciliation")
+        prior_entries_are_safe = allow_terminal_route_refusal and all(
+            entry.get("status") == "not_dispatched" or _is_legacy_missing_role_route_refusal(entry)
+            for entry in entries[:-1]
+        )
+        if not prior_entries_are_safe:
+            raise BlockedLeafOwnerError(
+                "multiple blocked-leaf resume actions require reconciliation"
+            )
+        entries = (entries[-1],)
     if entries:
         entry = entries[0]
         args = entry.get("arguments")
@@ -5006,7 +5016,9 @@ def _resolve_blocked_leaf_owner(
             raise BlockedLeafOwnerError(
                 "blocked-leaf resume journal conflicts with this declaration"
             )
-        if entry.get("status") == "rejected":
+        if entry.get("status") == "rejected" and not (
+            allow_terminal_route_refusal and _is_legacy_missing_role_route_refusal(entry)
+        ):
             raise BlockedLeafOwnerError("the exact blocked-leaf resume request was rejected")
         if entry.get("status") in {"intended", "unknown"} and not isinstance(
             args.get("route_fingerprint"), str
@@ -5127,6 +5139,11 @@ def _terminal_owner_recovery_proof(
         return None, "terminal-owner recovery requires the project and authoritative ledger"
     if state.plan_manifest is None:
         return None, "terminal-owner recovery requires the accepted plan manifest"
+    if not _is_role_route_configuration_fingerprint(config.role_route_configuration_fingerprint):
+        return (
+            None,
+            "terminal-owner recovery requires the current accepted role-route configuration fingerprint",
+        )
     node = next((item for item in state.plan_manifest.nodes if item.name == leaf.name), None)
     if (
         node is None
@@ -5223,7 +5240,14 @@ def _terminal_owner_recovery_proof(
     ):
         return None, "terminal-owner branch is not anchored to the accepted parent declaration"
     try:
-        resolved = _resolve_blocked_leaf_owner(state, config, store, leaf, current)
+        resolved = _resolve_blocked_leaf_owner(
+            state,
+            config,
+            store,
+            leaf,
+            current,
+            allow_terminal_route_refusal=True,
+        )
     except (BlockedLeafOwnerError, OSError, ValueError) as error:
         return (
             None,
@@ -5264,7 +5288,8 @@ def _terminal_owner_recovery_proof(
     resume_journal = EffectJournal(state.run_id, store.run_dir / "action-journal.json")
     resume_entries = resume_journal.entries_for("resume_blocked_leaf", leaf.name)
     if len(resume_entries) > 1 and any(
-        entry.get("status") != "not_dispatched" for entry in resume_entries[:-1]
+        entry.get("status") != "not_dispatched" and not _is_legacy_missing_role_route_refusal(entry)
+        for entry in resume_entries[:-1]
     ):
         return None, "multiple terminal-owner resume actions require reconciliation"
     latest_resume_entry = resume_entries[-1] if resume_entries else None
@@ -5415,6 +5440,19 @@ def _terminal_owner_recovery_proof(
         spawn_event_seq,
         blocker_event_seq,
     )
+    route_fields = {
+        "harness": choice.harness,
+        "agent_type": route.agent_type,
+        "model": desired_model,
+        **_dispatch_route_fields(
+            config,
+            state,
+            harness=choice.harness,
+            agent_type=route.agent_type,
+            model=desired_model,
+            choice=choice,
+        ),
+    }
     saved_authorization = evidence.get("configured_route_authorization")
     fresh_gate_authorization = gate_authorization
     confirmed_resume = (
@@ -5473,10 +5511,46 @@ def _terminal_owner_recovery_proof(
             ("desired_effort", desired_effort),
             ("recovery_gate_authorization", dict(gate_authorization or {})),
             ("configured_role", config.role),
+            ("harness", route_fields["harness"]),
+            ("agent_type", route_fields["agent_type"]),
+            ("model", route_fields["model"]),
+            ("role", route_fields["role"]),
+            ("effort", route_fields["effort"]),
+            ("route_configuration_fingerprint", route_fields["route_configuration_fingerprint"]),
+            ("route_policy_fingerprint", route_fields["route_policy_fingerprint"]),
+            ("route_manifest_digest", route_fields["route_manifest_digest"]),
+            ("route_fingerprint", route_fields["route_fingerprint"]),
         )
         expected_arguments = (*expected_arguments, ("task", leaf.task))
         conflicts = [key for key, value in expected_arguments if existing_args.get(key) != value]
         if conflicts:
+            fresh_legacy_refusal_retry = (
+                latest_resume_entry is not None
+                and _is_legacy_missing_role_route_refusal(latest_resume_entry)
+                and isinstance(gate_authorization, Mapping)
+                and gate_authorization.get("gate_name") == gate_name
+                and gate_authorization.get("status") == GateStatus.APPROVED.value
+                and (
+                    saved_authorization == route_authorization
+                    or _fresh_terminal_gate_reauthorization(
+                        saved_authorization, route_authorization
+                    )
+                )
+                and set(conflicts)
+                <= {
+                    "route_authorization_digest",
+                    "recovery_gate_authorization",
+                    "harness",
+                    "agent_type",
+                    "model",
+                    "role",
+                    "effort",
+                    "route_configuration_fingerprint",
+                    "route_policy_fingerprint",
+                    "route_manifest_digest",
+                    "route_fingerprint",
+                }
+            )
             fresh_not_dispatched_retry = (
                 latest_resume_entry is not None
                 and latest_resume_entry.get("status") == "not_dispatched"
@@ -5492,12 +5566,20 @@ def _terminal_owner_recovery_proof(
                     "configured_role",
                 }
             )
-            if not fresh_not_dispatched_retry:
+            if not fresh_not_dispatched_retry and not fresh_legacy_refusal_retry:
                 return (
                     None,
                     "journaled terminal-owner authorization conflicts with current evidence or configuration: "
                     + ", ".join(conflicts),
                 )
+            action_arguments = None
+        elif (
+            latest_resume_entry is not None
+            and _is_legacy_missing_role_route_refusal(latest_resume_entry)
+            and isinstance(gate_authorization, Mapping)
+            and gate_authorization.get("gate_name") == gate_name
+            and gate_authorization.get("status") == GateStatus.APPROVED.value
+        ):
             action_arguments = None
         else:
             action_arguments = existing_args
@@ -5522,19 +5604,7 @@ def _terminal_owner_recovery_proof(
         route_authorization_digest=route_digest,
         accepted_spawn_event_seq=spawn_event_seq,
         blocker_event_seq=blocker_event_seq,
-        route_fields={
-            "harness": choice.harness,
-            "agent_type": route.agent_type,
-            "model": desired_model,
-            **_dispatch_route_fields(
-                config,
-                state,
-                harness=choice.harness,
-                agent_type=route.agent_type,
-                model=desired_model,
-                choice=choice,
-            ),
-        },
+        route_fields=route_fields,
     )
     successor_adoption_authorization = None
     if confirmed_resume:
@@ -6008,6 +6078,7 @@ def _terminal_route_authorization_digest(
         raise ValueError("terminal route authorization role is missing")
     payload = {
         "authorization_source": "accepted_operator_role_configuration",
+        "configuration_fingerprint": config.role_route_configuration_fingerprint,
         "manifest_digest": manifest_digest,
         "role": config.role,
         "policy": {
@@ -6056,6 +6127,7 @@ def _terminal_route_authorization_record(
     return {
         "source": "accepted_operator_role_configuration",
         "digest": digest,
+        "configuration_fingerprint": config.role_route_configuration_fingerprint,
         "terminal_invocation_digest": terminal_invocation_digest,
         "role": config.role,
         "harness": harness,
@@ -6078,6 +6150,35 @@ def _terminal_route_authorization_record(
         "accepted_spawn_event_seq": spawn_event_seq,
         "blocker_event_seq": blocker_event_seq,
     }
+
+
+def _is_role_route_configuration_fingerprint(value: object) -> bool:
+    prefix = "sha256:v1:"
+    return (
+        isinstance(value, str)
+        and value.startswith(prefix)
+        and _is_sha256_text(value[len(prefix) :])
+    )
+
+
+def _is_legacy_missing_role_route_refusal(entry: Mapping[str, object]) -> bool:
+    """Recognize only the historical host refusal that proves no launch occurred."""
+    arguments = entry.get("arguments")
+    result = entry.get("result")
+    error = "Invalid input: blocked-leaf controller recovery requires its accepted role route"
+    return (
+        entry.get("operation") == "resume_blocked_leaf"
+        and entry.get("status") == "rejected"
+        and isinstance(arguments, Mapping)
+        and arguments.get("recovery_mode") == "terminal_provider_failure"
+        and arguments.get("route_configuration_fingerprint") is None
+        and arguments.get("role_route") is None
+        and isinstance(result, Mapping)
+        and result.get("success") is False
+        and result.get("result") is None
+        and result.get("error") == error
+        and entry.get("error") == error
+    )
 
 
 def _persist_terminal_route_authorization(

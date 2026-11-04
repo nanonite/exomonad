@@ -1696,7 +1696,9 @@ e2e_log "Actual init refused the legacy lock; compiled inspect/apply recovered a
 
 # The blocker-only acceptance keeps #814 active before first replay. The normal
 # aggregate run leaves the failure proof available for its ordered retry path.
-PHASE8_SERVER_COMMAND="EXOMONAD_TMUX_SESSION=$AGGREGATE_SESSION EXOMONAD_ROOT_AGENT_TYPE=codex EXOMONAD_SPAWN_AGENT_TYPE=codex EXOMONAD_REVIEWER_AGENT_TYPE=codex EXOMONAD_CODEX_MODEL=gpt-6-luna $EXOMONAD_BIN serve"
+# Keep server and init on the same accepted workspace route configuration.
+# Per-command overrides here changed server provenance without changing init.
+PHASE8_SERVER_COMMAND="EXOMONAD_TMUX_SESSION=$AGGREGATE_SESSION $EXOMONAD_BIN serve"
 tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_SERVER_COMMAND"
 tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
 for _ in $(seq 1 100); do
@@ -1732,6 +1734,11 @@ if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" ]]; then
         "${TERMINAL_SEED_ARGS[@]}" \
         > "$AGG_DIR/preexisting-opencode-owner-seed.json" \
         || { cat "$AGG_DIR/preexisting-opencode-owner-seed.json"; e2e_fail "failed to seed historical accepted OpenCode records and terminal provider failure"; }
+    PYTHONPATH="$PROJECT_ROOT" "$PROJECT_ROOT/tl_loop/.venv/bin/python" -m tl_loop gate \
+        --project-root "$AGG_REPO" --run-id kani --parent-run-id root \
+        --name "tl-terminal-owner-recovery-issue-814-substitution-model-kani" --reject \
+        > "$AGG_DIR/reject-terminal-recovery-gate.log" 2>&1 \
+        || { cat "$AGG_DIR/reject-terminal-recovery-gate.log"; e2e_fail "could not record the disposable operator rejection before route recovery"; }
     # The fixture writes a historical owner after the server's startup scan.
     # Restart only the disposable server so its in-memory resolver loads that
     # persisted identity before the production controller attempts recovery.
@@ -1866,6 +1873,52 @@ if [[ -n "$KANI_BLOCKER_EVENT_ID" && -n "$KANI_BLOCKER_RUN_SEQ" ]]; then
     assert_active_kani_blocker_replayed "$KANI_BLOCKER_EVENT_ID" "$KANI_BLOCKER_RUN_SEQ"
 fi
 if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" ]]; then
+    TERMINAL_GATE_RECORDED=""
+    for _ in $(seq 1 400); do
+        TERMINAL_GATE_RECORDED="$(python3 - "$AGG_REPO" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+run_path = Path(sys.argv[1]) / ".exo/tl-loop/root/kani/run.json"
+try:
+    run = json.loads(run_path.read_text())
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(0)
+leaf = run.get("slices", {}).get("issue-814-substitution-model-kani", {})
+evidence = (leaf.get("recovery") or {}).get("evidence") or {}
+gate_name = "tl-terminal-owner-recovery-issue-814-substitution-model-kani"
+gate = next((row for row in run.get("gates", []) if row.get("name") == gate_name), {})
+if gate.get("status") == "rejected" and isinstance(
+    evidence.get("terminal_owner_recovery_gate_rejection"), dict
+):
+    print("recorded")
+PY
+        2>/dev/null)" || TERMINAL_GATE_RECORDED=""
+        [[ "$TERMINAL_GATE_RECORDED" == "recorded" ]] && break
+        sleep 0.1
+    done
+    [[ "$TERMINAL_GATE_RECORDED" == "recorded" ]] \
+        || { cat "$AGG_REPO/.exo/tl-loop/root/controller-output.log" 2>/dev/null || true; e2e_fail "controller did not durably preserve the rejected terminal recovery gate"; }
+    python3 - "$AGG_REPO" "$AGG_DIR/preexisting-opencode-owner.json" <<'PY' \
+        || e2e_fail "controller issued a resume before explicit fixture approval"
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+baseline = json.loads(Path(sys.argv[2]).read_text())
+journal = json.loads((repo / ".exo/tl-loop/root/kani/action-journal.json").read_text())
+assert not [row for row in journal if row.get("operation") == "resume_blocked_leaf"], journal
+owner = Path(baseline["owner_dir"])
+assert json.loads((owner / "invocation.json").read_text()) == baseline["prior_invocation"]
+PY
+    PYTHONPATH="$PROJECT_ROOT" "$PROJECT_ROOT/tl_loop/.venv/bin/python" -m tl_loop gate \
+        --project-root "$AGG_REPO" --run-id kani --parent-run-id root \
+        --name "tl-terminal-owner-recovery-issue-814-substitution-model-kani" --approve \
+        > "$AGG_DIR/approve-terminal-recovery-gate.log" 2>&1 \
+        || { cat "$AGG_DIR/approve-terminal-recovery-gate.log"; e2e_fail "could not explicitly approve the disposable terminal-owner route recovery"; }
+    e2e_log "Disposable terminal-owner recovery proceeded only after a recorded rejection and explicit fresh approval"
     python3 "$SCRIPT_DIR/configured-owner-resume.py" verify-controller \
         --repo "$AGG_REPO" --baseline "$AGG_DIR/preexisting-opencode-owner.json" \
         --output "$AGG_DIR/configured-owner-resume.json" \

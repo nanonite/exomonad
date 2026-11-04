@@ -236,9 +236,13 @@ def seed_terminal_provider_failure(
     from tl_loop.client.effects import ToolResult
     from tl_loop.fsm.child import ChildKind, ChildRecord
     from tl_loop.fsm.scope import TLRunning
-    from tl_loop.loop.driver import EffectIntent, derive_child_branch
+    from tl_loop.loop.driver import (
+        EffectIntent,
+        _terminal_owner_recovery_gate_name,
+        derive_child_branch,
+    )
     from tl_loop.loop.journal import EffectJournal
-    from tl_loop.state.schema import SliceStatus
+    from tl_loop.state.schema import GateStatus, SliceStatus
     from tl_loop.state.store import RunStore
 
     transport = TransportClient(project_root=repository, timeout=30)
@@ -685,6 +689,35 @@ def seed_terminal_provider_failure(
             "terminal blocker does not follow the accepted OpenCode spawn"
         )
 
+    # Exercise the real compiled host refusal for a route-less retry. It must
+    # leave the historical OpenCode owner untouched; this probe is not added
+    # to the controller action journal because it is a fixture negative control.
+    identity_before = digest(owner_dir / "identity.json")
+    invocation_before = digest(owner_dir / "invocation.json")
+    route_less_refusal = controller.resume_blocked_leaf(
+        chainlink_issue_id=BLOCKED_ISSUE_ID,
+        expected_invocation_id=invocation_id,
+        expected_branch=branch,
+        expected_worktree_fingerprint=worktree_fingerprint(worktree),
+        task=task,
+        human_approved=True,
+    )
+    expected_refusal = "Invalid input: blocked-leaf controller recovery requires its accepted role route"
+    if (
+        route_less_refusal.success is not False
+        or route_less_refusal.error != expected_refusal
+    ):
+        raise RuntimeError(
+            "compiled host did not reject the missing-role-route negative control"
+        )
+    if (
+        digest(owner_dir / "identity.json") != identity_before
+        or digest(owner_dir / "invocation.json") != invocation_before
+    ):
+        raise RuntimeError("route-less negative control changed the retained owner")
+    terminal_gate_name = _terminal_owner_recovery_gate_name(OWNER_SLICE)
+    child_store.set_gate(terminal_gate_name, GateStatus.PENDING)
+
     history = repository / ".exo/events" / f"{identity['agent_name']}.jsonl"
     evidence: dict[str, Any] = {
         "historical_dispatch_kind": "accepted_terminal_provider_failure",
@@ -703,6 +736,14 @@ def seed_terminal_provider_failure(
         "blocker_event_seq": blocker_rows[0]["run_seq"],
         "accepted_spawn_journal": journal.entries_for("spawn_leaf", OWNER_SLICE)[0],
         "history_lines": history.read_text(encoding="utf-8").splitlines(),
+        "route_less_host_refusal": {
+            "success": route_less_refusal.success,
+            "error": route_less_refusal.error,
+            "error_kind": route_less_refusal.error_kind,
+            "identity_sha256_before": identity_before,
+            "invocation_sha256_before": invocation_before,
+        },
+        "terminal_recovery_gate": terminal_gate_name,
     }
     if seed_parent_stall:
         evidence.update(_seed_historical_parent_stall(repository, blocker_rows[0]))
@@ -1167,6 +1208,106 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
         raise RuntimeError(
             f"controller did not retain exactly one confirmed resume action: {resume_rows!r}"
         )
+    init_log = repository / ".exo/logs/init.jsonl"
+    init_records = read_json_lines(init_log)
+    accepted_fingerprints = {
+        record.get("resolved", {}).get("role_route_config_fingerprint")
+        for record in init_records
+        if isinstance(record.get("resolved"), dict)
+        and isinstance(
+            record.get("resolved", {}).get("role_route_config_fingerprint"), str
+        )
+    }
+    if len(accepted_fingerprints) != 1:
+        raise RuntimeError(
+            "disposable init did not retain one consistent accepted route configuration fingerprint"
+        )
+    accepted_configuration_fingerprint = next(iter(accepted_fingerprints))
+    resume_arguments = resume_rows[0].get("arguments")
+    if not isinstance(resume_arguments, dict):
+        raise TypeError("confirmed resume journal lacks its accepted route arguments")
+    expected_route = {
+        "role": resume_arguments.get("role"),
+        "harness": resume_arguments.get("harness"),
+        "agent_type": resume_arguments.get("agent_type"),
+        "model": resume_arguments.get("model"),
+        "effort": resume_arguments.get("effort"),
+        "configuration_fingerprint": resume_arguments.get(
+            "route_configuration_fingerprint"
+        ),
+        "policy_fingerprint": resume_arguments.get("route_policy_fingerprint"),
+        "manifest_digest": resume_arguments.get("route_manifest_digest"),
+        "route_fingerprint": resume_arguments.get("route_fingerprint"),
+        "dispatch_intent_id": resume_arguments.get("dispatch_intent_id"),
+        "scope_id": OWNER_SLICE,
+    }
+    if (
+        expected_route["role"] != "worker"
+        or expected_route["harness"] != "codex/gpt-6-luna"
+        or expected_route["agent_type"] != "codex"
+        or expected_route["model"] != "gpt-6-luna"
+        or expected_route["effort"] != "xhigh"
+        or expected_route["configuration_fingerprint"]
+        != accepted_configuration_fingerprint
+        or any(
+            not isinstance(expected_route[key], str) or not expected_route[key]
+            for key in (
+                "policy_fingerprint",
+                "manifest_digest",
+                "route_fingerprint",
+                "dispatch_intent_id",
+            )
+        )
+    ):
+        raise RuntimeError(
+            "resume request route does not match the accepted init configuration and Kani declaration"
+        )
+    terminal_gate_name = baseline.get("terminal_recovery_gate")
+    recovery_evidence = (
+        child.get("slices", {}).get(OWNER_SLICE, {}).get("recovery") or {}
+    ).get("evidence") or {}
+    terminal_gate = next(
+        (
+            row
+            for row in child.get("gates", [])
+            if row.get("name") == terminal_gate_name
+        ),
+        None,
+    )
+    route_authorization = recovery_evidence.get("configured_route_authorization")
+    gate_authorization = resume_arguments.get("recovery_gate_authorization")
+    if (
+        not isinstance(terminal_gate, dict)
+        or terminal_gate.get("status") != "approved"
+        or not isinstance(
+            recovery_evidence.get("terminal_owner_recovery_gate_rejection"), dict
+        )
+        or not isinstance(route_authorization, dict)
+        or route_authorization.get("recovery_gate_authorization") != gate_authorization
+        or not isinstance(gate_authorization, dict)
+        or gate_authorization.get("status") != "approved"
+    ):
+        raise RuntimeError(
+            "resume route authorization is not bound to the fixture's explicit fresh gate approval"
+        )
+    response_payload = (resume_rows[0].get("result") or {}).get("result")
+    if not isinstance(response_payload, dict):
+        raise TypeError("confirmed resume journal lacks its typed response payload")
+    response_agent = response_payload.get("agent")
+    response_invocation = response_payload.get("invocation")
+    identity_route = identity.get("role_route")
+    invocation_route = successor.get("role_route")
+    if (
+        not isinstance(response_agent, dict)
+        or not isinstance(response_invocation, dict)
+        or response_agent.get("role_route") != expected_route
+        or response_invocation.get("role_route") != expected_route
+        or identity_route != expected_route
+        or invocation_route != expected_route
+    ):
+        raise RuntimeError(
+            "accepted route provenance differs across response receipts and durable owner records"
+        )
     ledger = canonical_events(repository)
     owner_invocations = [
         row
@@ -1216,6 +1357,8 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
 
     record = {
         "historical_dispatch_kind": baseline.get("historical_dispatch_kind"),
+        "route_less_host_refusal": baseline.get("route_less_host_refusal"),
+        "terminal_recovery_gate": baseline.get("terminal_recovery_gate"),
         "accepted_spawn_journal": baseline.get("accepted_spawn_journal"),
         "accepted_spawn_event": baseline.get("accepted_spawn_event"),
         "spawn_event_id": baseline.get("spawn_event_id"),
@@ -1229,6 +1372,8 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
         "runtime": successor["runtime"],
         "model": successor["model"],
         "effort": successor["effort"],
+        "accepted_route_configuration_fingerprint": accepted_configuration_fingerprint,
+        "accepted_role_route": expected_route,
         "pr_number": leaf["pr_number"],
         "head_sha": head_sha,
         "reviewer_name": reviewer["agent_name"],
@@ -1323,6 +1468,16 @@ def canonical_events(repository: Path) -> list[dict[str, Any]]:
 
 def verify_repeat(repository: Path, evidence_path: Path) -> None:
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    route_less_refusal = evidence.get("route_less_host_refusal")
+    if (
+        not isinstance(route_less_refusal, dict)
+        or route_less_refusal.get("success") is not False
+        or route_less_refusal.get("error")
+        != "Invalid input: blocked-leaf controller recovery requires its accepted role route"
+    ):
+        raise RuntimeError(
+            "fixture did not retain the compiled host missing-route refusal"
+        )
     retained_launch_event = [
         row
         for row in canonical_events(repository)
@@ -1415,6 +1570,26 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
         raise RuntimeError(
             "repeat init did not retain exactly one successful resume for the same successor"
         )
+    expected_route = evidence.get("accepted_role_route")
+    identity = json.loads((owner_dir / "identity.json").read_text(encoding="utf-8"))
+    if (
+        not isinstance(expected_route, dict)
+        or identity.get("role_route") != expected_route
+        or current_invocation.get("role_route") != expected_route
+        or (resume_actions[0].get("arguments") or {}).get(
+            "route_configuration_fingerprint"
+        )
+        != evidence.get("accepted_route_configuration_fingerprint")
+        or ((resume_actions[0].get("result") or {}).get("result") or {})
+        .get("agent", {})
+        .get("role_route")
+        != expected_route
+        or ((resume_actions[0].get("result") or {}).get("result") or {})
+        .get("invocation", {})
+        .get("role_route")
+        != expected_route
+    ):
+        raise RuntimeError("repeat init changed the accepted route provenance")
     reviewer_actions = [
         row
         for row in action_rows

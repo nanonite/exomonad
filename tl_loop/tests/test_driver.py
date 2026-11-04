@@ -20181,6 +20181,277 @@ def test_terminal_owner_rejection_after_route_authorization_blocks_resume(
     assert recovery_evidence["configured_route_authorization"] == fresh_proof.route_authorization
 
 
+def test_terminal_owner_configuration_change_invalidates_saved_route_authorization(
+    tmp_path: Path,
+) -> None:
+    plan, config, store, *_ = _seed_terminal_provider_failure_leaf(tmp_path)
+    leaf = plan.leaves[0]
+    gate_name = driver_module._terminal_owner_recovery_gate_name(leaf.name)
+    store.set_gate(gate_name, GateStatus.PENDING)
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+    assert proof is not None and reason is None
+    authorized = driver_module._persist_terminal_route_authorization(proof, store.load(), store)
+    saved_authorization = authorized.slices[leaf.name].recovery.evidence[
+        "configured_route_authorization"
+    ]
+    changed_config = replace(
+        config,
+        role_route_configuration_fingerprint="sha256:v1:" + "9" * 64,
+    )
+    transport = RecordingTransport()
+
+    held = driver_module._resume_terminal_owner_failure(
+        plan,
+        store.load(),
+        changed_config,
+        EffectClient(transport),
+        store,
+        EffectJournal(store.run_id, store.run_dir / "action-journal.json"),
+    )
+
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in transport.calls)
+    assert not EffectJournal(store.run_id, store.run_dir / "action-journal.json").entries_for(
+        "resume_blocked_leaf", leaf.name
+    )
+    persisted = held.slices[leaf.name].recovery.evidence
+    assert persisted["configured_route_authorization"] == saved_authorization
+    assert persisted["terminal_owner_recovery_hold"] == (
+        "persisted terminal-owner route authorization conflicts with current configuration"
+    )
+
+
+def test_terminal_owner_resume_holds_without_accepted_configuration_fingerprint(
+    tmp_path: Path,
+) -> None:
+    plan, config, store, *_ = _seed_terminal_provider_failure_leaf(tmp_path)
+    missing_config = replace(config, role_route_configuration_fingerprint=None)
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), missing_config, store
+    )
+    assert proof is None
+    assert reason == (
+        "terminal-owner recovery requires the current accepted role-route configuration fingerprint"
+    )
+    transport = RecordingTransport()
+
+    held = driver_module._resume_terminal_owner_failure(
+        plan,
+        store.load(),
+        missing_config,
+        EffectClient(transport),
+        store,
+        EffectJournal(store.run_id, store.run_dir / "action-journal.json"),
+    )
+
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in transport.calls)
+    assert not EffectJournal(store.run_id, store.run_dir / "action-journal.json").entries_for(
+        "resume_blocked_leaf", plan.leaves[0].name
+    )
+    assert (
+        held.slices[plan.leaves[0].name].recovery.evidence["terminal_owner_recovery_hold"] == reason
+    )
+
+
+def test_terminal_owner_retries_exact_legacy_route_refusal_after_fresh_gate_approval(
+    tmp_path: Path,
+) -> None:
+    plan, config, store, owner_dir, owner_name, prior_invocation_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    leaf = plan.leaves[0]
+    gate_name = driver_module._terminal_owner_recovery_gate_name(leaf.name)
+    store.set_gate(gate_name, GateStatus.PENDING)
+    state = store.load()
+    terminal, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
+    assert terminal is not None and reason is None
+
+    legacy_config = replace(config, role_route_configuration_fingerprint=None)
+    legacy_route = driver_module._dispatch_route_fields(
+        legacy_config,
+        state,
+        harness=terminal.resume.desired_harness,
+        agent_type=terminal.resume.desired_agent_type,
+        model=terminal.resume.desired_model,
+        choice=None,
+    )
+    legacy_digest = driver_module._terminal_route_authorization_digest(
+        legacy_config,
+        cast(str, terminal.resume.desired_harness),
+        cast(str, terminal.resume.desired_agent_type),
+        terminal.resume.desired_model,
+        cast(str, terminal.resume.desired_effort),
+        cast(str, terminal.route_authorization["prior_runtime"]),
+        terminal.route_authorization["prior_model"],
+        terminal.route_authorization["prior_effort"],
+        None,
+        cast(str, state.plan_manifest.digest),
+    )
+    legacy_authorization = dict(terminal.route_authorization)
+    legacy_authorization.pop("configuration_fingerprint")
+    legacy_authorization["digest"] = legacy_digest
+    legacy_authorization["recovery_gate_authorization"] = {}
+    current = state.slices[leaf.name]
+    assert current.recovery is not None
+    recovery = replace(
+        current.recovery,
+        evidence={
+            **current.recovery.evidence,
+            "configured_route_authorization": legacy_authorization,
+        },
+    )
+    store.checkpoint(
+        state.fsm,
+        {**state.slices, leaf.name: replace(current, recovery=recovery)},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        plan_manifest=state.plan_manifest,
+    )
+
+    legacy_arguments = dict(
+        driver_module._blocked_leaf_resume_action_arguments(terminal.resume, state)
+    )
+    legacy_arguments.update(legacy_route)
+    legacy_arguments["route_authorization_digest"] = legacy_digest
+    legacy_arguments["recovery_gate_authorization"] = {}
+    old_intent = EffectIntent("resume_blocked_leaf", leaf.name, legacy_arguments, True)
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    journal.append(old_intent)
+    legacy_refusal = ToolResult.from_raw(
+        {
+            "success": False,
+            "error": "Invalid input: blocked-leaf controller recovery requires its accepted role route",
+        }
+    )
+    journal.mark_result(old_intent, legacy_refusal)
+    original_refusal = journal.entries_for("resume_blocked_leaf", leaf.name)[0]
+
+    rejected = store.answer_gate(gate_name, GateStatus.REJECTED)
+    refused_transport = RecordingTransport()
+    held = driver_module._resume_terminal_owner_failure(
+        plan,
+        rejected,
+        config,
+        EffectClient(refused_transport),
+        store,
+        journal,
+    )
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in refused_transport.calls)
+    assert held.slices[leaf.name].recovery.evidence["terminal_owner_recovery_gate_rejection"]
+    assert journal.entries_for("resume_blocked_leaf", leaf.name) == (original_refusal,)
+
+    approved = store.answer_gate(gate_name, GateStatus.APPROVED)
+    approved_proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, approved, config, store
+    )
+    assert approved_proof is not None and reason is None, reason
+    retry_arguments = driver_module._blocked_leaf_resume_action_arguments(
+        approved_proof.resume, approved
+    )
+    assert retry_arguments["route_configuration_fingerprint"] == (
+        config.role_route_configuration_fingerprint
+    )
+    assert retry_arguments["route_fingerprint"] != legacy_arguments["route_fingerprint"]
+
+    successor_id = "terminal-route-refusal-successor"
+
+    class AcceptedRouteResumeTransport(RecordingTransport):
+        def call_tool(self, role, name, tool_name, arguments):
+            if tool_name != "resume_blocked_leaf":
+                return super().call_tool(role, name, tool_name, arguments)
+            self.calls.append((tool_name, arguments))
+            route_receipt = cast(dict[str, object], arguments["role_route"])
+            identity_path = owner_dir / "identity.json"
+            identity = json.loads(identity_path.read_text(encoding="utf-8"))
+            identity.update(
+                {
+                    "agent_type": "codex",
+                    "model": "gpt-6-luna",
+                    "effort": "xhigh",
+                    "role_route": route_receipt,
+                }
+            )
+            identity_path.write_text(json.dumps(identity), encoding="utf-8")
+            invocation = {
+                "invocation_id": successor_id,
+                "generation": 2,
+                "status": "running",
+                "runtime": "codex",
+                "model": "gpt-6-luna",
+                "effort": "xhigh",
+                "trigger": "resume_blocked",
+                "branch": identity["birth_branch"],
+                "worktree": identity["working_dir"],
+                "prior_invocation_id": prior_invocation_id,
+                "pr_number": None,
+                "head_sha": None,
+                "role_route": route_receipt,
+            }
+            (owner_dir / "invocation.json").write_text(json.dumps(invocation), encoding="utf-8")
+            (owner_dir / "dispatch_intent").write_text(
+                f"{route_receipt['dispatch_intent_id']}\n", encoding="utf-8"
+            )
+            (owner_dir / "routing.json").write_text(
+                json.dumps(
+                    {
+                        "owner_agent_id": owner_name,
+                        "owner_invocation_id": successor_id,
+                        "owner_generation": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return {
+                "success": True,
+                "result": {
+                    "chainlink_issue_id": 814,
+                    "agent": {
+                        "id": owner_name,
+                        "issue": leaf.name,
+                        "intent_id": route_receipt["dispatch_intent_id"],
+                        "agent_type": "codex",
+                        "branch_name": identity["birth_branch"],
+                        "worktree_path": identity["working_dir"],
+                        "role_route": route_receipt,
+                    },
+                    "invocation": {
+                        "invocation_id": successor_id,
+                        "trigger": "resume_blocked",
+                        "runtime": "codex",
+                        "ready": True,
+                        "fresh": True,
+                        "outcome": "started",
+                        "role_route": route_receipt,
+                    },
+                },
+            }
+
+    accepted_transport = AcceptedRouteResumeTransport()
+    resumed = driver_module._resume_terminal_owner_failure(
+        plan,
+        approved,
+        config,
+        EffectClient(accepted_transport),
+        store,
+        journal,
+    )
+    assert sum(tool == "resume_blocked_leaf" for tool, _ in accepted_transport.calls) == 1
+    assert resumed.slices[leaf.name].dispatch_invocation_id == successor_id
+    entries = journal.entries_for("resume_blocked_leaf", leaf.name)
+    assert len(entries) == 2 and entries[0] == original_refusal
+    assert entries[0]["status"] == "rejected"
+    assert entries[1]["status"] == "confirmed"
+    assert entries[1]["arguments"]["route_configuration_fingerprint"] == (
+        config.role_route_configuration_fingerprint
+    )
+    assert (
+        json.loads((owner_dir / "identity.json").read_text())["role_route"]
+        == (entries[1]["result"]["result"]["agent"]["role_route"])
+    )
+
+
 def test_terminal_owner_rejection_at_dispatch_boundary_prevents_resume_call(
     tmp_path: Path,
 ) -> None:
@@ -20475,7 +20746,7 @@ def test_parent_schedules_terminal_provider_failure_before_human_gate_projection
         integration=integration,
         plan_manifest=manifest,
     )
-    calls: list[tuple[str, str | None]] = []
+    calls: list[tuple[str, str | None, str | None]] = []
 
     def run_child(spec: Mapping[str, object], config: TLLoopConfig, budgets: BudgetLedger):
         del budgets
@@ -20483,6 +20754,7 @@ def test_parent_schedules_terminal_provider_failure_before_human_gate_projection
             (
                 str(spec["run_id"]),
                 config.declared_manifest.digest if config.declared_manifest else None,
+                config.role_route_configuration_fingerprint,
             )
         )
         return SimpleNamespace(final_state=child_store.load())
@@ -20499,6 +20771,7 @@ def test_parent_schedules_terminal_provider_failure_before_human_gate_projection
 
     assert len(calls) == 1
     assert calls[0][0] == "substitution-model-kani-stage"
+    assert calls[0][2] == parent_config.role_route_configuration_fingerprint
     assert (
         calls[0][1]
         == manifest.child_manifests[
