@@ -421,6 +421,7 @@ ORDERED_RECOVERY_GATE_PREFIX = "tl-ordered-child-recovery-"
 MAX_CONVERGENCE_STEPS = 8
 MAX_ORDERED_INVOCATION_CHECKPOINT_ATTEMPTS = 8
 MAX_FRESH_STALL_RESET_CHECKPOINT_ATTEMPTS = 3
+MAX_OPTIONAL_SUB_TL_RECONCILIATION_ATTEMPTS = 3
 # A per-call fairness cap on _drain_direct_scope_convergence, not a
 # correctness bound: that function raises the moment a step makes no
 # progress, so exhausting this many *progressing* steps in one call just
@@ -18300,6 +18301,11 @@ def _run_sub_tls(
     """Run recursive children in deterministic, bounded order batches."""
     if not plan.sub_tls:
         return state
+    state, completion_hold = _reconcile_optional_sub_tl_completion(
+        plan, config, effects, store, effects_log
+    )
+    if completion_hold:
+        return state
     post_merge_verified: dict[str, bool] = {}
     state = _reconcile_aggregate_publication_gates(
         plan.sub_tls, state, config, effects, store, effects_log, post_merge_verified
@@ -18587,6 +18593,156 @@ def _run_sub_tls(
             effects_log,
         )
     return state
+
+
+def _reconcile_optional_sub_tl_completion(
+    plan: WorkPlan,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> tuple[RunState, bool]:
+    """Repair stale parent completion projections from accepted child proof."""
+    for _attempt in range(MAX_OPTIONAL_SUB_TL_RECONCILIATION_ATTEMPTS):
+        state = store.load()
+        assessment = _optional_sub_tl_completion_updates(plan, state, store)
+        if isinstance(assessment, OrderedCompletionEvidenceError):
+            try:
+                return (
+                    _hold_ordered_completion_evidence(
+                        state, assessment, config, effects, store, effects_log
+                    ),
+                    True,
+                )
+            except CheckpointConflict:
+                continue
+        slices, integration, clear_gates = assessment
+        if not clear_gates and slices == state.slices and integration == state.integration:
+            return state, False
+        try:
+            updated = store.checkpoint(
+                _phase_from_state(state),
+                slices,
+                state.budgets,
+                state.events.last_consumed_offset,
+                current_order=state.current_order,
+                ordered_stages=state.ordered_stages,
+                integration=integration,
+                expected_revision=state.revision,
+                clear_gates=clear_gates,
+            )
+        except CheckpointConflict:
+            continue
+        return updated, False
+    latest = store.load()
+    return latest, True
+
+
+def _optional_sub_tl_completion_updates(
+    plan: WorkPlan,
+    state: RunState,
+    store: RunStore,
+) -> (
+    tuple[dict[str, SliceState], IntegrationRuntimeState, tuple[str, ...]]
+    | OrderedCompletionEvidenceError
+):
+    """Assess completed optional children without trusting their parent label."""
+    if state.plan_manifest is None:
+        return state.slices, state.integration, ()
+    slices = dict(state.slices)
+    sub_tl_states = dict(state.integration.sub_tl_states)
+    sub_tl_recovery = dict(state.integration.sub_tl_recovery)
+    clear_gates: list[str] = []
+    for task in plan.sub_tls:
+        current = state.slices.get(task.name)
+        if (
+            task.integration.aggregate_pr_required
+            or current is None
+            or current.status is not SliceStatus.MERGED
+            or current.pr_number is not None
+        ):
+            continue
+        recovery = sub_tl_recovery.get(task.name)
+        lifecycle = sub_tl_states.get(task.name)
+        proof_gate = f"tl-ordered-completion-evidence-{task.name}"
+        gate = next((item for item in state.gates if item.name == proof_gate), None)
+        stale_projection = recovery is not None or lifecycle in {
+            SubTLLifecycle.RECOVERING,
+            SubTLLifecycle.HUMAN_GATE,
+        }
+        if current.post_merge is not None and not stale_projection and gate is None:
+            continue
+        if gate is not None and gate.status is GateStatus.REJECTED:
+            return OrderedCompletionEvidenceError(
+                task.name, "optional child completion proof hold was explicitly rejected"
+            )
+        if recovery is not None and not _optional_child_recovery_projection_matches(
+            recovery, state.run_id, task.name
+        ):
+            return OrderedCompletionEvidenceError(
+                task.name, "parent recovery projection conflicts with the accepted child scope"
+            )
+        child_store = RunStore(task.name, store.run_dir)
+        if not child_store.path.exists():
+            return OrderedCompletionEvidenceError(
+                task.name, "accepted child checkpoint is unavailable"
+            )
+        try:
+            child_state = child_store.load()
+        except (OSError, ValueError) as error:
+            return OrderedCompletionEvidenceError(
+                task.name, f"accepted child checkpoint is unreadable ({type(error).__name__})"
+            )
+        if child_state.repository_identity != state.repository_identity:
+            return OrderedCompletionEvidenceError(
+                task.name, "child repository identity conflicts with the accepted parent"
+            )
+        proven, proof_reason = _aggregate_child_completion_proven(
+            state, child_state, child_store, task.name
+        )
+        if not proven:
+            return OrderedCompletionEvidenceError(
+                task.name, f"child completion proof is unresolved: {proof_reason}"
+            )
+        if not _child_handoff_ready(child_state, state.run_id):
+            return OrderedCompletionEvidenceError(
+                task.name, "child scope still has an unresolved recovery projection"
+            )
+        try:
+            receipt = _accepted_sub_tl_completion_receipt(state, task, current, store)
+            if receipt.phase is not PostMergePhase.NOT_REQUIRED:
+                raise OrderedCompletionEvidenceError(
+                    task.name, "optional child has a conflicting post-merge receipt"
+                )
+        except OrderedCompletionEvidenceError as error:
+            return error
+        slices[task.name] = replace(current, post_merge=receipt)
+        sub_tl_states[task.name] = IntegrationLifecycle.MERGED
+        sub_tl_recovery.pop(task.name, None)
+        if gate is not None and gate.status is GateStatus.PENDING:
+            clear_gates.append(proof_gate)
+    integration = replace(
+        state.integration,
+        sub_tl_states=sub_tl_states,
+        sub_tl_recovery=sub_tl_recovery,
+    )
+    return slices, integration, tuple(sorted(clear_gates))
+
+
+def _optional_child_recovery_projection_matches(
+    recovery: object,
+    parent_run_id: str,
+    child_run_id: str,
+) -> bool:
+    """Clear only a recovery projection owned by this declared child."""
+    if not isinstance(recovery, ChildRecoverySummary):
+        return False
+    return (
+        recovery.owner_run_id == child_run_id
+        and len(recovery.child_path) >= 2
+        and recovery.child_path[0] == parent_run_id
+        and recovery.child_path[1] == child_run_id
+    )
 
 
 def _emit_stage_completion(

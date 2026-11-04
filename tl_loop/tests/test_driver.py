@@ -17206,6 +17206,234 @@ def test_completed_optional_sub_tl_records_parent_not_required_receipt(
     assert driver_module._scope_declared_completion_matches(completed)
 
 
+@pytest.mark.parametrize(
+    (
+        "child_parent_run_id",
+        "child_complete",
+        "proof_gate_status",
+        "expected_proof_error",
+        "expected_gate_status",
+    ),
+    [
+        ("root", True, None, None, None),
+        ("foreign-parent", True, None, "aggregate_child_parent_mismatch", GateStatus.PENDING),
+        ("root", False, None, "aggregate_child_completion_incomplete", GateStatus.PENDING),
+        ("root", True, GateStatus.REJECTED, "explicitly rejected", GateStatus.REJECTED),
+    ],
+)
+def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
+    tmp_path: Path,
+    child_parent_run_id: str,
+    child_complete: bool,
+    proof_gate_status: GateStatus | None,
+    expected_proof_error: str | None,
+    expected_gate_status: GateStatus | None,
+) -> None:
+    child_plan = WorkPlan.from_mapping(
+        {
+            "leaves": [
+                {
+                    "name": "issue-814",
+                    "task": "complete the Kani implementation",
+                    "chainlink_issue_id": 814,
+                    "agent_type": "codex",
+                }
+            ]
+        }
+    )
+    task = SubTLTask(
+        "kani",
+        child_plan,
+        order=1,
+        integration=IntegrationContract(aggregate_pr_required=False),
+    )
+    plan = WorkPlan(sub_tls=(task,))
+    config = replace(_config(active=False), run_id="root", root_dir=tmp_path, branch="main")
+    manifest = driver_module._candidate_manifest(plan, "root", config)
+    root_slices = _initial_slices(plan, config, tmp_path, "root")
+    create(
+        "root",
+        {
+            "slices": root_slices,
+            "owner_branch": "main",
+            "owner_worktree": str(tmp_path),
+            "repository_identity": config.repository_identity.to_document(),
+            "plan_manifest": manifest.to_document(),
+        },
+        root_dir=tmp_path,
+    )
+    root_store = RunStore("root", tmp_path)
+    root_store.set_plan_manifest(manifest, slices=root_slices)
+    stages = (driver_module.OrderedStageState(1, ("kani",)),)
+    state = root_store.set_ordered_state(1, stages, root_store.load().integration)
+    parent_slice = replace(
+        state.slices["kani"],
+        status=SliceStatus.MERGED,
+        attempts=1,
+        dispatch_intent_id="accepted-kani-intent",
+        dispatch_agent_id="kani-controller",
+        dispatch_invocation_id="accepted-kani-invocation",
+        dispatch_authoritative_event_seq=1,
+        dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
+        post_merge=None,
+    )
+    stale_recovery = ChildRecoverySummary(
+        owner_run_id="kani",
+        child_path=("root", "kani", "issue-814"),
+        slice_id="issue-814",
+        cause="human_decision_required",
+        recovery_round=1,
+        next_probe_at=None,
+    )
+    integration = replace(
+        state.integration,
+        sub_tl_states={"kani": SubTLLifecycle.HUMAN_GATE},
+        sub_tl_recovery={"kani": stale_recovery},
+    )
+    root_state = root_store.checkpoint(
+        state.recursive_fsm or state.fsm,
+        {**state.slices, "kani": parent_slice},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=1,
+        ordered_stages=stages,
+        integration=integration,
+    )
+    if proof_gate_status is not None:
+        root_store.set_gate("tl-ordered-completion-evidence-kani", proof_gate_status)
+        root_state = root_store.load()
+
+    node = next(node for node in manifest.nodes if node.name == "kani")
+    child_manifest = manifest.child_manifests[node.node_id]
+    child_store = RunStore("kani", root_store.run_dir)
+    child_branch = parent_slice.branch or "main.kani"
+    child_worktree = parent_slice.worktree or str(tmp_path / "kani-worktree")
+    child_config = replace(
+        config,
+        run_id="kani",
+        root_dir=root_store.run_dir,
+        branch=child_branch,
+        parent_branch="main",
+        parent_run_id=child_parent_run_id,
+        parent_agent_id="root",
+        depth=1,
+        declared_manifest=child_manifest,
+    )
+    child_slices = _initial_slices(child_plan, child_config, root_store.run_dir, "kani")
+    create(
+        "kani",
+        {
+            "slices": child_slices,
+            "owner_branch": child_branch,
+            "owner_worktree": child_worktree,
+            "parent_branch": "main",
+            "parent_run_id": child_parent_run_id,
+            "parent_agent_id": "root",
+            "depth": 1,
+            "repository_identity": config.repository_identity.to_document(),
+            "plan_manifest": child_manifest.to_document(),
+        },
+        root_dir=root_store.run_dir,
+    )
+    child_store.set_plan_manifest(child_manifest, slices=child_slices)
+    child_state = child_store.load()
+    child_slices = dict(child_state.slices)
+    leaf_receipt = PostMergeState(
+        PostMergePhase.NOT_REQUIRED,
+        {"leaf_result": "completed"},
+    )
+    if child_complete:
+        child_slices["issue-814"] = replace(
+            child_slices["issue-814"],
+            status=SliceStatus.MERGED,
+            attempts=1,
+            post_merge=leaf_receipt,
+        )
+    child_phase = (
+        RecursiveTLAllMerged(
+            scope_path=(child_manifest.scope_id,),
+            plan_digest=child_manifest.digest,
+            completed_children={"issue-814": leaf_receipt},
+        )
+        if child_complete
+        else RecursiveTLRunning(
+            current_order=1,
+            pending_by_order={
+                1: (
+                    ChildRecord(
+                        "issue-814",
+                        ChildKind.LEAF,
+                        manifest_node_id=child_manifest.nodes[0].node_id,
+                        manifest_revision=child_manifest.manifest_revision,
+                    ),
+                )
+            },
+            scope_path=(child_manifest.scope_id,),
+            plan_digest=child_manifest.digest,
+        )
+    )
+    child_state = child_store.checkpoint(
+        child_phase,
+        child_slices,
+        child_store.load().budgets,
+        child_store.load().events.last_consumed_offset,
+    )
+    child_bytes_before = child_store.path.read_bytes()
+    transport = RecordingTransport()
+    effects_log: list[EffectIntent] = []
+
+    result = driver_module._run_sub_tls(
+        plan,
+        root_state,
+        config,
+        SyntheticQueue([]),
+        EffectClient(transport),
+        root_store,
+        effects_log,
+    )
+
+    parent_after = root_store.load()
+    assert child_store.path.read_bytes() == child_bytes_before
+    assert not any(
+        name in {"spawn_worker", "spawn_leaf", "resume_blocked_leaf"} for name, _ in transport.calls
+    )
+    if expected_proof_error is None:
+        receipt = parent_after.slices["kani"].post_merge
+        assert receipt is not None
+        assert receipt.phase is PostMergePhase.NOT_REQUIRED
+        assert receipt.evidence == {"child_id": "kani", "aggregate_pr_required": "false"}
+        assert "kani" not in parent_after.integration.sub_tl_recovery
+        assert parent_after.integration.sub_tl_states["kani"] is IntegrationLifecycle.MERGED
+        assert driver_module._scope_declared_completion_matches(parent_after)
+        assert result.slices["kani"].post_merge == receipt
+        assert not any(gate.name == "tl-ordered-completion-evidence-kani" for gate in result.gates)
+        repeated = driver_module._run_sub_tls(
+            plan,
+            parent_after,
+            config,
+            SyntheticQueue([]),
+            EffectClient(transport),
+            root_store,
+            effects_log,
+        )
+        assert repeated.slices["kani"].post_merge == receipt
+        assert "kani" not in repeated.integration.sub_tl_recovery
+        assert child_store.path.read_bytes() == child_bytes_before
+        assert not any(
+            name in {"spawn_worker", "spawn_leaf", "resume_blocked_leaf"}
+            for name, _ in transport.calls
+        )
+    else:
+        assert isinstance(result.recursive_fsm, RecursiveTLFailed)
+        assert expected_proof_error in result.recursive_fsm.reason
+        assert result.slices["kani"].post_merge is None
+        assert result.integration.sub_tl_recovery["kani"] == stale_recovery
+        matching_gate = next(
+            gate for gate in result.gates if gate.name == "tl-ordered-completion-evidence-kani"
+        )
+        assert matching_gate.status is expected_gate_status
+
+
 def test_ordered_recovery_retains_valid_entry_added_completion_evidence(
     tmp_path: Path,
 ) -> None:
