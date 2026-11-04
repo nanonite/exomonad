@@ -1918,7 +1918,96 @@ PY
         --name "tl-terminal-owner-recovery-issue-814-substitution-model-kani" --approve \
         > "$AGG_DIR/approve-terminal-recovery-gate.log" 2>&1 \
         || { cat "$AGG_DIR/approve-terminal-recovery-gate.log"; e2e_fail "could not explicitly approve the disposable terminal-owner route recovery"; }
-    e2e_log "Disposable terminal-owner recovery proceeded only after a recorded rejection and explicit fresh approval"
+    APPROVED_CONTROLLER_TARGET="$(python3 - "$AGG_REPO" "$CONTROLLER_EPOCH_PATH" "$AGGREGATE_SESSION" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+epoch_path = Path(sys.argv[2])
+session = sys.argv[3]
+owner = json.loads((repo / ".exo/tl-loop/root/controller-target.json").read_text())
+epoch = epoch_path.read_text().strip()
+assert owner.get("tmux_session") == session, "controller owner belongs to another tmux session"
+assert owner.get("controller_epoch") == epoch, "controller owner is not the current epoch"
+print(owner["window_id"], owner["pane_id"], epoch)
+PY
+)" || e2e_fail "could not resolve the exact approved controller target"
+    read -r APPROVED_CONTROLLER_WINDOW APPROVED_CONTROLLER_PANE APPROVED_CONTROLLER_EPOCH \
+        <<< "$APPROVED_CONTROLLER_TARGET"
+    APPROVED_CONTROLLER_PANE_ROWS="$(tmux list-panes -s -t "$AGGREGATE_SESSION" \
+        -F '#{window_id} #{pane_id} #{pane_dead}' \
+        | awk -v window="$APPROVED_CONTROLLER_WINDOW" -v pane="$APPROVED_CONTROLLER_PANE" \
+            '$1 == window && $2 == pane { print $0 }')"
+    [[ "$(printf '%s\n' "$APPROVED_CONTROLLER_PANE_ROWS" | awk 'NF { count += 1 } END { print count + 0 }')" == "1" ]] \
+        || e2e_fail "approved controller pane is absent or ambiguous"
+    python3 - "$AGG_REPO" "$AGG_DIR/preexisting-opencode-owner.json" <<'PY' \
+        || e2e_fail "explicit approval unexpectedly launched a successor before fresh startup replay"
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+baseline = json.loads(Path(sys.argv[2]).read_text())
+journal = json.loads((repo / ".exo/tl-loop/root/kani/action-journal.json").read_text())
+assert not [row for row in journal if row.get("operation") == "resume_blocked_leaf"], journal
+owner = Path(baseline["owner_dir"])
+assert json.loads((owner / "invocation.json").read_text()) == baseline["prior_invocation"]
+PY
+    APPROVED_SHUTDOWN_STATUS=0
+    (
+        cd "$AGG_REPO"
+        HOME="$AGG_HOME" "$EXOMONAD_BIN" shutdown --workspace
+    ) > "$AGG_DIR/shutdown-after-terminal-approval.log" 2>&1 \
+        || APPROVED_SHUTDOWN_STATUS=$?
+    [[ "$APPROVED_SHUTDOWN_STATUS" == "0" ]] \
+        || { cat "$AGG_DIR/shutdown-after-terminal-approval.log"; e2e_fail "supported workspace shutdown did not stop the approved recovery controller"; }
+    for _ in $(seq 1 100); do
+        [[ ! -S "$AGG_REPO/.exo/server.sock" ]] && break
+        sleep 0.1
+    done
+    [[ ! -S "$AGG_REPO/.exo/server.sock" ]] \
+        || e2e_fail "approved terminal-recovery workspace shutdown did not stop the Server"
+    APPROVED_CONTROLLER_PANE_AFTER_SHUTDOWN="$(tmux list-panes -s -t "$AGGREGATE_SESSION" \
+        -F '#{window_id} #{pane_id} #{pane_dead}' \
+        | awk -v window="$APPROVED_CONTROLLER_WINDOW" -v pane="$APPROVED_CONTROLLER_PANE" \
+            '$1 == window && $2 == pane { print $3 }')"
+    [[ "$APPROVED_CONTROLLER_PANE_AFTER_SHUTDOWN" != "0" ]] \
+        || e2e_fail "workspace shutdown left the exact approved controller pane live"
+    assert_one_live_window RecoveryKeeper
+    tmux kill-window -t "$AGGREGATE_SESSION:Server" 2>/dev/null || true
+    tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_SERVER_COMMAND"
+    tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
+    for _ in $(seq 1 100); do
+        if python3 - "$AGG_REPO/.exo/server.sock" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(0.2)
+client.connect(sys.argv[1])
+client.close()
+PY
+        then
+            break
+        fi
+        sleep 0.1
+    done
+    [[ -S "$AGG_REPO/.exo/server.sock" ]] \
+        || { tmux capture-pane -p -t "$AGGREGATE_SESSION:Server" > "$AGG_DIR/server-after-terminal-approval-restart.log" 2>&1 || true; cat "$AGG_DIR/server-after-terminal-approval-restart.log"; e2e_fail "Server did not restart after the approved recovery controller shutdown"; }
+    APPROVED_RESTART_STATUS=0
+    HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
+        "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
+        > "$AGG_DIR/init-after-terminal-approval.log" 2>&1 || APPROVED_RESTART_STATUS=$?
+    assert_init_status "$APPROVED_RESTART_STATUS" "$AGG_DIR/init-after-terminal-approval.log" \
+        "fresh init --continue after explicit terminal-recovery approval"
+    [[ "$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)" != "$APPROVED_CONTROLLER_EPOCH" ]] \
+        || { cat "$AGG_DIR/init-after-terminal-approval.log"; e2e_fail "approved recovery did not start a fresh controller invocation"; }
+    rg -Fq "server_build=\"$AGGREGATE_BUILD_ID\" controller_build=\"$AGGREGATE_BUILD_ID\"" \
+        "$AGG_DIR/init-after-terminal-approval.log" \
+        || { cat "$AGG_DIR/init-after-terminal-approval.log"; e2e_fail "approved recovery used an unexpected runtime artifact"; }
+    assert_one_live_window Server
+    e2e_log "Disposable terminal-owner recovery proceeded only after recorded rejection, explicit fresh approval, supported workspace shutdown, and a new controller startup"
     python3 "$SCRIPT_DIR/configured-owner-resume.py" verify-controller \
         --repo "$AGG_REPO" --baseline "$AGG_DIR/preexisting-opencode-owner.json" \
         --output "$AGG_DIR/configured-owner-resume.json" \
