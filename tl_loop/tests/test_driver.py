@@ -17222,9 +17222,10 @@ def test_completed_optional_sub_tl_records_parent_not_required_receipt(
         "expected_proof_error",
         "expected_gate_status",
         "complete_child_during_controller_poll",
+        "child_post_merge_finishes_during_controller_poll",
     ),
     [
-        ("root", True, None, None, None, False),
+        ("root", True, None, None, None, False, False),
         (
             "foreign-parent",
             True,
@@ -17232,10 +17233,28 @@ def test_completed_optional_sub_tl_records_parent_not_required_receipt(
             "aggregate_child_parent_mismatch",
             GateStatus.PENDING,
             False,
+            False,
         ),
-        ("root", False, None, "aggregate_child_completion_incomplete", GateStatus.PENDING, False),
-        ("root", True, GateStatus.REJECTED, "explicitly rejected", GateStatus.REJECTED, False),
-        ("root", False, None, None, None, True),
+        (
+            "root",
+            False,
+            None,
+            "aggregate_child_completion_incomplete",
+            GateStatus.PENDING,
+            False,
+            False,
+        ),
+        (
+            "root",
+            True,
+            GateStatus.REJECTED,
+            "explicitly rejected",
+            GateStatus.REJECTED,
+            False,
+            False,
+        ),
+        ("root", False, None, None, None, True, False),
+        ("root", False, None, None, None, False, True),
     ],
 )
 def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
@@ -17246,6 +17265,7 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
     expected_proof_error: str | None,
     expected_gate_status: GateStatus | None,
     complete_child_during_controller_poll: bool,
+    child_post_merge_finishes_during_controller_poll: bool,
 ) -> None:
     child_plan = WorkPlan.from_mapping(
         {
@@ -17360,12 +17380,54 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
         PostMergePhase.NOT_REQUIRED,
         {"leaf_result": "completed"},
     )
+    pending_leaf_merge = PostMergeState(
+        PostMergePhase.REMOTE_MERGE_ADOPTED,
+        {
+            "child_id": "issue-814",
+            "repository": config.repository_identity.remote_url,
+            "parent_branch": "main.kani",
+            "pr_number": "3",
+            "head_sha": "a" * 40,
+            "merge_journal_id": "kani-merge-journal",
+            "lane_epoch": "1",
+        },
+    )
+    completed_leaf_merge = PostMergeState(
+        PostMergePhase.COMPLETE,
+        {
+            **dict(pending_leaf_merge.evidence),
+            "parent_commit_sha": "b" * 40,
+            "issue_id": "814",
+            "issue_close_intent_id": "close-814-intent",
+            "issue_close_journal_id": "chainlink-close:814",
+            "changelog_intent_id": "changelog-814-intent",
+            "changelog_generation": "1",
+            "changelog_commit_sha": "c" * 40,
+            "parent_push_intent_id": "push-814-intent",
+            "push_journal_id": "push-814-journal",
+            "expected_base_sha": "b" * 40,
+            "push_receipt_id": "push-814-receipt",
+            "pushed_commit": "b" * 40,
+            "bookkeeping_commit": "b" * 40,
+            "observed_remote_head": "b" * 40,
+            "ancestry_proof": f"ancestor:{'b' * 40}->{'b' * 40}",
+        },
+    )
     if child_complete:
         child_slices["issue-814"] = replace(
             child_slices["issue-814"],
             status=SliceStatus.MERGED,
             attempts=1,
             post_merge=leaf_receipt,
+        )
+    if child_post_merge_finishes_during_controller_poll:
+        child_slices["issue-814"] = replace(
+            child_slices["issue-814"],
+            status=SliceStatus.MERGED,
+            attempts=1,
+            pr_number=3,
+            reviewed_head="a" * 40,
+            post_merge=pending_leaf_merge,
         )
     terminal_incomplete_child = (
         not child_complete and expected_proof_error == "aggregate_child_completion_incomplete"
@@ -17374,9 +17436,17 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
         RecursiveTLAllMerged(
             scope_path=(child_manifest.scope_id,),
             plan_digest=child_manifest.digest,
-            completed_children={"issue-814": leaf_receipt} if child_complete else {},
+            completed_children=(
+                {"issue-814": completed_leaf_merge}
+                if child_post_merge_finishes_during_controller_poll and child_complete
+                else {"issue-814": leaf_receipt}
+                if child_complete
+                else {}
+            ),
         )
-        if child_complete or terminal_incomplete_child
+        if child_complete
+        or terminal_incomplete_child
+        or child_post_merge_finishes_during_controller_poll
         else RecursiveTLRunning(
             current_order=1,
             pending_by_order={
@@ -17403,7 +17473,10 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
     transport = RecordingTransport()
     effects_log: list[EffectIntent] = []
 
-    if complete_child_during_controller_poll:
+    poll_completes_child = (
+        complete_child_during_controller_poll or child_post_merge_finishes_during_controller_poll
+    )
+    if poll_completes_child:
 
         class CompleteChildOnPollQueue(SyntheticQueue):
             completed = False
@@ -17415,9 +17488,10 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
                 if not self.completed:
                     self.completed = True
                     current_child = child_store.load()
-                    completed_receipt = PostMergeState(
-                        PostMergePhase.NOT_REQUIRED,
-                        {"leaf_result": "completed"},
+                    completed_receipt = (
+                        completed_leaf_merge
+                        if child_post_merge_finishes_during_controller_poll
+                        else leaf_receipt
                     )
                     completed_slices = dict(current_child.slices)
                     completed_slices["issue-814"] = replace(
@@ -17425,12 +17499,22 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
                         status=SliceStatus.MERGED,
                         attempts=1,
                         post_merge=completed_receipt,
+                        pr_number=(3 if child_post_merge_finishes_during_controller_poll else None),
+                        reviewed_head=(
+                            "a" * 40 if child_post_merge_finishes_during_controller_poll else None
+                        ),
                     )
                     child_store.checkpoint(
                         RecursiveTLAllMerged(
                             scope_path=(child_manifest.scope_id,),
                             plan_digest=child_manifest.digest,
-                            completed_children={"issue-814": completed_receipt},
+                            completed_children={
+                                "issue-814": (
+                                    completed_leaf_merge
+                                    if child_post_merge_finishes_during_controller_poll
+                                    else leaf_receipt
+                                )
+                            },
                         ),
                         completed_slices,
                         current_child.budgets,
@@ -17459,8 +17543,8 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
         )
 
     parent_after = root_store.load()
-    result_state = result.final_state if complete_child_during_controller_poll else result
-    if complete_child_during_controller_poll:
+    result_state = result.final_state if poll_completes_child else result
+    if poll_completes_child:
         assert child_store.path.read_bytes() != child_bytes_before
         assert driver_module._aggregate_scope_phase_complete(child_store.load())
         child_bytes_after_completion = child_store.path.read_bytes()
@@ -17482,7 +17566,7 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
         assert not any(
             gate.name == "tl-ordered-completion-evidence-kani" for gate in result_state.gates
         )
-        if complete_child_during_controller_poll:
+        if poll_completes_child:
             assert result_state.fsm.phase is TLPhase.TLDone
         repeated = driver_module._run_sub_tls(
             plan,

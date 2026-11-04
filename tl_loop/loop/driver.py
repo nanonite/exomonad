@@ -18787,8 +18787,14 @@ def _optional_sub_tl_completion_reconciliation_needed(
 def _optional_child_completion_is_in_progress(state: RunState) -> bool:
     """Defer proof holds while the child controller still has active work."""
     phase = state.recursive_fsm
+    if isinstance(phase, (RecursiveTLPlanning, RecursiveTLRunning, RecursiveTLFinalizing)):
+        return True
+    if isinstance(phase, (RecursiveTLAllMerged, RecursiveTLFinalizing, RecursiveTLPRFiled)):
+        return _scope_has_incomplete_post_merge_receipt(state)
     if phase is not None:
-        return isinstance(phase, (RecursiveTLPlanning, RecursiveTLRunning, RecursiveTLFinalizing))
+        return False
+    if state.fsm.phase in {TLPhase.TLAllMerged, TLPhase.TLPRFiled}:
+        return _scope_has_incomplete_post_merge_receipt(state)
     return state.fsm.phase in {
         TLPhase.TLPlanning,
         TLPhase.TLRunning,
@@ -18797,6 +18803,17 @@ def _optional_child_completion_is_in_progress(state: RunState) -> bool:
         TLPhase.TLWaiting,
         TLPhase.TLMerging,
     }
+
+
+def _scope_has_incomplete_post_merge_receipt(state: RunState) -> bool:
+    """Recognize a durable post-merge handoff that the child can still finish."""
+    return any(
+        current.status is SliceStatus.MERGED
+        and current.pr_number is not None
+        and current.post_merge is not None
+        and current.post_merge.phase not in {PostMergePhase.NOT_REQUIRED, PostMergePhase.COMPLETE}
+        for current in state.slices.values()
+    )
 
 
 def _optional_child_recovery_projection_matches(
