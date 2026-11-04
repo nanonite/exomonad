@@ -2426,6 +2426,7 @@ PY
     wait_for_aggregate_tl_terminal "terminal-owner recovery"
     python3 "$SCRIPT_DIR/configured-owner-resume.py" verify-controller \
         --repo "$AGG_REPO" --baseline "$AGG_DIR/preexisting-opencode-owner.json" \
+        --gate-approval "$AGG_DIR/terminal-recovery-approval.json" \
         --output "$AGG_DIR/configured-owner-resume.json" \
         > "$AGG_DIR/configured-owner-resume-terminal.stdout" \
         || { cat "$AGG_DIR/configured-owner-resume-terminal.stdout"; e2e_fail "terminal recovery did not retain its final worker, reviewer and publication state"; }
