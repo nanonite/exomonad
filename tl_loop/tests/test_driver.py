@@ -17223,9 +17223,10 @@ def test_completed_optional_sub_tl_records_parent_not_required_receipt(
         "expected_gate_status",
         "complete_child_during_controller_poll",
         "child_post_merge_finishes_during_controller_poll",
+        "concurrent_race",
     ),
     [
-        ("root", True, None, None, None, False, False),
+        ("root", True, None, None, None, False, False, None),
         (
             "foreign-parent",
             True,
@@ -17234,6 +17235,7 @@ def test_completed_optional_sub_tl_records_parent_not_required_receipt(
             GateStatus.PENDING,
             False,
             False,
+            None,
         ),
         (
             "root",
@@ -17243,6 +17245,7 @@ def test_completed_optional_sub_tl_records_parent_not_required_receipt(
             GateStatus.PENDING,
             False,
             False,
+            None,
         ),
         (
             "root",
@@ -17252,13 +17255,65 @@ def test_completed_optional_sub_tl_records_parent_not_required_receipt(
             GateStatus.REJECTED,
             False,
             False,
+            None,
         ),
-        ("root", False, None, None, None, True, False),
-        ("root", False, None, None, None, False, True),
+        ("root", False, None, None, None, True, False, None),
+        ("root", False, None, None, None, False, True, None),
+        (
+            "foreign-parent",
+            True,
+            GateStatus.PENDING,
+            "aggregate_child_parent_mismatch",
+            GateStatus.PENDING,
+            False,
+            False,
+            "preserve_concurrent_binding",
+        ),
+        (
+            "foreign-parent",
+            True,
+            None,
+            "aggregate_child_parent_mismatch",
+            GateStatus.PENDING,
+            False,
+            False,
+            "create_gate_after_concurrent_binding",
+        ),
+        (
+            "foreign-parent",
+            True,
+            None,
+            "aggregate_child_parent_mismatch",
+            GateStatus.REJECTED,
+            False,
+            False,
+            "operator_rejects_gate_during_hold",
+        ),
+        (
+            "foreign-parent",
+            True,
+            None,
+            "aggregate_child_parent_mismatch",
+            None,
+            False,
+            False,
+            "operator_abandons_during_hold",
+        ),
+        (
+            "foreign-parent",
+            True,
+            None,
+            "aggregate_child_parent_mismatch",
+            None,
+            False,
+            False,
+            "conflict_until_exhausted",
+        ),
     ],
 )
 def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     child_parent_run_id: str,
     child_complete: bool,
     proof_gate_status: GateStatus | None,
@@ -17266,6 +17321,7 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
     expected_gate_status: GateStatus | None,
     complete_child_during_controller_poll: bool,
     child_post_merge_finishes_during_controller_poll: bool,
+    concurrent_race: str | None,
 ) -> None:
     child_plan = WorkPlan.from_mapping(
         {
@@ -17286,7 +17342,14 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
         integration=IntegrationContract(aggregate_pr_required=False),
     )
     plan = WorkPlan(sub_tls=(task,))
-    config = replace(_config(active=False), run_id="root", root_dir=tmp_path, branch="main")
+    state_root = tmp_path / ".exo" / "tl-loop"
+    config = replace(
+        _config(active=False),
+        run_id="root",
+        project_root=tmp_path,
+        root_dir=state_root,
+        branch="main",
+    )
     manifest = driver_module._candidate_manifest(plan, "root", config)
     root_slices = _initial_slices(plan, config, tmp_path, "root")
     create(
@@ -17298,9 +17361,9 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
             "repository_identity": config.repository_identity.to_document(),
             "plan_manifest": manifest.to_document(),
         },
-        root_dir=tmp_path,
+        root_dir=state_root,
     )
-    root_store = RunStore("root", tmp_path)
+    root_store = RunStore("root", state_root)
     root_store.set_plan_manifest(manifest, slices=root_slices)
     stages = (driver_module.OrderedStageState(1, ("kani",)),)
     state = root_store.set_ordered_state(1, stages, root_store.load().integration)
@@ -17473,6 +17536,114 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
     transport = RecordingTransport()
     effects_log: list[EffectIntent] = []
 
+    prior_intent = EffectIntent("merge_pr", "historical-kani", {"pr_number": 17}, True)
+    root_journal = EffectJournal("root", root_store.run_dir / "action-journal.json")
+    root_journal.append(prior_intent)
+    root_journal.mark_result(
+        prior_intent,
+        ToolResult.from_raw({"success": True, "result": {"pr_number": 17}}),
+    )
+    historical_merge_entry = root_journal.snapshot()[0]
+
+    if concurrent_race is not None:
+        original_checkpoint = RunStore.checkpoint
+        race_count = 0
+        concurrent_integration = None
+        concurrent_budget = None
+
+        def interleave_parent_update() -> None:
+            nonlocal race_count, concurrent_integration, concurrent_budget
+            race_count += 1
+            latest = root_store.load()
+            current = latest.slices["kani"]
+            if concurrent_race == "operator_rejects_gate_during_hold":
+                root_store.set_gate("tl-ordered-completion-evidence-kani", GateStatus.REJECTED)
+                latest = root_store.load()
+                current = latest.slices["kani"]
+            if concurrent_race == "operator_abandons_during_hold":
+                active_parent = replace(
+                    current,
+                    status=SliceStatus.SPAWNED,
+                    park_cause=None,
+                )
+                root_store.checkpoint(
+                    latest.recursive_fsm or latest.fsm,
+                    {**latest.slices, "kani": active_parent},
+                    latest.budgets,
+                    latest.events.last_consumed_offset,
+                    current_order=latest.current_order,
+                    ordered_stages=latest.ordered_stages,
+                    integration=latest.integration,
+                    expected_revision=latest.revision,
+                )
+                abandoned = abandon_slice(
+                    config.project_root,
+                    "root",
+                    "kani",
+                    effects=EffectClient(RecordingTransport()),
+                )
+                assert abandoned["status"] == "abandoned"
+                latest = root_store.load()
+                changed_parent = latest.slices["kani"]
+            else:
+                changed_parent = replace(
+                    current,
+                    attempts=70 + race_count,
+                    dispatch_intent_id=f"concurrent-intent-{race_count}",
+                    dispatch_invocation_id=f"concurrent-new-invocation-{race_count}",
+                    dispatch_authoritative_event_seq=100 + race_count,
+                )
+            changed_budget = replace(
+                latest.budgets,
+                tokens=100 + race_count,
+                role_spent={**latest.budgets.role_spent, "worker": 50 + race_count},
+            )
+            changed_integration = replace(
+                latest.integration,
+                sub_tl_states={
+                    **latest.integration.sub_tl_states,
+                    "kani": SubTLLifecycle.RECOVERING,
+                },
+            )
+            concurrent_budget = changed_budget
+            concurrent_integration = changed_integration
+            original_checkpoint(
+                root_store,
+                latest.recursive_fsm or latest.fsm,
+                {**latest.slices, "kani": changed_parent},
+                changed_budget,
+                latest.events.last_consumed_offset,
+                current_order=latest.current_order,
+                ordered_stages=latest.ordered_stages,
+                integration=changed_integration,
+                expected_revision=latest.revision,
+            )
+
+        def checkpoint_with_concurrent_parent_write(
+            checkpoint_store: RunStore,
+            fsm,
+            slices,
+            budgets,
+            offset,
+            **kwargs,
+        ):
+            should_interleave = (
+                checkpoint_store.run_id == "root"
+                and isinstance(fsm, RecursiveTLFailed)
+                and (
+                    (
+                        concurrent_race == "conflict_until_exhausted"
+                        and race_count < driver_module.MAX_OPTIONAL_SUB_TL_RECONCILIATION_ATTEMPTS
+                    )
+                    or (concurrent_race != "conflict_until_exhausted" and race_count == 0)
+                )
+            )
+            if should_interleave:
+                interleave_parent_update()
+            return original_checkpoint(checkpoint_store, fsm, slices, budgets, offset, **kwargs)
+
+        monkeypatch.setattr(RunStore, "checkpoint", checkpoint_with_concurrent_parent_write)
+
     poll_completes_child = (
         complete_child_during_controller_poll or child_post_merge_finishes_during_controller_poll
     )
@@ -17529,7 +17700,7 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
             source,
             ReadOnlyEffectClient(EffectClient(transport)),
             config=replace(config, poll_interval=0.001, keep_alive_on_waiting=False),
-            root_dir=tmp_path,
+            root_dir=state_root,
         )
     else:
         result = driver_module._run_sub_tls(
@@ -17554,7 +17725,35 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
     assert not any(
         name in {"spawn_worker", "spawn_leaf", "resume_blocked_leaf"} for name, _ in transport.calls
     )
-    if expected_proof_error is None:
+    if concurrent_race == "operator_abandons_during_hold":
+        assert parent_after.slices["kani"].status is SliceStatus.PARKED
+        assert parent_after.slices["kani"].park_cause is ParkCause.ATTEMPT_ABANDONED
+        assert parent_after.slices["kani"].dispatch_intent_id == "accepted-kani-intent"
+        assert parent_after.slices["kani"].dispatch_invocation_id == "accepted-kani-invocation"
+        assert parent_after.slices["kani"].attempts == 1
+        assert parent_after.slices["kani"].park_audit is not None
+        assert parent_after.slices["kani"].park_audit["reason"] == "operator_requested"
+        assert parent_after.budgets == concurrent_budget
+        assert parent_after.integration == concurrent_integration
+        assert not any(
+            gate.name == "tl-ordered-completion-evidence-kani" for gate in parent_after.gates
+        )
+        assert not isinstance(parent_after.recursive_fsm, RecursiveTLFailed) or (
+            "aggregate_child_parent_mismatch" not in parent_after.recursive_fsm.reason
+        )
+    elif concurrent_race == "conflict_until_exhausted":
+        assert race_count == driver_module.MAX_OPTIONAL_SUB_TL_RECONCILIATION_ATTEMPTS
+        assert parent_after.slices["kani"].dispatch_invocation_id == (
+            f"concurrent-new-invocation-{race_count}"
+        )
+        assert parent_after.slices["kani"].attempts == 70 + race_count
+        assert parent_after.budgets.tokens == 100 + race_count
+        assert not isinstance(parent_after.recursive_fsm, RecursiveTLFailed)
+        assert not any(
+            gate.name == "tl-ordered-completion-evidence-kani" for gate in parent_after.gates
+        )
+        assert parent_after.integration == concurrent_integration
+    elif expected_proof_error is None:
         receipt = parent_after.slices["kani"].post_merge
         assert receipt is not None
         assert receipt.phase is PostMergePhase.NOT_REQUIRED
@@ -17586,13 +17785,33 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
         )
     else:
         assert isinstance(result.recursive_fsm, RecursiveTLFailed)
-        assert expected_proof_error in result.recursive_fsm.reason
+        expected_reason = (
+            "explicitly rejected"
+            if concurrent_race == "operator_rejects_gate_during_hold"
+            else expected_proof_error
+        )
+        assert expected_reason in result.recursive_fsm.reason
         assert result.slices["kani"].post_merge is None
         assert result.integration.sub_tl_recovery["kani"] == stale_recovery
         matching_gate = next(
             gate for gate in result.gates if gate.name == "tl-ordered-completion-evidence-kani"
         )
         assert matching_gate.status is expected_gate_status
+        if concurrent_race in {
+            "preserve_concurrent_binding",
+            "create_gate_after_concurrent_binding",
+            "operator_rejects_gate_during_hold",
+        }:
+            assert parent_after.slices["kani"].dispatch_invocation_id == (
+                "concurrent-new-invocation-1"
+            )
+            assert parent_after.slices["kani"].attempts == 71
+            assert parent_after.slices["kani"].dispatch_authoritative_event_seq == 101
+            assert parent_after.budgets == concurrent_budget
+            assert parent_after.integration == concurrent_integration
+        assert historical_merge_entry in root_journal.snapshot()
+
+    assert historical_merge_entry in root_journal.snapshot()
 
 
 def test_ordered_recovery_retains_valid_entry_added_completion_evidence(

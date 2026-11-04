@@ -1758,6 +1758,7 @@ def run_tl_loop(
                         return _terminal_ordered_completion_hold_result(
                             existing_state,
                             error,
+                            recovery_plan,
                             selected,
                             effects,
                             store,
@@ -1822,6 +1823,7 @@ def run_tl_loop(
                         return _terminal_ordered_completion_hold_result(
                             existing_state,
                             error,
+                            recovery_plan,
                             selected,
                             effects,
                             store,
@@ -4385,9 +4387,12 @@ def _reconcile_continued_root_failure(
         return state
     completed_error = _completed_ordered_sub_tl_evidence_error(state, plan, store)
     if completed_error is not None:
-        return _hold_ordered_completion_evidence(
-            state, completed_error, config, effects, store, effects_log
+        state, hold_active, _held_error = _hold_reassessed_ordered_completion_evidence(
+            plan, state, completed_error, config, effects, store, effects_log
         )
+        if hold_active:
+            return state
+        phase = _phase_from_state(state)
     stage = next(
         (stage for stage in plan.ordered_stages if stage.order == state.current_order),
         None,
@@ -4427,10 +4432,10 @@ def _reconcile_continued_root_failure(
     if decision is None:
         return state
     if not decision.recoverable:
-        state = _hold_ordered_recovery_gate(store, decision)
-        return _persist_rederived_root_failure(
-            state,
-            decision.reason,
+        return _persist_reassessed_ordered_recovery_failure(
+            plan,
+            previous_failure_reason,
+            getattr(phase, "scope_path", ("root",)),
             config,
             effects,
             store,
@@ -4445,7 +4450,10 @@ def _reconcile_continued_root_failure(
             authorized=decision.authorized,
         )
     except OrderedCompletionEvidenceError as error:
-        return _hold_ordered_completion_evidence(state, error, config, effects, store, effects_log)
+        held, hold_active, _held_error = _hold_reassessed_ordered_completion_evidence(
+            plan, state, error, config, effects, store, effects_log
+        )
+        return held if hold_active else store.load()
 
 
 def _completed_ordered_sub_tl_evidence_error(
@@ -4482,6 +4490,86 @@ def _completed_ordered_sub_tl_evidence_error(
     return None
 
 
+def _ordered_reopen_completion_error(
+    state: RunState,
+    plan: WorkPlan,
+    store: RunStore,
+) -> OrderedCompletionEvidenceError | None:
+    """Revalidate every completed declaration that reopening would retain."""
+    manifest = state.plan_manifest
+    if manifest is None:
+        return OrderedCompletionEvidenceError("scope", "accepted manifest is missing")
+    planning = _canonical_planning_from_manifest(manifest, state.slices)
+    tasks_by_name = {task.name: task for task in plan.sub_tls}
+    records = (
+        *planning.parallel_children,
+        *(record for _, group in planning.ordered_children for record in group),
+    )
+    for record in records:
+        current = state.slices.get(record.child_id)
+        if current is None:
+            return OrderedCompletionEvidenceError(
+                record.child_id, "ordered recovery slice is missing"
+            )
+        task = tasks_by_name.get(record.child_id)
+        complete = (
+            _ordered_child_complete(task, current)
+            if task is not None
+            else _ordered_slice_complete(current)
+        )
+        if complete:
+            try:
+                if record.kind is ChildKind.SUB_TL:
+                    _ordered_sub_tl_completion_state(state, record, task, current, store)
+                elif record.kind is ChildKind.LEAF:
+                    _ordered_leaf_completion_state(record, current)
+            except OrderedCompletionEvidenceError as error:
+                return error
+        elif record.kind is ChildKind.SUB_TL and current.status is SliceStatus.MERGED:
+            return OrderedCompletionEvidenceError(
+                record.child_id,
+                "merged declaration lacks its required completion proof; "
+                "recovery will not reopen the completed producer",
+            )
+    return None
+
+
+def _persist_reassessed_ordered_recovery_failure(
+    plan: WorkPlan,
+    previous_failure_reason: str,
+    scope_path: tuple[str, ...],
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Persist only a fresh unrecoverable-child decision, with bounded CAS retry."""
+    for _attempt in range(MAX_OPTIONAL_SUB_TL_RECONCILIATION_ATTEMPTS):
+        latest = store.load()
+        if _is_terminal_phase(_phase_from_state(latest)):
+            return latest
+        proof_state = replace(
+            latest,
+            recursive_fsm=RecursiveTLFailed(previous_failure_reason, scope_path=scope_path),
+        )
+        decision = _ordered_terminal_recovery_decision(proof_state, plan, config, store)
+        if decision is None or decision.recoverable:
+            return latest
+        try:
+            return _persist_rederived_root_failure(
+                latest,
+                decision.reason,
+                config,
+                effects,
+                store,
+                effects_log,
+                ensure_gates=((decision.gate_name, GateStatus.PENDING),),
+            )
+        except CheckpointConflict:
+            continue
+    return store.load()
+
+
 def _hold_ordered_completion_evidence(
     state: RunState,
     error: OrderedCompletionEvidenceError,
@@ -4490,10 +4578,8 @@ def _hold_ordered_completion_evidence(
     store: RunStore,
     effects_log: list[EffectIntent],
 ) -> RunState:
-    """Persist one scoped hold when a completed declaration lacks valid proof."""
+    """Atomically persist a scoped failure and its proof gate at one revision."""
     gate_name = f"tl-ordered-completion-evidence-{error.child_id}"
-    if not any(gate.name == gate_name for gate in state.gates):
-        state = store.set_gate(gate_name, GateStatus.PENDING)
     return _persist_rederived_root_failure(
         state,
         str(error),
@@ -4501,12 +4587,45 @@ def _hold_ordered_completion_evidence(
         effects,
         store,
         effects_log,
+        ensure_gates=((gate_name, GateStatus.PENDING),),
     )
+
+
+def _hold_reassessed_ordered_completion_evidence(
+    plan: WorkPlan,
+    state: RunState,
+    initial_error: OrderedCompletionEvidenceError,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> tuple[RunState, bool, OrderedCompletionEvidenceError | None]:
+    """Retry a completion hold only after fresh proof still requires it."""
+    latest_error = initial_error
+    for _attempt in range(MAX_OPTIONAL_SUB_TL_RECONCILIATION_ATTEMPTS):
+        latest = store.load()
+        latest_error = _completed_ordered_sub_tl_evidence_error(latest, plan, store)
+        if latest_error is None:
+            latest_error = _ordered_reopen_completion_error(latest, plan, store)
+        if latest_error is None:
+            return latest, False, None
+        try:
+            return (
+                _hold_ordered_completion_evidence(
+                    latest, latest_error, config, effects, store, effects_log
+                ),
+                True,
+                latest_error,
+            )
+        except CheckpointConflict:
+            continue
+    return store.load(), True, latest_error
 
 
 def _terminal_ordered_completion_hold_result(
     state: RunState,
     error: OrderedCompletionEvidenceError,
+    plan: WorkPlan,
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
     store: RunStore,
@@ -4520,7 +4639,14 @@ def _terminal_ordered_completion_hold_result(
         else []
     )
     effects_log.extend(identity_effects)
-    held = _hold_ordered_completion_evidence(state, error, config, effects, store, effects_log)
+    held, hold_active, held_error = _hold_reassessed_ordered_completion_evidence(
+        plan, state, error, config, effects, store, effects_log
+    )
+    diagnostic = (
+        str(held_error)
+        if hold_active and held_error is not None
+        else f"superseded by current checkpoint evidence: {error}"
+    )
     return TLRunResult(
         held,
         tuple(effects_log),
@@ -4530,7 +4656,7 @@ def _terminal_ordered_completion_hold_result(
         {
             "reducer_version": held.reducer_version,
             "cursor": held.events.last_consumed_offset,
-            "ordered_completion_recovery": str(error),
+            "ordered_completion_recovery": diagnostic,
         },
         _journal_entries(effects_log),
     )
@@ -4591,6 +4717,8 @@ def _persist_rederived_root_failure(
     effects: EffectClient | ReadOnlyEffectClient,
     store: RunStore,
     effects_log: list[EffectIntent],
+    *,
+    ensure_gates: Sequence[tuple[str, GateStatus]] = (),
 ) -> RunState:
     """Persist the failure found by this replay instead of reviving the old verdict."""
     before_phase = _phase_from_state(state)
@@ -4606,6 +4734,8 @@ def _persist_rederived_root_failure(
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
         integration=state.integration,
+        expected_revision=state.revision,
+        ensure_gates=ensure_gates,
     )
     _emit_phase_change(
         state.run_id,

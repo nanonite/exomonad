@@ -332,6 +332,7 @@ class RunStore:
         plan_manifest: PlanManifest | None = None,
         expected_revision: int | None = None,
         clear_gates: Sequence[str] = (),
+        ensure_gates: Sequence[tuple[str, GateStatus]] = (),
     ) -> RunState:
         """Persist one checkpoint through the shared atomic mutation path."""
         return checkpoint(
@@ -347,6 +348,7 @@ class RunStore:
             plan_manifest=plan_manifest,
             expected_revision=expected_revision,
             clear_gates=clear_gates,
+            ensure_gates=ensure_gates,
         )
 
     def set_plan_manifest(
@@ -1541,8 +1543,9 @@ def checkpoint(
     plan_manifest: PlanManifest | None = None,
     expected_revision: int | None = None,
     clear_gates: Sequence[str] = (),
+    ensure_gates: Sequence[tuple[str, GateStatus]] = (),
 ) -> RunState:
-    """Atomically update a run's FSM, slices, budget ledger, and event offset."""
+    """Atomically update a run checkpoint and its scoped gate changes."""
     run_directory = _resolve_run_directory(run_id, path, root_dir)
     if type(offset) is not int or offset < 0:
         raise ValueError("event-log offset must be a non-negative integer")
@@ -1562,6 +1565,17 @@ def checkpoint(
         raise ValueError("state_version must be a non-negative integer")
     if any(not isinstance(name, str) or not name for name in clear_gates):
         raise ValueError("clear_gates must contain non-empty gate names")
+    for gate in ensure_gates:
+        if (
+            not isinstance(gate, tuple)
+            or len(gate) != 2
+            or not isinstance(gate[0], str)
+            or not gate[0]
+            or not isinstance(gate[1], GateStatus)
+        ):
+            raise ValueError("ensure_gates must contain (name, GateStatus) pairs")
+    if set(clear_gates).intersection(name for name, _ in ensure_gates):
+        raise ValueError("a checkpoint cannot both clear and ensure the same gate")
     _assert_encoded_consistent(run_directory / "run.json", encoded_fsm, encoded_slices)
 
     def mutate(document: dict[str, object]) -> dict[str, object]:
@@ -1630,6 +1644,19 @@ def checkpoint(
                 for gate in gates
                 if not isinstance(gate, Mapping) or gate.get("name") not in to_clear
             ]
+        if ensure_gates:
+            gates = document.get("gates")
+            if not isinstance(gates, list):
+                raise CorruptCheckpoint("run state gates are not an array")
+            existing_names = {
+                gate.get("name")
+                for gate in gates
+                if isinstance(gate, Mapping) and isinstance(gate.get("name"), str)
+            }
+            for name, status in ensure_gates:
+                if name not in existing_names:
+                    gates.append({"name": name, "status": status.value})
+                    existing_names.add(name)
         document.setdefault("reducer_version", REDUCER_VERSION)
         if current_order is not None:
             document["current_order"] = current_order
