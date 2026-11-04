@@ -118,7 +118,7 @@ PY
     exec sleep "${E2E_FAST_WORKER_LIFETIME:-120}"
 fi
 
-if [[ "$role" == "dev" && "$agent" == *issue-814* ]]; then
+if [[ ( "$role" == "dev" || "$role" == "worker" ) && "$agent" == *issue-814* ]]; then
     if [[ "$(basename "$0")" == "opencode" ]]; then
         record_event historical_opencode_owner_failed '{"reason":"accepted OpenCode invocation ended in a terminal provider failure"}'
         # Let the host observe a live routed pane before recording the
