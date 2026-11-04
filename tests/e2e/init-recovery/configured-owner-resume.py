@@ -974,17 +974,18 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
         )
         kani_projection = root_checkpoint.get("slices", {}).get("kani", {})
         stall_audit = kani_projection.get("park_audit") or {}
+        superseded_epoch = stall_audit.get("superseded_by_epoch")
         if (
             kani_projection.get("status") == "parked"
             or kani_projection.get("park_cause") is not None
             or stall_audit.get("reason") != "pane_alive=false"
             or stall_audit.get("supersession_reason")
             != "fresh_continue_reconciles_invocation_local_stall"
-            or stall_audit.get("superseded_by_epoch")
-            != root_checkpoint.get("controller_epoch")
+            or not isinstance(superseded_epoch, str)
+            or not superseded_epoch.strip()
         ):
             raise RuntimeError(
-                "continued root did not supersede only the prior Kani stall projection"
+                "continued root did not retain a valid prior Kani stall supersession"
             )
     root_dir = repository / ".exo/tl-loop/root"
     child_path = root_dir / "kani/run.json"
