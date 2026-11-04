@@ -9621,10 +9621,7 @@ def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> 
     assert worker_state.dispatch_effort == "xhigh"
     assert worker_state.dispatch_route_configuration_fingerprint == "sha256:v1:" + "1" * 64
     assert worker_state.dispatch_route_manifest_digest == result.final_state.plan_manifest.digest
-    assert (
-        worker_state.dispatch_route_policy_fingerprint
-        == worker_route["policy_fingerprint"]
-    )
+    assert worker_state.dispatch_route_policy_fingerprint == worker_route["policy_fingerprint"]
     assert worker_state.dispatch_route_fingerprint == worker_route["route_fingerprint"]
     worker_intent = next(intent for intent in result.effects if intent.operation == "spawn_worker")
     assert worker_intent.arguments["name"] == spawn_worker_call["name"]
@@ -19157,6 +19154,10 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
             if tool_name == "resume_blocked_leaf":
                 self.calls.append((tool_name, arguments))
                 observed_resume_intents.append(expected_intent)
+                persisted_route = dict(arguments["role_route"])
+                # The host serializer retains optional provenance fields as
+                # explicit nulls when the accepted route has no policy.
+                persisted_route.setdefault("policy_fingerprint", None)
                 if len(observed_resume_intents) == 1:
                     identity_path = owner_dir / "identity.json"
                     updated_identity = json.loads(identity_path.read_text(encoding="utf-8"))
@@ -19165,6 +19166,7 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
                             "agent_type": "opencode",
                             "model": "opencode-go/deepseek-v4.1-flash",
                             "effort": "high",
+                            "role_route": persisted_route,
                         }
                     )
                     identity_path.write_text(json.dumps(updated_identity), encoding="utf-8")
@@ -19182,6 +19184,7 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
                         "prior_invocation_id": "opencode-prior-invocation",
                         "pr_number": None,
                         "head_sha": None,
+                        "role_route": persisted_route,
                     }
                     invocation_path.write_text(json.dumps(updated_invocation), encoding="utf-8")
                     (owner_dir / "dispatch_intent").write_text(
@@ -19209,7 +19212,7 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
                             "agent_type": "opencode",
                             "branch_name": branch,
                             "worktree_path": str(worktree),
-                            "role_route": dict(arguments["role_route"]),
+                            "role_route": persisted_route,
                         },
                         "invocation": {
                             "invocation_id": "opencode-successor-invocation",
@@ -19222,6 +19225,7 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
                                 if len(observed_resume_intents) == 1
                                 else "adopted_after_response_loss"
                             ),
+                            "role_route": persisted_route,
                         },
                     },
                 }
@@ -19894,7 +19898,15 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
             self.calls.append((tool_name, arguments))
             identity_path = owner_dir / "identity.json"
             identity = json.loads(identity_path.read_text(encoding="utf-8"))
-            identity.update({"agent_type": "codex", "model": "gpt-6-luna", "effort": "xhigh"})
+            route_receipt = driver_module._blocked_resume_role_route_response(terminal_proof.resume)
+            identity.update(
+                {
+                    "agent_type": "codex",
+                    "model": "gpt-6-luna",
+                    "effort": "xhigh",
+                    "role_route": route_receipt,
+                }
+            )
             identity_path.write_text(json.dumps(identity), encoding="utf-8")
             (owner_dir / "invocation.json").write_text(
                 json.dumps(
@@ -19911,6 +19923,7 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
                         "prior_invocation_id": prior_invocation_id,
                         "pr_number": None,
                         "head_sha": None,
+                        "role_route": route_receipt,
                     }
                 ),
                 encoding="utf-8",
@@ -19939,9 +19952,7 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
                         "agent_type": "codex",
                         "branch_name": identity["birth_branch"],
                         "worktree_path": identity["working_dir"],
-                        "role_route": driver_module._blocked_resume_role_route_response(
-                            terminal_proof.resume
-                        ),
+                        "role_route": route_receipt,
                     },
                     "invocation": {
                         "invocation_id": successor_id,
@@ -19950,6 +19961,7 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
                         "ready": True,
                         "fresh": True,
                         "outcome": "started",
+                        "role_route": route_receipt,
                     },
                 },
             }
@@ -20269,7 +20281,16 @@ def test_terminal_provider_recovery_authorizes_effort_only_route_change(
 
     identity_path = owner_dir / "identity.json"
     identity = json.loads(identity_path.read_text(encoding="utf-8"))
-    identity.update({"agent_type": "codex", "model": "gpt-6-luna", "effort": "high"})
+    route_receipt = driver_module._blocked_resume_role_route_response(proof.resume)
+    assert route_receipt is not None
+    identity.update(
+        {
+            "agent_type": "codex",
+            "model": "gpt-6-luna",
+            "effort": "high",
+            "role_route": route_receipt,
+        }
+    )
     identity_path.write_text(json.dumps(identity), encoding="utf-8")
     (owner_dir / "invocation.json").write_text(
         json.dumps(
@@ -20286,6 +20307,7 @@ def test_terminal_provider_recovery_authorizes_effort_only_route_change(
                 "prior_invocation_id": prior_invocation_id,
                 "pr_number": None,
                 "head_sha": None,
+                "role_route": route_receipt,
             }
         ),
         encoding="utf-8",
@@ -20313,9 +20335,7 @@ def test_terminal_provider_recovery_authorizes_effort_only_route_change(
                     "agent_type": "codex",
                     "branch_name": proof.resume.owner.branch,
                     "worktree_path": str(proof.resume.owner.worktree),
-                    "role_route": driver_module._blocked_resume_role_route_response(
-                        proof.resume
-                    ),
+                    "role_route": route_receipt,
                 },
                 "invocation": {
                     "invocation_id": "effort-only-successor",
@@ -20324,6 +20344,7 @@ def test_terminal_provider_recovery_authorizes_effort_only_route_change(
                     "ready": True,
                     "fresh": True,
                     "outcome": "started",
+                    "role_route": route_receipt,
                 },
             },
         }
@@ -20341,6 +20362,19 @@ def test_terminal_provider_recovery_authorizes_effort_only_route_change(
         "gpt-6-luna",
         "xhigh",
     )
+    for receipt_name in ("agent", "invocation"):
+        conflicting_response = json.loads(json.dumps(response.result))
+        conflicting_response[receipt_name]["role_route"]["dispatch_intent_id"] = (
+            "different-dispatch-intent"
+        )
+        with pytest.raises(
+            driver_module.BlockedLeafRouteProvenanceError,
+            match="response role-route provenance",
+        ):
+            driver_module._validated_blocked_resume_result(
+                proof.resume,
+                ToolResult.from_raw({"success": True, "result": conflicting_response}),
+            )
 
     unchanged_plan, unchanged_config, unchanged_store, *_ = _seed_terminal_provider_failure_leaf(
         tmp_path / "unchanged",
@@ -20967,7 +21001,15 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
     successor_id = "codex-terminal-response-loss-successor"
     identity_path = owner_dir / "identity.json"
     identity = json.loads(identity_path.read_text(encoding="utf-8"))
-    identity.update({"agent_type": "codex", "model": "gpt-6-luna", "effort": "xhigh"})
+    route_receipt = driver_module._blocked_resume_role_route_response(terminal.resume)
+    identity.update(
+        {
+            "agent_type": "codex",
+            "model": "gpt-6-luna",
+            "effort": "xhigh",
+            "role_route": route_receipt,
+        }
+    )
     identity_path.write_text(json.dumps(identity), encoding="utf-8")
     (owner_dir / "invocation.json").write_text(
         json.dumps(
@@ -20984,6 +21026,7 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
                 "prior_invocation_id": prior_invocation_id,
                 "pr_number": None,
                 "head_sha": None,
+                "role_route": route_receipt,
             }
         ),
         encoding="utf-8",
@@ -21018,9 +21061,7 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
                             "agent_type": "codex",
                             "branch_name": owner.branch,
                             "worktree_path": str(owner.worktree),
-                            "role_route": driver_module._blocked_resume_role_route_response(
-                                terminal.resume
-                            ),
+                            "role_route": route_receipt,
                         },
                         "invocation": {
                             "invocation_id": successor_id,
@@ -21029,6 +21070,7 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
                             "ready": True,
                             "fresh": False,
                             "outcome": "adopted_after_response_loss",
+                            "role_route": route_receipt,
                         },
                     },
                 }
@@ -21098,11 +21140,40 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
     assert transport.resume_calls == 1
 
 
+@pytest.mark.parametrize(
+    "route_mismatch_fields",
+    [
+        ("configuration_fingerprint", "route_fingerprint"),
+        ("role",),
+        ("harness",),
+        ("agent_type",),
+        ("model",),
+        ("effort",),
+        ("policy_fingerprint",),
+        ("manifest_digest",),
+        ("dispatch_intent_id",),
+        ("scope_id",),
+        ("missing_role",),
+        ("missing_harness",),
+        ("missing_agent_type",),
+        ("missing_model",),
+        ("missing_effort",),
+        ("missing_configuration_fingerprint",),
+        ("missing_policy_fingerprint",),
+        ("missing_manifest_digest",),
+        ("missing_route_fingerprint",),
+        ("missing_dispatch_intent_id",),
+        ("missing_scope_id",),
+        ("missing_identity_role_route",),
+        ("missing_invocation_role_route",),
+    ],
+)
 @pytest.mark.parametrize("legacy_adoption_audit", [False, True])
 def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpoint_crash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     legacy_adoption_audit: bool,
+    route_mismatch_fields: tuple[str, ...],
 ) -> None:
     reference_requirement = _terminal_reference_requirement()
     plan, config, store, owner_dir, owner_name, prior_invocation_id = (
@@ -21142,9 +21213,17 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
                 return super().call_tool(role, name, tool_name, arguments)
             self.calls.append((tool_name, arguments))
             resume_calls += 1
+            route_receipt = driver_module._blocked_resume_role_route_response(terminal.resume)
             identity_path = owner_dir / "identity.json"
             identity = json.loads(identity_path.read_text(encoding="utf-8"))
-            identity.update({"agent_type": "codex", "model": "gpt-6-luna", "effort": "xhigh"})
+            identity.update(
+                {
+                    "agent_type": "codex",
+                    "model": "gpt-6-luna",
+                    "effort": "xhigh",
+                    "role_route": route_receipt,
+                }
+            )
             identity_path.write_text(json.dumps(identity), encoding="utf-8")
             (owner_dir / "invocation.json").write_text(
                 json.dumps(
@@ -21161,6 +21240,7 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
                         "prior_invocation_id": prior_invocation_id,
                         "pr_number": None,
                         "head_sha": None,
+                        "role_route": route_receipt,
                     }
                 ),
                 encoding="utf-8",
@@ -21189,9 +21269,7 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
                         "agent_type": "codex",
                         "branch_name": owner.branch,
                         "worktree_path": str(owner.worktree),
-                        "role_route": driver_module._blocked_resume_role_route_response(
-                            terminal.resume
-                        ),
+                        "role_route": route_receipt,
                     },
                     "invocation": {
                         "invocation_id": successor_id,
@@ -21200,6 +21278,7 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
                         "ready": True,
                         "fresh": True,
                         "outcome": "started",
+                        "role_route": route_receipt,
                     },
                 },
             }
@@ -21301,6 +21380,74 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
     assert conflicting_lineage is None
     assert lineage_reason is not None
     invocation_path.write_bytes(successor_invocation)
+
+    # A confirmed response must not authorize adoption when both host-owned
+    # durable route records have since acquired stale route fingerprints. All
+    # runtime/model/effort, owner, invocation, and worktree coordinates still
+    # match the exact response journaled before the checkpoint crash.
+    identity_path = owner_dir / "identity.json"
+    valid_identity = identity_path.read_bytes()
+    valid_invocation = invocation_path.read_bytes()
+    valid_route = driver_module._blocked_resume_role_route_response(terminal.resume)
+    assert valid_route is not None
+    stale_route = dict(valid_route)
+    missing_fields = {
+        field.removeprefix("missing_")
+        for field in route_mismatch_fields
+        if field.startswith("missing_")
+        and field
+        not in {
+            "missing_identity_role_route",
+            "missing_invocation_role_route",
+        }
+    }
+    for provenance_field in route_mismatch_fields:
+        if provenance_field.startswith("missing_"):
+            continue
+        stale_route[provenance_field] = f"stale-{provenance_field}"
+    for missing_field in missing_fields:
+        stale_route.pop(missing_field, None)
+    identity = json.loads(valid_identity)
+    if route_mismatch_fields == ("missing_identity_role_route",):
+        identity.pop("role_route", None)
+    else:
+        identity["role_route"] = stale_route
+    identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    invocation = json.loads(valid_invocation)
+    if route_mismatch_fields == ("missing_invocation_role_route",):
+        invocation.pop("role_route", None)
+    else:
+        invocation["role_route"] = stale_route
+    invocation_path.write_text(json.dumps(invocation), encoding="utf-8")
+    stale_identity_bytes = identity_path.read_bytes()
+    stale_invocation_bytes = invocation_path.read_bytes()
+    journal_path = store.run_dir / "action-journal.json"
+    confirmed_journal_bytes = journal_path.read_bytes()
+    stale_route_transport = RecordingTransport()
+    held_route = driver_module._resume_terminal_owner_failure(
+        plan,
+        store.load(),
+        config,
+        EffectClient(stale_route_transport),
+        store,
+        EffectJournal(store.run_id, journal_path),
+    )
+    held_leaf = held_route.slices[leaf.name]
+    assert held_leaf.status is SliceStatus.SPAWNED
+    assert held_leaf.dispatch_invocation_id == prior_invocation_id
+    assert held_leaf.recovery is not None
+    assert "role-route provenance" in str(
+        held_leaf.recovery.evidence.get("terminal_owner_recovery_hold", "")
+    )
+    assert not any(
+        tool_name == "resume_blocked_leaf" for tool_name, _ in stale_route_transport.calls
+    )
+    assert identity_path.read_bytes() == stale_identity_bytes
+    assert invocation_path.read_bytes() == stale_invocation_bytes
+    assert journal_path.read_bytes() == confirmed_journal_bytes
+    assert resume_calls == 1
+    identity_path.write_bytes(valid_identity)
+    invocation_path.write_bytes(valid_invocation)
 
     legacy_adoption_entry = None
     if legacy_adoption_audit:

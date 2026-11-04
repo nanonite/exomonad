@@ -338,10 +338,12 @@ from tl_loop.state.store import (
 from .blocked_leaf_resume import (
     BlockedLeafOwner,
     BlockedLeafOwnerError,
+    BlockedLeafRouteProvenanceError,
     blocked_resume_intent_id,
     resolve_dormant_owner_for_slice,
     resolve_owner_for_resume_retry,
     validate_resumed_owner,
+    validate_role_route_provenance,
 )
 from .dispatch_classification import (
     DEFAULT_RETRY_BASE_DELAY_SECONDS,
@@ -5543,7 +5545,10 @@ def _terminal_owner_recovery_proof(
             return None, "confirmed terminal-owner result is missing or malformed"
         if confirmed_result.success is not True:
             return None, "confirmed terminal-owner result does not establish a launched successor"
-        successor = _validated_blocked_resume_result(resume, confirmed_result)
+        try:
+            successor = _validated_blocked_resume_result(resume, confirmed_result)
+        except BlockedLeafRouteProvenanceError as error:
+            return None, str(error)
         if successor is None or successor[0] != owner.invocation_record.get("invocation_id"):
             return (
                 None,
@@ -6519,7 +6524,18 @@ def _resume_approved_blocked_leaf(
                 effects_log,
                 "configured blocked-leaf resume was rejected; inspect the exact owner evidence",
             )
-        successor = _validated_blocked_resume_result(proof, result)
+        try:
+            successor = _validated_blocked_resume_result(proof, result)
+        except BlockedLeafRouteProvenanceError as error:
+            return _hold_owner_resume(
+                state,
+                proof,
+                config,
+                effects,
+                store,
+                effects_log,
+                str(error),
+            )
         if successor is None:
             return _hold_owner_resume(
                 state,
@@ -6758,6 +6774,11 @@ def _validated_blocked_resume_result(
         return None
     invocation_id = invocation.get("invocation_id")
     runtime = invocation.get("runtime")
+    expected_role_route = _blocked_resume_role_route_response(proof)
+    if expected_role_route is None:
+        raise BlockedLeafRouteProvenanceError(
+            "accepted blocked-leaf role route provenance is unavailable"
+        )
     if (
         payload.get("chainlink_issue_id") != proof.owner.issue_id
         or any(
@@ -6788,7 +6809,10 @@ def _validated_blocked_resume_result(
             invocation_id=invocation_id,
             dispatch_intent_id=proof.intent_id,
             runtime=runtime,
+            expected_role_route=expected_role_route,
         )
+    except BlockedLeafRouteProvenanceError:
+        raise
     except BlockedLeafOwnerError:
         return None
     observed_model = _optional_nonempty_text(identity.get("model"))
@@ -6803,20 +6827,13 @@ def _validated_blocked_resume_result(
     expected_effort = (
         expected_route.get("effort") if isinstance(expected_route, Mapping) else None
     ) or proof.desired_effort
-    expected_role_route = _blocked_resume_role_route_response(proof)
-    observed_role_route = agent.get("role_route")
-    if expected_role_route is not None and (
-        not isinstance(observed_role_route, Mapping)
-        or {key: value for key, value in observed_role_route.items() if value is not None}
-        != expected_role_route
-    ):
-        LOGGER.warning(
-            "blocked-leaf resume route receipt mismatch slice=%s expected=%r observed=%r",
-            proof.leaf.name,
-            expected_role_route,
-            observed_role_route,
+    if expected_role_route is not None:
+        validate_role_route_provenance(
+            agent.get("role_route"), expected_role_route, "agent response"
         )
-        return None
+        validate_role_route_provenance(
+            invocation.get("role_route"), expected_role_route, "invocation response"
+        )
     if (
         runtime != expected_agent_type
         or observed_model != expected_model
@@ -6850,7 +6867,7 @@ def _blocked_resume_role_route_response(
         "dispatch_intent_id": proof.intent_id,
         "scope_id": proof.leaf.name,
     }
-    return {key: value for key, value in values.items() if value is not None}
+    return values
 
 
 def _optional_nonempty_text(value: object) -> str | None:
@@ -16458,7 +16475,9 @@ def _dispatch_route_receipt_error(
         "dispatch_intent_id": attempt.intent_id,
         "scope_id": slice_id,
     }
-    expected_response = {key: value for key, value in expected_response.items() if value is not None}
+    expected_response = {
+        key: value for key, value in expected_response.items() if value is not None
+    }
     if observed != expected_response:
         return "route-bound spawn response conflicts with the accepted role-route receipt"
     invocation_id = receipt.get("invocation_id")

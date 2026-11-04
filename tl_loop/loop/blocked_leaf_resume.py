@@ -14,6 +14,10 @@ class BlockedLeafOwnerError(ValueError):
     """Raised when the local owner cannot be bound to a blocked plan leaf."""
 
 
+class BlockedLeafRouteProvenanceError(BlockedLeafOwnerError):
+    """Raised when a route-bound resume lacks matching durable provenance."""
+
+
 @dataclass(frozen=True)
 class BlockedLeafOwner:
     """Verified current owner coordinates required by the host resume tool."""
@@ -210,8 +214,9 @@ def validate_resumed_owner(
     invocation_id: str,
     dispatch_intent_id: str,
     runtime: str,
+    expected_role_route: Mapping[str, object],
 ) -> tuple[Mapping[str, object], Mapping[str, object]]:
-    """Verify that host-persisted records describe this exact successor."""
+    """Verify owner records and the exact accepted route for this successor."""
     identity = _read_object(owner.directory / "identity.json", "resumed owner identity")
     invocation = _read_object(owner.directory / "invocation.json", "resumed owner invocation")
     routing = _read_object(owner.directory / "routing.json", "resumed owner routing")
@@ -262,11 +267,76 @@ def validate_resumed_owner(
         raise BlockedLeafOwnerError(
             "resumed invocation routing ownership is incomplete or conflicting"
         )
+    validate_role_route_provenance(
+        identity.get("role_route"), expected_role_route, "owner identity"
+    )
+    validate_role_route_provenance(
+        invocation.get("role_route"), expected_role_route, "owner invocation"
+    )
     issue_id = _read_issue_id(owner.directory)
     if issue_id != owner.issue_id:
         raise BlockedLeafOwnerError("resumed owner issue binding changed")
     _validate_git_branch(owner.worktree, owner.branch)
     return identity, invocation
+
+
+def validate_role_route_provenance(
+    observed: object,
+    expected: Mapping[str, object],
+    source: str,
+) -> None:
+    """Require an exact route receipt; explicit null policy means no policy."""
+    required = {
+        "role",
+        "harness",
+        "agent_type",
+        "model",
+        "effort",
+        "configuration_fingerprint",
+        "policy_fingerprint",
+        "manifest_digest",
+        "route_fingerprint",
+        "dispatch_intent_id",
+        "scope_id",
+    }
+    required_text = required - {"policy_fingerprint"}
+    if (
+        set(expected) != required
+        or any(
+            not isinstance(expected.get(key), str) or not expected[key].strip()
+            for key in required_text
+        )
+        or (
+            expected.get("policy_fingerprint") is not None
+            and (
+                not isinstance(expected.get("policy_fingerprint"), str)
+                or not expected["policy_fingerprint"].strip()
+            )
+        )
+    ):
+        raise BlockedLeafRouteProvenanceError(
+            "accepted blocked-leaf role route provenance is incomplete"
+        )
+    if (
+        not isinstance(observed, Mapping)
+        or set(observed) != set(expected)
+        or any(observed.get(key) != value for key, value in expected.items())
+    ):
+        differing_fields = (
+            sorted(
+                key
+                for key in set(observed) | set(expected)
+                if key not in observed
+                or key not in expected
+                or observed.get(key) != expected.get(key)
+            )
+            if isinstance(observed, Mapping)
+            else sorted(expected)
+        )
+        raise BlockedLeafRouteProvenanceError(
+            f"resumed {source} role-route provenance is missing or conflicts with the accepted route "
+            f"(fields: {', '.join(differing_fields)})"
+        )
 
 
 def _owners_for_issue(

@@ -360,6 +360,10 @@ async fn compiled_blocked_resume_uses_the_controller_selected_worker_route() {
         output["result"]["agent"]["role_route"], invocation["role_route"],
         "compiled tool response reports the exact persisted route provenance"
     );
+    assert_eq!(
+        output["result"]["invocation"]["role_route"], invocation["role_route"],
+        "compiled invocation receipt retains the exact persisted route provenance"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -120,7 +120,8 @@ resumeBlockedLeafCore args
                       "target_id" .= AC.routingTargetId agent,
                       "fresh" .= AC.invocationFresh agent,
                       "ready" .= AC.invocationReady agent,
-                      "outcome" .= AC.invocationOutcome agent
+                      "outcome" .= AC.invocationOutcome agent,
+                      "role_route" .= AC.roleRouteEvidence agent
                     ]
               ]
   where
