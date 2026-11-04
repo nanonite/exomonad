@@ -3777,6 +3777,26 @@ def _ordered_sub_tl_completion_state(
     return receipt
 
 
+def _accepted_sub_tl_completion_receipt(
+    state: RunState,
+    task: SubTLTask,
+    current: SliceState,
+    store: RunStore,
+) -> PostMergeState:
+    """Derive a sub-TL receipt only from its accepted direct manifest node."""
+    manifest = state.plan_manifest
+    if manifest is None:
+        raise OrderedCompletionEvidenceError(task.name, "accepted manifest is missing")
+    node = next(
+        (candidate for candidate in manifest.nodes if candidate.name == task.name),
+        None,
+    )
+    if node is None or node.kind != "sub_tl":
+        raise OrderedCompletionEvidenceError(task.name, "accepted sub-TL declaration is missing")
+    record = _canonical_child_record(node, current, manifest.manifest_revision)
+    return _ordered_sub_tl_completion_state(state, record, task, current, store)
+
+
 def _ordered_worker_completion_state(
     record: ChildRecord,
     current: SliceState,
@@ -19755,6 +19775,11 @@ def _complete_sub_tl_batch(
                     head_sha=candidate.head_sha,
                     patch_digest=candidate.patch_digest,
                 )
+        if status is SliceStatus.MERGED and not task.integration.aggregate_pr_required:
+            current = replace(
+                current,
+                post_merge=_accepted_sub_tl_completion_receipt(state, task, current, store),
+            )
         updated_slices[task.name] = (
             current
             if status is SliceStatus.PARKED

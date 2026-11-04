@@ -936,7 +936,12 @@ def wait_for_agent_event(path: Path, expected: str) -> None:
     raise RuntimeError(f"worker did not record actual activity {expected!r}")
 
 
-def verify_controller(repository: Path, baseline_path: Path, output: Path) -> None:
+def verify_controller(
+    repository: Path,
+    baseline_path: Path,
+    output: Path,
+    gate_approval_path: Path | None = None,
+) -> None:
     """Verify recovery, publication and review came from the continued controller."""
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
     if baseline.get("historical_dispatch_kind") == "accepted_terminal_provider_failure":
@@ -1277,20 +1282,43 @@ def verify_controller(repository: Path, baseline_path: Path, output: Path) -> No
     )
     route_authorization = recovery_evidence.get("configured_route_authorization")
     gate_authorization = resume_arguments.get("recovery_gate_authorization")
-    if (
-        not isinstance(terminal_gate, dict)
-        or terminal_gate.get("status") != "approved"
-        or not isinstance(
-            recovery_evidence.get("terminal_owner_recovery_gate_rejection"), dict
+    if gate_approval_path is None:
+        gate_rejection = recovery_evidence.get("terminal_owner_recovery_gate_rejection")
+        if (
+            not isinstance(terminal_gate, dict)
+            or terminal_gate.get("status") != "approved"
+            or not isinstance(gate_rejection, dict)
+            or not isinstance(route_authorization, dict)
+            or route_authorization.get("recovery_gate_authorization")
+            != gate_authorization
+            or not isinstance(gate_authorization, dict)
+            or gate_authorization.get("status") != "approved"
+        ):
+            raise RuntimeError(
+                "resume route authorization is not bound to the fixture's explicit fresh gate approval"
+            )
+    else:
+        approval_observation = json.loads(
+            gate_approval_path.read_text(encoding="utf-8")
         )
-        or not isinstance(route_authorization, dict)
-        or route_authorization.get("recovery_gate_authorization") != gate_authorization
-        or not isinstance(gate_authorization, dict)
-        or gate_authorization.get("status") != "approved"
-    ):
-        raise RuntimeError(
-            "resume route authorization is not bound to the fixture's explicit fresh gate approval"
-        )
+        expected_gate_authorization = approval_observation.get("authorization")
+        if (
+            approval_observation.get("gate_name") != terminal_gate_name
+            or approval_observation.get("gate_status") != "approved"
+            or not isinstance(expected_gate_authorization, dict)
+            or expected_gate_authorization.get("gate_name") != terminal_gate_name
+            or expected_gate_authorization.get("status") != "approved"
+            or type(expected_gate_authorization.get("rejected_state_version"))
+            is not int
+            or type(expected_gate_authorization.get("approved_state_version"))
+            is not int
+            or expected_gate_authorization["approved_state_version"]
+            <= expected_gate_authorization["rejected_state_version"]
+            or gate_authorization != expected_gate_authorization
+        ):
+            raise RuntimeError(
+                "resume route authorization does not match the captured explicit gate decision"
+            )
     response_payload = (resume_rows[0].get("result") or {}).get("result")
     if not isinstance(response_payload, dict):
         raise TypeError("confirmed resume journal lacks its typed response payload")
@@ -1758,6 +1786,7 @@ def main() -> None:
     parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--baseline", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--gate-approval", type=Path)
     parser.add_argument("--historical-parent-stall", action="store_true")
     arguments = parser.parse_args()
     if arguments.mode == "seed":
@@ -1775,7 +1804,12 @@ def main() -> None:
     elif arguments.mode == "verify-controller":
         if arguments.baseline is None or arguments.output is None:
             parser.error("verify-controller requires --baseline and --output")
-        verify_controller(arguments.repo, arguments.baseline, arguments.output)
+        verify_controller(
+            arguments.repo,
+            arguments.baseline,
+            arguments.output,
+            arguments.gate_approval,
+        )
     else:
         if arguments.baseline is None:
             parser.error("verify-repeat requires --baseline")

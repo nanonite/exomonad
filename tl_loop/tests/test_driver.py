@@ -17099,6 +17099,113 @@ def test_ordered_recovery_keeps_declared_aggregate_not_required_outcome(
     assert reopened.slices["architecture"].post_merge == architecture.post_merge
 
 
+def test_completed_optional_sub_tl_records_parent_not_required_receipt(
+    tmp_path: Path,
+) -> None:
+    task = SubTLTask(
+        "kani",
+        WorkPlan(),
+        order=1,
+        integration=IntegrationContract(aggregate_pr_required=False),
+    )
+    plan = WorkPlan(sub_tls=(task,))
+    config = replace(_config(), run_id="root", root_dir=tmp_path, branch="main")
+    manifest = driver_module._candidate_manifest(plan, "root", config)
+    root_slices = _initial_slices(plan, config, tmp_path, "root")
+    create(
+        "root",
+        {
+            "slices": root_slices,
+            "owner_branch": "main",
+            "owner_worktree": str(tmp_path),
+            "repository_identity": config.repository_identity.to_document(),
+            "plan_manifest": manifest.to_document(),
+        },
+        root_dir=tmp_path,
+    )
+    root_store = RunStore("root", tmp_path)
+    root_store.set_plan_manifest(manifest, slices=root_slices)
+    stages = (driver_module.OrderedStageState(1, ("kani",)),)
+    state = root_store.set_ordered_state(1, stages, root_store.load().integration)
+    parent_slice = replace(
+        state.slices["kani"],
+        status=SliceStatus.SPAWNED,
+        attempts=1,
+        dispatch_intent_id="kani-intent",
+        dispatch_agent_id="kani",
+        dispatch_invocation_id="kani-invocation",
+        dispatch_authoritative_event_seq=1,
+        dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
+    )
+    state = root_store.checkpoint(
+        state.recursive_fsm or state.fsm,
+        {**state.slices, "kani": parent_slice},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=1,
+        ordered_stages=stages,
+        integration=state.integration,
+    )
+
+    node = next(node for node in manifest.nodes if node.name == "kani")
+    child_manifest = manifest.child_manifests[node.node_id]
+    child_store = RunStore("kani", root_store.run_dir)
+    child_config = replace(
+        config,
+        run_id="kani",
+        root_dir=root_store.run_dir,
+        branch=parent_slice.branch or "main.kani",
+        parent_branch="main",
+        parent_run_id="root",
+        parent_agent_id="root",
+        depth=1,
+        declared_manifest=child_manifest,
+    )
+    child_slices = _initial_slices(task.plan, child_config, root_store.run_dir, "kani")
+    create(
+        "kani",
+        {
+            "slices": child_slices,
+            "owner_branch": child_config.branch,
+            "owner_worktree": parent_slice.worktree or str(tmp_path / "kani-worktree"),
+            "parent_branch": "main",
+            "parent_run_id": "root",
+            "parent_agent_id": "root",
+            "depth": 1,
+            "repository_identity": config.repository_identity.to_document(),
+            "plan_manifest": child_manifest.to_document(),
+        },
+        root_dir=root_store.run_dir,
+    )
+    child_store.set_plan_manifest(child_manifest, slices=child_slices)
+    child_state = child_store.checkpoint(
+        RecursiveTLAllMerged(
+            scope_path=(child_manifest.scope_id,),
+            plan_digest=child_manifest.digest,
+        ),
+        child_slices,
+        child_store.load().budgets,
+        child_store.load().events.last_consumed_offset,
+    )
+    assert driver_module._child_handoff_ready(child_state, "root")
+
+    completed = driver_module._complete_sub_tl_batch(
+        (task,),
+        ((task, TLPhase.TLAllMerged, child_state),),
+        state,
+        config,
+        EffectClient(RecordingTransport()),
+        root_store,
+        [],
+    )
+
+    receipt = completed.slices["kani"].post_merge
+    assert receipt is not None
+    assert receipt.phase is PostMergePhase.NOT_REQUIRED
+    assert receipt.evidence == {"child_id": "kani", "aggregate_pr_required": "false"}
+    assert driver_module._scope_declared_completion_matches(completed)
+
+
 def test_ordered_recovery_retains_valid_entry_added_completion_evidence(
     tmp_path: Path,
 ) -> None:

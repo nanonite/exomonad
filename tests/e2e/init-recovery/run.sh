@@ -1918,6 +1918,39 @@ PY
         --name "tl-terminal-owner-recovery-issue-814-substitution-model-kani" --approve \
         > "$AGG_DIR/approve-terminal-recovery-gate.log" 2>&1 \
         || { cat "$AGG_DIR/approve-terminal-recovery-gate.log"; e2e_fail "could not explicitly approve the disposable terminal-owner route recovery"; }
+    python3 - "$AGG_REPO" "$AGG_DIR/terminal-recovery-approval.json" \
+        "tl-terminal-owner-recovery-issue-814-substitution-model-kani" <<'PY' \
+        || e2e_fail "explicit terminal-recovery gate decision could not be retained"
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+output = Path(sys.argv[2])
+gate_name = sys.argv[3]
+run = json.loads((repo / ".exo/tl-loop/root/kani/run.json").read_text())
+gate = next((row for row in run.get("gates", []) if row.get("name") == gate_name), None)
+leaf = run.get("slices", {}).get("issue-814-substitution-model-kani", {})
+recovery_evidence = (leaf.get("recovery") or {}).get("evidence") or {}
+rejection = recovery_evidence.get("terminal_owner_recovery_gate_rejection")
+assert gate and gate.get("status") == "approved", "terminal gate is not explicitly approved"
+assert isinstance(rejection, dict) and rejection.get("status") == "rejected"
+assert rejection.get("gate_name") == gate_name
+approved_at = run.get("state_version")
+rejected_at = rejection.get("state_version")
+assert type(approved_at) is int and type(rejected_at) is int and approved_at > rejected_at
+output.write_text(json.dumps({
+    "gate_name": gate_name,
+    "gate_status": gate["status"],
+    "rejection": rejection,
+    "authorization": {
+        "gate_name": gate_name,
+        "status": "approved",
+        "rejected_state_version": rejected_at,
+        "approved_state_version": approved_at,
+    },
+}, sort_keys=True, indent=2) + "\n")
+PY
     APPROVED_CONTROLLER_TARGET="$(python3 - "$AGG_REPO" "$CONTROLLER_EPOCH_PATH" "$AGGREGATE_SESSION" <<'PY'
 import json
 import sys
@@ -2010,6 +2043,7 @@ PY
     e2e_log "Disposable terminal-owner recovery proceeded only after recorded rejection, explicit fresh approval, supported workspace shutdown, and a new controller startup"
     python3 "$SCRIPT_DIR/configured-owner-resume.py" verify-controller \
         --repo "$AGG_REPO" --baseline "$AGG_DIR/preexisting-opencode-owner.json" \
+        --gate-approval "$AGG_DIR/terminal-recovery-approval.json" \
         --output "$AGG_DIR/configured-owner-resume.json" \
         > "$AGG_DIR/configured-owner-resume.stdout" \
         || { cat "$AGG_DIR/configured-owner-resume.stdout"; e2e_fail "controller did not recover the accepted terminal OpenCode owner through Codex and reviewer flow"; }
@@ -2110,6 +2144,7 @@ PY
         "controller recovery of active #814 human gate"
     python3 "$SCRIPT_DIR/configured-owner-resume.py" verify-controller \
         --repo "$AGG_REPO" --baseline "$AGG_DIR/preexisting-opencode-owner.json" \
+        --gate-approval "$AGG_DIR/terminal-recovery-approval.json" \
         --output "$AGG_DIR/configured-owner-resume.json" \
         > "$AGG_DIR/configured-owner-resume.stdout" \
         || { cat "$AGG_DIR/configured-owner-resume.stdout"; e2e_fail "controller did not checkpoint the resumed Codex owner and publication"; }
