@@ -735,7 +735,16 @@ def _scope_has_pending_post_merge(state: RunState) -> bool:
 def _ordered_child_complete(task: SubTLTask, current: SliceState) -> bool:
     """Require aggregate post-merge recovery before releasing a child barrier."""
     if not task.integration.aggregate_pr_required:
-        return _ordered_slice_complete(current)
+        if current.status is not SliceStatus.MERGED:
+            return False
+        if current.pr_number is None:
+            return (
+                current.post_merge is not None
+                and current.post_merge.phase is PostMergePhase.NOT_REQUIRED
+            )
+        return (
+            current.post_merge is not None and current.post_merge.phase is PostMergePhase.COMPLETE
+        )
     return (
         current.status is SliceStatus.MERGED
         and current.pr_number is not None
@@ -7820,6 +7829,17 @@ def _run_loop(
                         _emit_phase_change(
                             run_id, before_phase, phase, config, effects, effects_log
                         )
+            if not recovery_pending and _optional_sub_tl_completion_reconciliation_needed(
+                plan, state
+            ):
+                prior_revision = state.revision
+                state, completion_hold = _reconcile_optional_sub_tl_completion(
+                    plan, config, effects, store, effects_log
+                )
+                phase = _phase_from_state(state)
+                if not completion_hold and state.revision != prior_revision:
+                    state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
+                    phase = _phase_from_state(state)
             if (
                 not recovery_pending
                 and _sub_tls_waiting_for_integration(plan, state)
@@ -18421,6 +18441,7 @@ def _run_sub_tls(
             task
             for task, current in zip(stage_tasks, stage_states)
             if current is not None
+            and current.status is not SliceStatus.MERGED
             and current.status not in {SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
             and not (
                 current.status is SliceStatus.PARKED
@@ -18693,6 +18714,8 @@ def _optional_sub_tl_completion_updates(
             return OrderedCompletionEvidenceError(
                 task.name, f"accepted child checkpoint is unreadable ({type(error).__name__})"
             )
+        if _optional_child_completion_is_in_progress(child_state):
+            continue
         if child_state.repository_identity != state.repository_identity:
             return OrderedCompletionEvidenceError(
                 task.name, "child repository identity conflicts with the accepted parent"
@@ -18727,6 +18750,53 @@ def _optional_sub_tl_completion_updates(
         sub_tl_recovery=sub_tl_recovery,
     )
     return slices, integration, tuple(sorted(clear_gates))
+
+
+def _optional_sub_tl_completion_reconciliation_needed(
+    plan: WorkPlan,
+    state: RunState,
+) -> bool:
+    """Detect a merged optional child whose parent completion projection is stale."""
+    for task in plan.sub_tls:
+        current = state.slices.get(task.name)
+        if (
+            task.integration.aggregate_pr_required
+            or current is None
+            or current.status is not SliceStatus.MERGED
+            or current.pr_number is not None
+        ):
+            continue
+        lifecycle = state.integration.sub_tl_states.get(task.name)
+        recovery = state.integration.sub_tl_recovery.get(task.name)
+        proof_gate = f"tl-ordered-completion-evidence-{task.name}"
+        has_gate = any(gate.name == proof_gate for gate in state.gates)
+        if (
+            current.post_merge is None
+            or recovery is not None
+            or lifecycle
+            in {
+                SubTLLifecycle.RECOVERING,
+                SubTLLifecycle.HUMAN_GATE,
+            }
+            or has_gate
+        ):
+            return True
+    return False
+
+
+def _optional_child_completion_is_in_progress(state: RunState) -> bool:
+    """Defer proof holds while the child controller still has active work."""
+    phase = state.recursive_fsm
+    if phase is not None:
+        return isinstance(phase, (RecursiveTLPlanning, RecursiveTLRunning, RecursiveTLFinalizing))
+    return state.fsm.phase in {
+        TLPhase.TLPlanning,
+        TLPhase.TLRunning,
+        TLPhase.TLFinalizing,
+        TLPhase.TLDispatching,
+        TLPhase.TLWaiting,
+        TLPhase.TLMerging,
+    }
 
 
 def _optional_child_recovery_projection_matches(
