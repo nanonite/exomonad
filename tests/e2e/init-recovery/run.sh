@@ -2009,6 +2009,11 @@ PY
         || e2e_fail "workspace shutdown left the exact approved controller pane live"
     assert_one_live_window RecoveryKeeper
     tmux kill-window -t "$AGGREGATE_SESSION:Server" 2>/dev/null || true
+    python3 "$SCRIPT_DIR/configured-owner-resume.py" seed-wrong-route-successor \
+        --repo "$AGG_REPO" --baseline "$AGG_DIR/preexisting-opencode-owner.json" \
+        > "$AGG_DIR/legacy-wrong-route-successor-seed.json" \
+        || { cat "$AGG_DIR/legacy-wrong-route-successor-seed.json"; e2e_fail "could not seed the exact f446-to-f285 legacy route mismatch after explicit gate approval"; }
+    e2e_log "Seeded immutable Luna/xhigh generation-1 intent and terminal Sol/xhigh generation-2 successor; generation 1 remains in the Kani checkpoint"
     tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_SERVER_COMMAND"
     tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
     for _ in $(seq 1 100); do
@@ -2747,9 +2752,23 @@ if terminal_provider_failure:
         and entry.get("target") == "issue-814-substitution-model-kani"
         and entry.get("status") == "confirmed"
     ]
-    assert len(resume_actions) == 1
-    assert resume_actions[0]["arguments"]["route_reconciliation_source"] == "proven_terminal_provider_failure"
-    assert resume_actions[0]["arguments"]["dispatch_intent_id"] == leaf["dispatch_intent_id"]
+    historical = baseline.get("historical_wrong_route_successor")
+    expected_resume_count = 2 if isinstance(historical, dict) else 1
+    assert len(resume_actions) == expected_resume_count
+    if isinstance(historical, dict):
+        assert resume_actions[0] == historical["action"], "historical Sol result changed"
+        assert resume_actions[0]["arguments"]["desired_model"] == "gpt-6-luna"
+        assert resume_actions[0]["result"]["result"]["invocation"]["model"] == "gpt-6.1-sol"
+        assert resume_actions[0]["result"]["result"]["invocation"]["generation"] == 2
+        current_resume = resume_actions[1]
+        assert current_resume["arguments"]["expected_invocation_id"] == historical["invocation"]["invocation_id"]
+        assert current_resume["arguments"]["prior_generation"] == 2
+        assert current_resume["arguments"]["desired_model"] == "gpt-6-luna"
+        assert current_resume["result"]["result"]["invocation"]["generation"] == 3
+    else:
+        current_resume = resume_actions[0]
+    assert current_resume["arguments"]["route_reconciliation_source"] == "proven_terminal_provider_failure"
+    assert current_resume["arguments"]["dispatch_intent_id"] == leaf["dispatch_intent_id"]
     assert accepted["arguments"]["intent_id"] != leaf["dispatch_intent_id"]
 else:
     assert sum(entry.get("status") == "rejected" for entry in spawns) == 1

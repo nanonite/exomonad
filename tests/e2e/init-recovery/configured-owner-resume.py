@@ -303,7 +303,7 @@ def seed_terminal_provider_failure(
     (owner_dir / "identity.json").write_text(
         json.dumps(identity, sort_keys=True, indent=2) + "\n", encoding="utf-8"
     )
-    invocation_id = "e2e-historical-opencode-invocation"
+    invocation_id = "f4460477-40bf-4824-941b-dcc3d0ebc9a1"
     started_at = int(time.time()) - 30
     ended_at = started_at + 5
     original: dict[str, Any] = {
@@ -434,7 +434,7 @@ def seed_terminal_provider_failure(
         "source": "rust",
         "session_id": session_id,
         "data": {
-            "agent_type": "OpenCode",
+            "agent_type": "opencode",
             "branch": branch,
             "child_agent": owner_name,
             "effort": "high",
@@ -753,6 +753,240 @@ def seed_terminal_provider_failure(
     print(
         json.dumps(
             {"accepted_spawn": invocation_id, "terminal_status": original["status"]}
+        )
+    )
+
+
+def seed_confirmed_wrong_route_successor(repository: Path, baseline_path: Path) -> None:
+    """Retain the historical Luna-intent/Sol-successor record from #1299."""
+    from tl_loop.__main__ import _authoritative_ledger_run_id
+    from tl_loop.client.effects import ToolResult
+    from tl_loop.loop.driver import (
+        EffectIntent,
+        TLLoopConfig,
+        WorkPlan,
+        _blocked_leaf_resume_action_arguments,
+        _persist_terminal_route_authorization,
+        _terminal_owner_recovery_proof,
+    )
+    from tl_loop.loop.journal import EffectJournal
+    from tl_loop.select.capability import load_capability
+    from tl_loop.select.model import load_model_catalog
+    from tl_loop.select.policy import load_policy
+    from tl_loop.state.store import RunStore
+
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    if baseline.get("historical_dispatch_kind") != "accepted_terminal_provider_failure":
+        raise RuntimeError(
+            "wrong-route successor requires the accepted terminal-owner fixture"
+        )
+    root = repository / ".exo/tl-loop"
+    child_store = RunStore("kani", root / "root")
+    state = child_store.load()
+    current = state.slices.get(OWNER_SLICE)
+    if current is None or not isinstance(current.base_ref, str) or not current.base_ref:
+        raise RuntimeError("accepted Kani checkpoint has no parent branch binding")
+    if (
+        baseline["prior_invocation"]["invocation_id"]
+        != "f4460477-40bf-4824-941b-dcc3d0ebc9a1"
+    ):
+        raise RuntimeError(
+            "initial OpenCode fixture does not retain the exact f446 predecessor"
+        )
+    if current.dispatch_invocation_id != "f4460477-40bf-4824-941b-dcc3d0ebc9a1":
+        raise RuntimeError(
+            "Kani checkpoint no longer points at the original f446 invocation"
+        )
+    snapshot = json.loads((root / "plan.snapshot").read_text(encoding="utf-8"))
+    declarations = snapshot.get("plan", {}).get("sub_tls", [])
+    kani_declaration = next(
+        row
+        for row in declarations
+        if isinstance(row, dict) and row.get("name") == "kani"
+    )
+    plan = WorkPlan.from_mapping(kani_declaration["plan"])
+    init_records = read_json_lines(repository / ".exo/logs/init.jsonl")
+    resolved_rows = [
+        row.get("resolved")
+        for row in init_records
+        if isinstance(row.get("resolved"), dict)
+        and row["resolved"].get("role_route_config_fingerprint")
+    ]
+    if not resolved_rows:
+        raise RuntimeError("accepted init route configuration is unavailable")
+    resolved = resolved_rows[-1]
+    worker_effort = resolved.get("worker_effort")
+    if not isinstance(worker_effort, dict) or worker_effort.get("level") != "xhigh":
+        raise RuntimeError(
+            "accepted init configuration does not select xhigh worker effort"
+        )
+    policy_path = repository / ".exo/harness_policy.toml"
+    policy = load_policy(policy_path)
+    capabilities = load_capability(
+        repository / ".exo/harness_capability.toml", policy_path=policy_path
+    )
+    catalog = load_model_catalog(repository / ".exo/model-catalog.json")
+    config = TLLoopConfig(
+        active=True,
+        root_dir=root,
+        project_root=repository,
+        run_id=state.run_id,
+        ledger_run_id=_authoritative_ledger_run_id(repository),
+        branch=current.base_ref,
+        role="worker",
+        worktree=Path(state.owner_worktree)
+        if state.owner_worktree is not None
+        else None,
+        parent_run_id=state.parent_run_id,
+        parent_branch=state.parent_branch,
+        parent_agent_id=state.parent_agent_id,
+        depth=state.depth,
+        declared_manifest=state.plan_manifest,
+        policy=policy,
+        capabilities=capabilities,
+        catalog=catalog,
+        requested_model=resolved.get("worker_model"),
+        worker_effort_level=worker_effort.get("level"),
+        role_route_configuration_fingerprint=resolved.get(
+            "role_route_config_fingerprint"
+        ),
+    )
+    proof, reason = _terminal_owner_recovery_proof(plan, state, config, child_store)
+    if proof is None:
+        raise RuntimeError(
+            f"could not derive the accepted historical route authorization: {reason}"
+        )
+    if (
+        proof.resume.desired_harness != "codex/gpt-6-luna"
+        or proof.resume.desired_model != "gpt-6-luna"
+        or proof.resume.desired_effort != "xhigh"
+    ):
+        raise RuntimeError(
+            "production route selection did not resolve Codex Luna/xhigh"
+        )
+    state = _persist_terminal_route_authorization(proof, state, child_store)
+    arguments = dict(_blocked_leaf_resume_action_arguments(proof.resume, state))
+    arguments.pop("route_fingerprint", None)
+    if (
+        arguments.get("expected_invocation_id")
+        != baseline["prior_invocation"]["invocation_id"]
+        or arguments.get("prior_generation") != 1
+        or arguments.get("desired_model") != "gpt-6-luna"
+        or arguments.get("desired_effort") != "xhigh"
+    ):
+        raise RuntimeError(
+            "historical action is not anchored to f446 with Luna/xhigh intent"
+        )
+    intent_id = str(arguments["dispatch_intent_id"])
+    owner_dir = Path(baseline["owner_dir"])
+    owner_name = baseline["owner_agent_name"]
+    branch = baseline["branch"]
+    worktree = Path(baseline["worktree"]).resolve(strict=True)
+    successor_id = "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d"
+    journal = EffectJournal("kani", child_store.run_dir / "action-journal.json")
+    intent = EffectIntent("resume_blocked_leaf", OWNER_SLICE, arguments, True)
+    journal.append(intent)
+    response = ToolResult.from_raw(
+        {
+            "success": True,
+            "result": {
+                "chainlink_issue_id": BLOCKED_ISSUE_ID,
+                "agent": {
+                    "id": owner_name,
+                    "issue": OWNER_SLICE,
+                    "intent_id": intent_id,
+                    "agent_type": "codex",
+                    "model": "gpt-6.1-sol",
+                    "effort": "xhigh",
+                    "branch_name": branch,
+                    "worktree_path": str(worktree),
+                },
+                "invocation": {
+                    "invocation_id": successor_id,
+                    "generation": 2,
+                    "trigger": "resume_blocked",
+                    "runtime": "codex",
+                    "model": "gpt-6.1-sol",
+                    "effort": "xhigh",
+                    "status": "exited",
+                    "ended_at": int(time.time()) - 1,
+                    "exit_code": 0,
+                    "exit_reason": "one_shot_complete",
+                    "exit_classification": "one_shot_complete",
+                    "one_shot_complete": True,
+                    "branch": branch,
+                    "worktree": str(worktree),
+                    "prior_invocation_id": baseline["prior_invocation"][
+                        "invocation_id"
+                    ],
+                    "slice_id": OWNER_SLICE,
+                    "pr_number": None,
+                    "head_sha": None,
+                },
+            },
+        }
+    )
+    journal.mark_result(intent, response)
+    identity_path = owner_dir / "identity.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    if "role_route" in identity:
+        raise RuntimeError(
+            "legacy OpenCode predecessor unexpectedly has modern route provenance"
+        )
+    identity.update({"agent_type": "codex", "model": "gpt-6.1-sol", "effort": "xhigh"})
+    identity_path.write_text(json.dumps(identity, sort_keys=True, indent=2) + "\n")
+    successor = response.result["invocation"]
+    successor["runtime_agent_id"] = owner_name
+    invocation_path = owner_dir / "invocation.json"
+    persisted_successor = {
+        **successor,
+        "started_at": int(successor["ended_at"]) - 1,
+        "routing": {"window_id": "@999999"},
+    }
+    invocation_path.write_text(
+        json.dumps(persisted_successor, sort_keys=True, indent=2) + "\n"
+    )
+    if "role_route" in successor:
+        raise RuntimeError(
+            "legacy Sol successor unexpectedly has a modern route receipt"
+        )
+    (owner_dir / "dispatch_intent").write_text(intent_id + "\n", encoding="utf-8")
+    (owner_dir / "routing.json").write_text(
+        json.dumps(
+            {
+                "owner_agent_id": owner_name,
+                "owner_invocation_id": successor_id,
+                "owner_generation": 2,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    confirmed = journal.entries_for("resume_blocked_leaf", OWNER_SLICE)
+    if len(confirmed) != 1 or confirmed[0].get("status") != "confirmed":
+        raise RuntimeError("legacy confirmed resume action was not durably recorded")
+    baseline["historical_wrong_route_successor"] = {
+        "action": confirmed[0],
+        "invocation": successor,
+        "identity": identity,
+        "checkpoint_invocation_id": baseline["prior_invocation"]["invocation_id"],
+        "checkpoint_generation": 1,
+    }
+    baseline_path.write_text(json.dumps(baseline, sort_keys=True, indent=2) + "\n")
+    print(
+        json.dumps(
+            {
+                "intent_invocation": baseline["prior_invocation"]["invocation_id"],
+                "intent_generation": 1,
+                "actual_invocation": successor_id,
+                "actual_generation": 2,
+                "actual_route": "codex/gpt-6.1-sol/xhigh",
+                "checkpoint_still_bound_to": baseline["prior_invocation"][
+                    "invocation_id"
+                ],
+            },
+            sort_keys=True,
         )
     )
 
@@ -1106,7 +1340,12 @@ def verify_controller(
     publication = leaf["publication"]
     head_sha = publication["head_sha"]
     identity = json.loads((owner_dir / "identity.json").read_text(encoding="utf-8"))
-    prior = baseline["prior_invocation"]
+    historical_wrong_route = baseline.get("historical_wrong_route_successor")
+    prior = (
+        historical_wrong_route["invocation"]
+        if isinstance(historical_wrong_route, dict)
+        else baseline["prior_invocation"]
+    )
     if (
         successor.get("runtime") != "codex"
         or successor.get("model") != "gpt-6-luna"
@@ -1210,9 +1449,17 @@ def verify_controller(
         and row.get("target") == OWNER_SLICE
         and row.get("status") == "confirmed"
     ]
-    if len(resume_rows) != 1:
+    expected_resume_count = 2 if isinstance(historical_wrong_route, dict) else 1
+    if len(resume_rows) != expected_resume_count:
         raise RuntimeError(
-            f"controller did not retain exactly one confirmed resume action: {resume_rows!r}"
+            "controller did not retain the expected immutable historical action and current "
+            f"resume action: {resume_rows!r}"
+        )
+    if isinstance(historical_wrong_route, dict) and resume_rows[
+        0
+    ] != historical_wrong_route.get("action"):
+        raise RuntimeError(
+            "controller rewrote the confirmed historical Sol successor result"
         )
     init_log = repository / ".exo/logs/init.jsonl"
     init_records = read_json_lines(init_log)
@@ -1229,7 +1476,7 @@ def verify_controller(
             "disposable init did not retain one consistent accepted route configuration fingerprint"
         )
     accepted_configuration_fingerprint = next(iter(accepted_fingerprints))
-    resume_arguments = resume_rows[0].get("arguments")
+    resume_arguments = resume_rows[-1].get("arguments")
     if not isinstance(resume_arguments, dict):
         raise TypeError("confirmed resume journal lacks its accepted route arguments")
     expected_route = {
@@ -1319,7 +1566,7 @@ def verify_controller(
             raise RuntimeError(
                 "resume route authorization does not match the captured explicit gate decision"
             )
-    response_payload = (resume_rows[0].get("result") or {}).get("result")
+    response_payload = (resume_rows[-1].get("result") or {}).get("result")
     if not isinstance(response_payload, dict):
         raise TypeError("confirmed resume journal lacks its typed response payload")
     response_agent = response_payload.get("agent")
@@ -1337,6 +1584,41 @@ def verify_controller(
         raise RuntimeError(
             "accepted route provenance differs across response receipts and durable owner records"
         )
+    if isinstance(historical_wrong_route, dict):
+        old_action = resume_rows[0]
+        old_result = (old_action.get("result") or {}).get("result") or {}
+        old_agent = old_result.get("agent") or {}
+        old_invocation = old_result.get("invocation") or {}
+        if (
+            old_action.get("arguments", {}).get("expected_invocation_id")
+            != baseline["prior_invocation"]["invocation_id"]
+            or old_action.get("arguments", {}).get("prior_generation") != 1
+            or old_action.get("arguments", {}).get("desired_model") != "gpt-6-luna"
+            or old_action.get("arguments", {}).get("desired_effort") != "xhigh"
+            or "route_fingerprint" in old_action.get("arguments", {})
+            or old_agent.get("agent_type") != "codex"
+            or old_agent.get("model") != "gpt-6.1-sol"
+            or old_agent.get("effort") != "xhigh"
+            or old_invocation.get("invocation_id")
+            != historical_wrong_route.get("invocation", {}).get("invocation_id")
+            or old_invocation.get("generation") != 2
+            or old_invocation.get("runtime") != "codex"
+            or old_invocation.get("model") != "gpt-6.1-sol"
+            or old_invocation.get("effort") != "xhigh"
+            or old_invocation.get("exit_code") != 0
+            or old_invocation.get("exit_classification") != "one_shot_complete"
+            or old_invocation.get("pr_number") is not None
+            or old_invocation.get("head_sha") is not None
+            or resume_arguments.get("expected_invocation_id")
+            != old_invocation.get("invocation_id")
+            or resume_arguments.get("prior_generation") != 2
+            or successor.get("generation") != 3
+            or successor.get("prior_invocation_id")
+            != old_invocation.get("invocation_id")
+        ):
+            raise RuntimeError(
+                "generation-three recovery did not preserve and supersede the exact Sol/xhigh generation-two history"
+            )
     ledger = canonical_events(repository)
     owner_invocations = [
         row
@@ -1386,6 +1668,7 @@ def verify_controller(
 
     record = {
         "historical_dispatch_kind": baseline.get("historical_dispatch_kind"),
+        "historical_wrong_route_successor": historical_wrong_route,
         "route_less_host_refusal": baseline.get("route_less_host_refusal"),
         "terminal_recovery_gate": baseline.get("terminal_recovery_gate"),
         "accepted_spawn_journal": baseline.get("accepted_spawn_journal"),
@@ -1588,9 +1871,11 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
         and row.get("target") == OWNER_SLICE
         and row.get("status") == "confirmed"
     ]
+    historical_wrong_route = evidence.get("historical_wrong_route_successor")
+    expected_resume_count = 2 if isinstance(historical_wrong_route, dict) else 1
     if (
-        len(resume_actions) != 1
-        or (resume_actions[0].get("result") or {})
+        len(resume_actions) != expected_resume_count
+        or (resume_actions[-1].get("result") or {})
         .get("result", {})
         .get("agent", {})
         .get("invocation_id")
@@ -1601,19 +1886,25 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
         )
     expected_route = evidence.get("accepted_role_route")
     identity = json.loads((owner_dir / "identity.json").read_text(encoding="utf-8"))
+    if isinstance(historical_wrong_route, dict) and resume_actions[
+        0
+    ] != historical_wrong_route.get("action"):
+        raise RuntimeError(
+            "repeat init changed the confirmed historical Sol successor result"
+        )
     if (
         not isinstance(expected_route, dict)
         or identity.get("role_route") != expected_route
         or current_invocation.get("role_route") != expected_route
-        or (resume_actions[0].get("arguments") or {}).get(
+        or (resume_actions[-1].get("arguments") or {}).get(
             "route_configuration_fingerprint"
         )
         != evidence.get("accepted_route_configuration_fingerprint")
-        or ((resume_actions[0].get("result") or {}).get("result") or {})
+        or ((resume_actions[-1].get("result") or {}).get("result") or {})
         .get("agent", {})
         .get("role_route")
         != expected_route
-        or ((resume_actions[0].get("result") or {}).get("result") or {})
+        or ((resume_actions[-1].get("result") or {}).get("result") or {})
         .get("invocation", {})
         .get("role_route")
         != expected_route
@@ -1781,7 +2072,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "mode",
-        choices=("seed", "seed-terminal", "verify-controller", "verify-repeat"),
+        choices=(
+            "seed",
+            "seed-terminal",
+            "seed-wrong-route-successor",
+            "verify-controller",
+            "verify-repeat",
+        ),
     )
     parser.add_argument("--repo", required=True, type=Path)
     parser.add_argument("--baseline", type=Path)
@@ -1801,6 +2098,10 @@ def main() -> None:
             arguments.output,
             seed_parent_stall=arguments.historical_parent_stall,
         )
+    elif arguments.mode == "seed-wrong-route-successor":
+        if arguments.baseline is None:
+            parser.error("seed-wrong-route-successor requires --baseline")
+        seed_confirmed_wrong_route_successor(arguments.repo, arguments.baseline)
     elif arguments.mode == "verify-controller":
         if arguments.baseline is None or arguments.output is None:
             parser.error("verify-controller requires --baseline and --output")
