@@ -6,6 +6,22 @@ from dataclasses import dataclass
 
 SUPPORTED_AGENT_TYPES = frozenset({"claude", "codex", "opencode", "shoal"})
 
+_RUNTIME_LABELS = {
+    "Claude": "claude",
+    "claude": "claude",
+    "Codex": "codex",
+    "codex": "codex",
+    "OpenCode": "opencode",
+    "opencode": "opencode",
+    "Shoal": "shoal",
+    "shoal": "shoal",
+}
+
+
+def normalize_runtime_label(value: object) -> str | None:
+    """Return a canonical runtime for an exact supported wire or Rust Debug label."""
+    return _RUNTIME_LABELS.get(value) if isinstance(value, str) else None
+
 
 @dataclass(frozen=True)
 class HarnessRoute:

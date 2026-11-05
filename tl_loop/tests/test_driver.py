@@ -20752,6 +20752,64 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
     assert not any(name == "resume_blocked_leaf" for name, _ in repeated_transport.calls)
 
 
+@pytest.mark.parametrize(
+    ("prior_runtime", "prior_model", "producer_runtime"),
+    (
+        ("opencode", "opencode-go/deepseek-v4.1-flash", "OpenCode"),
+        ("codex", "gpt-6.1-sol", "Codex"),
+        ("claude", "claude-sonnet-4-5", "Claude"),
+    ),
+)
+def test_terminal_recovery_accepts_supported_producer_runtime_spelling(
+    tmp_path: Path,
+    prior_runtime: str,
+    prior_model: str,
+    producer_runtime: str,
+) -> None:
+    plan, config, store, _, _, _ = _seed_terminal_provider_failure_leaf(
+        tmp_path,
+        prior_runtime=prior_runtime,
+        prior_model=prior_model,
+    )
+    ledger_path = (
+        Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
+    )
+    events = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()]
+    spawn_event = next(event for event in events if event.get("type") == "agent.spawned")
+    spawn_event["data"]["agent_type"] = producer_runtime
+    ledger_path.write_text("".join(json.dumps(event, sort_keys=True) + "\n" for event in events))
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+
+    assert proof is not None, reason
+    assert proof.resume.owner.runtime == prior_runtime
+    assert proof.resume.owner.invocation_record["runtime"] == prior_runtime
+
+
+@pytest.mark.parametrize(
+    ("producer_runtime", "reason_fragment"),
+    (("OPENCODE", "unsupported"), ("Codex", "conflict")),
+)
+def test_terminal_recovery_rejects_unknown_or_conflicting_producer_runtime(
+    tmp_path: Path,
+    producer_runtime: str,
+    reason_fragment: str,
+) -> None:
+    plan, config, store, _, _, _ = _seed_terminal_provider_failure_leaf(tmp_path)
+    ledger_path = (
+        Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
+    )
+    events = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()]
+    spawn_event = next(event for event in events if event.get("type") == "agent.spawned")
+    spawn_event["data"]["agent_type"] = producer_runtime
+    ledger_path.write_text("".join(json.dumps(event, sort_keys=True) + "\n" for event in events))
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+
+    assert proof is None
+    assert reason is not None and reason_fragment in reason
+
+
 def test_terminal_recovery_reconciles_confirmed_wrong_route_successor_before_current_route(
     tmp_path: Path,
 ) -> None:
@@ -20990,6 +21048,17 @@ def test_terminal_resume_history_accepts_multiple_stopped_successors_and_route_r
     plan, config, store, owner_dir, owner_name, original_id = _seed_terminal_provider_failure_leaf(
         tmp_path
     )
+    ledger_path = (
+        Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
+    )
+    ledger_rows = [
+        json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()
+    ]
+    accepted_spawn = next(row for row in ledger_rows if row.get("type") == "agent.spawned")
+    accepted_spawn["data"]["agent_type"] = "OpenCode"
+    ledger_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in ledger_rows), encoding="utf-8"
+    )
     proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
     assert proof is not None, reason
     driver_module._persist_terminal_route_authorization(proof, store.load(), store)
@@ -21047,12 +21116,15 @@ def test_terminal_resume_history_accepts_multiple_stopped_successors_and_route_r
         *,
         effort: str = "xhigh",
         legacy: bool,
+        prior_runtime_label: str | None = None,
     ) -> Mapping[str, object]:
         runtime = current_proof.resume.desired_agent_type
         assert isinstance(runtime, str)
         arguments = dict(
             driver_module._blocked_leaf_resume_action_arguments(current_proof.resume, store.load())
         )
+        if prior_runtime_label is not None:
+            arguments["prior_runtime"] = prior_runtime_label
         route = driver_module._blocked_resume_role_route_response(current_proof.resume)
         assert route is not None
         if legacy:
@@ -21149,6 +21221,7 @@ def test_terminal_resume_history_accepts_multiple_stopped_successors_and_route_r
         original_id,
         "gpt-6.1-sol",
         legacy=True,
+        prior_runtime_label="OpenCode",
     )
     proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
     assert proof is not None, reason

@@ -434,7 +434,7 @@ def seed_terminal_provider_failure(
         "source": "rust",
         "session_id": session_id,
         "data": {
-            "agent_type": "opencode",
+            "agent_type": "OpenCode",
             "branch": branch,
             "child_agent": owner_name,
             "effort": "high",

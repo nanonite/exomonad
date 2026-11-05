@@ -239,7 +239,7 @@ from tl_loop.select.agent_type import (
     selection_failure,
 )
 from tl_loop.select.capability import CapabilityMap, load_capability
-from tl_loop.select.harness import HarnessRoute
+from tl_loop.select.harness import HarnessRoute, normalize_runtime_label
 from tl_loop.select.learned_policy import LearnedPolicy
 from tl_loop.select.ledger import apply_spawn_and_charge
 from tl_loop.select.model import ModelCatalog, select_model, select_model_for_difficulty
@@ -5204,6 +5204,16 @@ def _terminal_resume_authorization_matches(
     for record in records:
         if not isinstance(record, Mapping) or record.get("digest") != digest:
             continue
+        record_prior_raw = record.get("prior_runtime")
+        argument_prior_raw = arguments.get("prior_runtime")
+        if record_prior_raw is None or argument_prior_raw is None:
+            same_prior_runtime = record_prior_raw is None and argument_prior_raw is None
+        else:
+            record_prior_runtime = normalize_runtime_label(record_prior_raw)
+            argument_prior_runtime = normalize_runtime_label(argument_prior_raw)
+            same_prior_runtime = (
+                record_prior_runtime is not None and record_prior_runtime == argument_prior_runtime
+            )
         base_matches = (
             record.get("source") == "accepted_operator_role_configuration"
             and record.get("manifest_digest") == state.plan_manifest.digest
@@ -5242,7 +5252,7 @@ def _terminal_resume_authorization_matches(
                 == arguments.get("expected_worktree_fingerprint"),
                 record.get("accepted_spawn_event_seq") == arguments.get("accepted_spawn_event_seq"),
                 record.get("blocker_event_seq") == arguments.get("blocker_event_seq"),
-                record.get("prior_runtime") == arguments.get("prior_runtime"),
+                same_prior_runtime,
                 record.get("prior_model") == arguments.get("prior_model"),
                 record.get("prior_effort") == arguments.get("prior_effort"),
             )
@@ -5300,7 +5310,14 @@ def _terminal_resume_history_proof(
     expected_generation: int | None = None
     route_fields = ("agent_type", "model", "effort")
     for field_name, observed in zip(route_fields, initial_spawn_route, strict=True):
-        if field_name in spawn_arguments and spawn_arguments[field_name] != observed:
+        if field_name not in spawn_arguments:
+            continue
+        argument_value = spawn_arguments[field_name]
+        if field_name == "agent_type":
+            argument_value = normalize_runtime_label(argument_value)
+            if argument_value is None:
+                return None, "accepted spawn journal contains an unsupported runtime label"
+        if argument_value != observed:
             return None, "accepted spawn arguments conflict with authoritative invocation route"
     expected_route = initial_spawn_route
     try:
@@ -5349,11 +5366,16 @@ def _terminal_resume_history_proof(
         if arguments.get("prior_generation") != expected_generation:
             return None, "resume history invocation generations are discontinuous"
         prior_fields = ("prior_runtime", "prior_model", "prior_effort")
-        if any(
-            field_name in arguments and arguments[field_name] != observed
-            for field_name, observed in zip(prior_fields, expected_route, strict=True)
-        ):
-            return None, "resume history prior route conflicts with the preceding invocation"
+        for field_name, observed in zip(prior_fields, expected_route, strict=True):
+            if field_name not in arguments:
+                continue
+            prior_value = arguments[field_name]
+            if field_name == "prior_runtime":
+                prior_value = normalize_runtime_label(prior_value)
+                if prior_value is None:
+                    return None, "resume history contains an unsupported prior runtime label"
+            if prior_value != observed:
+                return None, "resume history prior route conflicts with the preceding invocation"
         if status in {"not_dispatched"} or _is_legacy_missing_role_route_refusal(entry):
             continue
         if status in {"intended", "unknown"}:
@@ -6555,6 +6577,10 @@ def _terminal_owner_ledger_proof(
         )
     ):
         return None, "accepted spawn ledger row lacks authoritative runtime/model/effort evidence"
+    canonical_runtime = normalize_runtime_label(spawn_route[0])
+    if canonical_runtime is None:
+        return None, "accepted spawn ledger row contains an unsupported runtime label"
+    spawn_route = (canonical_runtime, spawn_route[1], spawn_route[2])
     blocked = [
         event
         for event in rows.events
