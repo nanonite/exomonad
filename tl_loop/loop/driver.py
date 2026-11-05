@@ -19361,15 +19361,69 @@ def _scope_handoff_is_unresolved(effects_log: list[EffectIntent], handoff_id: st
     )
 
 
+_SHUTDOWN_REOPEN_ATTEMPTS = 3
+
+
+def _workspace_shutdown_recorded(
+    project_root: Path,
+    agent_id: str,
+    invocation_id: str,
+    generation: int,
+) -> bool:
+    """Whether a completed workspace shutdown names this exact controller."""
+    archive = project_root / ".exo" / "controller-lifecycle" / "archive"
+    try:
+        records = tuple(archive.glob("*.json"))
+    except OSError:
+        return False
+    for path in records:
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(record, Mapping) or record.get("phase") != "complete":
+            continue
+        controllers = record.get("controllers")
+        if not isinstance(controllers, list):
+            continue
+        if any(
+            isinstance(controller, Mapping)
+            and controller.get("agent_id") == agent_id
+            and controller.get("invocation_id") == invocation_id
+            and controller.get("generation") == generation
+            for controller in controllers
+        ):
+            return True
+    return False
+
+
 def _child_controller_shutdown_matches(
     current: SliceState | None,
     task: SubTLTask,
     config: TLLoopConfig,
 ) -> bool:
-    """Whether this child dispatch points at a controller stopped by workspace shutdown."""
+    """Whether this exact accepted dispatch points at a workspace-shutdown stop."""
     if config.project_root is None or current is None:
         return False
-    agent_id = current.dispatch_agent_id or _child_controller_name(task)
+    if (
+        current.status is not SliceStatus.SPAWNED
+        or current.dispatch_last_boundary
+        not in {
+            SUB_TL_DISPATCH_STARTED_BOUNDARY,
+            SUB_TL_DISPATCH_RECOVERED_BOUNDARY,
+        }
+        or not isinstance(current.dispatch_invocation_id, str)
+        or not current.dispatch_invocation_id
+        or not isinstance(current.dispatch_agent_id, str)
+        or not current.dispatch_agent_id
+        or not isinstance(current.dispatch_intent_id, str)
+        or not current.dispatch_intent_id
+        or type(current.dispatch_generation) is not int
+        or current.dispatch_generation < 0
+        or current.dispatch_authoritative_event_seq is None
+    ):
+        return False
+    agent_id = current.dispatch_agent_id
     try:
         invocation = json.loads(
             (
@@ -19378,13 +19432,31 @@ def _child_controller_shutdown_matches(
         )
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
-    return bool(
-        isinstance(invocation, Mapping)
-        and invocation.get("status") in {"exited", "failed", "killed"}
-        and invocation.get("exit_reason") == "workspace control-plane shutdown"
+    if not isinstance(invocation, Mapping):
+        return False
+    generation = invocation.get("generation")
+    if type(generation) is not int:
+        return False
+    shutdown_outcome = (
+        invocation.get("exit_reason") == "workspace control-plane shutdown"
         and invocation.get("exit_classification") == "workspace_control_plane_shutdown"
-        and invocation.get("runtime_agent_id") in {None, agent_id}
-        and invocation.get("slice_id") in {None, task.name}
+    ) or (
+        invocation.get("status") in {"exited", "failed", "killed"}
+        and invocation.get("exit_classification") == "missing_exit_marker"
+        and _workspace_shutdown_recorded(
+            Path(config.project_root),
+            agent_id,
+            str(current.dispatch_invocation_id),
+            generation,
+        )
+    )
+    return bool(
+        shutdown_outcome
+        and invocation.get("invocation_id") == current.dispatch_invocation_id
+        and invocation.get("runtime_agent_id") == agent_id
+        and generation == current.dispatch_generation
+        and invocation.get("slice_id") == task.name
+        and invocation.get("status") in {"exited", "failed", "killed"}
         and (current.branch is None or invocation.get("branch") == current.branch)
         and (
             current.worktree is None
@@ -19392,6 +19464,23 @@ def _child_controller_shutdown_matches(
             == Path(current.worktree).resolve()
         )
     )
+
+
+def _shutdown_sub_tl_reopen_updates(
+    plan: WorkPlan,
+    state: RunState,
+    config: TLLoopConfig,
+) -> dict[str, SliceState]:
+    """Assess the latest checkpoint for exact shutdown dispatches to reopen."""
+    updates: dict[str, SliceState] = {}
+    for task in plan.sub_tls:
+        current = state.slices.get(task.name)
+        if not _child_controller_shutdown_matches(current, task, config):
+            continue
+        assert current is not None
+        reopened = slice_transition(current, SliceStatusChanged(SliceStatus.PENDING))
+        updates[task.name] = replace(reopened, park_cause=None, recovery=None)
+    return updates
 
 
 def _reopen_shutdown_sub_tl_dispatches(
@@ -19406,40 +19495,38 @@ def _reopen_shutdown_sub_tl_dispatches(
     not fabricate a child failure. The next continue must therefore reopen the
     exact accepted child dispatch instead of treating the shell's dead pane as
     a live controller forever. Only the explicit workspace-shutdown outcome is
-    accepted, and only after the durable invocation still matches the child
-    slice's branch, worktree and agent identity.
+    accepted, and only when the durable invocation id, owner, generation,
+    slice, branch and worktree still match the accepted dispatch.
+
+    Persistence is revision-checked and bounded. Each conflict reloads and
+    reassesses the latest checkpoint and durable invocation, so a newer
+    accepted binding, operator decision or coordinate change invalidates the
+    stale reopen instead of being overwritten.
     """
-    updates: dict[str, SliceState] = {}
-    for task in plan.sub_tls:
-        current = state.slices.get(task.name)
-        if (
-            current is None
-            or current.status is not SliceStatus.SPAWNED
-            or current.dispatch_last_boundary
-            not in {
-                SUB_TL_DISPATCH_STARTED_BOUNDARY,
-                SUB_TL_DISPATCH_RECOVERED_BOUNDARY,
-            }
-            or not _child_controller_shutdown_matches(current, task, config)
-        ):
+    del state
+    for _attempt in range(_SHUTDOWN_REOPEN_ATTEMPTS):
+        latest = store.load()
+        updates = _shutdown_sub_tl_reopen_updates(plan, latest, config)
+        if not updates:
+            return latest
+        sub_tl_recovery = dict(latest.integration.sub_tl_recovery)
+        for name in updates:
+            sub_tl_recovery.pop(name, None)
+        integration = replace(latest.integration, sub_tl_recovery=sub_tl_recovery)
+        try:
+            return store.checkpoint(
+                _phase_from_state(latest),
+                {**latest.slices, **updates},
+                latest.budgets,
+                latest.events.last_consumed_offset,
+                current_order=latest.current_order,
+                ordered_stages=latest.ordered_stages,
+                integration=integration,
+                expected_revision=latest.revision,
+            )
+        except CheckpointConflict:
             continue
-        reopened = slice_transition(current, SliceStatusChanged(SliceStatus.PENDING))
-        updates[task.name] = replace(reopened, park_cause=None, recovery=None)
-    if not updates:
-        return state
-    sub_tl_recovery = dict(state.integration.sub_tl_recovery)
-    for name in updates:
-        sub_tl_recovery.pop(name, None)
-    integration = replace(state.integration, sub_tl_recovery=sub_tl_recovery)
-    return store.checkpoint(
-        _phase_from_state(state),
-        {**state.slices, **updates},
-        state.budgets,
-        state.events.last_consumed_offset,
-        current_order=state.current_order,
-        ordered_stages=state.ordered_stages,
-        integration=integration,
-    )
+    return store.load()
 
 
 def _run_sub_tls(
@@ -19454,6 +19541,9 @@ def _run_sub_tls(
     """Run recursive children in deterministic, bounded order batches."""
     if not plan.sub_tls:
         return state
+    for task in plan.sub_tls:
+        _adopt_live_child_controller_invocation(config, task)
+    state = store.load()
     state = _reopen_shutdown_sub_tl_dispatches(plan, state, config, store)
     state, completion_hold = _reconcile_optional_sub_tl_completion(
         plan, config, effects, store, effects_log
@@ -20150,6 +20240,8 @@ def _run_sub_tl_batch(
     budgets: BudgetLedger,
 ) -> tuple[tuple[SubTLTask, TLPhase | None, RunState | None], ...]:
     """Run one bounded batch and collect outcomes in plan order."""
+    for task in tasks:
+        _adopt_live_child_controller_invocation(config, task)
     if (
         config.active
         and isinstance(effects, EffectClient)
@@ -20234,6 +20326,8 @@ def _run_live_sub_tl_batch(
     budgets: BudgetLedger,
 ) -> tuple[tuple[SubTLTask, TLPhase | None, RunState | None], ...]:
     """Run live children as independently owned controller processes."""
+    for task in tasks:
+        _adopt_live_child_controller_invocation(config, task)
     if "fork" not in multiprocessing.get_all_start_methods():
         raise TLLoopError("live ordered sub-TLs require fork-capable controller isolation")
     context = multiprocessing.get_context("fork")
@@ -20380,6 +20474,75 @@ def _persist_child_startup_failure(child_store: RunStore, reason: str) -> None:
         return
 
 
+def _adopt_live_child_controller_invocation(
+    config: TLLoopConfig,
+    task: SubTLTask,
+) -> None:
+    """Bind the parent to a live controller_restart successor with exact lineage."""
+    if config.project_root is None:
+        return
+    parent_store = RunStore(config.run_id, config.root_dir)
+    if not parent_store.path.exists():
+        return
+    for _attempt in range(MAX_ORDERED_INVOCATION_CHECKPOINT_ATTEMPTS):
+        try:
+            state = parent_store.load()
+        except (OSError, ValueError):
+            return
+        current = state.slices.get(task.name)
+        if (
+            current is None
+            or current.status is not SliceStatus.SPAWNED
+            or not isinstance(current.dispatch_invocation_id, str)
+            or not current.dispatch_invocation_id
+        ):
+            return
+        agent_id = current.dispatch_agent_id or _child_controller_name(task)
+        try:
+            invocation = json.loads(
+                (
+                    Path(config.project_root) / ".exo" / "agents" / agent_id / "invocation.json"
+                ).read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return
+        if not isinstance(invocation, Mapping):
+            return
+        invocation_id = invocation.get("invocation_id")
+        generation = invocation.get("generation")
+        if (
+            not isinstance(invocation_id, str)
+            or not invocation_id
+            or invocation_id == current.dispatch_invocation_id
+            or invocation.get("status") != "running"
+            or invocation.get("runtime_agent_id") != agent_id
+            or invocation.get("slice_id") != task.name
+            or invocation.get("trigger") != "controller_restart"
+            or invocation.get("prior_invocation_id") != current.dispatch_invocation_id
+            or type(generation) is not int
+            or generation < 1
+            or (
+                type(current.dispatch_generation) is int
+                and generation != current.dispatch_generation + 1
+            )
+            or (current.branch is None or invocation.get("branch") != current.branch)
+            or (
+                current.worktree is not None
+                and Path(str(invocation.get("worktree", ""))).resolve()
+                != Path(current.worktree).resolve()
+            )
+        ):
+            return
+        try:
+            _checkpoint_ordered_sub_tl_invocation(
+                parent_store, task.name, invocation_id, generation=generation
+            )
+            return
+        except CheckpointConflict:
+            continue
+    return
+
+
 def _supervise_live_sub_tl(
     process: multiprocessing.Process,
     child_store: RunStore,
@@ -20390,6 +20553,8 @@ def _supervise_live_sub_tl(
     terminal_owner_recovery: bool = False,
 ) -> RunState | None:
     """Supervise a child until it resolves or explicit cancellation is requested."""
+    if task is not None:
+        _adopt_live_child_controller_invocation(config, task)
     poll_interval = max(config.poll_interval, 0.05)
     cancelled = False
     while process.is_alive():
@@ -20401,6 +20566,8 @@ def _supervise_live_sub_tl(
             _persist_child_startup_failure(child_store, reason)
             _record_child_exit_reason(child_store, reason, outcome="cancelled")
             break
+        if task is not None:
+            _adopt_live_child_controller_invocation(config, task)
         try:
             child_state = child_store.load()
         except (OSError, ValueError):
@@ -20656,6 +20823,8 @@ def _checkpoint_ordered_sub_tl_invocation(
     store: RunStore,
     child_id: str,
     invocation_id: str,
+    *,
+    generation: int | None = None,
 ) -> None:
     """Persist the server-confirmed invocation across the parent FSM and slice."""
     if not isinstance(invocation_id, str) or not invocation_id.strip():
@@ -20708,6 +20877,9 @@ def _checkpoint_ordered_sub_tl_invocation(
         slices[child_id] = replace(
             target,
             dispatch_invocation_id=invocation_id,
+            dispatch_generation=(
+                generation if generation is not None else target.dispatch_generation
+            ),
             recovery=recovery,
         )
         updated_fsm = replace(

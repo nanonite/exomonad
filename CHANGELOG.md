@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Bind shutdown reopening to the exact accepted controller invocation and preserve concurrent checkpoints (#1314)
 - Re-provision child controllers stopped by an explicit workspace shutdown (#1311)
 - Fix continuation across repeated model, effort, and harness route changes (#1314)
 - Fix continuation after settled worker-lifecycle blockers on adopted successors (#1316)

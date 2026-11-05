@@ -620,6 +620,9 @@ PY
     install -m 0755 "$SCRIPT_DIR/fake-codex.sh" "$FAKE_CODEX_BIN/claude"
     install -m 0755 "$SCRIPT_DIR/fake-codex.sh" "$FAKE_CODEX_BIN/opencode"
     augment_repeated_worker_capabilities
+    python3 "$SCRIPT_DIR/configured-owner-resume.py" bind-child-controller \
+        --repo "$AGG_REPO" > "$AGG_DIR/repeated-child-binding.log" 2>&1 \
+        || { cat "$AGG_DIR/repeated-child-binding.log"; e2e_fail "could not bind the seeded parent to the live Kani controller"; }
     local cycle=0 spec harness model effort attempt init_pid init_status
     for spec in "${specs[@]}"; do
         cycle=$((cycle + 1))
@@ -629,7 +632,6 @@ PY
         write_repeated_worker_policy "$harness/$model"
         python3 "$SCRIPT_DIR/configured-owner-resume.py" reset-child-controller             --repo "$AGG_REPO" > "$AGG_DIR/repeated-cycle-$cycle-child-reset.log" 2>&1 \
             || { cat "$AGG_DIR/repeated-cycle-$cycle-child-reset.log"; e2e_fail "could not reopen the disposable child controller dispatch"; }
-        reset_repeated_session
         restart_repeated_server "$attempt" "$harness" "$model" "$effort"
         HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
             "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
@@ -637,6 +639,8 @@ PY
         init_pid=$!
         local started=""
         for _ in $(seq 1 1200); do
+            python3 "$SCRIPT_DIR/configured-owner-resume.py" bind-child-controller \
+                --repo "$AGG_REPO" > "$AGG_DIR/repeated-cycle-$cycle-child-binding.log" 2>&1 || true
             started="$(python3 - "$E2E_AGENT_LOG" "$attempt" <<'PY'
 import json
 import sys
@@ -693,6 +697,31 @@ PY
         done
         [[ "$terminal" == "ready" ]] \
             || e2e_fail "repeated transition $cycle did not finish as one terminal no-PR successor: $terminal"
+        local binding=""
+        for _ in $(seq 1 600); do
+            python3 "$SCRIPT_DIR/configured-owner-resume.py" bind-child-controller \
+                --repo "$AGG_REPO" > "$AGG_DIR/repeated-cycle-$cycle-child-binding.log" 2>&1 || true
+            binding="$(python3 - "$AGG_REPO" <<'PYBIND'
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+root = json.loads((repo / ".exo/tl-loop/root/run.json").read_text())
+controller = json.loads((repo / ".exo/agents/kani/invocation.json").read_text())
+slice_state = root["slices"]["kani"]
+ready = (
+    slice_state.get("dispatch_invocation_id") == controller.get("invocation_id")
+    and slice_state.get("dispatch_generation") == controller.get("generation")
+)
+print("ready" if ready else "waiting")
+PYBIND
+)"
+            [[ "$binding" == "ready" ]] && break
+            sleep 0.05
+        done
+        [[ "$binding" == "ready" ]] \
+            || e2e_fail "repeated transition $cycle parent/child invocation binding did not settle before shutdown"
         (
             cd "$AGG_REPO"
             HOME="$AGG_HOME" "$EXOMONAD_BIN" shutdown --workspace
@@ -702,6 +731,34 @@ PY
             [[ ! -S "$AGG_REPO/.exo/server.sock" ]] && break
             sleep 0.05
         done
+        local settled=""
+        for _ in $(seq 1 600); do
+            settled="$(python3 - "$AGG_REPO" <<'PYTERMINAL'
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+try:
+    root = json.loads((repo / ".exo/tl-loop/root/run.json").read_text())
+    controller = json.loads((repo / ".exo/agents/kani/invocation.json").read_text())
+except (OSError, json.JSONDecodeError):
+    print("waiting")
+    raise SystemExit(0)
+slice_state = root["slices"]["kani"]
+ready = (
+    controller.get("status") in {"exited", "failed", "killed"}
+    and slice_state.get("dispatch_invocation_id") == controller.get("invocation_id")
+    and slice_state.get("dispatch_generation") == controller.get("generation")
+)
+print("ready" if ready else "waiting")
+PYTERMINAL
+)"
+            [[ "$settled" == "ready" ]] && break
+            sleep 0.05
+        done
+        [[ "$settled" == "ready" ]] \
+            || e2e_fail "repeated transition $cycle controller did not settle to an exact terminal binding before the next init"
         REPEATED_CONTROLLER_WINDOW="$(python3 - "$AGG_REPO/.exo/tl-loop/root/controller-target.json" <<'PYTARGET'
 import json
 import sys

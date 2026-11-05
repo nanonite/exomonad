@@ -25305,6 +25305,7 @@ def test_workspace_shutdown_reopens_exact_child_dispatch_for_reprovision(
         dispatch_invocation_id="workspace-shutdown-child-invocation",
         dispatch_intent_id="workspace-shutdown-child-intent",
         dispatch_authoritative_event_seq=1,
+        dispatch_generation=1,
         dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
         worktree=worktree,
     )
@@ -25321,6 +25322,7 @@ def test_workspace_shutdown_reopens_exact_child_dispatch_for_reprovision(
     owner_dir.mkdir(parents=True)
     invocation = {
         "invocation_id": "workspace-shutdown-child-invocation",
+        "generation": 1,
         "status": "killed",
         "runtime_agent_id": "child-controller",
         "slice_id": "child-controller",
@@ -25366,3 +25368,365 @@ def test_workspace_shutdown_reopens_exact_child_dispatch_for_reprovision(
     (owner_dir / "invocation.json").write_text(json.dumps(invocation), encoding="utf-8")
     unchanged = driver_module._reopen_shutdown_sub_tl_dispatches(plan, store.load(), config, store)
     assert unchanged.slices["child-controller"].status is SliceStatus.SPAWNED
+
+
+def _shutdown_child_fixture(
+    tmp_path: Path,
+    *,
+    invocation_updates: Mapping[str, object] | None = None,
+    current_updates: Mapping[str, object] | None = None,
+) -> tuple[WorkPlan, TLLoopConfig, RunStore, Path, Path]:
+    """Build one accepted child dispatch with a durable shutdown invocation."""
+    plan = WorkPlan(sub_tls=(SubTLTask("child-controller", WorkPlan(), order=1),))
+    config, store = _seed_nonroot_failed_scope(tmp_path / "state", "root-scope", plan)
+    project = tmp_path / "repo"
+    config = replace(config, project_root=project)
+    state = store.load()
+    child = state.slices["child-controller"]
+    assert child.branch is not None
+    worktree = str(project / ".exo" / "worktrees" / "child-controller")
+    spawned_fields: dict[str, object] = {
+        "status": SliceStatus.SPAWNED,
+        "attempts": 1,
+        "dispatch_agent_id": "child-controller",
+        "dispatch_invocation_id": "workspace-shutdown-child-invocation",
+        "dispatch_intent_id": "workspace-shutdown-child-intent",
+        "dispatch_authoritative_event_seq": 1,
+        "dispatch_generation": 1,
+        "dispatch_last_boundary": driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
+        "worktree": worktree,
+    }
+    spawned_fields.update(current_updates or {})
+    spawned = replace(child, **spawned_fields)
+    store.checkpoint(
+        driver_module._phase_from_state(state),
+        {**state.slices, "child-controller": spawned},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+    owner_dir = project / ".exo" / "agents" / "child-controller"
+    owner_dir.mkdir(parents=True)
+    invocation: dict[str, object] = {
+        "invocation_id": "workspace-shutdown-child-invocation",
+        "generation": 1,
+        "status": "killed",
+        "runtime_agent_id": "child-controller",
+        "slice_id": "child-controller",
+        "branch": child.branch,
+        "worktree": worktree,
+        "trigger": "controller_restart",
+        "exit_reason": "workspace control-plane shutdown",
+        "exit_classification": "workspace_control_plane_shutdown",
+    }
+    invocation.update(invocation_updates or {})
+    (owner_dir / "invocation.json").write_text(json.dumps(invocation), encoding="utf-8")
+    return plan, config, store, owner_dir, owner_dir / "invocation.json"
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_reopen"),
+    (
+        ("matching", True),
+        ("missing_invocation_id", False),
+        ("foreign_invocation_id", False),
+        ("stale_checkpoint_invocation", False),
+        ("changed_owner", False),
+        ("changed_generation", False),
+        ("changed_branch", False),
+        ("changed_worktree", False),
+        ("changed_slice", False),
+        ("live_outcome", False),
+        ("unknown_outcome", False),
+        ("provider_failure", False),
+        ("missing_record", False),
+        ("shutdown_archive_only", True),
+        ("foreign_shutdown_archive", False),
+    ),
+)
+def test_shutdown_reopen_requires_exact_accepted_invocation(
+    tmp_path: Path,
+    scenario: str,
+    expected_reopen: bool,
+) -> None:
+    """Only the exact accepted terminal shutdown invocation may be reopened."""
+    invocation_updates: dict[str, object] = {}
+    current_updates: dict[str, object] = {}
+    if scenario == "missing_invocation_id":
+        invocation_updates["invocation_id"] = None
+    elif scenario == "foreign_invocation_id":
+        invocation_updates["invocation_id"] = "foreign-shutdown-invocation"
+    elif scenario == "stale_checkpoint_invocation":
+        current_updates["dispatch_invocation_id"] = "newer-controller-invocation"
+    elif scenario == "changed_owner":
+        invocation_updates["runtime_agent_id"] = "foreign-owner"
+    elif scenario == "changed_generation":
+        invocation_updates["generation"] = 2
+    elif scenario == "changed_branch":
+        invocation_updates["branch"] = "main.foreign"
+    elif scenario == "changed_worktree":
+        invocation_updates["worktree"] = str(tmp_path / "foreign-worktree")
+    elif scenario == "changed_slice":
+        invocation_updates["slice_id"] = "other-slice"
+    elif scenario == "live_outcome":
+        invocation_updates.update(
+            {"status": "running", "exit_reason": None, "exit_classification": None}
+        )
+    elif scenario == "unknown_outcome":
+        invocation_updates.update(
+            {"status": "unknown", "exit_reason": None, "exit_classification": None}
+        )
+    elif scenario == "provider_failure":
+        invocation_updates.update(
+            {
+                "exit_reason": "tmux_target_exited_with_nonzero_code",
+                "exit_classification": "nonzero_exit",
+            }
+        )
+    plan, config, store, _owner_dir, invocation_path = _shutdown_child_fixture(
+        tmp_path,
+        invocation_updates=invocation_updates,
+        current_updates=current_updates,
+    )
+    if scenario == "missing_record":
+        invocation_path.unlink()
+    if scenario in {"shutdown_archive_only", "foreign_shutdown_archive"}:
+        archive = tmp_path / "repo" / ".exo" / "controller-lifecycle" / "archive"
+        archive.mkdir(parents=True)
+        (archive / "shutdown.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "phase": "complete",
+                    "controllers": [
+                        {
+                            "agent_id": "child-controller",
+                            "invocation_id": (
+                                "workspace-shutdown-child-invocation"
+                                if scenario == "shutdown_archive_only"
+                                else "foreign-shutdown-invocation"
+                            ),
+                            "generation": 1,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        invocation = json.loads(invocation_path.read_text(encoding="utf-8"))
+        invocation.update(
+            {
+                "status": "killed",
+                "exit_reason": "tmux_target_exited_without_exit_marker",
+                "exit_classification": "missing_exit_marker",
+            }
+        )
+        invocation_path.write_text(json.dumps(invocation), encoding="utf-8")
+
+    reopened = driver_module._reopen_shutdown_sub_tl_dispatches(plan, store.load(), config, store)
+
+    child = reopened.slices["child-controller"]
+    if expected_reopen:
+        assert child.status is SliceStatus.PENDING
+        assert child.dispatch_invocation_id == "workspace-shutdown-child-invocation"
+    else:
+        assert child.status is SliceStatus.SPAWNED
+        assert child.dispatch_invocation_id != "workspace-shutdown-child-invocation" or (
+            child.dispatch_invocation_id == "workspace-shutdown-child-invocation"
+            and scenario != "stale_checkpoint_invocation"
+        )
+        assert child.attempts == 1
+
+
+def _inject_concurrent_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    store: RunStore,
+    *,
+    child_updates: Mapping[str, object] | None = None,
+    budget_tokens: int | None = None,
+) -> None:
+    """Inject one legitimate CAS checkpoint immediately before reopening."""
+    original = RunStore.checkpoint
+    injected = False
+
+    def wrapped(self, fsm, slices, budgets, offset, **kwargs):
+        nonlocal injected
+        if self.run_id == store.run_id and not injected:
+            injected = True
+            latest = store.load()
+            concurrent = dict(latest.slices)
+            if child_updates:
+                concurrent["child-controller"] = replace(
+                    concurrent["child-controller"], **child_updates
+                )
+            concurrent_budgets = (
+                replace(latest.budgets, tokens=budget_tokens)
+                if budget_tokens is not None
+                else latest.budgets
+            )
+            original(
+                store,
+                fsm,
+                concurrent,
+                concurrent_budgets,
+                offset,
+                expected_revision=latest.revision,
+            )
+        return original(self, fsm, slices, budgets, offset, **kwargs)
+
+    monkeypatch.setattr(RunStore, "checkpoint", wrapped)
+
+
+def test_shutdown_reopen_preserves_unrelated_concurrent_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A conflict reloads and reopens against the newer coherent state."""
+    plan, config, store, _owner_dir, _invocation_path = _shutdown_child_fixture(tmp_path)
+    baseline = store.load()
+    expected_tokens = baseline.budgets.tokens + 77
+    _inject_concurrent_checkpoint(monkeypatch, store, budget_tokens=expected_tokens)
+
+    reopened = driver_module._reopen_shutdown_sub_tl_dispatches(plan, baseline, config, store)
+
+    assert reopened.slices["child-controller"].status is SliceStatus.PENDING
+    assert reopened.budgets.tokens == expected_tokens
+    assert reopened.revision > baseline.revision
+
+
+def test_shutdown_reopen_conflict_invalidates_stale_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newer accepted child invocation wins over a stale shutdown proof."""
+    plan, config, store, _owner_dir, _invocation_path = _shutdown_child_fixture(tmp_path)
+    baseline = store.load()
+    _inject_concurrent_checkpoint(
+        monkeypatch,
+        store,
+        child_updates={
+            "attempts": 77,
+            "dispatch_invocation_id": "newer-controller-invocation",
+        },
+    )
+
+    reopened = driver_module._reopen_shutdown_sub_tl_dispatches(plan, baseline, config, store)
+
+    child = reopened.slices["child-controller"]
+    assert child.status is SliceStatus.SPAWNED
+    assert child.attempts == 77
+    assert child.dispatch_invocation_id == "newer-controller-invocation"
+
+
+def test_shutdown_reopen_conflict_exhaustion_never_writes_stale_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bounded conflict retries leave the newer durable state untouched."""
+    plan, config, store, _owner_dir, _invocation_path = _shutdown_child_fixture(tmp_path)
+    baseline = store.load()
+    calls = 0
+
+    def always_conflict(self, fsm, slices, budgets, offset, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise driver_module.CheckpointConflict("simulated concurrent writer")
+
+    monkeypatch.setattr(RunStore, "checkpoint", always_conflict)
+
+    reopened = driver_module._reopen_shutdown_sub_tl_dispatches(plan, baseline, config, store)
+
+    assert calls > 0
+    assert reopened.slices["child-controller"] == baseline.slices["child-controller"]
+    assert reopened.revision == baseline.revision
+
+
+def _live_child_controller_fixture(
+    tmp_path: Path,
+    *,
+    prior_invocation_id: str = "parent-bound-controller-invocation",
+) -> tuple[WorkPlan, TLLoopConfig, RunStore, Path]:
+    plan = WorkPlan(sub_tls=(SubTLTask("child-controller", WorkPlan(), order=1),))
+    config, store = _seed_nonroot_failed_scope(tmp_path / "state", "root-scope", plan)
+    project = tmp_path / "repo"
+    config = replace(config, project_root=project)
+    state = store.load()
+    child = state.slices["child-controller"]
+    assert child.branch is not None
+    worktree = str(project / ".exo" / "worktrees" / "child-controller")
+    spawned = replace(
+        child,
+        status=SliceStatus.SPAWNED,
+        attempts=1,
+        dispatch_agent_id="child-controller",
+        dispatch_invocation_id="parent-bound-controller-invocation",
+        dispatch_intent_id="child-controller-intent",
+        dispatch_authoritative_event_seq=1,
+        dispatch_generation=2,
+        dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_RECOVERED_BOUNDARY,
+        worktree=worktree,
+    )
+    manifest = state.plan_manifest
+    assert manifest is not None
+    node = next(node for node in manifest.nodes if node.name == "child-controller")
+    store.checkpoint(
+        RecursiveTLRunning(
+            current_order=1,
+            pending_by_order={
+                1: (
+                    ChildRecord(
+                        "child-controller",
+                        ChildKind.SUB_TL,
+                        manifest_node_id=node.node_id,
+                        manifest_revision=manifest.manifest_revision,
+                    ),
+                )
+            },
+            scope_path=(manifest.scope_id,),
+            plan_digest=manifest.digest,
+        ),
+        {**state.slices, "child-controller": spawned},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+    owner_dir = project / ".exo" / "agents" / "child-controller"
+    owner_dir.mkdir(parents=True)
+    invocation = {
+        "invocation_id": "live-restarted-controller-invocation",
+        "generation": 3,
+        "status": "running",
+        "runtime_agent_id": "child-controller",
+        "slice_id": "child-controller",
+        "branch": child.branch,
+        "worktree": worktree,
+        "trigger": "controller_restart",
+        "prior_invocation_id": prior_invocation_id,
+    }
+    (owner_dir / "invocation.json").write_text(json.dumps(invocation), encoding="utf-8")
+    return plan, config, store, owner_dir
+
+
+def test_parent_adopts_exactly_linked_live_controller_restart(tmp_path: Path) -> None:
+    """Controller restarts update the parent only through exact predecessor lineage."""
+    plan, config, store, owner_dir = _live_child_controller_fixture(tmp_path)
+
+    driver_module._adopt_live_child_controller_invocation(config, plan.sub_tls[0])
+
+    child = store.load().slices["child-controller"]
+    assert child.dispatch_invocation_id == "live-restarted-controller-invocation"
+    assert child.dispatch_generation == 3
+
+    # A non-linked replacement cannot be adopted over the accepted binding.
+    invocation = json.loads((owner_dir / "invocation.json").read_text(encoding="utf-8"))
+    invocation["prior_invocation_id"] = "foreign-predecessor"
+    invocation["invocation_id"] = "foreign-live-controller-invocation"
+    (owner_dir / "invocation.json").write_text(json.dumps(invocation), encoding="utf-8")
+    driver_module._adopt_live_child_controller_invocation(config, plan.sub_tls[0])
+    assert store.load().slices["child-controller"].dispatch_invocation_id == (
+        "live-restarted-controller-invocation"
+    )

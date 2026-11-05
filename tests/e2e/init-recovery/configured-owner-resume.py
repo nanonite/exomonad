@@ -2069,6 +2069,73 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
     )
 
 
+def bind_child_controller_invocation(repository: Path) -> None:
+    """Bind the seeded parent to the actual live Kani controller invocation."""
+    from tl_loop.loop.driver import _phase_from_state
+    from tl_loop.state.store import RunStore
+
+    root_store = RunStore("root", repository / ".exo/tl-loop")
+    state = root_store.load()
+    current = state.slices.get("kani")
+    if current is None or current.status.value != "spawned":
+        raise RuntimeError("root Kani slice is not spawned")
+    agent_dir = repository / ".exo/agents/kani"
+    invocation = json.loads((agent_dir / "invocation.json").read_text(encoding="utf-8"))
+    from tl_loop.loop.driver import _workspace_shutdown_recorded
+
+    live_or_shutdown = invocation.get("status") == "running" or (
+        invocation.get("status") == "killed"
+        and (
+            (
+                invocation.get("exit_reason") == "workspace control-plane shutdown"
+                and invocation.get("exit_classification")
+                == "workspace_control_plane_shutdown"
+            )
+            or (
+                invocation.get("exit_classification") == "missing_exit_marker"
+                and _workspace_shutdown_recorded(
+                    repository,
+                    "kani",
+                    str(invocation.get("invocation_id")),
+                    int(invocation.get("generation") or 0),
+                )
+            )
+        )
+    )
+    if (
+        not live_or_shutdown
+        or invocation.get("runtime_agent_id") != "kani"
+        or invocation.get("slice_id") != "kani"
+        or invocation.get("branch") != current.branch
+        or Path(str(invocation.get("worktree", ""))).resolve()
+        != Path(str(current.worktree)).resolve()
+        or type(invocation.get("generation")) is not int
+        or invocation["generation"] < 1
+    ):
+        raise RuntimeError(
+            "live Kani controller invocation does not match the parent slice"
+        )
+    updated = replace(
+        current,
+        dispatch_invocation_id=invocation["invocation_id"],
+        dispatch_generation=invocation["generation"],
+    )
+    if updated == current:
+        print("Kani controller binding already current")
+        return
+    root_store.checkpoint(
+        _phase_from_state(state),
+        {**state.slices, "kani": updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        expected_revision=state.revision,
+    )
+    print(f"Kani controller binding adopted {invocation['invocation_id']}")
+
+
 def reset_child_controller_dispatch(repository: Path) -> None:
     """Reopen the disposable child controller dispatch after a workspace restart."""
     from tl_loop.loop.driver import _phase_from_state
@@ -2372,6 +2439,7 @@ def main() -> None:
             "verify-repeat",
             "verify-repeated",
             "reset-child-controller",
+            "bind-child-controller",
         ),
     )
     parser.add_argument("--repo", required=True, type=Path)
@@ -2408,6 +2476,8 @@ def main() -> None:
         )
     elif arguments.mode == "reset-child-controller":
         reset_child_controller_dispatch(arguments.repo)
+    elif arguments.mode == "bind-child-controller":
+        bind_child_controller_invocation(arguments.repo)
     elif arguments.mode == "verify-repeat":
         if arguments.baseline is None:
             parser.error("verify-repeat requires --baseline")
