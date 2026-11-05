@@ -25283,3 +25283,86 @@ def test_stale_concurrent_continuation_adopts_without_duplicate_launch(
         entries[-1]["result"]["result"]["invocation"]["invocation_id"]
         == (launched["invocation_id"])
     )
+
+
+def test_workspace_shutdown_reopens_exact_child_dispatch_for_reprovision(
+    tmp_path: Path,
+) -> None:
+    """A supported shutdown stop is not a permanent live-child assumption."""
+    plan = WorkPlan(sub_tls=(SubTLTask("child-controller", WorkPlan(), order=1),))
+    config, store = _seed_nonroot_failed_scope(tmp_path / "state", "root-scope", plan)
+    project = tmp_path / "repo"
+    config = replace(config, project_root=project)
+    state = store.load()
+    child = state.slices["child-controller"]
+    assert child.branch is not None
+    worktree = str(project / ".exo" / "worktrees" / "child-controller")
+    spawned = replace(
+        child,
+        status=SliceStatus.SPAWNED,
+        attempts=1,
+        dispatch_agent_id="child-controller",
+        dispatch_invocation_id="workspace-shutdown-child-invocation",
+        dispatch_intent_id="workspace-shutdown-child-intent",
+        dispatch_authoritative_event_seq=1,
+        dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
+        worktree=worktree,
+    )
+    store.checkpoint(
+        driver_module._phase_from_state(state),
+        {**state.slices, "child-controller": spawned},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+    owner_dir = project / ".exo" / "agents" / "child-controller"
+    owner_dir.mkdir(parents=True)
+    invocation = {
+        "invocation_id": "workspace-shutdown-child-invocation",
+        "status": "killed",
+        "runtime_agent_id": "child-controller",
+        "slice_id": "child-controller",
+        "branch": child.branch,
+        "worktree": worktree,
+        "exit_reason": "workspace control-plane shutdown",
+        "exit_classification": "workspace_control_plane_shutdown",
+    }
+    (owner_dir / "invocation.json").write_text(json.dumps(invocation), encoding="utf-8")
+
+    reopened = driver_module._reopen_shutdown_sub_tl_dispatches(plan, store.load(), config, store)
+
+    assert reopened.slices["child-controller"].status is SliceStatus.PENDING
+    assert reopened.slices["child-controller"].dispatch_last_boundary == (
+        driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY
+    )
+    assert "child-controller" not in reopened.integration.sub_tl_recovery
+    repeated = driver_module._reopen_shutdown_sub_tl_dispatches(plan, reopened, config, store)
+    assert repeated.slices["child-controller"] == reopened.slices["child-controller"]
+
+    # A genuine provider failure remains a failure, not a reusable restart.
+    failed_state = store.load()
+    respawned = replace(
+        reopened.slices["child-controller"],
+        status=SliceStatus.SPAWNED,
+        dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
+    )
+    store.checkpoint(
+        driver_module._phase_from_state(failed_state),
+        {**failed_state.slices, "child-controller": respawned},
+        failed_state.budgets,
+        failed_state.events.last_consumed_offset,
+        current_order=failed_state.current_order,
+        ordered_stages=failed_state.ordered_stages,
+        integration=failed_state.integration,
+    )
+    invocation.update(
+        {
+            "exit_reason": "tmux_target_exited_with_nonzero_code",
+            "exit_classification": "nonzero_exit",
+        }
+    )
+    (owner_dir / "invocation.json").write_text(json.dumps(invocation), encoding="utf-8")
+    unchanged = driver_module._reopen_shutdown_sub_tl_dispatches(plan, store.load(), config, store)
+    assert unchanged.slices["child-controller"].status is SliceStatus.SPAWNED

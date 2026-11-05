@@ -19361,6 +19361,87 @@ def _scope_handoff_is_unresolved(effects_log: list[EffectIntent], handoff_id: st
     )
 
 
+def _child_controller_shutdown_matches(
+    current: SliceState | None,
+    task: SubTLTask,
+    config: TLLoopConfig,
+) -> bool:
+    """Whether this child dispatch points at a controller stopped by workspace shutdown."""
+    if config.project_root is None or current is None:
+        return False
+    agent_id = current.dispatch_agent_id or _child_controller_name(task)
+    try:
+        invocation = json.loads(
+            (
+                Path(config.project_root) / ".exo" / "agents" / agent_id / "invocation.json"
+            ).read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(invocation, Mapping)
+        and invocation.get("status") in {"exited", "failed", "killed"}
+        and invocation.get("exit_reason") == "workspace control-plane shutdown"
+        and invocation.get("exit_classification") == "workspace_control_plane_shutdown"
+        and invocation.get("runtime_agent_id") in {None, agent_id}
+        and invocation.get("slice_id") in {None, task.name}
+        and (current.branch is None or invocation.get("branch") == current.branch)
+        and (
+            current.worktree is None
+            or Path(str(invocation.get("worktree", ""))).resolve()
+            == Path(current.worktree).resolve()
+        )
+    )
+
+
+def _reopen_shutdown_sub_tl_dispatches(
+    plan: WorkPlan,
+    state: RunState,
+    config: TLLoopConfig,
+    store: RunStore,
+) -> RunState:
+    """Re-provision children whose controller exited through workspace shutdown.
+
+    A supported workspace shutdown stops the controllers but intentionally does
+    not fabricate a child failure. The next continue must therefore reopen the
+    exact accepted child dispatch instead of treating the shell's dead pane as
+    a live controller forever. Only the explicit workspace-shutdown outcome is
+    accepted, and only after the durable invocation still matches the child
+    slice's branch, worktree and agent identity.
+    """
+    updates: dict[str, SliceState] = {}
+    for task in plan.sub_tls:
+        current = state.slices.get(task.name)
+        if (
+            current is None
+            or current.status is not SliceStatus.SPAWNED
+            or current.dispatch_last_boundary
+            not in {
+                SUB_TL_DISPATCH_STARTED_BOUNDARY,
+                SUB_TL_DISPATCH_RECOVERED_BOUNDARY,
+            }
+            or not _child_controller_shutdown_matches(current, task, config)
+        ):
+            continue
+        reopened = slice_transition(current, SliceStatusChanged(SliceStatus.PENDING))
+        updates[task.name] = replace(reopened, park_cause=None, recovery=None)
+    if not updates:
+        return state
+    sub_tl_recovery = dict(state.integration.sub_tl_recovery)
+    for name in updates:
+        sub_tl_recovery.pop(name, None)
+    integration = replace(state.integration, sub_tl_recovery=sub_tl_recovery)
+    return store.checkpoint(
+        _phase_from_state(state),
+        {**state.slices, **updates},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=integration,
+    )
+
+
 def _run_sub_tls(
     plan: WorkPlan,
     state: RunState,
@@ -19373,6 +19454,7 @@ def _run_sub_tls(
     """Run recursive children in deterministic, bounded order batches."""
     if not plan.sub_tls:
         return state
+    state = _reopen_shutdown_sub_tl_dispatches(plan, state, config, store)
     state, completion_hold = _reconcile_optional_sub_tl_completion(
         plan, config, effects, store, effects_log
     )
@@ -20165,6 +20247,9 @@ def _run_live_sub_tl_batch(
         if child_store.path.exists():
             child_state = child_store.load()
             child_phase = _child_completion_phase(child_state)
+            controller_shutdown = _child_controller_shutdown_matches(
+                store.load().slices.get(task.name), task, config
+            )
             retrying_terminal_owner = _terminal_owner_recovery_candidate(task.plan, child_state)
             if retrying_terminal_owner:
                 terminal_owner_recovery_tasks.add(task.name)
@@ -20179,10 +20264,15 @@ def _run_live_sub_tl_batch(
             if blocked_leaf_resume_proof is not None:
                 blocked_leaf_resume_proofs[task.name] = blocked_leaf_resume_proof
             retrying_approved_blocked_leaf = blocked_leaf_resume_proof is not None
-            if (_child_handoff_ready(child_state, store.run_id) and not retrying_failed_child) or (
+            if (
+                _child_handoff_ready(child_state, store.run_id)
+                and not retrying_failed_child
+                and not controller_shutdown
+            ) or (
                 _child_recovery_projection(child_state, store.run_id) is not None
                 and not retrying_approved_blocked_leaf
                 and not retrying_terminal_owner
+                and not controller_shutdown
             ):
                 existing[task.name] = (task, child_phase, child_state)
                 continue
