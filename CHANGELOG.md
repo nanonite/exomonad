@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Reconcile configured worker and reviewer harnesses during init continuation (#1283)
 - Add commit-all tidying before TL handoff to the next scope (#1267)
 - Document and verify commit-all handoffs through disposable init recovery (#1270)
 - Wire audited commit-all into ordered TL handoff recovery (#1269)
@@ -18,12 +19,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Fix continuation across repeated model, effort, and harness route changes (#1314)
+- Fix continuation after settled worker-lifecycle blockers on adopted successors (#1316)
+- Fix stale concurrent continuation from launching a duplicate successor (#1317)
 - Fix reference submodule handoff and enforce Git repository boundaries (#1291)
+- Enforce assigned Git boundaries at mutation entry points (#1294)
+- Block recursive Git commands from mutating reference repositories (#1296)
 - Preserve reference gitlinks during scope handoff (#1293)
 - Persist and recover exact root controller target ownership through init (#1290)
+- Add durable workspace shutdown fencing for controller dispatch (#1289)
 - Reset invocation-local stall parks before replaying continued plans (#1284)
+- Fix recursive blocker routing across unrelated sibling scopes (#1282)
 - Fix dormant subTL controller continuation without a published PR (#1281)
 - Fix recovery of historical spawn refusals with missing error kinds (#1280)
+- Fix subTL failure recording and retry resolved pre-execution spawn refusals (#1275)
 - Fix continuation preserving completed subTL receipts during ordered recovery (#1266)
 - Fix recovered aggregate bookkeeping completion when its integration lane is idle (#1264)
 - Fix plan-scoped aggregate merge replay after interrupted parent synchronization (#1259)
@@ -574,6 +583,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`exomonad shutdown`**: Graceful server shutdown.
 
 ### Changed
+- Persist and return accepted runtime-route provenance for launched agents (#1309)
 - 1165c: recursive handoff + Beast PR #45 regression + docs (#1169)
 - 1165b: post-merge issue close keyed by slice binding; durable not-applicable path for unlinked slices (#1168)
 - 1165a: optional slice-level Chainlink issue binding; remove run-scoped chainlink_issue_id and its inheritance (#1167)

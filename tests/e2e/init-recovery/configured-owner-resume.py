@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2068,6 +2069,297 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
     )
 
 
+def reset_child_controller_dispatch(repository: Path) -> None:
+    """Reopen the disposable child controller dispatch after a workspace restart."""
+    from tl_loop.loop.driver import _phase_from_state
+    from tl_loop.state.schema import SliceStatus
+    from tl_loop.state.store import RunStore
+
+    root_store = RunStore("root", repository / ".exo/tl-loop")
+    state = root_store.load()
+    current = state.slices.get("kani")
+    if current is None:
+        raise RuntimeError("root checkpoint has no Kani controller slice")
+    reopened = replace(
+        current, status=SliceStatus.PENDING, park_cause=None, recovery=None
+    )
+    root_store.checkpoint(
+        _phase_from_state(state),
+        {**state.slices, "kani": reopened},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+    print("kani controller dispatch reopened for the next directed route")
+
+
+def verify_repeated_transitions(
+    repository: Path,
+    baseline_path: Path,
+    expected_path: Path,
+) -> None:
+    """Verify the compiled repeated-route continuation history end to end."""
+    baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    expected = json.loads(expected_path.read_text(encoding="utf-8"))
+    if not isinstance(expected, list) or not expected:
+        raise RuntimeError("repeated-transition expectations are missing")
+    journal = json.loads(
+        (repository / ".exo/tl-loop/root/kani/action-journal.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    entries = [
+        row
+        for row in journal
+        if row.get("operation") == "resume_blocked_leaf"
+        and row.get("target") == OWNER_SLICE
+    ]
+    if len(entries) != len(expected) + 1:
+        raise RuntimeError(
+            f"expected {len(expected) + 1} linked resume actions, found {len(entries)}"
+        )
+    historical = baseline.get("historical_wrong_route_successor")
+    if not isinstance(historical, dict):
+        raise RuntimeError("baseline lacks the preserved f285 legacy successor")
+    if entries[0] != historical.get("action"):
+        raise RuntimeError("the retained legacy f285 action changed")
+    if entries[0].get("status") != "confirmed":
+        raise RuntimeError("the retained legacy f285 action is not confirmed")
+
+    previous_id = historical.get("invocation", {}).get("invocation_id")
+    previous_generation = historical.get("invocation", {}).get("generation")
+    if (
+        previous_id != "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d"
+        or previous_generation != 2
+    ):
+        raise RuntimeError("baseline does not end at the exact f285 generation 2")
+    intent_ids: set[str] = set()
+    invocation_ids: set[str] = set()
+    for index, route in enumerate(expected, start=1):
+        entry = entries[index]
+        arguments = entry.get("arguments") or {}
+        result = entry.get("result") or {}
+        payload = result.get("result") or {}
+        invocation = payload.get("invocation") or {}
+        agent = payload.get("agent") or {}
+        if entry.get("status") != "confirmed":
+            raise RuntimeError(f"repeated transition {index} was not confirmed")
+        if arguments.get("expected_invocation_id") != previous_id:
+            raise RuntimeError(
+                f"repeated transition {index} did not link to its predecessor"
+            )
+        if arguments.get("prior_generation") != previous_generation:
+            raise RuntimeError(
+                f"repeated transition {index} has a discontinuous generation"
+            )
+        for field in ("harness", "agent_type", "model", "effort"):
+            if arguments.get(field) != route.get(field):
+                raise RuntimeError(
+                    f"repeated transition {index} selected {field}={arguments.get(field)!r}, "
+                    f"expected {route.get(field)!r}"
+                )
+        if arguments.get("desired_harness") != route.get("harness"):
+            raise RuntimeError(f"repeated transition {index} desired harness drifted")
+        if arguments.get("desired_model") != route.get("model"):
+            raise RuntimeError(f"repeated transition {index} desired model drifted")
+        if arguments.get("desired_effort") != route.get("effort"):
+            raise RuntimeError(f"repeated transition {index} desired effort drifted")
+        intent_id = arguments.get("dispatch_intent_id")
+        if not isinstance(intent_id, str) or not intent_id:
+            raise RuntimeError(f"repeated transition {index} lacks its intent identity")
+        if intent_id in intent_ids:
+            raise RuntimeError(f"repeated transition {index} reused an earlier intent")
+        intent_ids.add(intent_id)
+        invocation_id = invocation.get("invocation_id")
+        if not isinstance(invocation_id, str) or not invocation_id:
+            raise RuntimeError(
+                f"repeated transition {index} lacks its actual invocation"
+            )
+        if invocation_id in invocation_ids:
+            raise RuntimeError(
+                f"repeated transition {index} reused an earlier invocation"
+            )
+        invocation_ids.add(invocation_id)
+        next_arguments = (
+            entries[index + 1].get("arguments") if index + 1 < len(entries) else None
+        )
+        actual_generation = (
+            next_arguments.get("prior_generation")
+            if isinstance(next_arguments, Mapping)
+            else previous_generation + 1
+        )
+        if actual_generation != previous_generation + 1:
+            raise RuntimeError(
+                f"repeated transition {index} did not advance generation once"
+            )
+        if invocation.get("trigger") != "resume_blocked":
+            raise RuntimeError(f"repeated transition {index} was not a blocked resume")
+        route_receipt = invocation.get("role_route") or agent.get("role_route")
+        if not isinstance(route_receipt, dict):
+            raise RuntimeError(f"repeated transition {index} lacks its route receipt")
+        if (
+            invocation.get("runtime") != route.get("agent_type")
+            or route_receipt.get("model") != route.get("model")
+            or route_receipt.get("effort") != route.get("effort")
+        ):
+            raise RuntimeError(
+                f"repeated transition {index} actual route conflicts with intent"
+            )
+        for field, argument_key in (
+            ("role", "role"),
+            ("harness", "harness"),
+            ("agent_type", "agent_type"),
+            ("model", "model"),
+            ("effort", "effort"),
+            ("configuration_fingerprint", "route_configuration_fingerprint"),
+            ("policy_fingerprint", "route_policy_fingerprint"),
+            ("manifest_digest", "route_manifest_digest"),
+            ("route_fingerprint", "route_fingerprint"),
+            ("dispatch_intent_id", "dispatch_intent_id"),
+            ("scope_id", "route_scope_id"),
+        ):
+            expected_value = (
+                OWNER_SLICE if field == "scope_id" else arguments.get(argument_key)
+            )
+            if route_receipt.get(field) != expected_value:
+                raise RuntimeError(
+                    f"repeated transition {index} route receipt field {field} conflicts"
+                )
+        if agent.get("id") != baseline.get("owner_agent_name"):
+            raise RuntimeError(f"repeated transition {index} changed the logical owner")
+        previous_id = invocation_id
+        previous_generation = actual_generation
+
+    if previous_id is None or previous_generation is None:
+        raise RuntimeError("repeated transition history has no final invocation")
+    owner_dir = Path(baseline["owner_dir"])
+    current = invocation(owner_dir)
+    if (
+        current.get("invocation_id") != previous_id
+        or current.get("generation") != previous_generation
+        or current.get("status") != "exited"
+        or current.get("exit_code") != 0
+        or current.get("exit_classification") != "one_shot_complete"
+        or current.get("pr_number") is not None
+        or current.get("head_sha") is not None
+    ):
+        raise RuntimeError(
+            "final owner invocation is not the retained terminal no-PR successor"
+        )
+    final_route = expected[-1]
+    if (
+        current.get("runtime") != final_route.get("agent_type")
+        or current.get("model") != final_route.get("model")
+        or current.get("effort") != final_route.get("effort")
+    ):
+        raise RuntimeError(
+            "final owner invocation route does not match the directed route"
+        )
+    if not isinstance(current.get("role_route"), dict):
+        raise RuntimeError("final owner invocation has no durable route receipt")
+
+    child = json.loads(
+        (repository / ".exo/tl-loop/root/kani/run.json").read_text(encoding="utf-8")
+    )
+    leaf = child.get("slices", {}).get(OWNER_SLICE, {})
+    if (
+        leaf.get("dispatch_invocation_id") != previous_id
+        or leaf.get("dispatch_generation") != previous_generation
+        or leaf.get("dispatch_agent_id") != baseline.get("owner_agent_name")
+        or leaf.get("pr_number") is not None
+        or leaf.get("publication") is not None
+    ):
+        raise RuntimeError(
+            "child checkpoint did not adopt the final repeated-route successor"
+        )
+    recovery = leaf.get("recovery") or {}
+    evidence = recovery.get("evidence") or {}
+    if (
+        recovery.get("phase") != "human_gate"
+        or evidence.get("attempt") != len(expected) + 1
+        or evidence.get("invocation_id") != previous_id
+    ):
+        raise RuntimeError(
+            "final repeated-route human gate is not bound to the final successor"
+        )
+
+    events = read_json_lines(Path(os.environ["E2E_AGENT_LOG"]))
+    starts = [
+        event
+        for event in events
+        if event.get("event") == "repeated_route_worker_started"
+    ]
+    if len(starts) != len(expected):
+        raise RuntimeError(
+            f"expected one shim launch per repeated route, found {len(starts)}"
+        )
+    for index, route in enumerate(expected, start=1):
+        attempt = index + 1
+        matching = [event for event in starts if event.get("attempt") == attempt]
+        if len(matching) != 1:
+            raise RuntimeError(
+                f"expected one shim start for attempt {attempt}, found {len(matching)}"
+            )
+        event = matching[0]
+        if (
+            event.get("harness") != route.get("agent_type")
+            or event.get("model") != route.get("model")
+            or event.get("effort") != route.get("effort")
+        ):
+            raise RuntimeError(
+                f"shim argv for attempt {attempt} did not match the directed route"
+            )
+    blocked = [
+        event
+        for event in events
+        if event.get("event") == "repeated_route_worker_blocked"
+    ]
+    if len(blocked) != len(expected):
+        raise RuntimeError(
+            f"expected one blocked lifecycle per repeated route, found {len(blocked)}"
+        )
+
+    publications_path = repository / ".exo/published-heads.json"
+    if publications_path.is_file():
+        publications = json.loads(publications_path.read_text(encoding="utf-8")).get(
+            "heads", []
+        )
+        owned = [
+            row
+            for row in publications
+            if row.get("author_agent") == baseline.get("owner_agent_name")
+            or row.get("slice_id") == OWNER_SLICE
+        ]
+        if owned:
+            raise RuntimeError("repeated-route transitions published a worker PR")
+
+    root = json.loads(
+        (repository / ".exo/tl-loop/root/run.json").read_text(encoding="utf-8")
+    )
+    architecture = root.get("slices", {}).get("architecture", {})
+    if (
+        architecture.get("status") != "merged"
+        or (architecture.get("post_merge") or {}).get("phase") != "complete"
+    ):
+        raise RuntimeError(
+            "repeated-route transitions changed the completed sibling receipt"
+        )
+
+    summary = {
+        "historical_invocation": historical.get("invocation", {}).get("invocation_id"),
+        "historical_generation": historical.get("invocation", {}).get("generation"),
+        "transitions": expected,
+        "successor_invocations": sorted(invocation_ids),
+        "final_invocation": previous_id,
+        "final_generation": previous_generation,
+        "final_attempt": len(expected) + 1,
+        "journal_entries": len(entries),
+    }
+    print(json.dumps(summary, sort_keys=True, indent=2))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -2078,6 +2370,8 @@ def main() -> None:
             "seed-wrong-route-successor",
             "verify-controller",
             "verify-repeat",
+            "verify-repeated",
+            "reset-child-controller",
         ),
     )
     parser.add_argument("--repo", required=True, type=Path)
@@ -2085,6 +2379,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--gate-approval", type=Path)
     parser.add_argument("--historical-parent-stall", action="store_true")
+    parser.add_argument("--expected", type=Path)
     arguments = parser.parse_args()
     if arguments.mode == "seed":
         if arguments.output is None:
@@ -2111,10 +2406,18 @@ def main() -> None:
             arguments.output,
             arguments.gate_approval,
         )
-    else:
+    elif arguments.mode == "reset-child-controller":
+        reset_child_controller_dispatch(arguments.repo)
+    elif arguments.mode == "verify-repeat":
         if arguments.baseline is None:
             parser.error("verify-repeat requires --baseline")
         verify_repeat(arguments.repo, arguments.baseline)
+    else:
+        if arguments.baseline is None or arguments.expected is None:
+            parser.error("verify-repeated requires --baseline and --expected")
+        verify_repeated_transitions(
+            arguments.repo, arguments.baseline, arguments.expected
+        )
 
 
 if __name__ == "__main__":

@@ -433,6 +433,342 @@ assert_one_live_window() {
     [[ "$pane_dead" == "0" ]] || e2e_fail "repeat init returned without a live $role window"
 }
 
+wait_for_repeated_server_socket() {
+    for _ in $(seq 1 200); do
+        if python3 - "$AGG_REPO/.exo/server.sock" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(0.2)
+client.connect(sys.argv[1])
+client.close()
+PY
+        then
+            return 0
+        fi
+        sleep 0.05
+    done
+    tmux capture-pane -p -t "$AGGREGATE_SESSION:Server" \
+        > "$AGG_DIR/repeated-server-pane.log" 2>&1 || true
+    cat "$AGG_DIR/repeated-server-pane.log"
+    return 1
+}
+
+write_repeated_worker_route() {
+    local harness="$1" model="$2" effort="$3"
+    python3 - "$AGG_REPO/.exo/config.toml" "$harness" "$model" "$effort" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+path, harness, model, effort = sys.argv[1:]
+target = Path(path)
+text = target.read_text(encoding="utf-8")
+if not re.search(r'(?m)^spawn_agent_type = ".*"$', text):
+    raise SystemExit("config.toml has no spawn_agent_type")
+text = re.sub(
+    r'(?m)^spawn_agent_type = ".*"$',
+    f'spawn_agent_type = "{harness}"',
+    text,
+    count=1,
+)
+worker_model = f'worker_model = "{model}"'
+if re.search(r'(?m)^worker_model = ', text):
+    text = re.sub(r'(?m)^worker_model = .*$', worker_model, text, count=1)
+else:
+    text = re.sub(
+        r'(?m)^(spawn_agent_type = ".*")$',
+        lambda match: f"{match.group(1)}\n{worker_model}",
+        text,
+        count=1,
+    )
+if not re.search(r'(?m)^worker_effort_level = ', text):
+    raise SystemExit("config.toml has no worker_effort_level")
+text = re.sub(
+    r'(?m)^worker_effort_level = .*$',
+    f'worker_effort_level = "{effort}"',
+    text,
+    count=1,
+)
+target.write_text(text, encoding="utf-8")
+PY
+}
+
+write_repeated_worker_policy() {
+    local route="$1"
+    python3 - "$AGG_REPO/.exo/harness_policy.toml" "$route" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+path, route = sys.argv[1:]
+target = Path(path)
+text = target.read_text(encoding="utf-8")
+block = (
+    "[roles.worker]\n"
+    f'allow = ["{route}"]\n'
+    f'cost_rank = {{ "{route}" = 1 }}\n'
+    "token_budget = 120000\n"
+    f'per_harness_budget = {{ "{route}" = 80000 }}\n'
+    "escalate_after_attempts = 1\n\n"
+)
+updated, count = re.subn(
+    r'(?ms)^\[roles\.worker\]\n.*?(?=^\[|\Z)',
+    block,
+    text,
+    count=1,
+)
+if count != 1:
+    raise SystemExit("harness policy has no worker role")
+target.write_text(updated, encoding="utf-8")
+PY
+}
+
+augment_repeated_worker_capabilities() {
+    python3 - "$AGG_REPO/.exo/harness_capability.toml" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+entries = {
+    '"codex/gpt-6-luna"': '"hard"',
+    '"codex/gpt-6.1-sol"': '"standard"',
+    '"claude/claude-sonnet-4-5"': '"hard"',
+    '"opencode/opencode-go/deepseek-v4.1-flash"': '"standard"',
+}
+missing = [
+    f"{harness} = {level}"
+    for harness, level in entries.items()
+    if f"{harness} =" not in text
+]
+if missing:
+    text = text.rstrip() + "\n" + "\n".join(missing) + "\n"
+    path.write_text(text, encoding="utf-8")
+PY
+}
+
+reset_repeated_session() {
+    tmux new-session -d -s "${AGGREGATE_SESSION}-keepalive" "exec sleep 3600" 2>/dev/null || true
+    tmux kill-session -t "$AGGREGATE_SESSION" 2>/dev/null || true
+    tmux new-session -d -s "$AGGREGATE_SESSION" -n Bootstrap "exec sleep 300"
+    tmux set-environment -t "$AGGREGATE_SESSION" GIT_SSH_COMMAND "$AGG_DIR/git-ssh"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_GIT_REMOTE_DIR "$AGG_REMOTE"
+    tmux set-environment -t "$AGGREGATE_SESSION" PATH "$PATH"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_AGENT_LOG "$AGENT_EVENT_LOG"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_SOURCE_WORKTREE "$HANDOFF_WORKTREE"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_ROOT_ONLY_DIRTY_FILE "$ROOT_ONLY_DIRTY_FILE"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_HANDOFF_HEAD_FILE "$HANDOFF_HEAD_FILE"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_MOCK_URL "$AGG_MOCK_URL"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_MCP_SOCKET "$AGG_REPO/.exo/server.sock"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_AGG_REPO "$AGG_REPO"
+    tmux set-environment -t "$AGGREGATE_SESSION" CODEX_HOME "$CODEX_HOME"
+    tmux set-environment -t "$AGGREGATE_SESSION" HOME "$AGG_HOME"
+}
+
+restart_repeated_server() {
+    local attempt="$1" harness="$2" model="$3" effort="$4"
+    tmux send-keys -t "$AGGREGATE_SESSION:Server" C-c 2>/dev/null || true
+    for _ in $(seq 1 100); do
+        [[ ! -S "$AGG_REPO/.exo/server.sock" ]] && break
+        sleep 0.05
+    done
+    tmux kill-window -t "$AGGREGATE_SESSION:Server" 2>/dev/null || true
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_REPEATED_ROUTE_TRANSITIONS 1
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_BLOCKED_ATTEMPT "$attempt"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_EXPECTED_AGENT_TYPE "$harness"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_EXPECTED_MODEL "$model"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_EXPECTED_EFFORT "$effort"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_REPO "$AGG_REPO"
+    local command="E2E_REPEATED_ROUTE_TRANSITIONS=1 E2E_BLOCKED_ATTEMPT=$attempt E2E_EXPECTED_AGENT_TYPE=$harness E2E_EXPECTED_MODEL=$model E2E_EXPECTED_EFFORT=$effort E2E_REPO=$AGG_REPO EXOMONAD_TMUX_SESSION=$AGGREGATE_SESSION $EXOMONAD_BIN serve"
+    tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$command"
+    tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
+    wait_for_repeated_server_socket \
+        || e2e_fail "repeated-route server did not create its socket for attempt $attempt"
+}
+
+run_repeated_route_transitions() {
+    local specs=(
+        "codex|gpt-6-luna|xhigh"
+        "codex|gpt-6.1-sol|xhigh"
+        "codex|gpt-6-luna|high"
+        "claude|claude-sonnet-4-5|high"
+        "opencode|opencode-go/deepseek-v4.1-flash|high"
+        "codex|gpt-6-luna|xhigh"
+    )
+    local expected="$AGG_DIR/repeated-routes.json"
+    python3 - "$expected" "${specs[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+output = Path(sys.argv[1])
+routes = []
+for spec in sys.argv[2:]:
+    harness, model, effort = spec.split("|", 2)
+    routes.append(
+        {
+            "harness": f"{harness}/{model}",
+            "agent_type": harness,
+            "model": model,
+            "effort": effort,
+        }
+    )
+output.write_text(json.dumps(routes, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+PY
+    install -m 0755 "$SCRIPT_DIR/fake-codex.sh" "$FAKE_CODEX_BIN/claude"
+    install -m 0755 "$SCRIPT_DIR/fake-codex.sh" "$FAKE_CODEX_BIN/opencode"
+    augment_repeated_worker_capabilities
+    local cycle=0 spec harness model effort attempt init_pid init_status
+    for spec in "${specs[@]}"; do
+        cycle=$((cycle + 1))
+        IFS='|' read -r harness model effort <<< "$spec"
+        attempt=$((cycle + 1))
+        write_repeated_worker_route "$harness" "$model" "$effort"
+        write_repeated_worker_policy "$harness/$model"
+        python3 "$SCRIPT_DIR/configured-owner-resume.py" reset-child-controller             --repo "$AGG_REPO" > "$AGG_DIR/repeated-cycle-$cycle-child-reset.log" 2>&1 \
+            || { cat "$AGG_DIR/repeated-cycle-$cycle-child-reset.log"; e2e_fail "could not reopen the disposable child controller dispatch"; }
+        reset_repeated_session
+        restart_repeated_server "$attempt" "$harness" "$model" "$effort"
+        HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
+            "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
+            > "$AGG_DIR/repeated-cycle-$cycle-init.log" 2>&1 &
+        init_pid=$!
+        local started=""
+        for _ in $(seq 1 1200); do
+            started="$(python3 - "$E2E_AGENT_LOG" "$attempt" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path, attempt = Path(sys.argv[1]), int(sys.argv[2])
+try:
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+except (OSError, json.JSONDecodeError):
+    rows = []
+print("yes" if any(
+    row.get("event") == "repeated_route_worker_started" and row.get("attempt") == attempt
+    for row in rows
+) else "")
+PY
+)"
+            [[ "$started" == "yes" ]] && break
+            if ! kill -0 "$init_pid" 2>/dev/null; then
+                wait "$init_pid" || init_status=$?
+                [[ "$init_status" == "0" || "$init_status" == "1" ]]                     || { cat "$AGG_DIR/repeated-cycle-$cycle-init.log"; e2e_fail "repeated transition $cycle init exited with status $init_status"; }
+                # A detached non-TTY init returns after handing the controller
+                # to tmux; the controller keeps running and launches the shim.
+            fi
+            sleep 0.05
+        done
+        [[ "$started" == "yes" ]] \
+            || e2e_fail "repeated transition $cycle did not launch its directed worker shim"
+        local terminal=""
+        for _ in $(seq 1 1200); do
+            terminal="$(python3 - "$AGG_DIR/preexisting-opencode-owner.json" "$attempt" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+baseline = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+attempt = int(sys.argv[2])
+try:
+    current = json.loads((Path(baseline["owner_dir"]) / "invocation.json").read_text())
+except (OSError, json.JSONDecodeError):
+    print("waiting")
+    raise SystemExit(0)
+ready = (
+    current.get("status") == "exited"
+    and current.get("exit_code") == 0
+    and current.get("exit_classification") == "one_shot_complete"
+    and current.get("generation") == attempt + 1
+    and current.get("pr_number") is None
+)
+print("ready" if ready else f"waiting {current.get('status')}/{current.get('generation')}")
+PY
+)"
+            [[ "$terminal" == "ready" ]] && break
+            sleep 0.05
+        done
+        [[ "$terminal" == "ready" ]] \
+            || e2e_fail "repeated transition $cycle did not finish as one terminal no-PR successor: $terminal"
+        (
+            cd "$AGG_REPO"
+            HOME="$AGG_HOME" "$EXOMONAD_BIN" shutdown --workspace
+        ) > "$AGG_DIR/repeated-cycle-$cycle-shutdown.log" 2>&1 \
+            || { cat "$AGG_DIR/repeated-cycle-$cycle-shutdown.log"; e2e_fail "repeated transition $cycle workspace shutdown failed"; }
+        for _ in $(seq 1 100); do
+            [[ ! -S "$AGG_REPO/.exo/server.sock" ]] && break
+            sleep 0.05
+        done
+        REPEATED_CONTROLLER_WINDOW="$(python3 - "$AGG_REPO/.exo/tl-loop/root/controller-target.json" <<'PYTARGET'
+import json
+import sys
+from pathlib import Path
+
+try:
+    print(json.loads(Path(sys.argv[1]).read_text()).get("window_id", ""))
+except (OSError, json.JSONDecodeError):
+    print("")
+PYTARGET
+)"
+        if [[ -n "$REPEATED_CONTROLLER_WINDOW" ]]; then
+            tmux kill-window -t "$AGGREGATE_SESSION:$REPEATED_CONTROLLER_WINDOW" 2>/dev/null || true
+        fi
+        init_status=0
+        wait "$init_pid" || init_status=$?
+        [[ "$init_status" == "0" || "$init_status" == "1" || "$init_status" == "130" || "$init_status" == "143" ]] \
+            || { cat "$AGG_DIR/repeated-cycle-$cycle-init.log"; e2e_fail "repeated transition $cycle init ended with status $init_status"; }
+        python3 - "$AGG_REPO" "$AGG_DIR/preexisting-opencode-owner.json" "$cycle" "$harness" "$model" "$effort" "$attempt" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+baseline = json.loads(Path(sys.argv[2]).read_text())
+cycle = int(sys.argv[3])
+harness, model, effort, attempt = sys.argv[4], sys.argv[5], sys.argv[6], int(sys.argv[7])
+journal = json.loads(
+    (repo / ".exo/tl-loop/root/kani/action-journal.json").read_text()
+)
+entries = [
+    row for row in journal
+    if row.get("operation") == "resume_blocked_leaf"
+    and row.get("target") == "issue-814-substitution-model-kani"
+]
+if len(entries) != cycle + 1:
+    raise SystemExit(f"cycle {cycle}: expected {cycle + 1} resume actions, found {len(entries)}")
+entry = entries[-1]
+if entry.get("status") != "confirmed":
+    raise SystemExit(f"cycle {cycle}: last resume action is {entry.get('status')}")
+arguments = entry.get("arguments") or {}
+invocation = ((entry.get("result") or {}).get("result") or {}).get("invocation") or {}
+route_receipt = invocation.get("role_route") or (entry.get("result") or {}).get("result", {}).get("agent", {}).get("role_route") or {}
+if (
+    arguments.get("desired_harness") != f"{harness}/{model}"
+    or arguments.get("desired_model") != model
+    or arguments.get("desired_effort") != effort
+    or invocation.get("runtime") != harness
+    or route_receipt.get("model") != model
+    or route_receipt.get("effort") != effort
+):
+    raise SystemExit(f"cycle {cycle}: launched route does not match the directed route")
+owner = json.loads((Path(baseline["owner_dir"]) / "invocation.json").read_text())
+if owner.get("invocation_id") != invocation.get("invocation_id"):
+    raise SystemExit(f"cycle {cycle}: owner did not adopt the confirmed successor")
+print(f"cycle {cycle}: {harness}/{model}/{effort} invocation={owner['invocation_id']} generation={owner['generation']}")
+PY
+    done
+    python3 "$SCRIPT_DIR/configured-owner-resume.py" verify-repeated \
+        --repo "$AGG_REPO" --baseline "$AGG_DIR/preexisting-opencode-owner.json" \
+        --expected "$expected" \
+        > "$AGG_DIR/repeated-routes-verify.json" \
+        || { cat "$AGG_DIR/repeated-routes-verify.json"; e2e_fail "repeated-route continuation history did not verify"; }
+    e2e_log "PASS: compiled init executed repeated A/model-only/effort-only/Claude/OpenCode/A transitions with one linked successor per intent"
+    exit 0
+}
+
 run_init_with_interrupted_handoff() {
     local startup_path="$AGG_REPO/.exo/tl-loop/root/controller-startup.json"
     local first_pid first_status phase target window pane pane_pid epoch worker worker_index controller_index
@@ -2033,6 +2369,9 @@ PY
     done
     [[ -S "$AGG_REPO/.exo/server.sock" ]] \
         || { tmux capture-pane -p -t "$AGGREGATE_SESSION:Server" > "$AGG_DIR/server-after-terminal-approval-restart.log" 2>&1 || true; cat "$AGG_DIR/server-after-terminal-approval-restart.log"; e2e_fail "Server did not restart after the approved recovery controller shutdown"; }
+    if [[ "${E2E_REPEATED_ROUTE_TRANSITIONS:-0}" == "1" ]]; then
+        run_repeated_route_transitions
+    fi
     APPROVED_RESTART_STATUS=0
     HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
         "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \

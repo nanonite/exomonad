@@ -1251,6 +1251,39 @@ mod role_routes_tests {
     }
 
     #[test]
+    fn claude_and_opencode_worker_routes_ignore_contradictory_host_defaults() {
+        for (harness, model, effort) in [
+            ("claude", "claude-sonnet-4-5", "high"),
+            ("opencode", "opencode-go/deepseek-v4.1-flash", "medium"),
+        ] {
+            let config = discover_config(
+                &format!(
+                    "spawn_agent_type = '{harness}'\nworker_model = '{model}'\nworker_effort_level = '{effort}'\n"
+                ),
+                &[],
+            );
+            let route = config
+                .resolve_role_route(
+                    "dev-leaf",
+                    None,
+                    &RoleRouteOverrides::default(),
+                    Some("gpt-6.1-sol".to_string()),
+                )
+                .unwrap();
+            assert_eq!(route.role, CanonicalRole::Worker);
+            let expected_agent = match harness {
+                "claude" => AgentType::Claude,
+                "opencode" => AgentType::OpenCode,
+                _ => unreachable!(),
+            };
+            assert_eq!(route.agent_type, expected_agent);
+            assert_eq!(route.model.as_deref(), Some(model));
+            assert_eq!(route.model_source, RouteValueSource::ProjectConfig);
+            assert_eq!(route.effort.level.to_string(), effort);
+        }
+    }
+
+    #[test]
     fn cli_overrides_are_explicit_and_empty_policy_models_are_rejected() {
         let config = discover_config("spawn_agent_type = 'codex'\n", &[]);
         let route = config

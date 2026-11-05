@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${1:-}" == "models" && "${2:-}" == "--verbose" ]]; then
+    cat <<'JSON'
+{"id":"opencode-go/deepseek-v4.1-flash","providerID":"opencode-go","variants":{"high":{},"xhigh":{}}}
+{"id":"opencode-go/deepseek-v4.1-pro","providerID":"opencode-go","variants":{"high":{}}}
+JSON
+    exit 0
+fi
+
 if [[ "${1:-}" == "debug" && "${2:-}" == "models" ]]; then
     cat <<'JSON'
 {"models":[{"slug":"gpt-5.6-luna","supported_reasoning_levels":[{"effort":"minimal"},{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]},{"slug":"gpt-6-luna","supported_reasoning_levels":[{"effort":"minimal"},{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]},{"slug":"gpt-6.1-sol","supported_reasoning_levels":[{"effort":"minimal"},{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]}]}
@@ -13,6 +21,7 @@ role="${EXOMONAD_ROLE:-unknown}"
 model=""
 effort=""
 next_is_model=false
+next_is_effort=false
 for argument in "$@"; do
     if [[ "$next_is_model" == true ]]; then
         model="$argument"
@@ -23,8 +32,17 @@ for argument in "$@"; do
         model="${argument#--model=}"
     elif [[ "$argument" == model_reasoning_effort=* ]]; then
         effort="${argument#model_reasoning_effort=}"
+    elif [[ "$next_is_effort" == true ]]; then
+        effort="$argument"
+        next_is_effort=false
+    elif [[ "$argument" == "--effort" ]]; then
+        next_is_effort=true
     fi
 done
+if [[ "$model" == *"#"* ]]; then
+    effort="${model#*#}"
+    model="${model%%#*}"
+fi
 
 record_event() {
     python3 - "$E2E_AGENT_LOG" "$1" "$agent" "$role" "$model" "$effort" "${2:-}" <<'PY'
@@ -78,6 +96,101 @@ if response.get("success") is not True:
     raise SystemExit("MCP tool returned a non-success result")
 PY
 }
+
+if [[ "${E2E_REPEATED_ROUTE_TRANSITIONS:-0}" == "1" && ( "$role" == "dev" || "$role" == "worker" ) && "$agent" == *issue-814* ]]; then
+    harness="$(basename "$0")"
+    expected_harness="${E2E_EXPECTED_AGENT_TYPE:?repeated transition requires E2E_EXPECTED_AGENT_TYPE}"
+    expected_model="${E2E_EXPECTED_MODEL:?repeated transition requires E2E_EXPECTED_MODEL}"
+    expected_effort="${E2E_EXPECTED_EFFORT:?repeated transition requires E2E_EXPECTED_EFFORT}"
+    attempt="${E2E_BLOCKED_ATTEMPT:?repeated transition requires E2E_BLOCKED_ATTEMPT}"
+    if [[ "$harness" != "$expected_harness" || "$model" != "$expected_model" || "$effort" != "$expected_effort" ]]; then
+        printf 'unexpected repeated-route worker argv: %s model=%s effort=%s expected=%s/%s/%s\n' \
+            "$harness" "$model" "$effort" "$expected_harness" "$expected_model" "$expected_effort" >&2
+        exit 2
+    fi
+    record_event repeated_route_worker_started "$(python3 - "$harness" "$model" "$effort" "$attempt" <<'PY'
+import json
+import sys
+
+harness, model, effort, attempt = sys.argv[1:]
+print(json.dumps({
+    "harness": harness,
+    "model": model,
+    "effort": effort,
+    "attempt": int(attempt),
+}))
+PY
+)"
+    blocked_payload="$(python3 - "$attempt" <<'PY'
+import json
+import sys
+
+attempt = int(sys.argv[1])
+print(json.dumps({
+    "status": "blocked",
+    "message": "Disposable repeated-route lifecycle stopped this invocation with an incomplete assignment.",
+    "blocked": {
+        "cause": "human_decision_required",
+        "needs_human": True,
+        "scope_attribution": "agent_lifecycle",
+        "retryable": True,
+        "recovery_action": "resume the preserved terminal assignment on the current directed route",
+        "evidence": {
+            "evidence_summary": "Disposable shim stopped a supported repeated-route invocation.",
+            "failed_checks": ["fixture.repeated_route_lifecycle"],
+        },
+        "slice_id": "issue-814-substitution-model-kani",
+        "declared_difficulty": "standard",
+        "matched_difficulty_rule": "missing_handoff:nonzero_exit",
+        "attempt": attempt,
+    },
+}))
+PY
+)"
+    response="$(mcp_call dev "$agent" notify_parent "$blocked_payload")"
+    require_tool_success "$response"
+    recovery_recorded=false
+    for _ in $(seq 1 300); do
+        if python3 - "${E2E_REPO:?repeated transition requires E2E_REPO}" "$attempt" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo, attempt = Path(sys.argv[1]), int(sys.argv[2])
+try:
+    run = json.loads((repo / ".exo/tl-loop/root/kani/run.json").read_text())
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+leaf = run.get("slices", {}).get("issue-814-substitution-model-kani", {})
+recovery = leaf.get("recovery") or {}
+evidence = recovery.get("evidence") or {}
+if (
+    recovery.get("phase") == "human_gate"
+    and evidence.get("attempt") == attempt
+    and evidence.get("cause") == "human_decision_required"
+):
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+        then
+            recovery_recorded=true
+            break
+        fi
+        sleep 0.1
+    done
+    [[ "$recovery_recorded" == true ]] || {
+        printf 'controller did not durably record the repeated-route blocked lifecycle\n' >&2
+        exit 3
+    }
+    record_event repeated_route_worker_blocked "$(python3 - "$attempt" <<'PY'
+import json
+import sys
+
+print(json.dumps({"attempt": int(sys.argv[1]), "exit": "one_shot_complete"}))
+PY
+)"
+    exit 0
+fi
 
 if [[ "$role" == "dev" && "${E2E_FAST_START:-0}" == "1" ]]; then
     [[ "$(basename "$0")" == "codex" && "$model" == "gpt-6-luna" && "$effort" == "xhigh" ]] || {

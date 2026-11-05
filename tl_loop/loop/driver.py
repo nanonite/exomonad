@@ -5183,6 +5183,51 @@ def _validate_terminal_resume_route_receipts(
     return expected, None
 
 
+def _terminal_resume_authorization_from_arguments(
+    arguments: Mapping[str, object],
+    leaf: LeafTask,
+) -> Mapping[str, object] | None:
+    """Rebuild one historical authorization from its durable action arguments.
+
+    A later human-recovery round legitimately replaces the previous recovery
+    evidence when the successor stops. The confirmed action journal still
+    carries every field that bound the launch to its accepted route, so the
+    authorization can be reconstructed instead of treating routine recovery
+    history as corruption.
+    """
+    digest = arguments.get("route_authorization_digest")
+    if arguments.get(
+        "route_authorization_source"
+    ) != "accepted_operator_role_configuration" or not _is_sha256_text(str(digest or "")):
+        return None
+    return {
+        "source": arguments.get("route_authorization_source"),
+        "digest": digest,
+        "configuration_fingerprint": arguments.get("route_configuration_fingerprint"),
+        "terminal_invocation_digest": arguments.get("terminal_invocation_digest"),
+        "role": arguments.get("configured_role"),
+        "harness": arguments.get("desired_harness"),
+        "agent_type": arguments.get("desired_agent_type"),
+        "model": arguments.get("desired_model"),
+        "effort": arguments.get("desired_effort"),
+        "prior_runtime": arguments.get("prior_runtime"),
+        "prior_model": arguments.get("prior_model"),
+        "prior_effort": arguments.get("prior_effort"),
+        "recovery_gate_authorization": arguments.get("recovery_gate_authorization"),
+        "manifest_digest": arguments.get("route_manifest_digest"),
+        "slice_id": leaf.name,
+        "issue_id": arguments.get("chainlink_issue_id"),
+        "owner_agent_id": arguments.get("owner_agent_name"),
+        "prior_invocation_id": arguments.get("expected_invocation_id"),
+        "dispatch_intent_id": arguments.get("prior_dispatch_intent_id"),
+        "dispatch_generation": arguments.get("prior_dispatch_generation"),
+        "branch": arguments.get("expected_branch"),
+        "worktree_fingerprint": arguments.get("expected_worktree_fingerprint"),
+        "accepted_spawn_event_seq": arguments.get("accepted_spawn_event_seq"),
+        "blocker_event_seq": arguments.get("blocker_event_seq"),
+    }
+
+
 def _terminal_resume_authorization_matches(
     entry: Mapping[str, object],
     state: RunState,
@@ -5201,6 +5246,12 @@ def _terminal_resume_authorization_matches(
         else []
     )
     digest = arguments.get("route_authorization_digest")
+    if not any(
+        isinstance(record, Mapping) and record.get("digest") == digest for record in records
+    ):
+        derived = _terminal_resume_authorization_from_arguments(arguments, leaf)
+        if derived is not None:
+            records.append(derived)
     for record in records:
         if not isinstance(record, Mapping) or record.get("digest") != digest:
             continue
@@ -5308,18 +5359,43 @@ def _terminal_resume_history_proof(
         return None, "accepted initial spawn result conflicts with the owner declaration"
     expected_id = initial_invocation_id
     expected_generation: int | None = None
+    if current.dispatch_invocation_id == initial_invocation_id:
+        expected_route = initial_spawn_route
+    else:
+        # The checkpoint has already adopted a confirmed resume successor, so
+        # the authoritative route of the *initial* spawn is no longer the row
+        # at the current dispatch sequence. Rebuild it from the first resume
+        # action, which was validated against the original invocation record.
+        if not entries:
+            return None, "resume history lacks its original invocation route"
+        first_arguments = entries[0].get("arguments")
+        if not isinstance(first_arguments, Mapping):
+            return None, "resume history lacks its original invocation route"
+        first_runtime = normalize_runtime_label(first_arguments.get("prior_runtime"))
+        if first_arguments.get("prior_runtime") is not None and first_runtime is None:
+            return None, "resume history contains an unsupported prior runtime label"
+        expected_route = (
+            first_runtime,
+            first_arguments.get("prior_model"),
+            first_arguments.get("prior_effort"),
+        )
     route_fields = ("agent_type", "model", "effort")
-    for field_name, observed in zip(route_fields, initial_spawn_route, strict=True):
-        if field_name not in spawn_arguments:
-            continue
-        argument_value = spawn_arguments[field_name]
-        if field_name == "agent_type":
-            argument_value = normalize_runtime_label(argument_value)
-            if argument_value is None:
-                return None, "accepted spawn journal contains an unsupported runtime label"
-        if argument_value != observed:
-            return None, "accepted spawn arguments conflict with authoritative invocation route"
-    expected_route = initial_spawn_route
+    if any(value is not None for value in expected_route):
+        for field_name, observed in zip(route_fields, expected_route, strict=True):
+            if field_name not in spawn_arguments:
+                continue
+            argument_value = spawn_arguments[field_name]
+            if field_name == "agent_type":
+                argument_value = normalize_runtime_label(argument_value)
+                if argument_value is None:
+                    return None, "accepted spawn journal contains an unsupported runtime label"
+            if observed is None:
+                continue
+            if argument_value != observed:
+                return (
+                    None,
+                    "accepted spawn arguments conflict with authoritative invocation route",
+                )
     try:
         identity_document = json.loads(
             (owner.directory / "identity.json").read_text(encoding="utf-8")
@@ -5329,7 +5405,7 @@ def _terminal_resume_history_proof(
     if not isinstance(identity_document, Mapping):
         return None, "terminal owner identity is malformed"
     identity = identity_document
-    latest_entry: Mapping[str, object] | None = None
+    latest_confirmed_entry: Mapping[str, object] | None = None
     latest_result: ToolResult | None = None
     latest_route_match: bool | None = None
     unresolved_latest = False
@@ -5382,7 +5458,6 @@ def _terminal_resume_history_proof(
             if index != len(entries) - 1:
                 return None, "an unresolved resume effect precedes a later owner mutation"
             unresolved_latest = True
-            latest_entry = entry
             continue
         if status != "confirmed":
             return None, "a terminal-owner resume was rejected; preserve its decision before retry"
@@ -5418,11 +5493,26 @@ def _terminal_resume_history_proof(
             persisted.get("runtime") if persisted_matches else None
         )
         model = invocation.get("model")
-        if model is None and persisted_matches:
-            model = persisted.get("model")
         effort = invocation.get("effort")
-        if effort is None and persisted_matches:
-            effort = persisted.get("effort")
+        if (model is None or effort is None) and persisted_matches:
+            model = persisted.get("model") if model is None else model
+            effort = persisted.get("effort") if effort is None else effort
+        if model is None or effort is None:
+            # The owner registry holds only the newest invocation. A later
+            # resume action recorded what it proved about this predecessor
+            # before the record rotated, so use that linked history rather
+            # than treating an older result's omission as a route conflict.
+            next_arguments = (
+                entries[index + 1].get("arguments") if index + 1 < len(entries) else None
+            )
+            if isinstance(next_arguments, Mapping):
+                next_runtime = next_arguments.get("prior_runtime")
+                if runtime is None and next_runtime is not None:
+                    runtime = normalize_runtime_label(next_runtime)
+                if model is None:
+                    model = next_arguments.get("prior_model")
+                if effort is None:
+                    effort = next_arguments.get("prior_effort")
         if (
             not isinstance(successor_id, str)
             or invocation.get("trigger") != "resume_blocked"
@@ -5459,7 +5549,7 @@ def _terminal_resume_history_proof(
         expected_id = successor_id
         expected_generation = prior_generation + 1
         expected_route = observed
-        latest_entry = entry
+        latest_confirmed_entry = entry
         latest_result = result
     invocation = owner.invocation_record
     if not unresolved_latest and (
@@ -5480,7 +5570,7 @@ def _terminal_resume_history_proof(
         or owner.effort != invocation.get("effort")
     ):
         return None, "terminal owner runtime and model records disagree"
-    if latest_result is not None and latest_entry is not None:
+    if latest_result is not None and latest_confirmed_entry is not None:
         payload = latest_result.result
         agent = payload.get("agent") if isinstance(payload, Mapping) else None
         result_invocation = payload.get("invocation") if isinstance(payload, Mapping) else None
@@ -5502,7 +5592,9 @@ def _terminal_resume_history_proof(
             or Path(str(agent.get("worktree_path", ""))).resolve() != owner.worktree
         ):
             return None, "confirmed resume result conflicts with the persisted terminal invocation"
-        result_route, route_reason = _terminal_resume_result_route(latest_entry, latest_result)
+        result_route, route_reason = _terminal_resume_result_route(
+            latest_confirmed_entry, latest_result
+        )
         if route_reason is not None:
             return None, route_reason
         identity_route = identity.get("role_route")
@@ -5552,7 +5644,7 @@ def _terminal_resume_history_proof(
     return (
         _TerminalResumeHistory(
             checkpointed_index,
-            latest_entry,
+            latest_confirmed_entry,
             latest_result,
             latest_route_match,
             unresolved_latest,
@@ -5976,8 +6068,6 @@ def _terminal_owner_recovery_proof(
     checkpoint_worktree = Path(current.worktree or "")
     if not checkpoint_worktree.is_absolute():
         checkpoint_worktree = Path(config.project_root) / checkpoint_worktree
-    if checkpoint_worktree.resolve() != planned_worktree.resolve():
-        return None, "terminal-owner checkpoint planned worktree conflicts with its manifest"
     if not isinstance(expected.get("branch"), str) or not current.branch:
         return None, "terminal-owner checkpoint branch is missing from accepted coordinates"
     declared_branch = str(expected["branch"])
@@ -6027,8 +6117,9 @@ def _terminal_owner_recovery_proof(
         or owner.issue_id != leaf.chainlink_issue_id
         or owner.parent_branch != config.branch
         or owner.branch != current.branch
+        or checkpoint_worktree.resolve() not in {planned_worktree.resolve(), owner.worktree}
     ):
-        return None, "terminal owner identity, issue, or branch conflicts"
+        return None, "terminal owner identity, issue, branch, or worktree conflicts"
     event_proof, event_reason = _terminal_owner_ledger_proof(
         current, recovery, state, config, store
     )
@@ -6322,12 +6413,21 @@ def _terminal_owner_recovery_proof(
             evidence,
             config,
             state.plan_manifest.digest,
+        ) or _saved_terminal_launch_authorization_matches(
+            saved_authorization,
+            route_authorization,
+            config,
+            state.plan_manifest.digest,
         ):
+            # A routine recovery round clears the human-gate evidence that held
+            # the previous supersession link, but the exact saved authorization
+            # still names this same terminal predecessor and target route.
+            # Reuse it instead of reporting a configuration conflict.
             route_authorization = cast(Mapping[str, object], saved_authorization)
             route_digest = cast(str, route_authorization["digest"])
-            route_authorization_supersedes_digest = cast(
-                str, route_authorization["supersedes_route_authorization_digest"]
-            )
+            supersedes_saved = route_authorization.get("supersedes_route_authorization_digest")
+            if isinstance(supersedes_saved, str):
+                route_authorization_supersedes_digest = supersedes_saved
         else:
             authorization_changes = (
                 sorted(
@@ -6588,7 +6688,7 @@ def _terminal_owner_ledger_proof(
         and event.run_seq is not None
         and spawn_seq < event.run_seq <= state.events.last_consumed_offset
         and event.run_id == config.ledger_run_id
-        and event.agent_id == state.run_id
+        and event.agent_id in {state.run_id, current.dispatch_agent_id}
         and event.task_blocked is not None
         and event.task_blocked.slice_id == current.id
         and event.task_blocked.attempt == current.attempts
@@ -7278,6 +7378,11 @@ def _resume_terminal_owner_failure(
     effects_log: list[EffectIntent],
 ) -> RunState:
     """Reconcile a confirmed launch whose exact host invocation ended in failure."""
+    latest = store.load()
+    if latest.revision > state.revision:
+        # A concurrent continuation may already have launched the successor.
+        # Never authorize a second effect from a stale pre-launch snapshot.
+        state = latest
     terminal, reason = _terminal_owner_recovery_proof(plan, state, config, store)
     if terminal is None:
         if reason is None:
