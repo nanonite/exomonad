@@ -20157,6 +20157,7 @@ def _seed_terminal_provider_failure_leaf(
     prior_effort: str = "high",
     controller_invocation_id: str = "accepted-kani-controller-invocation",
     reference_requirements: tuple[ReferenceVerificationRequirement, ...] = (),
+    omit_initial_spawn_effort: bool = False,
 ) -> tuple[WorkPlan, TLLoopConfig, RunStore, Path, str, str]:
     """Build the retained accepted-launch / terminal-provider-failure shape."""
     run_id = "substitution-model-kani-stage"
@@ -20361,17 +20362,19 @@ def _seed_terminal_provider_failure_leaf(
     )
     assert recovery.plan_revision != manifest.manifest_revision
     assert recovery.plan_revision < store.load().revision
+    launch_arguments: dict[str, object] = {
+        "name": slice_id,
+        "task": plan.leaves[0].task,
+        "intent_id": dispatch_intent_id,
+        "agent_type": prior_runtime,
+        "model": prior_model,
+    }
+    if not omit_initial_spawn_effort:
+        launch_arguments["effort"] = prior_effort
     accepted_launch = EffectIntent(
         "spawn_leaf",
         slice_id,
-        {
-            "name": slice_id,
-            "task": plan.leaves[0].task,
-            "intent_id": dispatch_intent_id,
-            "agent_type": prior_runtime,
-            "model": prior_model,
-            "effort": prior_effort,
-        },
+        launch_arguments,
         True,
     )
     launch_journal = EffectJournal(run_id, store.run_dir / "action-journal.json")
@@ -20983,6 +20986,7 @@ def test_terminal_recovery_reconciles_confirmed_wrong_route_successor_before_cur
 def test_terminal_resume_history_accepts_multiple_stopped_successors_and_route_return(
     tmp_path: Path,
 ) -> None:
+    """Replay linked generations across accepted route A -> B -> A."""
     plan, config, store, owner_dir, owner_name, original_id = _seed_terminal_provider_failure_leaf(
         tmp_path
     )
@@ -20992,6 +20996,47 @@ def test_terminal_resume_history_accepts_multiple_stopped_successors_and_route_r
     journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
     identity_path = owner_dir / "identity.json"
     identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    route_a = config
+
+    def route_configuration(
+        agent_type: str, model: str, effort: str, fingerprint_digit: str
+    ) -> TLLoopConfig:
+        assert config.policy is not None
+        selected_harness = f"{agent_type}/{model}"
+        role_documents: dict[str, dict[str, object]] = {}
+        for role_name, role_policy in config.policy.roles.items():
+            allowed = (selected_harness,) if role_name == "worker" else role_policy.allow
+            role_documents[role_name] = {
+                "allow": list(allowed),
+                "cost_rank": {harness: 1 for harness in allowed},
+                "token_budget": role_policy.token_budget,
+                "per_harness_budget": {
+                    harness: role_policy.per_harness_budget.get(harness, 80000)
+                    for harness in allowed
+                },
+                "escalate_after_attempts": role_policy.escalate_after_attempts,
+            }
+        catalog = ModelCatalog.from_payload(
+            {
+                "models": [
+                    {"harness": "codex", "model_id": "gpt-6-luna"},
+                    {"harness": "codex", "model_id": "gpt-6.1-sol"},
+                    {
+                        "harness": "opencode",
+                        "model_id": "opencode-go/deepseek-v4.1-flash",
+                    },
+                ]
+            }
+        )
+        return replace(
+            config,
+            policy=validate_policy({"roles": role_documents}),
+            capabilities=CapabilityMap({selected_harness: Difficulty.STANDARD}),
+            catalog=catalog,
+            requested_model=model,
+            worker_effort_level=effort,
+            role_route_configuration_fingerprint=("sha256:v1:" + fingerprint_digit * 64),
+        )
 
     def record_terminal_resume(
         current_proof,
@@ -21000,8 +21045,11 @@ def test_terminal_resume_history_accepts_multiple_stopped_successors_and_route_r
         predecessor_id: str,
         model: str,
         *,
+        effort: str = "xhigh",
         legacy: bool,
     ) -> Mapping[str, object]:
+        runtime = current_proof.resume.desired_agent_type
+        assert isinstance(runtime, str)
         arguments = dict(
             driver_module._blocked_leaf_resume_action_arguments(current_proof.resume, store.load())
         )
@@ -21020,7 +21068,7 @@ def test_terminal_resume_history_accepts_multiple_stopped_successors_and_route_r
                     "id": owner_name,
                     "issue": plan.leaves[0].name,
                     "intent_id": current_proof.resume.intent_id,
-                    "agent_type": "codex",
+                    "agent_type": runtime,
                     "branch_name": current_proof.resume.owner.branch,
                     "worktree_path": str(current_proof.resume.owner.worktree),
                 },
@@ -21028,9 +21076,9 @@ def test_terminal_resume_history_accepts_multiple_stopped_successors_and_route_r
                     "invocation_id": invocation_id,
                     "generation": generation,
                     "trigger": "resume_blocked",
-                    "runtime": "codex",
+                    "runtime": runtime,
                     "model": model,
-                    "effort": "xhigh",
+                    "effort": effort,
                     "ready": True,
                     "fresh": True,
                     "outcome": "started",
@@ -21043,9 +21091,9 @@ def test_terminal_resume_history_accepts_multiple_stopped_successors_and_route_r
         journal.mark_result(intent, ToolResult.from_raw(result_document))
         identity.update(
             {
-                "agent_type": "codex",
+                "agent_type": runtime,
                 "model": model,
-                "effort": "xhigh",
+                "effort": effort,
             }
         )
         if response_route is not None:
@@ -21059,9 +21107,9 @@ def test_terminal_resume_history_accepts_multiple_stopped_successors_and_route_r
                     "invocation_id": invocation_id,
                     "generation": generation,
                     "status": "exited",
-                    "runtime": "codex",
+                    "runtime": runtime,
                     "model": model,
-                    "effort": "xhigh",
+                    "effort": effort,
                     "trigger": "resume_blocked",
                     "branch": current_proof.resume.owner.branch,
                     "worktree": str(current_proof.resume.owner.worktree),
@@ -21115,19 +21163,340 @@ def test_terminal_resume_history_accepts_multiple_stopped_successors_and_route_r
         legacy=False,
     )
 
+    # A second accepted configuration changes harness, model, and effort. Reconcile
+    # that stopped successor as history, then authorize the returned Luna route.
+    config_b = route_configuration("opencode", "opencode-go/deepseek-v4.1-flash", "high", "3")
+    proof_b, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config_b, store
+    )
+    assert proof_b is not None, reason
+    assert proof_b.resume.desired_harness == "opencode/opencode-go/deepseek-v4.1-flash"
+    assert proof_b.resume.desired_agent_type == "opencode"
+    assert proof_b.resume.desired_model == "opencode-go/deepseek-v4.1-flash"
+    assert proof_b.resume.desired_effort == "high"
+    state = driver_module._persist_terminal_route_authorization(proof_b, store.load(), store)
+    proof_b, reason = driver_module._terminal_owner_recovery_proof(plan, state, config_b, store)
+    assert proof_b is not None, reason
+    third_args = record_terminal_resume(
+        proof_b,
+        "terminal-route-b-successor",
+        4,
+        "e861f870-65f7-47cb-b75b-0a26dbbde0b7",
+        "opencode-go/deepseek-v4.1-flash",
+        legacy=False,
+        effort="high",
+    )
+
+    state = store.load()
+    config = route_a
+    proof_a_again, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
+    assert proof_a_again is not None, reason
+    assert proof_a_again.resume.desired_model == "gpt-6-luna"
+    assert proof_a_again.resume.desired_effort == "xhigh"
+    assert (
+        proof_a_again.route_authorization_supersedes_digest
+        == third_args["route_authorization_digest"]
+    )
+    state = driver_module._persist_terminal_route_authorization(proof_a_again, store.load(), store)
+    proof_a_again, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
+    assert proof_a_again is not None, reason
+    fourth_args = record_terminal_resume(
+        proof_a_again,
+        "terminal-route-a-return-successor",
+        5,
+        "terminal-route-b-successor",
+        "gpt-6-luna",
+        legacy=False,
+    )
+
     proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
 
     assert proof is not None, reason
-    assert proof.resume.owner.prior_invocation_id == "e861f870-65f7-47cb-b75b-0a26dbbde0b7"
-    assert proof.resume.owner.generation == 3
+    assert proof.resume.owner.prior_invocation_id == "terminal-route-a-return-successor"
+    assert proof.resume.owner.generation == 5
     assert proof.resume.desired_model == "gpt-6-luna"
     assert proof.resume.desired_effort == "xhigh"
-    assert proof.route_authorization_supersedes_digest == second_args["route_authorization_digest"]
+    assert proof.route_authorization_supersedes_digest == fourth_args["route_authorization_digest"]
     entries = journal.entries_for("resume_blocked_leaf", plan.leaves[0].name)
-    assert len(entries) == 2
+    assert len(entries) == 4
     assert entries[0]["arguments"] == first_args
     assert entries[1]["arguments"] == second_args
-    assert entries[0]["status"] == entries[1]["status"] == "confirmed"
+    assert entries[2]["arguments"] == third_args
+    assert entries[3]["arguments"] == fourth_args
+    assert all(entry["status"] == "confirmed" for entry in entries)
+    assert [entries[index]["arguments"]["expected_invocation_id"] for index in range(4)] == [
+        original_id,
+        "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d",
+        "e861f870-65f7-47cb-b75b-0a26dbbde0b7",
+        "terminal-route-b-successor",
+    ]
+    assert [entries[index]["arguments"]["prior_generation"] for index in range(4)] == [
+        1,
+        2,
+        3,
+        4,
+    ]
+    assert [entries[index]["arguments"]["desired_model"] for index in range(4)] == [
+        "gpt-6-luna",
+        "gpt-6-luna",
+        "opencode-go/deepseek-v4.1-flash",
+        "gpt-6-luna",
+    ]
+    assert [entries[index]["arguments"]["desired_effort"] for index in range(4)] == [
+        "xhigh",
+        "xhigh",
+        "high",
+        "xhigh",
+    ]
+    assert entries[0]["arguments"].get("route_fingerprint") is None
+    assert (
+        entries[1]["arguments"]["route_configuration_fingerprint"]
+        == route_a.role_route_configuration_fingerprint
+    )
+    assert (
+        entries[2]["arguments"]["route_configuration_fingerprint"]
+        == config_b.role_route_configuration_fingerprint
+    )
+    assert (
+        entries[3]["arguments"]["route_configuration_fingerprint"]
+        == route_a.role_route_configuration_fingerprint
+    )
+    authorization_history = (
+        store.load()
+        .slices[plan.leaves[0].name]
+        .recovery.evidence["configured_route_authorization_history"]
+    )
+    assert len(authorization_history) >= 2
+    assert authorization_history[-1]["agent_type"] == "opencode"
+    assert authorization_history[-1]["model"] == "opencode-go/deepseek-v4.1-flash"
+    assert (
+        store.load()
+        .slices[plan.leaves[0].name]
+        .recovery.evidence["configured_route_authorization"]["model"]
+        == "gpt-6-luna"
+    )
+
+
+def _seed_modern_confirmed_terminal_resume(
+    tmp_path: Path,
+    *,
+    missing: str | None = None,
+    conflict: str | None = None,
+    omit_initial_spawn_effort: bool = False,
+) -> tuple[WorkPlan, TLLoopConfig, RunStore]:
+    plan, config, store, owner_dir, owner_name, original_id = _seed_terminal_provider_failure_leaf(
+        tmp_path,
+        omit_initial_spawn_effort=omit_initial_spawn_effort,
+    )
+    initial, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert initial is not None, reason
+    state = driver_module._persist_terminal_route_authorization(initial, store.load(), store)
+    initial, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
+    assert initial is not None, reason
+    arguments = dict(driver_module._blocked_leaf_resume_action_arguments(initial.resume, state))
+    route = driver_module._blocked_resume_role_route_response(initial.resume)
+    assert route is not None and arguments.get("route_fingerprint")
+    invocation_id = "modern-terminal-resume-generation-two"
+    if conflict == "action_route":
+        arguments["effort"] = "medium"
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    intent = EffectIntent("resume_blocked_leaf", plan.leaves[0].name, arguments, True)
+    journal.append(intent)
+
+    def receipt(name: str) -> dict[str, object]:
+        value = json.loads(json.dumps(route))
+        if conflict == name:
+            value["effort"] = "medium"
+        return value
+
+    agent_receipt = (
+        None if missing in {"agent_response", "all_receipts"} else receipt("agent_response")
+    )
+    invocation_receipt = (
+        None
+        if missing in {"invocation_response", "all_receipts"}
+        else receipt("invocation_response")
+    )
+    if missing == "both_response":
+        agent_receipt = None
+        invocation_receipt = None
+    result_agent: dict[str, object] = {
+        "id": owner_name,
+        "issue": plan.leaves[0].name,
+        "intent_id": initial.resume.intent_id,
+        "agent_type": "codex",
+        "branch_name": initial.resume.owner.branch,
+        "worktree_path": str(initial.resume.owner.worktree),
+    }
+    result_invocation: dict[str, object] = {
+        "invocation_id": invocation_id,
+        "generation": 2,
+        "trigger": "resume_blocked",
+        "runtime": "codex",
+        "model": "gpt-6-luna",
+        "effort": "xhigh",
+        "ready": True,
+        "fresh": True,
+        "outcome": "started",
+    }
+    if agent_receipt is not None:
+        result_agent["role_route"] = agent_receipt
+    if invocation_receipt is not None:
+        result_invocation["role_route"] = invocation_receipt
+    journal.mark_result(
+        intent,
+        ToolResult.from_raw(
+            {
+                "success": True,
+                "result": {
+                    "chainlink_issue_id": 814,
+                    "agent": result_agent,
+                    "invocation": result_invocation,
+                },
+            }
+        ),
+    )
+
+    identity_path = owner_dir / "identity.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    identity.update({"agent_type": "codex", "model": "gpt-6-luna", "effort": "xhigh"})
+    identity_route = (
+        None if missing in {"identity", "both_durable", "all_receipts"} else receipt("identity")
+    )
+    if identity_route is None:
+        identity.pop("role_route", None)
+    else:
+        identity["role_route"] = identity_route
+    identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    invocation = {
+        "invocation_id": invocation_id,
+        "generation": 2,
+        "status": "exited",
+        "runtime": "codex",
+        "model": "gpt-6-luna",
+        "effort": "xhigh",
+        "trigger": "resume_blocked",
+        "branch": initial.resume.owner.branch,
+        "worktree": str(initial.resume.owner.worktree),
+        "slice_id": plan.leaves[0].name,
+        "prior_invocation_id": original_id,
+        "pr_number": None,
+        "head_sha": None,
+        "ended_at": 1792734802,
+        "exit_code": 0,
+        "exit_reason": "one_shot_complete",
+        "exit_classification": "one_shot_complete",
+        "one_shot_complete": True,
+    }
+    invocation_route = (
+        None if missing in {"invocation", "both_durable", "all_receipts"} else receipt("invocation")
+    )
+    if invocation_route is not None:
+        invocation["role_route"] = invocation_route
+    (owner_dir / "invocation.json").write_text(json.dumps(invocation), encoding="utf-8")
+    (owner_dir / "dispatch_intent").write_text(initial.resume.intent_id + "\n", encoding="utf-8")
+    (owner_dir / "routing.json").write_text(
+        json.dumps(
+            {
+                "owner_agent_id": owner_name,
+                "owner_invocation_id": invocation_id,
+                "owner_generation": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return plan, config, store
+
+
+@pytest.mark.parametrize(
+    "missing",
+    (
+        "identity",
+        "invocation",
+        "both_durable",
+        "agent_response",
+        "invocation_response",
+        "both_response",
+        "all_receipts",
+    ),
+)
+def test_modern_terminal_resume_requires_complete_route_receipts(
+    tmp_path: Path,
+    missing: str,
+) -> None:
+    plan, config, store = _seed_modern_confirmed_terminal_resume(tmp_path, missing=missing)
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+
+    assert proof is None
+    assert reason is not None and "route" in reason
+
+
+@pytest.mark.parametrize(
+    "conflict",
+    ("identity", "invocation", "agent_response", "invocation_response", "action_route"),
+)
+def test_modern_terminal_resume_rejects_conflicting_route_receipts(
+    tmp_path: Path,
+    conflict: str,
+) -> None:
+    plan, config, store = _seed_modern_confirmed_terminal_resume(tmp_path, conflict=conflict)
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+
+    assert proof is None
+    assert reason is not None and "route" in reason
+
+
+def test_legacy_terminal_resume_corroborates_omitted_initial_spawn_effort(
+    tmp_path: Path,
+) -> None:
+    plan, config, store = _seed_modern_confirmed_terminal_resume(
+        tmp_path,
+        omit_initial_spawn_effort=True,
+    )
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+
+    assert proof is not None, reason
+    assert proof.resume.owner.prior_invocation_id == "modern-terminal-resume-generation-two"
+    assert proof.resume.owner.runtime == "codex"
+    spawn = EffectJournal(store.run_id, store.run_dir / "action-journal.json").entries_for(
+        "spawn_leaf", plan.leaves[0].name
+    )[0]
+    assert "effort" not in spawn["arguments"]
+
+
+@pytest.mark.parametrize(
+    ("initial_spawn_effort", "initial_spawn_effort_is_null"),
+    (("medium", False), (None, True)),
+)
+def test_legacy_terminal_resume_rejects_explicit_conflicting_spawn_effort(
+    tmp_path: Path,
+    initial_spawn_effort: str | None,
+    initial_spawn_effort_is_null: bool,
+) -> None:
+    plan, config, store = _seed_modern_confirmed_terminal_resume(tmp_path)
+    journal_path = store.run_dir / "action-journal.json"
+    entries = json.loads(journal_path.read_text(encoding="utf-8"))
+    spawn = next(
+        entry
+        for entry in entries
+        if entry.get("operation") == "spawn_leaf" and entry.get("target") == plan.leaves[0].name
+    )
+    spawn["arguments"]["effort"] = None if initial_spawn_effort_is_null else initial_spawn_effort
+    journal_path.write_text(json.dumps(entries), encoding="utf-8")
+    saved_spawn = EffectJournal(store.run_id, journal_path).entries_for(
+        "spawn_leaf", plan.leaves[0].name
+    )[0]
+    assert saved_spawn["arguments"]["effort"] == spawn["arguments"]["effort"]
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+
+    assert proof is None
+    assert reason is not None and "conflict" in reason
 
 
 @pytest.mark.parametrize("scenario", ("missing", "failed", "stale", "dirty"))
@@ -22736,7 +23105,7 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
         plan, approved, changed_route, store
     )
     assert changed_route_proof is None
-    assert "original route authorization" in str(changed_route_reason)
+    assert "route" in str(changed_route_reason)
     invocation_path = owner_dir / "invocation.json"
     successor_invocation = invocation_path.read_bytes()
     changed_invocation = json.loads(successor_invocation)
@@ -22822,7 +23191,7 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
         legacy_proof, legacy_reason = driver_module._terminal_owner_recovery_proof(
             plan, store.load(), config, store
         )
-        assert legacy_proof is not None and legacy_reason is None
+        assert legacy_proof is not None and legacy_reason is None, legacy_reason
         legacy_authorization = dict(legacy_proof.successor_adoption_authorization)
         legacy_authorization.pop("authorization_version")
         legacy_authorization.pop("predecessor_generation")

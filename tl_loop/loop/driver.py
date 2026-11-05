@@ -4991,6 +4991,14 @@ class _TerminalResumeHistory(NamedTuple):
     current_dispatch_invocation_generation: int
 
 
+class _TerminalOwnerLedgerProof(NamedTuple):
+    """Accepted dispatch and blocker rows, including the original actual route."""
+
+    spawn_event_seq: int
+    blocker_event_seq: int
+    spawn_route: tuple[object, object, object]
+
+
 def _terminal_resume_checkpointed_index(
     entries: Sequence[Mapping[str, object]], current: SliceState, journal: EffectJournal
 ) -> tuple[int | None, str | None]:
@@ -5033,6 +5041,12 @@ def _terminal_resume_result_route(
         or not isinstance(invocation, Mapping)
     ):
         return None, "confirmed resume result lacks its owner and invocation coordinates"
+    agent_has_route = "role_route" in agent
+    invocation_has_route = "role_route" in invocation
+    if agent_has_route != invocation_has_route:
+        return None, "confirmed resume response omitted one role-route receipt"
+    if not agent_has_route:
+        return None, None
     agent_route = agent.get("role_route")
     invocation_route = invocation.get("role_route")
     if agent_route is not None and invocation_route is not None and agent_route != invocation_route:
@@ -5043,8 +5057,138 @@ def _terminal_resume_result_route(
     return route if isinstance(route, Mapping) else None, None
 
 
+def _terminal_resume_route_is_bound(
+    arguments: Mapping[str, object],
+    result: ToolResult,
+    identity: Mapping[str, object],
+    invocation: Mapping[str, object],
+    persisted_matches: bool,
+) -> bool:
+    payload = result.result
+    agent = payload.get("agent") if isinstance(payload, Mapping) else None
+    response_invocation = payload.get("invocation") if isinstance(payload, Mapping) else None
+    return (
+        "route_fingerprint" in arguments
+        or (isinstance(agent, Mapping) and "role_route" in agent)
+        or (isinstance(response_invocation, Mapping) and "role_route" in response_invocation)
+        or (persisted_matches and ("role_route" in identity or "role_route" in invocation))
+    )
+
+
+def _terminal_resume_expected_route(
+    arguments: Mapping[str, object], leaf: LeafTask
+) -> tuple[Mapping[str, object] | None, str | None]:
+    fields = (
+        "role",
+        "harness",
+        "agent_type",
+        "model",
+        "effort",
+        "route_configuration_fingerprint",
+        "route_policy_fingerprint",
+        "route_manifest_digest",
+        "route_fingerprint",
+        "dispatch_intent_id",
+    )
+    if any(field not in arguments for field in fields):
+        return None, "modern resume action has incomplete accepted route provenance"
+    expected = {
+        "role": arguments.get("role"),
+        "harness": arguments.get("harness"),
+        "agent_type": arguments.get("agent_type"),
+        "model": arguments.get("model"),
+        "effort": arguments.get("effort"),
+        "configuration_fingerprint": arguments.get("route_configuration_fingerprint"),
+        "policy_fingerprint": arguments.get("route_policy_fingerprint"),
+        "manifest_digest": arguments.get("route_manifest_digest"),
+        "route_fingerprint": arguments.get("route_fingerprint"),
+        "dispatch_intent_id": arguments.get("dispatch_intent_id"),
+        "scope_id": leaf.name,
+    }
+    try:
+        validate_role_route_provenance(expected, expected, "resume action")
+    except BlockedLeafRouteProvenanceError:
+        return None, "modern resume action has incomplete accepted route provenance"
+    route_fingerprint_input = {
+        key: expected[key]
+        for key in (
+            "role",
+            "harness",
+            "agent_type",
+            "model",
+            "effort",
+            "configuration_fingerprint",
+            "policy_fingerprint",
+            "manifest_digest",
+        )
+    }
+    if (
+        not _is_role_route_configuration_fingerprint(expected["configuration_fingerprint"])
+        or (
+            expected["policy_fingerprint"] is not None
+            and not _is_role_route_configuration_fingerprint(expected["policy_fingerprint"])
+        )
+        or _route_fingerprint(route_fingerprint_input, "exomonad-role-route-v1")
+        != expected["route_fingerprint"]
+    ):
+        return None, "modern resume action has conflicting accepted route fingerprints"
+    if (
+        arguments.get("desired_agent_type") != expected["agent_type"]
+        or arguments.get("desired_model") != expected["model"]
+        or arguments.get("desired_effort") != expected["effort"]
+        or arguments.get("desired_harness") != expected["harness"]
+    ):
+        return None, "modern resume action route conflicts with its accepted desired route"
+    return expected, None
+
+
+def _validate_terminal_resume_route_receipts(
+    entry: Mapping[str, object],
+    result: ToolResult,
+    leaf: LeafTask,
+    identity: Mapping[str, object],
+    invocation: Mapping[str, object],
+    persisted_matches: bool,
+) -> tuple[Mapping[str, object] | None, str | None]:
+    arguments = entry.get("arguments")
+    if not isinstance(arguments, Mapping) or not _terminal_resume_route_is_bound(
+        arguments, result, identity, invocation, persisted_matches
+    ):
+        return None, None
+    expected, reason = _terminal_resume_expected_route(arguments, leaf)
+    if expected is None:
+        return None, reason
+    payload = result.result
+    agent = payload.get("agent") if isinstance(payload, Mapping) else None
+    response_invocation = payload.get("invocation") if isinstance(payload, Mapping) else None
+    receipts = (
+        (agent.get("role_route") if isinstance(agent, Mapping) else None, "agent response"),
+        (
+            response_invocation.get("role_route")
+            if isinstance(response_invocation, Mapping)
+            else None,
+            "invocation response",
+        ),
+    )
+    if persisted_matches:
+        receipts += (
+            (identity.get("role_route"), "owner identity"),
+            (invocation.get("role_route"), "owner invocation"),
+        )
+    try:
+        for observed, source in receipts:
+            validate_role_route_provenance(observed, expected, source)
+    except BlockedLeafRouteProvenanceError as error:
+        return None, f"terminal owner role-route provenance is incomplete or conflicting: {error}"
+    return expected, None
+
+
 def _terminal_resume_authorization_matches(
-    entry: Mapping[str, object], state: RunState, leaf: LeafTask, current: SliceState
+    entry: Mapping[str, object],
+    state: RunState,
+    leaf: LeafTask,
+    current: SliceState,
+    accepted_route: Mapping[str, object] | None,
 ) -> bool:
     arguments = entry.get("arguments")
     if not isinstance(arguments, Mapping):
@@ -5060,7 +5204,7 @@ def _terminal_resume_authorization_matches(
     for record in records:
         if not isinstance(record, Mapping) or record.get("digest") != digest:
             continue
-        return (
+        base_matches = (
             record.get("source") == "accepted_operator_role_configuration"
             and record.get("manifest_digest") == state.plan_manifest.digest
             and record.get("slice_id") == leaf.name
@@ -5076,6 +5220,33 @@ def _terminal_resume_authorization_matches(
             and record.get("model") == arguments.get("desired_model")
             and record.get("effort") == arguments.get("desired_effort")
         )
+        if not base_matches:
+            return False
+        if accepted_route is None:
+            return True
+        return all(
+            (
+                record.get("role") == accepted_route.get("role"),
+                record.get("role") == arguments.get("configured_role"),
+                record.get("harness") == accepted_route.get("harness"),
+                record.get("agent_type") == accepted_route.get("agent_type"),
+                record.get("model") == accepted_route.get("model"),
+                record.get("effort") == accepted_route.get("effort"),
+                record.get("manifest_digest") == accepted_route.get("manifest_digest"),
+                record.get("configuration_fingerprint")
+                == accepted_route.get("configuration_fingerprint"),
+                record.get("dispatch_intent_id") == arguments.get("prior_dispatch_intent_id"),
+                record.get("dispatch_generation") == arguments.get("prior_dispatch_generation"),
+                record.get("branch") == arguments.get("expected_branch"),
+                record.get("worktree_fingerprint")
+                == arguments.get("expected_worktree_fingerprint"),
+                record.get("accepted_spawn_event_seq") == arguments.get("accepted_spawn_event_seq"),
+                record.get("blocker_event_seq") == arguments.get("blocker_event_seq"),
+                record.get("prior_runtime") == arguments.get("prior_runtime"),
+                record.get("prior_model") == arguments.get("prior_model"),
+                record.get("prior_effort") == arguments.get("prior_effort"),
+            )
+        )
     return False
 
 
@@ -5086,6 +5257,7 @@ def _terminal_resume_history_proof(
     owner: BlockedLeafOwner,
     state: RunState,
     store: RunStore,
+    initial_spawn_route: tuple[object, object, object],
 ) -> tuple[_TerminalResumeHistory | None, str | None]:
     """Prove each confirmed resume as a linked historical effect without adopting its route."""
     journal = EffectJournal(state.run_id, store.run_dir / "action-journal.json")
@@ -5126,11 +5298,20 @@ def _terminal_resume_history_proof(
         return None, "accepted initial spawn result conflicts with the owner declaration"
     expected_id = initial_invocation_id
     expected_generation: int | None = None
-    expected_route = (
-        spawn_arguments.get("agent_type"),
-        spawn_arguments.get("model"),
-        spawn_arguments.get("effort"),
-    )
+    route_fields = ("agent_type", "model", "effort")
+    for field_name, observed in zip(route_fields, initial_spawn_route, strict=True):
+        if field_name in spawn_arguments and spawn_arguments[field_name] != observed:
+            return None, "accepted spawn arguments conflict with authoritative invocation route"
+    expected_route = initial_spawn_route
+    try:
+        identity_document = json.loads(
+            (owner.directory / "identity.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None, "terminal owner identity is unavailable or malformed"
+    if not isinstance(identity_document, Mapping):
+        return None, "terminal owner identity is malformed"
+    identity = identity_document
     latest_entry: Mapping[str, object] | None = None
     latest_result: ToolResult | None = None
     latest_route_match: bool | None = None
@@ -5167,12 +5348,11 @@ def _terminal_resume_history_proof(
             expected_generation = cast(int, arguments["prior_generation"])
         if arguments.get("prior_generation") != expected_generation:
             return None, "resume history invocation generations are discontinuous"
-        prior_route = (
-            arguments.get("prior_runtime"),
-            arguments.get("prior_model"),
-            arguments.get("prior_effort"),
-        )
-        if prior_route != expected_route:
+        prior_fields = ("prior_runtime", "prior_model", "prior_effort")
+        if any(
+            field_name in arguments and arguments[field_name] != observed
+            for field_name, observed in zip(prior_fields, expected_route, strict=True)
+        ):
             return None, "resume history prior route conflicts with the preceding invocation"
         if status in {"not_dispatched"} or _is_legacy_missing_role_route_refusal(entry):
             continue
@@ -5184,15 +5364,10 @@ def _terminal_resume_history_proof(
             continue
         if status != "confirmed":
             return None, "a terminal-owner resume was rejected; preserve its decision before retry"
-        if not _terminal_resume_authorization_matches(entry, state, leaf, current):
-            return None, "confirmed resume lacks its historical accepted route authorization"
         try:
             result = journal.replay(entry)
         except ActionJournalError:
             return None, "confirmed terminal-owner result is missing or malformed"
-        route, route_error = _terminal_resume_result_route(entry, result)
-        if route_error is not None:
-            return None, route_error
         payload = result.result
         agent = payload.get("agent") if isinstance(payload, Mapping) else None
         invocation = payload.get("invocation") if isinstance(payload, Mapping) else None
@@ -5200,20 +5375,32 @@ def _terminal_resume_history_proof(
         successor_id = invocation.get("invocation_id")
         persisted = owner.invocation_record
         persisted_matches = persisted.get("invocation_id") == successor_id
+        route, route_error = _terminal_resume_result_route(entry, result)
+        if route_error is not None:
+            return None, route_error
+        validated_route, route_error = _validate_terminal_resume_route_receipts(
+            entry,
+            result,
+            leaf,
+            identity,
+            persisted,
+            persisted_matches,
+        )
+        if route_error is not None:
+            return None, route_error
+        if validated_route is not None and route != validated_route:
+            return None, "confirmed resume route receipt conflicts with its accepted action"
+        if not _terminal_resume_authorization_matches(entry, state, leaf, current, validated_route):
+            return None, "confirmed resume lacks its historical accepted route authorization"
         runtime = invocation.get("runtime") or (
             persisted.get("runtime") if persisted_matches else None
         )
-        model = (
-            route.get("model")
-            if route is not None
-            else invocation.get("model") or (persisted.get("model") if persisted_matches else None)
-        )
-        effort = (
-            route.get("effort")
-            if route is not None
-            else invocation.get("effort")
-            or (persisted.get("effort") if persisted_matches else None)
-        )
+        model = invocation.get("model")
+        if model is None and persisted_matches:
+            model = persisted.get("model")
+        effort = invocation.get("effort")
+        if effort is None and persisted_matches:
+            effort = persisted.get("effort")
         if (
             not isinstance(successor_id, str)
             or invocation.get("trigger") != "resume_blocked"
@@ -5247,14 +5434,6 @@ def _terminal_resume_history_proof(
         recorded_generation = invocation.get("generation")
         if recorded_generation is not None and recorded_generation != prior_generation + 1:
             return None, "confirmed resume result has a conflicting invocation generation"
-        if index + 1 < len(entries):
-            next_arguments = entries[index + 1].get("arguments")
-            if (
-                isinstance(next_arguments, Mapping)
-                and next_arguments.get("expected_invocation_id") == successor_id
-                and next_arguments.get("prior_runtime") != runtime
-            ):
-                return None, "resume history prior route conflicts with the preceding result"
         expected_id = successor_id
         expected_generation = prior_generation + 1
         expected_route = observed
@@ -5270,15 +5449,6 @@ def _terminal_resume_history_proof(
         return None, "resume history has no checkpoint binding for the current dispatch"
     if checkpointed_index is not None and checkpointed_index >= len(entries):
         return None, "checkpointed resume history boundary is invalid"
-    try:
-        identity_document = json.loads(
-            (owner.directory / "identity.json").read_text(encoding="utf-8")
-        )
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None, "terminal owner identity is unavailable or malformed"
-    if not isinstance(identity_document, Mapping):
-        return None, "terminal owner identity is malformed"
-    identity = identity_document
     if (
         identity.get("agent_type") != invocation.get("runtime")
         or identity.get("model") != invocation.get("model")
@@ -5843,7 +6013,13 @@ def _terminal_owner_recovery_proof(
     if event_proof is None:
         return None, event_reason
     resume_history, history_reason = _terminal_resume_history_proof(
-        resume_entries, current, leaf, owner, state, store
+        resume_entries,
+        current,
+        leaf,
+        owner,
+        state,
+        store,
+        event_proof.spawn_route,
     )
     if resume_history is None:
         return None, history_reason
@@ -5862,7 +6038,8 @@ def _terminal_owner_recovery_proof(
         and evidence.get("generation") != resume_history.current_dispatch_invocation_generation
     ):
         return None, "terminal owner invocation generation conflicts with recovery evidence"
-    spawn_event_seq, blocker_event_seq = event_proof
+    spawn_event_seq = event_proof.spawn_event_seq
+    blocker_event_seq = event_proof.blocker_event_seq
     # A live retry after host launch is accepted only from this exact durable
     # action journal and host lineage. Otherwise the current owner must still be
     # the terminal failed predecessor whose route the operator is changing.
@@ -6328,7 +6505,7 @@ def _terminal_owner_ledger_proof(
     state: RunState,
     config: TLLoopConfig,
     store: RunStore,
-) -> tuple[tuple[int, int] | None, str | None]:
+) -> tuple[_TerminalOwnerLedgerProof | None, str | None]:
     """Correlate accepted spawn and terminal blocker rows by their exact coordinates."""
     assert config.project_root is not None and config.ledger_run_id is not None
     try:
@@ -6366,6 +6543,18 @@ def _terminal_owner_ledger_proof(
         )
     if spawn_seq is None:
         return None, "accepted spawn event has no sequence binding"
+    spawn_route = tuple(spawn.data.get(field) for field in ("agent_type", "model", "effort"))
+    if (
+        "agent_type" not in spawn.data
+        or not isinstance(spawn_route[0], str)
+        or not spawn_route[0].strip()
+        or any(
+            field not in spawn.data
+            or (value is not None and (not isinstance(value, str) or not value.strip()))
+            for field, value in zip(("model", "effort"), spawn_route[1:], strict=True)
+        )
+    ):
+        return None, "accepted spawn ledger row lacks authoritative runtime/model/effort evidence"
     blocked = [
         event
         for event in rows.events
@@ -6393,7 +6582,14 @@ def _terminal_owner_ledger_proof(
         or recovery.evidence.get("slice_id") != current.id
     ):
         return None, "human recovery binding conflicts with the accepted launch and blocker"
-    return (cast(int, spawn_seq), cast(int, blocked_event.run_seq)), None
+    return (
+        _TerminalOwnerLedgerProof(
+            cast(int, spawn_seq),
+            cast(int, blocked_event.run_seq),
+            cast(tuple[object, object, object], spawn_route),
+        ),
+        None,
+    )
 
 
 def _terminal_gate_authorization(
