@@ -25869,3 +25869,61 @@ def test_live_adoption_conflict_exhaustion_leaves_binding_unchanged(
     assert calls > 0
     assert child.dispatch_invocation_id == "parent-bound-controller-invocation"
     assert child.dispatch_generation == 2
+
+
+@pytest.mark.parametrize(
+    ("updates", "preserved_field", "preserved_value"),
+    (
+        (
+            {"dispatch_agent_id": "changed-controller-owner"},
+            "dispatch_agent_id",
+            "changed-controller-owner",
+        ),
+        ({"branch": "main.changed-owner"}, "branch", "main.changed-owner"),
+        (
+            {"worktree": "/tmp/changed-controller-worktree"},
+            "worktree",
+            "/tmp/changed-controller-worktree",
+        ),
+        (
+            {"dispatch_intent_id": "changed-controller-intent"},
+            "dispatch_intent_id",
+            "changed-controller-intent",
+        ),
+    ),
+)
+def test_live_adoption_rejects_changed_parent_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    updates: Mapping[str, object],
+    preserved_field: str,
+    preserved_value: object,
+) -> None:
+    """A same-revision predecessor is not proof of unchanged owner/coordinates."""
+    plan, config, store, _owner_dir = _live_child_controller_fixture(tmp_path)
+    original_helper = driver_module._checkpoint_ordered_sub_tl_invocation
+    injected = False
+
+    def interleaved_helper(store_arg, child_id, invocation_id, **kwargs):
+        nonlocal injected
+        if not injected:
+            injected = True
+            latest = store_arg.load()
+            changed = replace(latest.slices["child-controller"], **updates)
+            store_arg.checkpoint(
+                latest.fsm,
+                {**latest.slices, "child-controller": changed},
+                latest.budgets,
+                latest.events.last_consumed_offset,
+                expected_revision=latest.revision,
+            )
+        return original_helper(store_arg, child_id, invocation_id, **kwargs)
+
+    monkeypatch.setattr(driver_module, "_checkpoint_ordered_sub_tl_invocation", interleaved_helper)
+
+    driver_module._adopt_live_child_controller_invocation(config, plan.sub_tls[0])
+
+    child = store.load().slices["child-controller"]
+    assert getattr(child, preserved_field) == preserved_value
+    assert child.dispatch_invocation_id == "parent-bound-controller-invocation"
+    assert child.dispatch_generation == 2

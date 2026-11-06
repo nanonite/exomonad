@@ -20257,6 +20257,9 @@ def _run_sub_tl_batch(
         if child_store.path.exists():
             child_state = child_store.load()
             child_phase = _child_completion_phase(child_state)
+            controller_shutdown = _child_controller_shutdown_matches(
+                store.load().slices.get(task.name), task, config
+            )
             retrying_terminal_owner = _terminal_owner_recovery_candidate(task.plan, child_state)
             blocked_leaf_resume_proof = (
                 _approved_blocked_leaf_child_retry_proof(task, child_state, config, store)
@@ -20267,14 +20270,23 @@ def _run_sub_tl_batch(
                 config.ordered_recovery_child == task.name or blocked_leaf_resume_proof is not None
             )
             retrying_approved_blocked_leaf = blocked_leaf_resume_proof is not None
-            if _child_handoff_ready(child_state, store.run_id) and not retrying_failed_child:
+            if (
+                _child_handoff_ready(child_state, store.run_id)
+                and not retrying_failed_child
+                and not controller_shutdown
+            ):
                 return task, child_phase, child_state
-            if child_phase is TLPhase.TLFailed and not retrying_failed_child:
+            if (
+                child_phase is TLPhase.TLFailed
+                and not retrying_failed_child
+                and not controller_shutdown
+            ):
                 return task, child_phase, child_state
             if (
                 _child_recovery_projection(child_state, store.run_id) is not None
                 and not retrying_approved_blocked_leaf
                 and not retrying_terminal_owner
+                and not controller_shutdown
             ):
                 return task, child_phase, child_state
         effective_config = _ensure_ordered_parent_ready_for_provision(task, config, store)
@@ -20484,6 +20496,7 @@ def _adopt_live_child_controller_invocation(
     parent_store = RunStore(config.run_id, config.root_dir)
     if not parent_store.path.exists():
         return
+    assessed_binding: tuple[object, ...] | None = None
     for _attempt in range(MAX_ORDERED_INVOCATION_CHECKPOINT_ATTEMPTS):
         try:
             state = parent_store.load()
@@ -20496,6 +20509,23 @@ def _adopt_live_child_controller_invocation(
             or not isinstance(current.dispatch_invocation_id, str)
             or not current.dispatch_invocation_id
         ):
+            return
+        binding = (
+            current.dispatch_invocation_id,
+            current.dispatch_generation,
+            current.dispatch_agent_id,
+            current.dispatch_intent_id,
+            current.branch,
+            current.worktree,
+            current.manifest_node_id,
+            current.manifest_revision,
+            current.chainlink_issue_id,
+            current.status,
+            current.dispatch_last_boundary,
+        )
+        if assessed_binding is None:
+            assessed_binding = binding
+        elif binding != assessed_binding:
             return
         agent_id = current.dispatch_agent_id or _child_controller_name(task)
         try:
@@ -20541,6 +20571,7 @@ def _adopt_live_child_controller_invocation(
                 generation=generation,
                 expected_predecessor_invocation=current.dispatch_invocation_id,
                 expected_predecessor_generation=current.dispatch_generation,
+                expected_revision=state.revision,
             )
             if adopted:
                 return
@@ -20834,6 +20865,7 @@ def _checkpoint_ordered_sub_tl_invocation(
     generation: int | None = None,
     expected_predecessor_invocation: str | None = None,
     expected_predecessor_generation: int | None = None,
+    expected_revision: int | None = None,
 ) -> bool:
     """Persist the server-confirmed invocation across the parent FSM and slice."""
     if not isinstance(invocation_id, str) or not invocation_id.strip():
@@ -20843,6 +20875,8 @@ def _checkpoint_ordered_sub_tl_invocation(
     guarded = expected_predecessor_invocation is not None
     for _attempt in range(MAX_ORDERED_INVOCATION_CHECKPOINT_ATTEMPTS):
         state = store.load()
+        if expected_revision is not None and state.revision != expected_revision:
+            return False
         target = state.slices.get(child_id)
         if target is None:
             return False
