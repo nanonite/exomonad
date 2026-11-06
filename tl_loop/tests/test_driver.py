@@ -25730,3 +25730,142 @@ def test_parent_adopts_exactly_linked_live_controller_restart(tmp_path: Path) ->
     assert store.load().slices["child-controller"].dispatch_invocation_id == (
         "live-restarted-controller-invocation"
     )
+
+
+def test_live_adoption_rejects_stale_proof_after_concurrent_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newer accepted binding invalidates the predecessor proof mid-adoption."""
+    plan, config, store, _owner_dir = _live_child_controller_fixture(tmp_path)
+    original_helper = driver_module._checkpoint_ordered_sub_tl_invocation
+    injected = False
+
+    def interleaved_helper(store_arg, child_id, invocation_id, **kwargs):
+        nonlocal injected
+        if not injected:
+            injected = True
+            latest = store_arg.load()
+            concurrent = replace(
+                latest.slices["child-controller"],
+                dispatch_invocation_id="concurrent-newer-controller",
+                dispatch_generation=8,
+            )
+            store_arg.checkpoint(
+                latest.fsm,
+                {**latest.slices, "child-controller": concurrent},
+                latest.budgets,
+                latest.events.last_consumed_offset,
+                expected_revision=latest.revision,
+            )
+        return original_helper(store_arg, child_id, invocation_id, **kwargs)
+
+    monkeypatch.setattr(driver_module, "_checkpoint_ordered_sub_tl_invocation", interleaved_helper)
+
+    driver_module._adopt_live_child_controller_invocation(config, plan.sub_tls[0])
+
+    child = store.load().slices["child-controller"]
+    assert child.dispatch_invocation_id == "concurrent-newer-controller"
+    assert child.dispatch_generation == 8
+
+
+def test_live_adoption_preserves_unrelated_concurrent_update(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unrelated newer state survives a still-valid guarded adoption."""
+    plan, config, store, _owner_dir = _live_child_controller_fixture(tmp_path)
+    original_helper = driver_module._checkpoint_ordered_sub_tl_invocation
+    injected = False
+    expected_tokens = store.load().budgets.tokens + 41
+
+    def interleaved_helper(store_arg, child_id, invocation_id, **kwargs):
+        nonlocal injected
+        if not injected:
+            injected = True
+            latest = store_arg.load()
+            store_arg.checkpoint(
+                latest.fsm,
+                latest.slices,
+                replace(latest.budgets, tokens=expected_tokens),
+                latest.events.last_consumed_offset,
+                expected_revision=latest.revision,
+            )
+        return original_helper(store_arg, child_id, invocation_id, **kwargs)
+
+    monkeypatch.setattr(driver_module, "_checkpoint_ordered_sub_tl_invocation", interleaved_helper)
+
+    driver_module._adopt_live_child_controller_invocation(config, plan.sub_tls[0])
+
+    state = store.load()
+    assert state.slices["child-controller"].dispatch_invocation_id == (
+        "live-restarted-controller-invocation"
+    )
+    assert state.slices["child-controller"].dispatch_generation == 3
+    assert state.budgets.tokens == expected_tokens
+
+
+def test_live_adoption_preserves_concurrent_abandonment_and_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adoption never revives an abandoned child or clears an operator gate."""
+    plan, config, store, _owner_dir = _live_child_controller_fixture(tmp_path)
+    store.set_gate("operator-rejected-child", GateStatus.REJECTED)
+    original_helper = driver_module._checkpoint_ordered_sub_tl_invocation
+    injected = False
+
+    def interleaved_helper(store_arg, child_id, invocation_id, **kwargs):
+        nonlocal injected
+        if not injected:
+            injected = True
+            latest = store_arg.load()
+            abandoned = replace(
+                latest.slices["child-controller"],
+                status=SliceStatus.PARKED,
+                park_cause=ParkCause.ATTEMPT_ABANDONED,
+            )
+            store_arg.checkpoint(
+                latest.fsm,
+                {**latest.slices, "child-controller": abandoned},
+                latest.budgets,
+                latest.events.last_consumed_offset,
+                expected_revision=latest.revision,
+            )
+        return original_helper(store_arg, child_id, invocation_id, **kwargs)
+
+    monkeypatch.setattr(driver_module, "_checkpoint_ordered_sub_tl_invocation", interleaved_helper)
+
+    driver_module._adopt_live_child_controller_invocation(config, plan.sub_tls[0])
+
+    child = store.load().slices["child-controller"]
+    assert child.status is SliceStatus.PARKED
+    assert child.park_cause is ParkCause.ATTEMPT_ABANDONED
+    assert child.dispatch_invocation_id == "parent-bound-controller-invocation"
+    assert (
+        next(gate for gate in store.load().gates if gate.name == "operator-rejected-child").status
+        is GateStatus.REJECTED
+    )
+
+
+def test_live_adoption_conflict_exhaustion_leaves_binding_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bounded conflicts never persist the stale successor."""
+    plan, config, store, _owner_dir = _live_child_controller_fixture(tmp_path)
+    calls = 0
+
+    def always_conflict(self, fsm, slices, budgets, offset, **kwargs):
+        nonlocal calls
+        calls += 1
+        raise driver_module.CheckpointConflict("simulated concurrent writer")
+
+    monkeypatch.setattr(RunStore, "checkpoint", always_conflict)
+
+    driver_module._adopt_live_child_controller_invocation(config, plan.sub_tls[0])
+
+    child = store.load().slices["child-controller"]
+    assert calls > 0
+    assert child.dispatch_invocation_id == "parent-bound-controller-invocation"
+    assert child.dispatch_generation == 2

@@ -20534,10 +20534,17 @@ def _adopt_live_child_controller_invocation(
         ):
             return
         try:
-            _checkpoint_ordered_sub_tl_invocation(
-                parent_store, task.name, invocation_id, generation=generation
+            adopted = _checkpoint_ordered_sub_tl_invocation(
+                parent_store,
+                task.name,
+                invocation_id,
+                generation=generation,
+                expected_predecessor_invocation=current.dispatch_invocation_id,
+                expected_predecessor_generation=current.dispatch_generation,
             )
-            return
+            if adopted:
+                return
+            continue
         except CheckpointConflict:
             continue
     return
@@ -20825,17 +20832,26 @@ def _checkpoint_ordered_sub_tl_invocation(
     invocation_id: str,
     *,
     generation: int | None = None,
-) -> None:
+    expected_predecessor_invocation: str | None = None,
+    expected_predecessor_generation: int | None = None,
+) -> bool:
     """Persist the server-confirmed invocation across the parent FSM and slice."""
     if not isinstance(invocation_id, str) or not invocation_id.strip():
         raise TLLoopError("ordered sub-TL provisioning returned an empty invocation ID")
     if not store.path.exists():
-        return
+        return False
+    guarded = expected_predecessor_invocation is not None
     for _attempt in range(MAX_ORDERED_INVOCATION_CHECKPOINT_ATTEMPTS):
         state = store.load()
         target = state.slices.get(child_id)
         if target is None:
-            return
+            return False
+        if guarded and (
+            target.dispatch_invocation_id != expected_predecessor_invocation
+            or target.dispatch_generation != expected_predecessor_generation
+            or target.status is not SliceStatus.SPAWNED
+        ):
+            return False
         recursive_fsm = state.recursive_fsm
         if not isinstance(recursive_fsm, RecursiveTLRunning):
             raise TLLoopError(
@@ -20888,7 +20904,7 @@ def _checkpoint_ordered_sub_tl_invocation(
             dispatch_intents=dispatch_intents,
         )
         if slices[child_id] == target and updated_fsm == recursive_fsm:
-            return
+            return True
         try:
             store.checkpoint(
                 updated_fsm,
@@ -20897,9 +20913,13 @@ def _checkpoint_ordered_sub_tl_invocation(
                 state.events.last_consumed_offset,
                 expected_revision=state.revision,
             )
-            return
+            return True
         except CheckpointConflict:
+            if guarded:
+                return False
             continue
+    if guarded:
+        return False
     raise TLLoopError("parent checkpoint kept changing while recording ordered invocation")
 
 
