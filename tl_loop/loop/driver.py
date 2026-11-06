@@ -5319,6 +5319,7 @@ def _terminal_initial_spawn_evidence(
     config: TLLoopConfig,
     store: RunStore,
     event_seq: int,
+    expected_reporter: str,
 ) -> tuple[_TerminalOwnerLedgerProof | None, str | None]:
     """Read the exact original accepted spawn row by its checkpointed sequence."""
     if config.project_root is None or config.ledger_run_id is None:
@@ -5340,9 +5341,19 @@ def _terminal_initial_spawn_evidence(
     if len(spawn_rows) != 1:
         return None, "terminal initial spawn event is missing or ambiguous at its sequence"
     spawn = spawn_rows[0]
+    envelope_invocation = spawn.invocation_id
+    data_invocation = spawn.data.get("invocation_id")
+    if (
+        spawn.run_id != config.ledger_run_id
+        or spawn.agent_id != expected_reporter
+        or not isinstance(envelope_invocation, str)
+        or not envelope_invocation
+        or envelope_invocation != data_invocation
+    ):
+        return None, "terminal initial spawn event conflicts with its accepted reporter or run"
     route = tuple(spawn.data.get(field) for field in ("agent_type", "model", "effort"))
     canonical_runtime = normalize_runtime_label(route[0])
-    invocation_id = spawn.invocation_id or spawn.data.get("invocation_id")
+    invocation_id = envelope_invocation
     child_agent = spawn.data.get("child_agent")
     intent_id = spawn.data.get("intent_id")
     branch = spawn.data.get("branch")
@@ -5369,6 +5380,30 @@ def _terminal_initial_spawn_evidence(
             branch,
         ),
         None,
+    )
+
+
+_MODERN_SPAWN_REQUEST_MARKERS = (
+    "role_route",
+    "route_fingerprint",
+    "route_configuration_fingerprint",
+    "route_policy_fingerprint",
+    "route_manifest_digest",
+)
+_MODERN_SPAWN_RESPONSE_MARKERS = ("role_route", "route_fingerprint")
+
+
+def _spawn_result_coordinates_match(
+    payload: Mapping[str, object],
+    initial_spawn: _TerminalOwnerLedgerProof,
+    owner: BlockedLeafOwner,
+) -> bool:
+    """Require the result's owner coordinates and runtime to match the accepted event."""
+    return bool(
+        payload.get("branch_name") == owner.branch
+        and payload.get("branch_name") == initial_spawn.spawn_branch
+        and Path(str(payload.get("worktree_path", ""))).resolve() == owner.worktree
+        and normalize_runtime_label(payload.get("agent_type")) == initial_spawn.spawn_route[0]
     )
 
 
@@ -5415,16 +5450,19 @@ def _resolve_initial_spawn_identity(
             return None, "accepted initial spawn result conflicts with the accepted invocation"
         if arguments.get("intent_id") != initial_spawn.spawn_intent_id:
             return None, "accepted initial spawn result conflicts with the accepted intent"
+        if not _spawn_result_coordinates_match(payload, initial_spawn, owner):
+            return None, "accepted initial spawn result conflicts with accepted coordinates"
         return expected_invocation_id, None
     if agent_value is not None or invocation_value is not None:
         return None, "accepted initial spawn result has a malformed identity"
+    if any(field in payload for field in _MODERN_SPAWN_RESPONSE_MARKERS) or any(
+        field in arguments for field in _MODERN_SPAWN_REQUEST_MARKERS
+    ):
+        return None, "legacy initial spawn has incomplete or conflicting modern provenance"
     if any(payload.get(field) is not None for field in _LEGACY_SPAWN_HANDOFF_FIELDS):
         return None, "accepted initial spawn result is not a supported legacy projection"
     if (
-        payload.get("branch_name") != owner.branch
-        or payload.get("branch_name") != initial_spawn.spawn_branch
-        or Path(str(payload.get("worktree_path", ""))).resolve() != owner.worktree
-        or normalize_runtime_label(payload.get("agent_type")) != initial_spawn.spawn_route[0]
+        not _spawn_result_coordinates_match(payload, initial_spawn, owner)
         or arguments.get("intent_id") != initial_spawn.spawn_intent_id
         or initial_spawn.spawn_child_agent != expected_agent_id
         or initial_spawn.spawn_branch != owner.branch
@@ -5486,7 +5524,9 @@ def _terminal_resume_history_proof(
         or not isinstance(expected_agent_id, str)
     ):
         return None, "resume history lacks its original accepted spawn identity"
-    original_spawn, original_error = _terminal_initial_spawn_evidence(config, store, original_seq)
+    original_spawn, original_error = _terminal_initial_spawn_evidence(
+        config, store, original_seq, state.run_id
+    )
     if original_spawn is None:
         return None, original_error
     if (

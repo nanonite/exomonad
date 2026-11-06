@@ -20398,6 +20398,7 @@ def _seed_terminal_provider_failure_leaf(
         spawn_result = {
             "agent_id": owner_name,
             "invocation_id": invocation_id,
+            "agent_type": prior_runtime,
             "branch_name": branch,
             "worktree_path": str(owner_worktree),
         }
@@ -26074,6 +26075,161 @@ def test_legacy_initial_spawn_identity_requires_exact_corroboration(
         "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8"
     )
     journal_path.write_text(json.dumps(journal_rows), encoding="utf-8")
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+
+    assert proof is None
+    assert reason is not None and reason
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_fragment"),
+    (
+        ("wrong_branch", "coordinate"),
+        ("wrong_worktree", "coordinate"),
+        ("missing_branch", "coordinate"),
+        ("missing_worktree", "coordinate"),
+    ),
+)
+def test_modern_initial_spawn_requires_exact_coordinates(
+    tmp_path: Path,
+    scenario: str,
+    expected_fragment: str,
+) -> None:
+    """Modern identity IDs do not excuse wrong or missing owner coordinates."""
+    plan, config, store, _owner_dir, _owner_name, _original_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    journal_path = store.run_dir / "action-journal.json"
+    rows = json.loads(journal_path.read_text(encoding="utf-8"))
+    spawn = next(
+        row
+        for row in rows
+        if row.get("operation") == "spawn_leaf" and row.get("target") == plan.leaves[0].name
+    )
+    result = spawn["result"]["result"]
+    if scenario == "wrong_branch":
+        result["branch_name"] = "main.foreign-modern-owner"
+    elif scenario == "wrong_worktree":
+        result["worktree_path"] = "/tmp/foreign-modern-owner-worktree"
+    elif scenario == "missing_branch":
+        result.pop("branch_name")
+    elif scenario == "missing_worktree":
+        result.pop("worktree_path")
+    journal_path.write_text(json.dumps(rows), encoding="utf-8")
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+
+    assert proof is None
+    assert reason is not None and expected_fragment in reason
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    (
+        "response_role_route",
+        "response_route_fingerprint",
+        "request_route_fingerprint",
+        "request_role_route",
+    ),
+)
+def test_legacy_initial_spawn_rejects_modern_provenance_markers(
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    """A missing-ID response with modern provenance markers is not legacy."""
+    plan, config, store, _owner_dir, _owner_name, _original_id = (
+        _seed_terminal_provider_failure_leaf(
+            tmp_path,
+            legacy_spawn_result=True,
+        )
+    )
+    journal_path = store.run_dir / "action-journal.json"
+    rows = json.loads(journal_path.read_text(encoding="utf-8"))
+    spawn = next(
+        row
+        for row in rows
+        if row.get("operation") == "spawn_leaf" and row.get("target") == plan.leaves[0].name
+    )
+    if scenario == "response_role_route":
+        spawn["result"]["result"]["role_route"] = {
+            "route_fingerprint": "sha256:modern-marker-with-missing-identity"
+        }
+    elif scenario == "response_route_fingerprint":
+        spawn["result"]["result"]["route_fingerprint"] = "sha256:modern-marker"
+    elif scenario == "request_route_fingerprint":
+        spawn["arguments"]["route_fingerprint"] = "sha256:modern-marker"
+    elif scenario == "request_role_route":
+        spawn["arguments"]["role_route"] = {"route_fingerprint": "sha256:modern-marker"}
+    journal_path.write_text(json.dumps(rows), encoding="utf-8")
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+
+    assert proof is None
+    assert reason is not None and "modern" in reason.casefold()
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    (
+        "wrong_reporter",
+        "wrong_run",
+        "envelope_data_conflict",
+        "missing_event",
+        "ambiguous_event",
+    ),
+)
+def test_legacy_original_spawn_event_scope_validated_after_adoption(
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    """The original event remains authoritative only for its accepted scope."""
+    plan, config, store, owner_dir, owner_name, original_id = _seed_terminal_provider_failure_leaf(
+        tmp_path,
+        omit_initial_spawn_effort=True,
+        legacy_spawn_result=True,
+    )
+    ledger_path = (
+        Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
+    )
+    rows = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()]
+    original_event = next(row for row in rows if row.get("type") == "agent.spawned")
+    original_event["data"]["agent_type"] = "OpenCode"
+    ledger_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8"
+    )
+    successor_id = _stage_wrong_route_history(
+        plan, config, store, owner_dir, owner_name, original_id
+    )
+    transport = RepeatedTransitionTransport(
+        owner_dir=owner_dir, owner_name=owner_name, slice_id=plan.leaves[0].name
+    )
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    driver_module._resume_terminal_owner_failure(
+        plan, store.load(), config, EffectClient(transport), store, journal
+    )
+    _stop_terminal_successor_with_human_gate(plan, config, store, owner_dir, owner_name, transport)
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+    assert proof is not None, reason
+    assert proof.resume.owner.prior_invocation_id == "repeated-route-generation-3"
+
+    rows = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()]
+    spawn = next(row for row in rows if row.get("type") == "agent.spawned")
+    if scenario == "wrong_reporter":
+        spawn["agent_id"] = "foreign-scope-controller"
+    elif scenario == "wrong_run":
+        spawn["run_id"] = "foreign-ledger-run"
+    elif scenario == "envelope_data_conflict":
+        spawn["data"]["invocation_id"] = "foreign-invocation"
+    elif scenario == "missing_event":
+        rows = [row for row in rows if row is not spawn]
+    elif scenario == "ambiguous_event":
+        rows.append(
+            {**spawn, "event_id": "ambiguous-original-spawn", "id": "ambiguous-original-spawn"}
+        )
+    ledger_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8"
+    )
 
     proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
 
