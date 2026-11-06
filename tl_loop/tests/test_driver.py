@@ -20158,6 +20158,7 @@ def _seed_terminal_provider_failure_leaf(
     controller_invocation_id: str = "accepted-kani-controller-invocation",
     reference_requirements: tuple[ReferenceVerificationRequirement, ...] = (),
     omit_initial_spawn_effort: bool = False,
+    legacy_spawn_result: bool = False,
 ) -> tuple[WorkPlan, TLLoopConfig, RunStore, Path, str, str]:
     """Build the retained accepted-launch / terminal-provider-failure shape."""
     run_id = "substitution-model-kani-stage"
@@ -20379,19 +20380,30 @@ def _seed_terminal_provider_failure_leaf(
     )
     launch_journal = EffectJournal(run_id, store.run_dir / "action-journal.json")
     launch_journal.append(accepted_launch)
+    if legacy_spawn_result:
+        spawn_result: dict[str, object] = {
+            "agent_type": prior_runtime,
+            "branch_name": branch,
+            "worktree_path": str(owner_worktree),
+            "invocation_id": None,
+            "invocation_trigger": None,
+            "invocation_runtime": None,
+            "invocation_fresh": None,
+            "invocation_ready": None,
+            "invocation_outcome": None,
+            "routing_target_id": None,
+            "routing_target_type": None,
+        }
+    else:
+        spawn_result = {
+            "agent_id": owner_name,
+            "invocation_id": invocation_id,
+            "branch_name": branch,
+            "worktree_path": str(owner_worktree),
+        }
     launch_journal.mark_result(
         accepted_launch,
-        ToolResult.from_raw(
-            {
-                "success": True,
-                "result": {
-                    "agent_id": owner_name,
-                    "invocation_id": invocation_id,
-                    "branch_name": branch,
-                    "worktree_path": str(owner_worktree),
-                },
-            }
-        ),
+        ToolResult.from_raw({"success": True, "result": spawn_result}),
     )
     owner_dir = project / ".exo" / "agents" / owner_name
     owner_dir.mkdir(parents=True)
@@ -25927,3 +25939,143 @@ def test_live_adoption_rejects_changed_parent_binding(
     assert getattr(child, preserved_field) == preserved_value
     assert child.dispatch_invocation_id == "parent-bound-controller-invocation"
     assert child.dispatch_generation == 2
+
+
+def test_terminal_recovery_resolves_legacy_initial_spawn_identity(
+    tmp_path: Path,
+) -> None:
+    """The historical null-ID spawn response is corroborated from the accepted event."""
+    plan, config, store, owner_dir, owner_name, original_id = _seed_terminal_provider_failure_leaf(
+        tmp_path,
+        omit_initial_spawn_effort=True,
+        legacy_spawn_result=True,
+    )
+    ledger_path = (
+        Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
+    )
+    rows = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()]
+    spawn_event = next(row for row in rows if row.get("type") == "agent.spawned")
+    spawn_event["data"]["agent_type"] = "OpenCode"
+    ledger_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8"
+    )
+    journal_path = store.run_dir / "action-journal.json"
+    spawn_entry = EffectJournal(store.run_id, journal_path).entries_for(
+        "spawn_leaf", plan.leaves[0].name
+    )[0]
+    assert "agent_id" not in spawn_entry["result"]["result"]
+    assert spawn_entry["result"]["result"]["invocation_id"] is None
+    assert "effort" not in spawn_entry["arguments"]
+
+    successor_id = _stage_wrong_route_history(
+        plan, config, store, owner_dir, owner_name, original_id
+    )
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+    assert proof is not None, reason
+    assert proof.resume.owner.prior_invocation_id == successor_id
+    assert proof.resume.desired_model == "gpt-6-luna"
+    assert proof.resume.desired_effort == "xhigh"
+
+    transport = RepeatedTransitionTransport(
+        owner_dir=owner_dir, owner_name=owner_name, slice_id=plan.leaves[0].name
+    )
+    accepted = driver_module._resume_terminal_owner_failure(
+        plan,
+        store.load(),
+        config,
+        EffectClient(transport),
+        store,
+        EffectJournal(store.run_id, journal_path),
+    )
+    launched = transport.successors[-1]
+    assert launched["generation"] == 3
+    assert launched["prior_invocation_id"] == successor_id
+    assert launched["model"] == "gpt-6-luna"
+    assert launched["effort"] == "xhigh"
+    assert (
+        accepted.slices[plan.leaves[0].name].dispatch_invocation_id == (launched["invocation_id"])
+    )
+    assert (
+        spawn_entry
+        == EffectJournal(store.run_id, journal_path).entries_for("spawn_leaf", plan.leaves[0].name)[
+            0
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    (
+        "wrong_agent",
+        "wrong_invocation",
+        "partial_identity",
+        "wrong_branch",
+        "wrong_worktree",
+        "wrong_agent_type",
+        "wrong_intent",
+        "non_null_handoff",
+        "wrong_event_child",
+        "wrong_event_intent",
+        "unknown_event_runtime",
+        "missing_event",
+    ),
+)
+def test_legacy_initial_spawn_identity_requires_exact_corroboration(
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    """Missing IDs are resolved only from one exact corroborating historical event."""
+    plan, config, store, _owner_dir, _owner_name, _original_id = (
+        _seed_terminal_provider_failure_leaf(
+            tmp_path,
+            omit_initial_spawn_effort=True,
+            legacy_spawn_result=True,
+        )
+    )
+    project = Path(config.project_root)
+    ledger_path = project / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
+    rows = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()]
+    spawn_event = next(row for row in rows if row.get("type") == "agent.spawned")
+    spawn_event["data"]["agent_type"] = "OpenCode"
+    journal_path = store.run_dir / "action-journal.json"
+    journal_rows = json.loads(journal_path.read_text(encoding="utf-8"))
+    spawn_entry = next(
+        row
+        for row in journal_rows
+        if row.get("operation") == "spawn_leaf" and row.get("target") == plan.leaves[0].name
+    )
+    result = spawn_entry["result"]["result"]
+    arguments = spawn_entry["arguments"]
+    if scenario == "wrong_agent":
+        result["agent_id"] = "foreign-owner"
+    elif scenario == "wrong_invocation":
+        result["invocation_id"] = "foreign-invocation"
+    elif scenario == "partial_identity":
+        result["agent_id"] = "issue-814-substitution-model-kani-opencode"
+    elif scenario == "wrong_branch":
+        result["branch_name"] = "main.foreign"
+    elif scenario == "wrong_worktree":
+        result["worktree_path"] = str(tmp_path / "foreign-worktree")
+    elif scenario == "wrong_agent_type":
+        result["agent_type"] = "codex"
+    elif scenario == "wrong_intent":
+        arguments["intent_id"] = "foreign-intent"
+    elif scenario == "non_null_handoff":
+        result["invocation_runtime"] = "codex"
+    elif scenario == "wrong_event_child":
+        spawn_event["data"]["child_agent"] = "foreign-owner"
+    elif scenario == "wrong_event_intent":
+        spawn_event["data"]["intent_id"] = "foreign-intent"
+    elif scenario == "unknown_event_runtime":
+        spawn_event["data"]["agent_type"] = "OPENCODE"
+    elif scenario == "missing_event":
+        rows = [row for row in rows if row.get("type") != "agent.spawned"]
+    ledger_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8"
+    )
+    journal_path.write_text(json.dumps(journal_rows), encoding="utf-8")
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+
+    assert proof is None
+    assert reason is not None and reason

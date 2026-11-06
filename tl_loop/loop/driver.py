@@ -4997,6 +4997,10 @@ class _TerminalOwnerLedgerProof(NamedTuple):
     spawn_event_seq: int
     blocker_event_seq: int
     spawn_route: tuple[object, object, object]
+    spawn_invocation_id: str
+    spawn_child_agent: str
+    spawn_intent_id: str
+    spawn_branch: str
 
 
 def _terminal_resume_checkpointed_index(
@@ -5311,14 +5315,142 @@ def _terminal_resume_authorization_matches(
     return False
 
 
+def _terminal_initial_spawn_evidence(
+    config: TLLoopConfig,
+    store: RunStore,
+    event_seq: int,
+) -> tuple[_TerminalOwnerLedgerProof | None, str | None]:
+    """Read the exact original accepted spawn row by its checkpointed sequence."""
+    if config.project_root is None or config.ledger_run_id is None:
+        return None, "terminal initial spawn evidence requires the authoritative ledger"
+    try:
+        reader = LedgerReader(
+            Path(config.project_root) / ".exo" / "ledger" / "segments",
+            run_dir=store.run_dir,
+            ledger_run_id=config.ledger_run_id,
+        )
+        rows = reader.read_from(cursor=max(0, event_seq - 1))
+    except (LedgerReadError, EnvelopeError, OSError, ValueError):
+        return None, "terminal initial spawn ledger evidence is unavailable or malformed"
+    spawn_rows = [
+        event
+        for event in rows.events
+        if event.event_type == "agent.spawned" and event.run_seq == event_seq
+    ]
+    if len(spawn_rows) != 1:
+        return None, "terminal initial spawn event is missing or ambiguous at its sequence"
+    spawn = spawn_rows[0]
+    route = tuple(spawn.data.get(field) for field in ("agent_type", "model", "effort"))
+    canonical_runtime = normalize_runtime_label(route[0])
+    invocation_id = spawn.invocation_id or spawn.data.get("invocation_id")
+    child_agent = spawn.data.get("child_agent")
+    intent_id = spawn.data.get("intent_id")
+    branch = spawn.data.get("branch")
+    if (
+        canonical_runtime is None
+        or not isinstance(invocation_id, str)
+        or not invocation_id
+        or not isinstance(child_agent, str)
+        or not child_agent
+        or not isinstance(intent_id, str)
+        or not intent_id
+        or not isinstance(branch, str)
+        or not branch
+    ):
+        return None, "terminal initial spawn event lacks authoritative identity evidence"
+    return (
+        _TerminalOwnerLedgerProof(
+            event_seq,
+            0,
+            (canonical_runtime, route[1], route[2]),
+            invocation_id,
+            child_agent,
+            intent_id,
+            branch,
+        ),
+        None,
+    )
+
+
+_LEGACY_SPAWN_HANDOFF_FIELDS = (
+    "invocation_trigger",
+    "invocation_runtime",
+    "invocation_fresh",
+    "invocation_ready",
+    "invocation_outcome",
+    "routing_target_id",
+    "routing_target_type",
+)
+
+
+def _resolve_initial_spawn_identity(
+    payload: Mapping[str, object],
+    arguments: Mapping[str, object],
+    initial_spawn: _TerminalOwnerLedgerProof,
+    expected_invocation_id: str,
+    expected_agent_id: str,
+    leaf: LeafTask,
+    owner: BlockedLeafOwner,
+) -> tuple[str | None, str | None]:
+    """Resolve the original invocation from the accepted event when a legacy result omits it.
+
+    A genuine historical spawn result omits agent_id and carries a null
+    invocation_id plus null handoff fields. The accepted spawn event and the
+    dispatch binding still name the exact invocation. This proof is narrow:
+    any non-null identity/handoff field, wrong coordinate, wrong intent, or
+    unsupported runtime is a conflict, never a legacy absence.
+    """
+    agent_value = payload.get("agent_id")
+    invocation_value = payload.get("invocation_id")
+    agent_present = isinstance(agent_value, str) and bool(agent_value)
+    invocation_present = isinstance(invocation_value, str) and bool(invocation_value)
+    if agent_present or invocation_present:
+        if not (agent_present and invocation_present):
+            return None, "accepted initial spawn result has a partial identity"
+        if (
+            agent_value != expected_agent_id
+            or invocation_value != expected_invocation_id
+            or agent_value != owner.agent_name
+        ):
+            return None, "accepted initial spawn result conflicts with the accepted invocation"
+        if arguments.get("intent_id") != initial_spawn.spawn_intent_id:
+            return None, "accepted initial spawn result conflicts with the accepted intent"
+        return expected_invocation_id, None
+    if agent_value is not None or invocation_value is not None:
+        return None, "accepted initial spawn result has a malformed identity"
+    if any(payload.get(field) is not None for field in _LEGACY_SPAWN_HANDOFF_FIELDS):
+        return None, "accepted initial spawn result is not a supported legacy projection"
+    if (
+        payload.get("branch_name") != owner.branch
+        or payload.get("branch_name") != initial_spawn.spawn_branch
+        or Path(str(payload.get("worktree_path", ""))).resolve() != owner.worktree
+        or normalize_runtime_label(payload.get("agent_type")) != initial_spawn.spawn_route[0]
+        or arguments.get("intent_id") != initial_spawn.spawn_intent_id
+        or initial_spawn.spawn_child_agent != expected_agent_id
+        or initial_spawn.spawn_branch != owner.branch
+        or initial_spawn.spawn_invocation_id != expected_invocation_id
+    ):
+        return None, "legacy accepted initial spawn result lacks corroborating identity evidence"
+    LOGGER.info(
+        "resolved legacy initial spawn invocation=%s agent=%s intent=%s branch=%s runtime=%s",
+        initial_spawn.spawn_invocation_id,
+        initial_spawn.spawn_child_agent,
+        initial_spawn.spawn_intent_id,
+        initial_spawn.spawn_branch,
+        initial_spawn.spawn_route[0],
+    )
+    return expected_invocation_id, None
+
+
 def _terminal_resume_history_proof(
     entries: Sequence[Mapping[str, object]],
     current: SliceState,
     leaf: LeafTask,
     owner: BlockedLeafOwner,
     state: RunState,
+    config: TLLoopConfig,
     store: RunStore,
-    initial_spawn_route: tuple[object, object, object],
+    initial_spawn: _TerminalOwnerLedgerProof,
 ) -> tuple[_TerminalResumeHistory | None, str | None]:
     """Prove each confirmed resume as a linked historical effect without adopting its route."""
     journal = EffectJournal(state.run_id, store.run_dir / "action-journal.json")
@@ -5335,16 +5467,47 @@ def _terminal_resume_history_proof(
         return None, "accepted initial spawn result is missing or malformed"
     spawn_payload = spawn_result.result
     spawn_arguments = spawn_entries[0].get("arguments")
-    initial_invocation_id = (
-        spawn_payload.get("invocation_id") if isinstance(spawn_payload, Mapping) else None
+    if not isinstance(spawn_payload, Mapping) or not isinstance(spawn_arguments, Mapping):
+        return None, "accepted initial spawn result is missing or malformed"
+    if entries:
+        first_arguments = entries[0].get("arguments")
+        if not isinstance(first_arguments, Mapping):
+            return None, "resume history lacks its original accepted spawn sequence"
+        original_seq = first_arguments.get("accepted_spawn_event_seq")
+        expected_invocation_id = first_arguments.get("expected_invocation_id")
+        expected_agent_id = first_arguments.get("owner_agent_name")
+    else:
+        original_seq = current.dispatch_authoritative_event_seq
+        expected_invocation_id = current.dispatch_invocation_id
+        expected_agent_id = current.dispatch_agent_id
+    if (
+        type(original_seq) is not int
+        or not isinstance(expected_invocation_id, str)
+        or not isinstance(expected_agent_id, str)
+    ):
+        return None, "resume history lacks its original accepted spawn identity"
+    original_spawn, original_error = _terminal_initial_spawn_evidence(config, store, original_seq)
+    if original_spawn is None:
+        return None, original_error
+    if (
+        original_spawn.spawn_invocation_id != expected_invocation_id
+        or original_spawn.spawn_child_agent != expected_agent_id
+    ):
+        return None, "original accepted spawn event conflicts with the resume history anchor"
+    initial_invocation_id, identity_error = _resolve_initial_spawn_identity(
+        spawn_payload,
+        spawn_arguments,
+        original_spawn,
+        expected_invocation_id,
+        expected_agent_id,
+        leaf,
+        owner,
     )
+    if identity_error is not None:
+        return None, identity_error
+    assert isinstance(initial_invocation_id, str)
     if (
         spawn_result.success is not True
-        or not isinstance(spawn_arguments, Mapping)
-        or not isinstance(initial_invocation_id, str)
-        or spawn_payload.get("agent_id") != owner.agent_name
-        or spawn_payload.get("branch_name") != owner.branch
-        or Path(str(spawn_payload.get("worktree_path", ""))).resolve() != owner.worktree
         or spawn_arguments.get("name") != leaf.name
         or spawn_arguments.get("task") != leaf.task
         or (
@@ -5358,6 +5521,7 @@ def _terminal_resume_history_proof(
     ):
         return None, "accepted initial spawn result conflicts with the owner declaration"
     expected_id = initial_invocation_id
+    initial_spawn_route = initial_spawn.spawn_route
     expected_generation: int | None = None
     if current.dispatch_invocation_id == initial_invocation_id:
         expected_route = initial_spawn_route
@@ -6131,8 +6295,9 @@ def _terminal_owner_recovery_proof(
         leaf,
         owner,
         state,
+        config,
         store,
-        event_proof.spawn_route,
+        event_proof,
     )
     if resume_history is None:
         return None, history_reason
@@ -6713,6 +6878,10 @@ def _terminal_owner_ledger_proof(
             cast(int, spawn_seq),
             cast(int, blocked_event.run_seq),
             cast(tuple[object, object, object], spawn_route),
+            current.dispatch_invocation_id,
+            current.dispatch_agent_id,
+            current.dispatch_intent_id,
+            current.branch,
         ),
         None,
     )

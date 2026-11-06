@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Resolve legacy initial spawn responses from the exact accepted spawn event (#1318)
 - Bind shutdown reopening to the exact accepted controller invocation and preserve concurrent checkpoints (#1314)
 - Re-provision child controllers stopped by an explicit workspace shutdown (#1311)
 - Fix continuation across repeated model, effort, and harness route changes (#1314)

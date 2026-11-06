@@ -361,10 +361,17 @@ def seed_terminal_provider_failure(
             {
                 "success": True,
                 "result": {
-                    "agent_id": owner_name,
-                    "invocation_id": invocation_id,
+                    "agent_type": "opencode",
                     "branch_name": branch,
                     "worktree_path": str(worktree),
+                    "invocation_id": None,
+                    "invocation_trigger": None,
+                    "invocation_runtime": None,
+                    "invocation_fresh": None,
+                    "invocation_ready": None,
+                    "invocation_outcome": None,
+                    "routing_target_id": None,
+                    "routing_target_type": None,
                 },
             }
         ),
