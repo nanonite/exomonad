@@ -210,14 +210,14 @@ from tl_loop.loop.work_clock import ActiveWorkClock
 from tl_loop.ordered import (
     AggregateCandidate,
     ChildRecoverySummary,
-    IntegrationContract,
+    IntegrationContract as IntegrationContract,
     IntegrationLifecycle,
     IntegrationReadinessEvidence,
     IntegrationState,
     IntegrationTransition,
     IntegrationTransitionError,
-    OrderedStage,
-    ReviewOwner,
+    OrderedStage as OrderedStage,
+    ReviewOwner as ReviewOwner,
     SubTLLifecycle,
     transition_integration,
 )
