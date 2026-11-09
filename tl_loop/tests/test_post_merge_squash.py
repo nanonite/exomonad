@@ -5,12 +5,12 @@ from __future__ import annotations
 import subprocess
 from dataclasses import replace
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, cast
 
 import pytest
 
-from tl_loop.client.effects import ToolResult
-from tl_loop.fsm.lane import LaneAbandoned, LanePhase, LaneReserved
+from tl_loop.client.effects import EffectClient, ToolResult
+from tl_loop.fsm.lane import LaneAbandoned, LanePhase, LaneReserved, LaneState
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.loop.driver import (
     TLLoopConfig,
@@ -20,6 +20,7 @@ from tl_loop.loop.driver import (
     _forgejo_merge_evidence,
     _include_selected_remote,
     _reconcile_merged_slice,
+    _recover_remote_advance,
     _refresh_post_merge_evidence,
     _remote_reconcile_effect,
     _run_issue_close,
@@ -419,6 +420,93 @@ def test_selected_remote_receipt_is_optional_for_legacy_and_validated_when_prese
     assert _include_selected_remote(receipt, {"remote_name": "forgejo"})["remote_name"] == "forgejo"
     with pytest.raises(ValueError, match="invalid selected remote name"):
         _include_selected_remote(receipt, {"remote_name": "--upload-pack=bad"})
+
+
+def test_remote_advance_recovery_names_missing_bookkeeping_lane_epoch(
+    tmp_path: Path,
+) -> None:
+    store, state = _load_state(tmp_path)
+    repository = "https://forge.example.com/org/repo.git"
+    parent_branch = "main"
+    evidence = {
+        "child_id": "slice-a",
+        "repository": repository,
+        "parent_branch": parent_branch,
+        "pr_number": "43",
+        "head_sha": "pr-head",
+        "merge_journal_id": "merge-journal",
+        "lane_epoch": "7",
+        "parent_commit_sha": "merge-commit",
+        "issue_id": "811",
+        "issue_close_intent_id": "close-intent",
+        "issue_close_journal_id": "close-journal",
+        "changelog_intent_id": "changelog-intent",
+        "changelog_generation": "1",
+        "changelog_commit_sha": "changelog-commit",
+        "parent_push_intent_id": "push-intent",
+        "push_journal_id": "push-journal",
+        "expected_base_sha": "base-head",
+    }
+    current = replace(
+        state.slices["slice-a"],
+        status=SliceStatus.MERGED,
+        post_merge=PostMergeState(PostMergePhase.PARENT_PUSH_PENDING, evidence),
+    )
+    lane = LaneState(repository, parent_branch, lane_epoch=None)
+    state = replace(
+        state,
+        slices={**state.slices, "slice-a": current},
+        integration=replace(
+            state.integration,
+            lanes={f"{repository}:{parent_branch}": lane},
+        ),
+    )
+
+    class RemoteReconcileClient:
+        def post_merge_remote_reconcile(self, **arguments: object) -> ToolResult:
+            del arguments
+            return ToolResult.from_raw(
+                {
+                    "success": True,
+                    "result": {
+                        "child_id": "slice-a",
+                        "pr_number": 43,
+                        "repository": repository,
+                        "parent_branch": parent_branch,
+                        "merged_head_sha": "pr-head",
+                        "expected_base_sha": "base-head",
+                        "lane_epoch": 7,
+                        "merge_journal_id": "merge-journal",
+                        "parent_commit_sha": "rebuilt-bookkeeping",
+                        "rebuilt_commit_sha": "rebuilt-bookkeeping",
+                        "remote_head_sha": "advanced-parent",
+                        "new_base_sha": "advanced-parent",
+                        "remote_ancestry_proof": (
+                            "ancestor:advanced-parent->rebuilt-bookkeeping"
+                        ),
+                        "ancestry_proof": "ancestor:pr-head->rebuilt-bookkeeping",
+                    },
+                }
+            )
+
+    with pytest.raises(ValueError, match="bookkeeping lane is missing its epoch"):
+        _recover_remote_advance(
+            state,
+            current,
+            pr_number=43,
+            evidence=evidence,
+            push_arguments={
+                "push_intent_id": "push-intent",
+                "push_journal_id": "push-journal",
+                "expected_base_sha": "base-head",
+                "lane_epoch": 7,
+            },
+            failed_result=ToolResult.from_raw({"success": False, "error": "non-fast-forward"}),
+            config=TLLoopConfig(active=True, ledger_run_id="recover"),
+            effects=cast(EffectClient, RemoteReconcileClient()),
+            effects_log=[],
+            store=store,
+        )
 
 
 @pytest.mark.parametrize(
