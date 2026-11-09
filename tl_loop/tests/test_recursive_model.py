@@ -7,7 +7,7 @@ from enum import Enum
 
 import pytest
 
-from tl_loop.fsm.child import ChildKind, ChildRecord
+from tl_loop.fsm.child import ChildKind, ChildRecord, TLOrchestrationEvent
 from tl_loop.fsm.lane import (
     LaneAbandoned,
     LaneBookkeepingStarted,
@@ -48,6 +48,7 @@ from tl_loop.fsm.scope import (
     LeafCompleted,
     MergeRequested,
     ParkRequested,
+    PhaseValue,
     PlanLoaded,
     PostMergeObserved,
     PublicationFiled,
@@ -146,7 +147,7 @@ _SCOPE_ALLOWED: dict[ModelScopePhase, frozenset[str]] = {
 }
 
 
-def _scope_events() -> dict[str, object]:
+def _scope_events() -> dict[str, TLOrchestrationEvent]:
     return {
         "PlanLoaded": PlanLoaded(("root",), "plan", ("child",), (1,)),
         "StageReleased": StageReleased(1, ("child",), ("root",)),
@@ -174,7 +175,7 @@ def _scope_events() -> dict[str, object]:
     }
 
 
-def _scope_phase(phase: ModelScopePhase) -> object:
+def _scope_phase(phase: ModelScopePhase) -> PhaseValue:
     if phase is ModelScopePhase.PLANNING:
         return TLPlanning(((1, (_child("child"),)),))
     if phase is ModelScopePhase.RUNNING:
@@ -210,7 +211,7 @@ def test_scope_reference_matrix_closes_terminal_phases() -> None:
         for name, event in events.items():
             if name in allowed:
                 before = _scope_phase(phase)
-                after = transition(before, event)  # type: ignore[arg-type]
+                after = transition(before, event)
                 assert isinstance(after, _scope_successor_type(phase, name))
                 if name == "StageReleased":
                     assert isinstance(after, TLRunning)
@@ -254,7 +255,7 @@ def test_scope_reference_matrix_closes_terminal_phases() -> None:
                     assert after.finalization_evidence["root_branch"] == "main"
             else:
                 with pytest.raises(IllegalTransition):
-                    transition(_scope_phase(phase), event)  # type: ignore[arg-type]
+                    transition(_scope_phase(phase), event)
 
 
 def test_scope_model_has_no_automatic_terminal_successors() -> None:
@@ -549,7 +550,16 @@ def _post_merge_state(phase: PostMergePhase) -> TLRunning:
     )
 
 
-def _post_merge_events() -> tuple[object, ...]:
+def _post_merge_events() -> tuple[
+    MergeAdopted,
+    ParentBranchSynced,
+    IssueClosePending,
+    IssueCloseConfirmed,
+    ChangelogPending,
+    ChangelogCommitted,
+    ParentPushPending,
+    PostMergeComplete,
+]:
     receipt = PushReceipt(
         repository="repo",
         parent_branch="main",

@@ -79,6 +79,7 @@ from tl_loop.fsm.lane import (
     LaneState,
     transition_lane,
 )
+from tl_loop.fsm.orchestration import IllegalTransition as ScopeIllegalTransition
 from tl_loop.fsm.orchestration import transition as scope_transition
 from tl_loop.fsm.phase import (
     ChildHandle,
@@ -259,6 +260,7 @@ from tl_loop.state.aggregate_approval import (
     parse_aggregate_approval_mode,
 )
 from tl_loop.state.legacy_manifest import (
+    JournalSnapshot,
     LegacyManifestReconciliation,
     reconcile_legacy_manifest,
 )
@@ -338,6 +340,7 @@ from tl_loop.state.store import (
     CheckpointConflict,
     CorruptCheckpoint,
     QuarantineStorageError,
+    FSMInput,
     RunStore,
     archived_dispatch_intent_ids,
     create,
@@ -1884,7 +1887,7 @@ def run_tl_loop(
             reconciliation = None
             if selected.active:
                 journal_path = store.run_dir / "action-journal.json"
-                migration_journal: list[EffectIntent] = (
+                migration_journal: JournalSnapshot | Sequence[Mapping[str, object]] = (
                     EffectJournal(run_id, journal_path)
                     if selected.ledger_run_id is not None or journal_path.exists()
                     else []
@@ -2182,7 +2185,9 @@ def _failure_phase(state: RunState, reason: str) -> PhaseValue | RecursivePhaseV
             ),
         ):
             return scope_transition(phase, ScopeFailureRecorded(reason))
-        raise IllegalTransition(f"no transition for {type(phase).__name__} and FailureRecorded")
+        raise ScopeIllegalTransition(
+            f"no transition for {type(phase).__name__} and FailureRecorded"
+        )
     return TLFailed(reason)
 
 
@@ -14715,7 +14720,9 @@ def _checkpoint_slice_action(
     current = slice_state or state.slices[slice_id]
     if slice_state is None:
         current = slice_transition(current, ActionChanged(action))
-    checkpoint_phase = _recursive_phase_after_slice_update(state, slice_id, current)
+    checkpoint_phase: FSMInput | None = _recursive_phase_after_slice_update(
+        state, slice_id, current
+    )
     if checkpoint_phase is None:
         checkpoint_phase = state.fsm
         if (

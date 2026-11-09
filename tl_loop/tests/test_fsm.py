@@ -24,6 +24,7 @@ from tl_loop.fsm import (
     TLEvent,
     TLFailed,
     TLMerging,
+    PhaseValue,
     TLPhase,
     TLPlanning,
     TLPRFiled,
@@ -105,7 +106,7 @@ def test_all_children_done_and_own_pr_filed_are_explicit_wildcard_arms() -> None
 
 
 def test_every_silent_haskell_noop_is_an_illegal_transition() -> None:
-    completed_illegal = [
+    completed_illegal: list[PhaseValue] = [
         TLPlanning(),
         TLDispatching(),
         TLMerging(10, {}),
@@ -114,7 +115,7 @@ def test_every_silent_haskell_noop_is_an_illegal_transition() -> None:
         TLDone(),
         TLFailed("failure"),
     ]
-    merged_illegal = [
+    merged_illegal: list[PhaseValue] = [
         TLPlanning(),
         TLDispatching(),
         TLAllMerged(),
@@ -140,9 +141,9 @@ def test_fsm_modules_do_not_import_client_effects() -> None:
         assert "tl_loop.client" not in inspect.getsource(module)
 
 
-def _assert_illegal(phase: object, event: TLEvent) -> None:
+def _assert_illegal(phase: PhaseValue, event: TLEvent) -> None:
     try:
-        transition(phase, event)  # type: ignore[arg-type]
+        transition(phase, event)
     except IllegalTransition as error:
         assert error.phase is phase
         assert error.event is event
