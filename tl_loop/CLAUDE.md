@@ -163,6 +163,44 @@ merged, or its head became reachable again -- is left exactly as it is.
 Reconciliation never resurrects a parked slice on an observation that no longer
 supports the decision.
 
+## Terminal owner recovery from legacy spawn responses
+
+A terminal provider-failure recovery proves the original invocation from the
+one accepted `agent.spawned` row at the journal's checkpointed
+`accepted_spawn_event_seq`; the saved spawn response is never rewritten. The
+event must belong to the ledger run, be reported by the run identity
+(`reporter == state.run_id`), and carry matching envelope and `data`
+`invocation_id` values. Its intent, child agent, branch, runtime, model, and
+effort are the only source of the original identity. Resume history may link a
+later successor to that identity, but it never re-binds the original anchor to
+the newer event.
+
+The historical spawn response omits `agent_id` and carries a null
+`invocation_id` plus null invocation handoff fields. That shape is accepted only
+when the accepted event and the recorded spawn arguments corroborate the same
+intent, child, branch, worktree, and normalized runtime. Both modern and legacy
+responses require a non-empty absolute `worktree_path` that resolves to the
+owner worktree, the exact owner and accepted-event `branch_name`, and a
+supported runtime label equal to the accepted event runtime. A relative or
+missing path never resolves against the controller's current directory.
+
+Legacy classification is a positive projection check, not a missing-identity
+default. The result must use only the pre-configured-route Haskell
+`SpawnResult` keys (`worktree_path`, `branch_name`, `tab_name`, `issue_title`,
+`agent_type`, `pane_id`, the invocation handoff keys, and the routing target
+keys), and the request must use only the historical controller `spawn_leaf`
+argument keys (`name`, `task`, `intent_id`, `agent_type`, `model`, `boundary`,
+`context`, `read_first`, `steps`, `verify`). Any other key, including an
+explicit null `agent_id`, `role_route`, a route fingerprint, or a future route
+field, is modern provenance and must satisfy the complete modern identity
+requirements.
+
+The original-event scope check runs on every replay, including after a
+successor has been adopted. Rust's `EventLog::append_with_seq` derives the
+envelope `invocation_id` from `data.invocation_id`, so a genuine
+`agent.spawned` row carries both values or neither; an envelope-only or
+data-only row is rejected as conflicting evidence.
+
 ## Aggregate publication block gate
 
 When a completed ordered sub-TL needs an aggregate PR and `file_pr` returns a

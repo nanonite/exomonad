@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Require exact legacy spawn coordinates and projection shape before continuation (#1318)
 - Resolve legacy initial spawn responses from the exact accepted spawn event (#1318)
 - Bind shutdown reopening to the exact accepted controller invocation and preserve concurrent checkpoints (#1314)
 - Re-provision child controllers stopped by an explicit workspace shutdown (#1311)
