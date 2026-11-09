@@ -1015,8 +1015,8 @@ DISPATCH_HISTORICAL_AUDIT = "historical_audit"
 DISPATCH_INTEGRITY_CONFLICT = "integrity_conflict"
 #: A spawn row was confirmed under a controller epoch that is not the current
 #: one, so it belongs to a predecessor generation and can never confirm a
-#: dispatch this run owns. This is the one refusal reason that is historical
-#: evidence rather than an integrity conflict.
+#: dispatch this run owns. Historical evidence rather than an integrity
+#: conflict.
 DISPATCH_EPOCH_MISMATCH = "controller_epoch_mismatch"
 #: A spawn row names an intent recorded by this run's own recreate archive.
 #: The row predates the current generation, so it is historical evidence on
@@ -1049,8 +1049,9 @@ RECONCILED_SUB_TL_DISPATCH_BOUNDARIES: frozenset[str] = frozenset(
 )
 #: Correlation markers that name a permanently retained audit row. A refused
 #: publication and a refused spawn confirmation from a predecessor controller
-#: epoch are the same class of evidence: they prove what an earlier generation
-#: did, so they are written to the audit log and never to the pending queue.
+#: epoch or an archived run generation are the same class of evidence: they
+#: prove what an earlier generation did, so they are written to the audit log
+#: and never to the pending queue.
 PUBLICATION_HISTORY_AUDIT = "publication_history_audit"
 SPAWN_HISTORY_AUDIT = "spawn_history_audit"
 AUDIT_CORRELATIONS = frozenset({PUBLICATION_HISTORY_AUDIT, SPAWN_HISTORY_AUDIT})
@@ -30872,12 +30873,13 @@ def _record_historical_child_merge(store: RunStore, event: EventEnvelope) -> Non
 
 
 def _record_historical_spawn(store: RunStore, event: EventEnvelope, reason: str) -> None:
-    """Retain a spawn row from a predecessor epoch permanently for audit.
+    """Retain a spawn row from a predecessor generation permanently for audit.
 
-    A row confirmed under another controller epoch proves what the generation
-    that wrote it did, never what this one owns, so it is audit evidence on the
-    same terms as a refused publication: it goes to the audit log, never to
-    the pending event-quarantine queue, and is never released.
+    A row confirmed under another controller epoch, or minted by a run
+    generation this controller only knows from its recreate archive, proves what
+    the generation that wrote it did, never what this one owns, so it is audit
+    evidence on the same terms as a refused publication: it goes to the audit
+    log, never to the pending event-quarantine queue, and is never released.
     """
     store.append_audit_event(
         {
