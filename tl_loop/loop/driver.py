@@ -5393,16 +5393,25 @@ _MODERN_SPAWN_REQUEST_MARKERS = (
 _MODERN_SPAWN_RESPONSE_MARKERS = ("role_route", "route_fingerprint")
 
 
+def _absolute_worktree_path(value: object) -> Path | None:
+    """Return the resolved absolute worktree path, or None for missing or relative values."""
+    if not isinstance(value, str) or not value or not Path(value).is_absolute():
+        return None
+    return Path(value).resolve()
+
+
 def _spawn_result_coordinates_match(
     payload: Mapping[str, object],
     initial_spawn: _TerminalOwnerLedgerProof,
     owner: BlockedLeafOwner,
 ) -> bool:
     """Require the result's owner coordinates and runtime to match the accepted event."""
+    worktree_path = _absolute_worktree_path(payload.get("worktree_path"))
     return bool(
         payload.get("branch_name") == owner.branch
         and payload.get("branch_name") == initial_spawn.spawn_branch
-        and Path(str(payload.get("worktree_path", ""))).resolve() == owner.worktree
+        and worktree_path is not None
+        and worktree_path == owner.worktree
         and normalize_runtime_label(payload.get("agent_type")) == initial_spawn.spawn_route[0]
     )
 
@@ -5556,7 +5565,7 @@ def _terminal_resume_history_proof(
         )
         or (
             "worktree_path" in spawn_arguments
-            and Path(str(spawn_arguments.get("worktree_path", ""))).resolve() != owner.worktree
+            and _absolute_worktree_path(spawn_arguments.get("worktree_path")) != owner.worktree
         )
     ):
         return None, "accepted initial spawn result conflicts with the owner declaration"

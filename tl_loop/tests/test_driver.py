@@ -26133,6 +26133,50 @@ def test_modern_initial_spawn_requires_exact_coordinates(
 
 
 @pytest.mark.parametrize(
+    ("scenario", "value"),
+    (
+        ("payload_missing", None),
+        ("payload_empty", ""),
+        ("payload_relative", "."),
+        ("argument_empty", ""),
+        ("argument_relative", "."),
+    ),
+)
+def test_spawn_result_worktree_path_must_be_absolute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    value: str | None,
+) -> None:
+    """Missing, empty, or relative worktree paths never resolve to the owner worktree."""
+    plan, config, store, _owner_dir, owner_name, _original_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    owner_worktree = Path(config.project_root) / ".exo" / "worktrees" / owner_name
+    monkeypatch.chdir(owner_worktree)
+    journal_path = store.run_dir / "action-journal.json"
+    rows = json.loads(journal_path.read_text(encoding="utf-8"))
+    spawn = next(
+        row
+        for row in rows
+        if row.get("operation") == "spawn_leaf" and row.get("target") == plan.leaves[0].name
+    )
+    if scenario.startswith("payload"):
+        if value is None:
+            spawn["result"]["result"].pop("worktree_path")
+        else:
+            spawn["result"]["result"]["worktree_path"] = value
+    else:
+        spawn["arguments"]["worktree_path"] = value
+    journal_path.write_text(json.dumps(rows), encoding="utf-8")
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+
+    assert proof is None
+    assert reason is not None and ("coordinate" in reason or "owner declaration" in reason)
+
+
+@pytest.mark.parametrize(
     "scenario",
     (
         "response_role_route",
