@@ -19199,15 +19199,9 @@ def test_recreated_controller_does_not_open_recovery_gate_for_archived_spawn(
     )
 
     class ArchiveSnapshotQueue(SyntheticQueue):
-        def capture_snapshot(self, cursor: int) -> SimpleNamespace:
+        def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
             events = (predecessor_event,) if cursor < 23 else ()
-            return SimpleNamespace(
-                events=events,
-                boundary_run_seq=23,
-                sequence_status=SequenceStatus.COMPLETE,
-                findings=(),
-                active_tail=None,
-            )
+            return LedgerSnapshot(events, 23, SequenceStatus.COMPLETE, (), None)
 
     source = ArchiveSnapshotQueue([predecessor_event])
     transport = RecordingTransport()
@@ -19293,6 +19287,60 @@ def test_current_generation_spawn_with_archived_intent_still_holds(
     assert reason == "spawn_confirmation_intent_mismatch"
 
 
+def test_archive_of_another_run_never_proves_history(tmp_path: Path) -> None:
+    """Archive evidence belongs only to the run whose checkpoint records it."""
+    store, config, state, _, _ = _recreated_run_with_archived_predecessor(tmp_path)
+    other_plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
+    other_epoch = "controller-other-run"
+    create(
+        "other-run",
+        {
+            "slices": _initial_slices(other_plan, _config(), store.root_dir, "other-run"),
+            "controller_epoch": other_epoch,
+        },
+        root_dir=store.root_dir,
+    )
+    other_store = RunStore("other-run", store.root_dir)
+    other = other_store.load()
+    other_intent = hashlib.sha256(
+        f"other-run:worker-a:1:{other_epoch}".encode()
+    ).hexdigest()[:32]
+    other_store.checkpoint(
+        other.fsm,
+        {
+            "worker-a": replace(
+                other.slices["worker-a"],
+                status=SliceStatus.SPAWNED,
+                attempts=1,
+                dispatch_intent_id=other_intent,
+                dispatch_generation=1,
+                dispatch_agent_id="worker-a-codex",
+                dispatch_authoritative_event_seq=21,
+            )
+        },
+        other.budgets,
+        0,
+    )
+    (store.root_dir / "other-run").rename(store.root_dir / "root.invalid-900")
+    event = _spawn_row(
+        state.run_id,
+        run_seq=24,
+        data={"slug": "worker-a", "intent_id": other_intent},
+    )
+
+    _, disposition, reason = driver_module._restore_dispatch_from_confirmation(
+        event,
+        "worker-a",
+        state,
+        config,
+        store,
+        [],
+    )
+
+    assert disposition == "hold"
+    assert reason == "spawn_confirmation_intent_mismatch"
+
+
 def test_recreated_controller_still_opens_recovery_gate_for_unowned_spawn(
     tmp_path: Path,
 ) -> None:
@@ -19306,15 +19354,9 @@ def test_recreated_controller_still_opens_recovery_gate_for_unowned_spawn(
     )
 
     class UnownedSnapshotQueue(SyntheticQueue):
-        def capture_snapshot(self, cursor: int) -> SimpleNamespace:
+        def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
             events = (unowned_event,) if cursor < 24 else ()
-            return SimpleNamespace(
-                events=events,
-                boundary_run_seq=24,
-                sequence_status=SequenceStatus.COMPLETE,
-                findings=(),
-                active_tail=None,
-            )
+            return LedgerSnapshot(events, 24, SequenceStatus.COMPLETE, (), None)
 
     source = UnownedSnapshotQueue([unowned_event])
     transport = RecordingTransport()
@@ -19337,7 +19379,10 @@ def test_recreated_controller_still_opens_recovery_gate_for_unowned_spawn(
     assert not any(name in {"spawn_worker", "spawn_leaf"} for name, _ in transport.calls)
 
 
-@pytest.mark.parametrize("archive_contents", ["{not json", None])
+@pytest.mark.parametrize(
+    "archive_contents",
+    [pytest.param("{not json", id="corrupt-json"), pytest.param(None, id="no-checkpoint")],
+)
 def test_unreadable_archive_fails_closed_instead_of_claiming_history(
     tmp_path: Path,
     archive_contents: str | None,
