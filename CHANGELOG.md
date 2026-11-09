@@ -20,6 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Distinguish a present non-phase recursive scope FSM from a missing one in TL transition diagnostics (#1325)
+- Cover the bookkeeping-lane epoch guard with a regression test (#1325)
 - Fix continuation of a legacy failed root checkpoint that stores its failure text in the phase message (#1322)
 - Report malformed ordered-stage members as schema errors instead of crashing run-state validation (#1322)
 - Fail closed when a confirmed repair action has no recorded attempt instead of comparing it with an integer (#1322)
