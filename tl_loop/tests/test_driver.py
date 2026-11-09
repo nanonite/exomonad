@@ -29,7 +29,7 @@ from tl_loop.events.reader import LedgerReader, LedgerSnapshot, SequenceStatus
 from tl_loop.fsm.child import ChildKind, ChildRecord
 from tl_loop.fsm.event import ChildCompleted, PRFiled, PRUpdated
 from tl_loop.fsm.lane import LanePhase, LaneReserved, LaneState
-from tl_loop.fsm.phase import ChildHandle, TLPhase, TLPlanning, TLWaiting
+from tl_loop.fsm.phase import ChildHandle, TLFailed, TLPhase, TLPlanning, TLWaiting
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState, begin_recovery
 from tl_loop.fsm.scope import TLAllMerged as RecursiveTLAllMerged
@@ -147,6 +147,7 @@ from tl_loop.state.schema import (
     ActionState,
     BudgetLedger,
     DurableReviewEvidence,
+    EventCursor,
     FSMState,
     GateState,
     GateStatus,
@@ -26808,3 +26809,41 @@ def test_initial_spawn_event_requires_envelope_and_data_invocation_agreement(
 
     assert proof is None
     assert reason == "terminal initial spawn event conflicts with its accepted reporter or run"
+
+
+def test_continued_failed_root_reads_the_legacy_phase_message(tmp_path: Path) -> None:
+    """A legacy failure checkpoint has no recursive FSM, so its text is ``message``.
+
+    ``_phase_from_state`` returns the phase-domain ``TLFailed`` when the run has
+    no recursive FSM.  That class stores the reason in ``message``; reading
+    ``reason`` raised ``AttributeError`` before a fresh ``--continue`` replay
+    could recover the run.
+    """
+    run_id = "legacy-failed-root"
+    manifest = build_plan_manifest(
+        {"workers": [{"name": "worker-a", "task": "task"}]},
+        scope_id=run_id,
+    )
+    state = RunState(
+        version=SCHEMA_VERSION,
+        revision=0,
+        run_id=run_id,
+        fsm=FSMState(TLPhase.TLFailed, ()),
+        slices={},
+        budgets=BudgetLedger(0, 0),
+        gates=(),
+        events=EventCursor(0),
+        plan_manifest=manifest,
+        recursive_fsm=None,
+    )
+    config = replace(_config(), session_mode="continue")
+
+    assert driver_module._continued_failed_root_reason(state, config) == (
+        "resumed shadow failure"
+    )
+    assert driver_module._phase_matches_prior_failure(
+        TLFailed("legacy reason"), "legacy reason"
+    )
+    assert driver_module._terminal_recovery_diagnostics(state, {}) == {
+        "ordered_recovery": "resumed shadow failure"
+    }

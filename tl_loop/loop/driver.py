@@ -2503,6 +2503,15 @@ def _ordered_recovery_gate_name(task_name: str | None) -> str:
     return f"{ORDERED_RECOVERY_GATE_PREFIX}{task_name or 'ambiguous'}"
 
 
+def _phase_failure_reason(phase: object) -> str | None:
+    """Return the failure text from either the canonical or legacy phase value."""
+    if isinstance(phase, RecursiveTLFailed):
+        return phase.reason
+    if isinstance(phase, TLFailed):
+        return phase.message
+    return None
+
+
 def _continued_failed_root_reason(state: RunState | None, config: TLLoopConfig) -> str | None:
     """Return the saved root failure only as input to a fresh continue replay."""
     if (
@@ -2512,10 +2521,7 @@ def _continued_failed_root_reason(state: RunState | None, config: TLLoopConfig) 
         or state.plan_manifest.role != "root"
     ):
         return None
-    phase = _phase_from_state(state)
-    if isinstance(phase, (TLFailed, RecursiveTLFailed)):
-        return phase.reason
-    return None
+    return _phase_failure_reason(_phase_from_state(state))
 
 
 def _reconcile_fresh_continue_stalls(
@@ -2589,7 +2595,7 @@ def _fresh_stall_snapshot_unchanged(
 
 def _phase_matches_prior_failure(phase: object, reason: str) -> bool:
     """Reconcile only the exact failure verdict captured before this continue."""
-    return isinstance(phase, (TLFailed, RecursiveTLFailed)) and phase.reason == reason
+    return _phase_failure_reason(phase) == reason
 
 
 def _fresh_stall_slice_projection(
@@ -4781,14 +4787,15 @@ def _terminal_recovery_diagnostics(
     """Expose the fresh replay's terminal decision and any still-pending gate."""
     result = dict(diagnostics)
     phase = _phase_from_state(state)
-    if not isinstance(phase, (TLFailed, RecursiveTLFailed)):
+    reason = _phase_failure_reason(phase)
+    if reason is None:
         return result
-    result["ordered_recovery"] = phase.reason
+    result["ordered_recovery"] = reason
     if (
-        phase.reason.startswith("ordered recovery child '")
-        and "completion proof is unresolved:" in phase.reason
+        reason.startswith("ordered recovery child '")
+        and "completion proof is unresolved:" in reason
     ):
-        result["ordered_completion_recovery"] = phase.reason
+        result["ordered_completion_recovery"] = reason
         gate = next(
             (
                 gate
