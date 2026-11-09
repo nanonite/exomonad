@@ -15717,10 +15717,11 @@ def _reconcile_confirmed_repair_actions(
         confirmed = _confirmed_repair_entry(effects_log, current)
         if confirmed is None:
             continue
+        action_attempt = _required_action_attempt(action)
         attempts = current.attempts
         repair_attempts = current.repair_attempts
-        if attempts <= action.attempt:
-            attempts = action.attempt + 1
+        if attempts <= action_attempt:
+            attempts = action_attempt + 1
             repair_attempts += 1
         updated = slice_transition(
             current,
@@ -15741,6 +15742,13 @@ def _reconcile_confirmed_repair_actions(
     return state
 
 
+def _required_action_attempt(action: ActionState) -> int:
+    """Return the attempt recorded on an action that must have one."""
+    if action.attempt is None:
+        raise TLLoopError("repair action is missing its attempt")
+    return action.attempt
+
+
 def _confirmed_repair_entry(
     effects_log: EffectJournal,
     current: SliceState,
@@ -15748,8 +15756,11 @@ def _confirmed_repair_entry(
     """Find successful resume evidence for the current PR, newest first."""
     if current.pr_number is None:
         return None
+    required_attempt = (
+        _required_action_attempt(current.action) if current.action is not None else 1
+    )
     entries = effects_log.confirmed_entries("resume_pr", current.id)
-    if len(entries) < max(1, current.action.attempt if current.action else 1):
+    if len(entries) < max(1, required_attempt):
         return None
     for entry in reversed(entries):
         arguments = entry.get("arguments")

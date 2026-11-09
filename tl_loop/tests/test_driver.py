@@ -26847,3 +26847,52 @@ def test_continued_failed_root_reads_the_legacy_phase_message(tmp_path: Path) ->
     assert driver_module._terminal_recovery_diagnostics(state, {}) == {
         "ordered_recovery": "resumed shadow failure"
     }
+
+
+def test_confirmed_repair_without_a_recorded_attempt_fails_closed(tmp_path: Path) -> None:
+    """A schema-valid repair action may omit its attempt; do not compare it to None."""
+    run_id = "repair-missing-attempt"
+    store = RunStore(run_id, tmp_path)
+    current = SliceState(
+        id="leaf-a",
+        status=SliceStatus.REPAIRING,
+        paths=("src/a.py",),
+        depends_on=(),
+        base_ref="main",
+        test_plan=("just test",),
+        agent_type="codex",
+        model="test-model",
+        branch="main.leaf-a",
+        worktree=".worktrees/leaf-a",
+        pr_number=42,
+        reviewed_head="head-a",
+        attempts=2,
+        verdict=None,
+        action=ActionState(
+            ActionKind.REPAIR,
+            ActionPhase.IN_FLIGHT,
+            intent_id="repair-intent",
+            head_sha="head-a",
+            attempt=None,
+        ),
+    )
+    state = RunState(
+        version=SCHEMA_VERSION,
+        revision=0,
+        run_id=run_id,
+        fsm=FSMState(TLPhase.TLWaiting, ("leaf-a",)),
+        slices={"leaf-a": current},
+        budgets=BudgetLedger(0, 0),
+        gates=(),
+        events=EventCursor(0),
+    )
+    journal = EffectJournal(run_id, store.run_dir / "action-journal.json")
+    intent = EffectIntent("resume_pr", "leaf-a", {"pr_number": 42}, True)
+    journal.append(intent)
+    journal.mark_result(
+        intent,
+        ToolResult.from_raw({"success": True, "result": {"pr_number": 42}}),
+    )
+
+    with pytest.raises(TLLoopError, match="repair action is missing its attempt"):
+        driver_module._reconcile_confirmed_repair_actions(state, store, journal)
