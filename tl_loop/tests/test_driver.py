@@ -26082,6 +26082,14 @@ def test_legacy_initial_spawn_identity_requires_exact_corroboration(
     assert reason is not None and reason
 
 
+def test_modern_initial_spawn_result_carries_agent_type(tmp_path: Path) -> None:
+    plan, _config, store, *_ = _seed_terminal_provider_failure_leaf(tmp_path)
+    spawn = EffectJournal(store.run_id, store.run_dir / "action-journal.json").entries_for(
+        "spawn_leaf", plan.leaves[0].name
+    )[0]
+    assert spawn["result"]["result"]["agent_type"] == "opencode"
+
+
 @pytest.mark.parametrize(
     ("scenario", "expected_fragment"),
     (
