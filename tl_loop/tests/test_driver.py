@@ -26266,6 +26266,7 @@ def test_legacy_initial_spawn_rejects_unrecognized_projection_fields(
     assert reason is not None and "modern" in reason.casefold()
 
 
+@pytest.mark.parametrize("legacy_spawn_result", (True, False))
 @pytest.mark.parametrize(
     "scenario",
     (
@@ -26279,12 +26280,13 @@ def test_legacy_initial_spawn_rejects_unrecognized_projection_fields(
 def test_legacy_original_spawn_event_scope_validated_after_adoption(
     tmp_path: Path,
     scenario: str,
+    legacy_spawn_result: bool,
 ) -> None:
     """The original event remains authoritative only for its accepted scope."""
     plan, config, store, owner_dir, owner_name, original_id = _seed_terminal_provider_failure_leaf(
         tmp_path,
-        omit_initial_spawn_effort=True,
-        legacy_spawn_result=True,
+        omit_initial_spawn_effort=legacy_spawn_result,
+        legacy_spawn_result=legacy_spawn_result,
     )
     ledger_path = (
         Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
