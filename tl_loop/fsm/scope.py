@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import TypeAlias
+from typing import TypeAlias, TypeGuard
 
 from .child import ChildKind, ChildRecord
 from .evidence import require_text as _require_text
@@ -265,6 +265,23 @@ PhaseValue: TypeAlias = (
 )
 
 
+def is_phase_value(value: object) -> TypeGuard[PhaseValue]:
+    """Whether a decoded checkpoint value is one of the canonical scope phases."""
+    return isinstance(
+        value,
+        (
+            TLPlanning,
+            TLRunning,
+            TLAllMerged,
+            TLFinalizing,
+            TLDone,
+            TLPRFiled,
+            TLFailed,
+            TLParked,
+        ),
+    )
+
+
 __all__ = [
     "BaseInvalidated",
     "CIObserved",
@@ -276,6 +293,7 @@ __all__ = [
     "FinalizationRequested",
     "Heartbeat",
     "IntegrationValidated",
+    "is_phase_value",
     "LeafCompleted",
     "MergeRequested",
     "ParkRequested",

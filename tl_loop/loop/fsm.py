@@ -16,7 +16,7 @@ from tl_loop.fsm.child import TLOrchestrationEvent
 from tl_loop.fsm.event import TLEvent
 from tl_loop.fsm.orchestration import IllegalTransition as ScopeIllegalTransition
 from tl_loop.fsm.orchestration import transition as scope_transition
-from tl_loop.fsm.scope import PhaseValue
+from tl_loop.fsm.scope import PhaseValue, is_phase_value
 from tl_loop.fsm.scope_projection import active_child_ids, phase_tag
 from tl_loop.fsm.transition import transition as lifecycle_transition
 from tl_loop.loop.heartbeat import SyntheticHeartbeatEvent
@@ -96,10 +96,10 @@ def step(state: RunState, event: Event) -> Transition:
 def _step_scope(state: RunState, event: TLOrchestrationEvent) -> Transition:
     """Reduce one canonical scope event and refresh its compatibility projection."""
     phase = state.recursive_fsm
-    if phase is None:
+    if not is_phase_value(phase):
         return Transition(state, ignored_reason="scope_fsm_missing")
     try:
-        next_phase = scope_transition(phase, event)  # type: ignore[arg-type]
+        next_phase = scope_transition(phase, event)
     except (ScopeIllegalTransition, TypeError, ValueError) as error:
         return Transition(state, ignored_reason=f"illegal_scope_transition:{error}")
     return Transition(_with_scope_phase(state, next_phase))
@@ -108,10 +108,10 @@ def _step_scope(state: RunState, event: TLOrchestrationEvent) -> Transition:
 def _step_lifecycle(state: RunState, event: TLEvent) -> Transition:
     """Route legacy wire events through the canonical reducer during migration."""
     phase = state.recursive_fsm
-    if phase is None:
+    if not is_phase_value(phase):
         return Transition(state, ignored_reason="legacy_scope_fsm_missing")
     try:
-        next_phase = lifecycle_transition(phase, event)  # type: ignore[arg-type]
+        next_phase = lifecycle_transition(phase, event)
     except (ScopeIllegalTransition, TypeError, ValueError) as error:
         return Transition(state, ignored_reason=f"illegal_scope_transition:{error}")
     return Transition(_with_scope_phase(state, next_phase))
