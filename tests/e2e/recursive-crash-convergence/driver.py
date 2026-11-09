@@ -291,17 +291,25 @@ class Scenario:
             # one every later check asserts on.
             self.pr_b = self.pr_a
             self.pr_b_head = self.pr_a_head
-        filed = self.project.typed("pr.filed")
-        require(
-            any(e.get("data", {}).get("pr_number") == self.pr_a for e in filed),
-            f"the ledger has no pr.filed row for #{self.pr_a}",
+        # The forge can report the pull before the publishing handler has
+        # appended its durable row, so wait for the ledger boundary itself
+        # rather than reading it in the same instant the pull appears.
+        await_boundary(
+            lambda: [
+                e
+                for e in self.project.typed("pr.filed")
+                if e.get("data", {}).get("pr_number") == self.pr_a
+            ]
+            or None,
+            description=f"a pr.filed ledger row for #{self.pr_a}",
+            timeout=60.0,
         )
         return {
             "pr_number": self.pr_a,
             "head_branch": leaf_branch,
             "head_sha": self.pr_a_head,
             "controller_epoch": self.controller_epoch,
-            "ledger_filed": len(filed),
+            "ledger_filed": len(self.project.typed("pr.filed")),
         }
 
     def confirmed_recreate(self) -> dict[str, Any]:
