@@ -32018,17 +32018,17 @@ def _validate_chainlink_issue_bindings(plan: WorkPlan) -> None:
         bindings[issue_id] = path
 
     def visit(current: WorkPlan, path: str) -> None:
-        for task in current.workers:
-            add(task.chainlink_issue_id, f"{path}.workers[{task.name!r}]")
-        for task in current.leaves:
-            add(task.chainlink_issue_id, f"{path}.leaves[{task.name!r}]")
-        for task in current.sub_tls:
-            child_path = f"{path}.sub_tls[{task.name!r}]"
-            add(task.chainlink_issue_id, child_path)
+        for worker in current.workers:
+            add(worker.chainlink_issue_id, f"{path}.workers[{worker.name!r}]")
+        for leaf in current.leaves:
+            add(leaf.chainlink_issue_id, f"{path}.leaves[{leaf.name!r}]")
+        for sub_tl in current.sub_tls:
+            child_path = f"{path}.sub_tls[{sub_tl.name!r}]"
+            add(sub_tl.chainlink_issue_id, child_path)
             nested = (
-                task.plan
-                if isinstance(task.plan, WorkPlan)
-                else WorkPlan.from_mapping(task.plan, path=f"{child_path}.plan")
+                sub_tl.plan
+                if isinstance(sub_tl.plan, WorkPlan)
+                else WorkPlan.from_mapping(sub_tl.plan, path=f"{child_path}.plan")
             )
             visit(nested, f"{child_path}.plan")
 
