@@ -96,8 +96,10 @@ def step(state: RunState, event: Event) -> Transition:
 def _step_scope(state: RunState, event: TLOrchestrationEvent) -> Transition:
     """Reduce one canonical scope event and refresh its compatibility projection."""
     phase = state.recursive_fsm
-    if not is_phase_value(phase):
+    if phase is None:
         return Transition(state, ignored_reason="scope_fsm_missing")
+    if not is_phase_value(phase):
+        return Transition(state, ignored_reason=f"scope_fsm_not_a_phase:{type(phase).__name__}")
     try:
         next_phase = scope_transition(phase, event)
     except (ScopeIllegalTransition, TypeError, ValueError) as error:
@@ -108,8 +110,10 @@ def _step_scope(state: RunState, event: TLOrchestrationEvent) -> Transition:
 def _step_lifecycle(state: RunState, event: TLEvent) -> Transition:
     """Route legacy wire events through the canonical reducer during migration."""
     phase = state.recursive_fsm
-    if not is_phase_value(phase):
+    if phase is None:
         return Transition(state, ignored_reason="legacy_scope_fsm_missing")
+    if not is_phase_value(phase):
+        return Transition(state, ignored_reason=f"scope_fsm_not_a_phase:{type(phase).__name__}")
     try:
         next_phase = lifecycle_transition(phase, event)
     except (ScopeIllegalTransition, TypeError, ValueError) as error:

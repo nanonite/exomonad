@@ -2,8 +2,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from tl_loop.events.envelope import EventKind
 from tl_loop.fsm.child import ChildKind, ChildRecord
+from tl_loop.fsm.event import ChildCompleted
+from tl_loop.fsm.phase import TLWaiting
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.post_merge_events import PostMergeComplete
 from tl_loop.fsm.post_merge_evidence import PushReceipt
@@ -107,6 +111,42 @@ def _canonical_state(phase: object) -> RunState:
         events=EventCursor(0),
         recursive_fsm=phase,
     )
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_reason"),
+    (
+        (None, "scope_fsm_missing"),
+        (TLWaiting({}), "scope_fsm_not_a_phase:TLWaiting"),
+    ),
+)
+def test_mealy_scope_step_names_missing_and_non_phase_fsm(
+    phase: object, expected_reason: str
+) -> None:
+    state = _canonical_state(phase)
+
+    transition = step(state, StageReleased(0, (), ("root",)))
+
+    assert transition.ignored_reason == expected_reason
+    assert transition.state is state
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_reason"),
+    (
+        (None, "legacy_scope_fsm_missing"),
+        (TLWaiting({}), "scope_fsm_not_a_phase:TLWaiting"),
+    ),
+)
+def test_mealy_lifecycle_step_names_missing_and_non_phase_fsm(
+    phase: object, expected_reason: str
+) -> None:
+    state = _canonical_state(phase)
+
+    transition = step(state, ChildCompleted("worker"))
+
+    assert transition.ignored_reason == expected_reason
+    assert transition.state is state
 
 
 def test_mealy_scope_step_projects_root_finalization_and_advances_once() -> None:
