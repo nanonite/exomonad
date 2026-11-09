@@ -1507,10 +1507,8 @@ e2e_phase "Phase 8" "Recovering the aggregate, committing the scope handoff, and
 # config overrides in this shell. Phase 8 must start from its repository-local
 # remotes and the transport created below.
 while IFS= read -r variable; do
-    case "$variable" in
-        GIT_*) unset "$variable" ;;
-    esac
-done < <(compgen -e)
+    unset "$variable"
+done < <(env | sed -n 's/^\(GIT_[A-Za-z0-9_]*\)=.*/\1/p')
 
 if [[ -n "$MOCK_PID" ]] && kill -0 "$MOCK_PID" 2>/dev/null; then
     kill "$MOCK_PID" 2>/dev/null || true
@@ -2134,7 +2132,7 @@ if [[ "${E2E_TERMINAL_PROVIDER_FAILURE:-0}" == "1" ]]; then
         "${TERMINAL_SEED_ARGS[@]}" \
         > "$AGG_DIR/preexisting-opencode-owner-seed.json" \
         || { cat "$AGG_DIR/preexisting-opencode-owner-seed.json"; e2e_fail "failed to seed historical accepted OpenCode records and terminal provider failure"; }
-    PYTHONPATH="$PROJECT_ROOT" "$PROJECT_ROOT/tl_loop/.venv/bin/python" -m tl_loop gate \
+    PYTHONPATH="$PROJECT_ROOT" python3 -m tl_loop gate \
         --project-root "$AGG_REPO" --run-id kani --parent-run-id root \
         --name "tl-terminal-owner-recovery-issue-814-substitution-model-kani" --reject \
         > "$AGG_DIR/reject-terminal-recovery-gate.log" 2>&1 \
@@ -2313,7 +2311,7 @@ assert not [row for row in journal if row.get("operation") == "resume_blocked_le
 owner = Path(baseline["owner_dir"])
 assert json.loads((owner / "invocation.json").read_text()) == baseline["prior_invocation"]
 PY
-    PYTHONPATH="$PROJECT_ROOT" "$PROJECT_ROOT/tl_loop/.venv/bin/python" -m tl_loop gate \
+    PYTHONPATH="$PROJECT_ROOT" python3 -m tl_loop gate \
         --project-root "$AGG_REPO" --run-id kani --parent-run-id root \
         --name "tl-terminal-owner-recovery-issue-814-substitution-model-kani" --approve \
         > "$AGG_DIR/approve-terminal-recovery-gate.log" 2>&1 \
@@ -2536,11 +2534,11 @@ PY
         sleep 0.1
     done
     [[ -S "$AGG_REPO/.exo/server.sock" ]] || e2e_fail "configured Codex server did not restart after owner setup"
-    PYTHONPATH="$PROJECT_ROOT" "$PROJECT_ROOT/tl_loop/.venv/bin/python" -m tl_loop gate --project-root "$AGG_REPO" --run-id root \
+    PYTHONPATH="$PROJECT_ROOT" python3 -m tl_loop gate --project-root "$AGG_REPO" --run-id root \
         --name "tl-ordered-child-recovery-kani" --approve \
         > "$AGG_DIR/approve-kani-ordered-recovery.log" 2>&1 \
         || { cat "$AGG_DIR/approve-kani-ordered-recovery.log"; e2e_fail "could not approve the retained ordered Kani recovery gate"; }
-    PYTHONPATH="$PROJECT_ROOT" "$PROJECT_ROOT/tl_loop/.venv/bin/python" -m tl_loop gate --project-root "$AGG_REPO" --run-id kani --parent-run-id root \
+    PYTHONPATH="$PROJECT_ROOT" python3 -m tl_loop gate --project-root "$AGG_REPO" --run-id kani --parent-run-id root \
         --name "tl-dispatch-failed-issue-814-substitution-model-kani" --approve \
         > "$AGG_DIR/approve-kani-dispatch-recovery.log" 2>&1 \
         || { cat "$AGG_DIR/approve-kani-dispatch-recovery.log"; e2e_fail "could not approve the retained Kani dispatch recovery gate"; }
