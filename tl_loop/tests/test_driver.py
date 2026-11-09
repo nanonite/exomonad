@@ -19080,6 +19080,374 @@ def test_recovery_consistency_hold_blocks_live_dispatch(tmp_path: Path) -> None:
     )
 
 
+def _recreated_run_with_archived_predecessor(
+    tmp_path: Path,
+    *,
+    run_id: str = "recreated-archive-run",
+    archive_name: str = "root.invalid-1000",
+) -> tuple[RunStore, TLLoopConfig, RunState, str, str]:
+    """Create a recreated pending run beside a predecessor archive.
+
+    The archive is the same directory shape ``exomonad init --recreate`` leaves
+    behind: the whole predecessor root is renamed to ``root.invalid-*``, so its
+    checkpoint and nested child checkpoints stay readable as evidence.
+    """
+    state_root = tmp_path / ".exo" / "tl-loop"
+    plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
+    config = replace(
+        _config(),
+        run_id=run_id,
+        ledger_run_id=run_id,
+        repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
+        keep_alive_on_waiting=False,
+        max_parallel_slices=None,
+        policy=None,
+    )
+    repository_identity = {"remote_url": "https://forge.example.com/org/repo.git"}
+    predecessor_epoch = "controller-predecessor"
+    predecessor_store = RunStore(run_id, state_root)
+    create(
+        run_id,
+        {
+            "slices": _initial_slices(plan, config, state_root, run_id),
+            "controller_epoch": predecessor_epoch,
+            "repository_identity": repository_identity,
+        },
+        root_dir=state_root,
+    )
+    predecessor = predecessor_store.load()
+    predecessor_intent = hashlib.sha256(
+        f"{run_id}:worker-a:1:{predecessor_epoch}".encode()
+    ).hexdigest()[:32]
+    dispatched = replace(
+        predecessor.slices["worker-a"],
+        status=SliceStatus.SPAWNED,
+        attempts=1,
+        dispatch_intent_id=predecessor_intent,
+        dispatch_generation=1,
+        dispatch_agent_id="worker-a-codex",
+        dispatch_authoritative_event_seq=21,
+    )
+    predecessor_store.checkpoint(
+        predecessor.fsm,
+        {"worker-a": dispatched},
+        predecessor.budgets,
+        0,
+    )
+    (state_root / run_id).rename(state_root / archive_name)
+
+    current_epoch = "controller-current"
+    create(
+        run_id,
+        {
+            "slices": _initial_slices(plan, config, state_root, run_id),
+            "controller_epoch": current_epoch,
+            "repository_identity": repository_identity,
+        },
+        root_dir=state_root,
+    )
+    store = RunStore(run_id, state_root)
+    state = store.load()
+    store.set_plan_manifest(
+        build_plan_manifest(
+            {"workers": [{"name": "worker-a", "task": "task"}]}, scope_id=run_id
+        ),
+        slices=state.slices,
+    )
+    state = store.load()
+    return store, config, state, predecessor_intent, current_epoch
+
+
+def test_recreated_controller_treats_archived_generation_spawn_as_historical(
+    tmp_path: Path,
+) -> None:
+    """A predecessor dispatch row is evidence, not a current intent conflict."""
+    store, config, state, predecessor_intent, _ = _recreated_run_with_archived_predecessor(
+        tmp_path
+    )
+    event = _spawn_row(
+        state.run_id,
+        run_seq=23,
+        data={"slug": "worker-a", "intent_id": predecessor_intent},
+    )
+
+    _, disposition, reason = driver_module._restore_dispatch_from_confirmation(
+        event,
+        "worker-a",
+        state,
+        config,
+        store,
+        [],
+    )
+
+    assert disposition == "historical"
+    assert reason == driver_module.DISPATCH_GENERATION_MISMATCH
+
+
+def test_recreated_controller_does_not_open_recovery_gate_for_archived_spawn(
+    tmp_path: Path,
+) -> None:
+    """Startup catch-up acknowledges the predecessor row and dispatches normally."""
+    store, config, state, predecessor_intent, _ = _recreated_run_with_archived_predecessor(
+        tmp_path
+    )
+    plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
+    predecessor_event = _spawn_row(
+        state.run_id,
+        run_seq=23,
+        data={"slug": "worker-a", "intent_id": predecessor_intent},
+    )
+
+    class ArchiveSnapshotQueue(SyntheticQueue):
+        def capture_snapshot(self, cursor: int) -> SimpleNamespace:
+            events = (predecessor_event,) if cursor < 23 else ()
+            return SimpleNamespace(
+                events=events,
+                boundary_run_seq=23,
+                sequence_status=SequenceStatus.COMPLETE,
+                findings=(),
+                active_tail=None,
+            )
+
+    source = ArchiveSnapshotQueue([predecessor_event])
+    transport = RecordingTransport()
+
+    result = run_tl_loop(
+        state.run_id,
+        plan,
+        source,
+        EffectClient(transport),
+        config=config,
+        root_dir=store.root_dir,
+    )
+
+    assert not any(
+        gate.name == driver_module.RECOVERY_CONSISTENCY_GATE_NAME
+        for gate in result.final_state.gates
+    ), result.diagnostics
+    assert 23 in source.acknowledged
+
+
+@pytest.mark.parametrize(
+    ("intent", "event_epoch"),
+    [
+        ("0" * 32, None),
+        ("0" * 32, "controller-current"),
+    ],
+)
+def test_spawn_row_outside_current_and_archived_generations_still_holds(
+    tmp_path: Path,
+    intent: str,
+    event_epoch: str | None,
+) -> None:
+    """An intent this run cannot place still opens the consistency gate."""
+    store, config, state, _, current_epoch = _recreated_run_with_archived_predecessor(
+        tmp_path
+    )
+    data: dict[str, object] = {"slug": "worker-a", "intent_id": intent}
+    if event_epoch is not None:
+        data["controller_epoch"] = current_epoch
+    event = _spawn_row(state.run_id, run_seq=24, data=data)
+
+    _, disposition, reason = driver_module._restore_dispatch_from_confirmation(
+        event,
+        "worker-a",
+        state,
+        config,
+        store,
+        [],
+    )
+
+    assert disposition == "hold"
+    assert reason == "spawn_confirmation_intent_mismatch"
+
+
+def test_current_generation_spawn_with_archived_intent_still_holds(
+    tmp_path: Path,
+) -> None:
+    """A row claiming this controller epoch is never reclassified from history."""
+    store, config, state, predecessor_intent, current_epoch = (
+        _recreated_run_with_archived_predecessor(tmp_path)
+    )
+    event = _spawn_row(
+        state.run_id,
+        run_seq=24,
+        data={
+            "slug": "worker-a",
+            "intent_id": predecessor_intent,
+            "controller_epoch": current_epoch,
+        },
+    )
+
+    _, disposition, reason = driver_module._restore_dispatch_from_confirmation(
+        event,
+        "worker-a",
+        state,
+        config,
+        store,
+        [],
+    )
+
+    assert disposition == "hold"
+    assert reason == "spawn_confirmation_intent_mismatch"
+
+
+def test_recreated_controller_still_opens_recovery_gate_for_unowned_spawn(
+    tmp_path: Path,
+) -> None:
+    """A spawn row no generation of this run minted still stops startup."""
+    store, config, state, _, _ = _recreated_run_with_archived_predecessor(tmp_path)
+    plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
+    unowned_event = _spawn_row(
+        state.run_id,
+        run_seq=24,
+        data={"slug": "worker-a", "intent_id": "0" * 32},
+    )
+
+    class UnownedSnapshotQueue(SyntheticQueue):
+        def capture_snapshot(self, cursor: int) -> SimpleNamespace:
+            events = (unowned_event,) if cursor < 24 else ()
+            return SimpleNamespace(
+                events=events,
+                boundary_run_seq=24,
+                sequence_status=SequenceStatus.COMPLETE,
+                findings=(),
+                active_tail=None,
+            )
+
+    source = UnownedSnapshotQueue([unowned_event])
+    transport = RecordingTransport()
+
+    result = run_tl_loop(
+        state.run_id,
+        plan,
+        source,
+        EffectClient(transport),
+        config=config,
+        root_dir=store.root_dir,
+    )
+
+    assert any(
+        gate.name == driver_module.RECOVERY_CONSISTENCY_GATE_NAME
+        and gate.status is GateStatus.PENDING
+        for gate in result.final_state.gates
+    )
+    assert result.diagnostics["recovery_consistency"] == "spawn_confirmation_intent_mismatch"
+    assert not any(name in {"spawn_worker", "spawn_leaf"} for name, _ in transport.calls)
+
+
+@pytest.mark.parametrize("archive_contents", ["{not json", None])
+def test_unreadable_archive_fails_closed_instead_of_claiming_history(
+    tmp_path: Path,
+    archive_contents: str | None,
+) -> None:
+    """A corrupt or incomplete archive cannot prove ownership, so the gate stays closed."""
+    store, config, state, predecessor_intent, _ = _recreated_run_with_archived_predecessor(
+        tmp_path
+    )
+    archive = store.root_dir / "root.invalid-2000"
+    archive.mkdir()
+    if archive_contents is not None:
+        (archive / "run.json").write_text(archive_contents, encoding="utf-8")
+    event = _spawn_row(
+        state.run_id,
+        run_seq=24,
+        data={"slug": "worker-a", "intent_id": predecessor_intent},
+    )
+
+    _, disposition, reason = driver_module._restore_dispatch_from_confirmation(
+        event,
+        "worker-a",
+        state,
+        config,
+        store,
+        [],
+    )
+
+    assert disposition == "hold"
+    assert reason == "spawn_confirmation_archive_unreadable"
+
+
+def test_nested_child_archive_proves_a_child_dispatch_is_historical(
+    tmp_path: Path,
+) -> None:
+    """Recreate archives nested child checkpoints along with the root."""
+    state_root = tmp_path / ".exo" / "tl-loop"
+    run_id = "root"
+    child_id = "architecture"
+    plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
+    predecessor_epoch = "controller-child-predecessor"
+    predecessor_root = RunStore(run_id, state_root)
+    create(run_id, {}, root_dir=state_root)
+    create(
+        child_id,
+        {
+            "slices": _initial_slices(plan, _config(), predecessor_root.run_dir, child_id),
+            "controller_epoch": predecessor_epoch,
+        },
+        root_dir=predecessor_root.run_dir,
+    )
+    child_store = RunStore(child_id, predecessor_root.run_dir)
+    child_state = child_store.load()
+    predecessor_intent = hashlib.sha256(
+        f"{child_id}:worker-a:1:{predecessor_epoch}".encode()
+    ).hexdigest()[:32]
+    dispatched = replace(
+        child_state.slices["worker-a"],
+        status=SliceStatus.SPAWNED,
+        attempts=1,
+        dispatch_intent_id=predecessor_intent,
+        dispatch_generation=1,
+        dispatch_agent_id="worker-a-codex",
+        dispatch_authoritative_event_seq=21,
+    )
+    child_store.checkpoint(
+        child_state.fsm,
+        {"worker-a": dispatched},
+        child_state.budgets,
+        0,
+    )
+    (state_root / run_id).rename(state_root / "root.invalid-3000")
+
+    create(run_id, {}, root_dir=state_root)
+    current_epoch = "controller-child-current"
+    create(child_id, {"controller_epoch": current_epoch}, root_dir=RunStore(run_id, state_root).run_dir)
+    active_child = RunStore(child_id, RunStore(run_id, state_root).run_dir)
+    active_child.set_plan_manifest(
+        build_plan_manifest(
+            {"workers": [{"name": "worker-a", "task": "task"}]}, scope_id=child_id
+        ),
+        slices=_initial_slices(plan, _config(), active_child.run_dir, child_id),
+    )
+    state = active_child.load()
+    config = replace(
+        _config(),
+        run_id=child_id,
+        ledger_run_id=run_id,
+        repository_identity=None,
+        keep_alive_on_waiting=False,
+        max_parallel_slices=None,
+        policy=None,
+    )
+    event = _spawn_row(
+        child_id,
+        run_seq=25,
+        data={"slug": "worker-a", "intent_id": predecessor_intent},
+    )
+
+    _, disposition, reason = driver_module._restore_dispatch_from_confirmation(
+        event,
+        "worker-a",
+        state,
+        config,
+        active_child,
+        [],
+    )
+
+    assert disposition == "historical"
+    assert reason == driver_module.DISPATCH_GENERATION_MISMATCH
+
+
 def test_finite_startup_prefix_drains_before_dispatch_and_live_events(
     tmp_path: Path,
 ) -> None:

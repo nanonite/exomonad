@@ -270,6 +270,16 @@ class WorktreeClaimError(RuntimeError):
     """A live run already owns the requested worktree."""
 
 
+class ArchivedCheckpointError(RuntimeError):
+    """A recreate archive exists but cannot prove its dispatch history."""
+
+    def __init__(self, path: Path, reason: str, *, cause: BaseException | None = None) -> None:
+        message = f"invalid recreate archive {path}: {reason}"
+        super().__init__(message)
+        if cause is not None:
+            self.__cause__ = cause
+
+
 @dataclass(frozen=True)
 class ResumeState:
     """The local state required to resume a controller without network I/O."""
@@ -1880,6 +1890,81 @@ def _lives_in_archived_root(candidate: Path, forest_root: Path) -> bool:
         ancestor.parent == forest_root and ancestor.name.startswith(ARCHIVED_ROOT_PREFIX)
         for ancestor in candidate.parents
     )
+
+
+def archived_dispatch_intent_ids(root_dir: str | Path, run_id: str) -> set[str]:
+    """Return dispatch intents recorded by recreate archives of one run.
+
+    A confirmed recreate renames the whole active root directory to a top-level
+    ``root.invalid-*`` sibling, so the predecessor root and every nested child
+    checkpoint remain readable together. Only checkpoints whose recorded
+    ``run_id`` names this run contribute evidence; every archive that exists
+    must still be readable, because an unreadable one could hide the intent
+    being looked for.
+    """
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("run_id must be a non-empty string")
+    forest_root = _active_forest_root(Path(root_dir))
+    if not forest_root.is_dir():
+        return set()
+    try:
+        archives = sorted(
+            candidate
+            for candidate in forest_root.iterdir()
+            if candidate.is_dir() and candidate.name.startswith(ARCHIVED_ROOT_PREFIX)
+        )
+    except OSError as error:
+        raise ArchivedCheckpointError(
+            forest_root, f"cannot list archives: {error}", cause=error
+        ) from error
+    intents: set[str] = set()
+    for archive in archives:
+        try:
+            checkpoints = sorted(archive.rglob("run.json"))
+        except OSError as error:
+            raise ArchivedCheckpointError(
+                archive, f"cannot walk archive: {error}", cause=error
+            ) from error
+        if not checkpoints:
+            raise ArchivedCheckpointError(archive, "archive contains no run checkpoint")
+        for checkpoint in checkpoints:
+            document = _read_archived_checkpoint(checkpoint)
+            if document.get("run_id") != run_id:
+                continue
+            slices = document.get("slices")
+            if not isinstance(slices, Mapping):
+                raise ArchivedCheckpointError(checkpoint, "checkpoint slices are not an object")
+            for slice_id, slice_document in slices.items():
+                if not isinstance(slice_id, str) or not isinstance(slice_document, Mapping):
+                    raise ArchivedCheckpointError(checkpoint, "checkpoint slice is malformed")
+                intent = slice_document.get("dispatch_intent_id")
+                if intent is None:
+                    continue
+                if not isinstance(intent, str) or not intent:
+                    raise ArchivedCheckpointError(
+                        checkpoint, f"slice {slice_id!r} has a malformed dispatch intent"
+                    )
+                intents.add(intent)
+    return intents
+
+
+def _read_archived_checkpoint(path: Path) -> Mapping[str, object]:
+    """Read one archived checkpoint without migrating or rewriting it."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ArchivedCheckpointError(
+            path, f"cannot read checkpoint: {error}", cause=error
+        ) from error
+    try:
+        document = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ArchivedCheckpointError(
+            path, f"checkpoint is not valid JSON: {error}", cause=error
+        ) from error
+    if not isinstance(document, Mapping):
+        raise ArchivedCheckpointError(path, "checkpoint is not an object")
+    return document
 
 
 def _resolve_run_directory(
@@ -3775,10 +3860,12 @@ def _normalize_worktree(value: str) -> str:
 
 __all__ = [
     "DEFAULT_ROOT",
+    "ArchivedCheckpointError",
     "CorruptCheckpoint",
     "ResumeState",
     "RunStore",
     "WorktreeClaimError",
+    "archived_dispatch_intent_ids",
     "checkpoint",
     "create",
     "load",

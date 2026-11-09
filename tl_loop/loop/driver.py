@@ -328,10 +328,12 @@ from tl_loop.state.slice_transition import (
 )
 from tl_loop.state.store import (
     DEFAULT_ROOT,
+    ArchivedCheckpointError,
     CheckpointConflict,
     CorruptCheckpoint,
     QuarantineStorageError,
     RunStore,
+    archived_dispatch_intent_ids,
     create,
 )
 
@@ -1016,6 +1018,10 @@ DISPATCH_INTEGRITY_CONFLICT = "integrity_conflict"
 #: dispatch this run owns. This is the one refusal reason that is historical
 #: evidence rather than an integrity conflict.
 DISPATCH_EPOCH_MISMATCH = "controller_epoch_mismatch"
+#: A spawn row names an intent recorded by this run's own recreate archive.
+#: The row predates the current generation, so it is historical evidence on
+#: the same terms as an epoch mismatch even though the runtime wrote no epoch.
+DISPATCH_GENERATION_MISMATCH = "controller_generation_mismatch"
 #: The spawn row names an intent this run already recorded a confirmation for.
 #: One dispatch writes two such rows -- the child registration carries
 #: ``child_agent`` and the dispatch record carries ``slug``/``task_summary`` --
@@ -9297,7 +9303,7 @@ def _run_loop(
                     history.boundary_run_seq,
                 )
             if disposition == "historical":
-                _record_historical_spawn(store, event, DISPATCH_EPOCH_MISMATCH)
+                _record_historical_spawn(store, event, reason or DISPATCH_EPOCH_MISMATCH)
                 diagnostics.filtered += 1
                 _checkpoint_and_ack(store, source, event, state, phase, acknowledge=not replaying)
                 if not replaying:
@@ -18138,6 +18144,28 @@ def _uncheckpointed_spawn_slice_hint(
     return (matches[0], False) if len(matches) == 1 else (None, len(matches) > 1)
 
 
+def _archived_spawn_is_historical(
+    event: EventEnvelope,
+    state: RunState,
+    store: RunStore,
+) -> tuple[bool, str | None]:
+    """Whether every intent the row names is recorded by a recreate archive.
+
+    Only a row that claims no controller epoch reaches this check: an epoch
+    naming another controller is already historical, and an epoch naming this
+    one is a current-generation claim that archive evidence must not override.
+    """
+    intent_ids = _spawn_event_intent_ids(event)
+    if not intent_ids:
+        return False, None
+    try:
+        archived_intents = archived_dispatch_intent_ids(store.root_dir, state.run_id)
+    except ArchivedCheckpointError as error:
+        LOGGER.warning("[TL loop] cannot read recreate archive evidence: %s", error)
+        return False, "spawn_confirmation_archive_unreadable"
+    return intent_ids <= archived_intents, None
+
+
 def _restore_dispatch_from_confirmation(
     event: EventEnvelope,
     slice_id: str,
@@ -18161,13 +18189,19 @@ def _restore_dispatch_from_confirmation(
         and event_epoch != state.controller_epoch
     ):
         return state, "historical", DISPATCH_EPOCH_MISMATCH
-    if not dependencies_satisfied(state.slices, slice_id):
-        return state, "hold", "spawn_confirmation_precedes_declared_dependencies"
     attempt = current.attempts + 1
     expected_intent = _dispatch_intent_id_for(state, slice_id, attempt)
     intent_ids = _spawn_event_intent_ids(event)
     if intent_ids != {expected_intent}:
+        if event_epoch is None:
+            historical, archive_error = _archived_spawn_is_historical(event, state, store)
+            if archive_error is not None:
+                return state, "hold", archive_error
+            if historical:
+                return state, "historical", DISPATCH_GENERATION_MISMATCH
         return state, "hold", "spawn_confirmation_intent_mismatch"
+    if not dependencies_satisfied(state.slices, slice_id):
+        return state, "hold", "spawn_confirmation_precedes_declared_dependencies"
     if not _spawn_event_generation_matches(event, attempt, state.controller_epoch):
         return state, "hold", "spawn_confirmation_generation_mismatch"
     identity, error = _spawn_event_identity(event, current, slice_id, config)
