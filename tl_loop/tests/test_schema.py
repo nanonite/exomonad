@@ -606,3 +606,11 @@ def _rejection(document: dict[str, object]) -> str:
     except SchemaError as error:
         return str(error)
     raise AssertionError("expected SchemaError")
+
+
+def test_non_array_ordered_stage_members_are_reported_not_iterated() -> None:
+    """Malformed stage members must produce a SchemaError, never a TypeError."""
+    document = _valid_document()
+    document["ordered_stages"] = [{"order": 1, "sub_tls": 5}]
+
+    _assert_rejected(document, "run.ordered_stages[0].sub_tls")

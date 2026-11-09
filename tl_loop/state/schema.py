@@ -1360,7 +1360,10 @@ def _ordered_state(root: dict[str, object], errors: list[tuple[str, str]]) -> No
                     errors.append((f"{path}.order", "must be contiguous and sorted from 1"))
                 expected += 1
                 _string_list(stage, "sub_tls", path, errors, allow_empty=False)
-                for name in stage.get("sub_tls", []):
+                sub_tls = stage.get("sub_tls")
+                if not isinstance(sub_tls, list):
+                    continue
+                for name in sub_tls:
                     if isinstance(name, str):
                         if name in seen:
                             errors.append(
@@ -2889,5 +2892,7 @@ def _nullable_number(
     holder: dict[str, object], key: str, path: str, errors: list[tuple[str, str]]
 ) -> None:
     value = holder.get(key)
-    if value is not None and (type(value) not in {int, float} or value < 0):
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
         errors.append((f"{path}.{key}", "must be null or a non-negative number"))
