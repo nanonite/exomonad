@@ -5383,14 +5383,40 @@ def _terminal_initial_spawn_evidence(
     )
 
 
-_MODERN_SPAWN_REQUEST_MARKERS = (
-    "role_route",
-    "route_fingerprint",
-    "route_configuration_fingerprint",
-    "route_policy_fingerprint",
-    "route_manifest_digest",
+# Historical spawn_leaf result and request projections emitted before configured
+# route provenance. Any other key is modern provenance.
+_LEGACY_SPAWN_RESULT_FIELDS = frozenset(
+    {
+        "worktree_path",
+        "branch_name",
+        "tab_name",
+        "issue_title",
+        "agent_type",
+        "pane_id",
+        "invocation_id",
+        "invocation_trigger",
+        "invocation_runtime",
+        "routing_target_type",
+        "routing_target_id",
+        "invocation_fresh",
+        "invocation_ready",
+        "invocation_outcome",
+    }
 )
-_MODERN_SPAWN_RESPONSE_MARKERS = ("role_route", "route_fingerprint")
+_LEGACY_SPAWN_ARGUMENT_FIELDS = frozenset(
+    {
+        "name",
+        "task",
+        "intent_id",
+        "agent_type",
+        "model",
+        "boundary",
+        "context",
+        "read_first",
+        "steps",
+        "verify",
+    }
+)
 
 
 def _absolute_worktree_path(value: object) -> Path | None:
@@ -5464,9 +5490,7 @@ def _resolve_initial_spawn_identity(
         return expected_invocation_id, None
     if agent_value is not None or invocation_value is not None:
         return None, "accepted initial spawn result has a malformed identity"
-    if any(field in payload for field in _MODERN_SPAWN_RESPONSE_MARKERS) or any(
-        field in arguments for field in _MODERN_SPAWN_REQUEST_MARKERS
-    ):
+    if set(payload) - _LEGACY_SPAWN_RESULT_FIELDS or set(arguments) - _LEGACY_SPAWN_ARGUMENT_FIELDS:
         return None, "legacy initial spawn has incomplete or conflicting modern provenance"
     if any(payload.get(field) is not None for field in _LEGACY_SPAWN_HANDOFF_FIELDS):
         return None, "accepted initial spawn result is not a supported legacy projection"

@@ -26181,8 +26181,12 @@ def test_spawn_result_worktree_path_must_be_absolute(
     (
         "response_role_route",
         "response_route_fingerprint",
-        "request_route_fingerprint",
+        "response_explicit_null_agent_id",
         "request_role_route",
+        "request_route_fingerprint",
+        "request_route_configuration_fingerprint",
+        "request_route_policy_fingerprint",
+        "request_route_manifest_digest",
     ),
 )
 def test_legacy_initial_spawn_rejects_modern_provenance_markers(
@@ -26193,6 +26197,7 @@ def test_legacy_initial_spawn_rejects_modern_provenance_markers(
     plan, config, store, _owner_dir, _owner_name, _original_id = (
         _seed_terminal_provider_failure_leaf(
             tmp_path,
+            omit_initial_spawn_effort=True,
             legacy_spawn_result=True,
         )
     )
@@ -26209,10 +26214,50 @@ def test_legacy_initial_spawn_rejects_modern_provenance_markers(
         }
     elif scenario == "response_route_fingerprint":
         spawn["result"]["result"]["route_fingerprint"] = "sha256:modern-marker"
-    elif scenario == "request_route_fingerprint":
-        spawn["arguments"]["route_fingerprint"] = "sha256:modern-marker"
+    elif scenario == "response_explicit_null_agent_id":
+        spawn["result"]["result"]["agent_id"] = None
     elif scenario == "request_role_route":
         spawn["arguments"]["role_route"] = {"route_fingerprint": "sha256:modern-marker"}
+    else:
+        spawn["arguments"][scenario.removeprefix("request_")] = "sha256:modern-marker"
+    journal_path.write_text(json.dumps(rows), encoding="utf-8")
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+
+    assert proof is None
+    assert reason is not None and "modern" in reason.casefold()
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    (
+        "response_unknown_route_field",
+        "request_unknown_route_field",
+    ),
+)
+def test_legacy_initial_spawn_rejects_unrecognized_projection_fields(
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    """A missing-ID response is legacy only when both projections match the historical shape."""
+    plan, config, store, _owner_dir, _owner_name, _original_id = (
+        _seed_terminal_provider_failure_leaf(
+            tmp_path,
+            omit_initial_spawn_effort=True,
+            legacy_spawn_result=True,
+        )
+    )
+    journal_path = store.run_dir / "action-journal.json"
+    rows = json.loads(journal_path.read_text(encoding="utf-8"))
+    spawn = next(
+        row
+        for row in rows
+        if row.get("operation") == "spawn_leaf" and row.get("target") == plan.leaves[0].name
+    )
+    if scenario == "response_unknown_route_field":
+        spawn["result"]["result"]["route_resolution_digest"] = "sha256:unknown-modern-marker"
+    else:
+        spawn["arguments"]["route_resolution_digest"] = "sha256:unknown-modern-marker"
     journal_path.write_text(json.dumps(rows), encoding="utf-8")
 
     proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
