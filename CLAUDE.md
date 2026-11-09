@@ -823,6 +823,9 @@ All E2E tests live in `tests/e2e/{name}/` and follow the same structure:
 - Do not depend on a checkout-local virtualenv; run tl_loop as
   `PYTHONPATH="$PROJECT_ROOT" python3 -m tl_loop`.
 - Avoid bash builtins missing from the dev shell's bash, such as `compgen`.
+- A harness never inherits the caller's `CHAINLINK_DB`: a phase that runs
+  Chainlink or a controller against a disposable repository exports that
+  repository's own `.chainlink/issues.db` before it starts.
 
 **Adding a new E2E test:**
 1. Create `tests/e2e/{name}/run.sh` following the pattern above
