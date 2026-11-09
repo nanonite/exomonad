@@ -2010,6 +2010,19 @@ def test_live_restart_fails_before_controller_on_identity_conflict(
     assert calls == ["provision"]
 
 
+def _live_child_state(phase: TLPhase = TLPhase.TLWaiting) -> RunState:
+    return RunState(
+        version=1,
+        revision=0,
+        run_id="child",
+        fsm=FSMState(phase, ()),
+        slices={},
+        budgets=BudgetLedger(0, 0),
+        gates=(),
+        events=EventCursor(0),
+    )
+
+
 def test_live_waiting_child_is_not_terminated_by_elapsed_supervision() -> None:
     class FakeProcess:
         def __init__(self) -> None:
@@ -2031,7 +2044,7 @@ def test_live_waiting_child_is_not_terminated_by_elapsed_supervision() -> None:
 
     process = FakeProcess()
     child_store = SimpleNamespace(
-        load=lambda: SimpleNamespace(fsm=SimpleNamespace(phase=TLPhase.TLWaiting)),
+        load=lambda: _live_child_state(),
         record_exit_reason=lambda reason: pytest.fail(reason),
     )
 
@@ -2342,7 +2355,7 @@ def test_live_waiting_child_is_terminated_on_explicit_cancellation() -> None:
     cancel_event = threading.Event()
     cancel_event.set()
     child_store = SimpleNamespace(
-        load=lambda: SimpleNamespace(fsm=SimpleNamespace(phase=TLPhase.TLWaiting)),
+        load=lambda: _live_child_state(),
         record_exit_reason=reasons.append,
     )
 
@@ -2377,7 +2390,7 @@ def test_exited_waiting_child_is_failed_as_process_loss() -> None:
 
     reasons: list[str] = []
     child_store = SimpleNamespace(
-        load=lambda: SimpleNamespace(fsm=SimpleNamespace(phase=TLPhase.TLWaiting)),
+        load=lambda: _live_child_state(),
         record_exit_reason=reasons.append,
     )
 

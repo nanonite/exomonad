@@ -20976,8 +20976,8 @@ def _supervise_live_sub_tl(
             return child_state
         empty_scope = (
             child_state is not None
-            and isinstance(getattr(child_state, "recursive_fsm", None), RecursiveTLAllMerged)
-            and getattr(child_state, "plan_manifest", None) is not None
+            and isinstance(child_state.recursive_fsm, RecursiveTLAllMerged)
+            and child_state.plan_manifest is not None
             and not child_state.plan_manifest.nodes
         )
         if child_state is None or (
@@ -21000,7 +21000,7 @@ def _supervise_live_sub_tl(
         child_state = child_store.load()
     except (OSError, ValueError):
         return None
-    recursive_fsm = getattr(child_state, "recursive_fsm", None)
+    recursive_fsm = child_state.recursive_fsm
     if isinstance(recursive_fsm, RecursiveTLFailed):
         _record_child_exit_reason(
             child_store,
