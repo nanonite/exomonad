@@ -1144,7 +1144,7 @@ PY
 }
 
 e2e_phase "Phase 0" "Checking preconditions..."
-e2e_require_commands nix tmux git curl python3
+e2e_require_commands nix tmux git curl rg chainlink python3
 
 cleanup() {
     local code=$?

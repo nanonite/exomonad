@@ -30,6 +30,7 @@
           protobuf  # For proto codegen (prost/proto3-suite)
           go         # For Go-based dev tooling
           cargo-nextest
+          ripgrep # justfile recipes and E2E harness assertions use rg
         ];
 
         # Proto3-suite code generator for Haskell
