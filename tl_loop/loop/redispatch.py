@@ -11,7 +11,10 @@ from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.fsm.phase import ChildHandle, TLPlanning, TLWaiting
 from tl_loop.loop.driver import (
+    LeafTask,
+    SubTLTask,
     TLLoopConfig,
+    WorkerTask,
     WorkPlan,
     _dispatch_children,
 )
@@ -143,8 +146,13 @@ def redispatch_slice(
     }
 
 
+def _direct_tasks(plan: WorkPlan) -> tuple[WorkerTask | LeafTask | SubTLTask, ...]:
+    """Return every direct child declaration regardless of kind."""
+    return (*plan.workers, *plan.leaves, *plan.sub_tls)
+
+
 def _task_for_slice(plan: WorkPlan, slice_id: str) -> object | None:
-    for task in (*plan.workers, *plan.leaves, *plan.sub_tls):
+    for task in _direct_tasks(plan):
         if task.name == slice_id:
             return task
     for sub_tl in plan.sub_tls:
@@ -158,7 +166,7 @@ def _task_for_slice(plan: WorkPlan, slice_id: str) -> object | None:
 
 
 def _plan_for_slice(plan: WorkPlan, slice_id: str) -> WorkPlan | None:
-    if any(task.name == slice_id for task in (*plan.workers, *plan.leaves, *plan.sub_tls)):
+    if any(task.name == slice_id for task in _direct_tasks(plan)):
         return plan
     for sub_tl in plan.sub_tls:
         nested = (

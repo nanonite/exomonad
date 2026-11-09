@@ -839,7 +839,7 @@ def _write_intent(path: Path, payload: dict[str, object]) -> None:
     os.replace(temporary, path)
 
 
-def _list_needs_human_issues(creator: object) -> list[object]:
+def _list_needs_human_issues(creator: object) -> list[Mapping[str, object]]:
     """List needs-human issues (open and closed), failing closed on uncertainty.
 
     Closed issues are included so a crash after creation is still reconciled
@@ -879,7 +879,7 @@ def _list_needs_human_issues(creator: object) -> list[object]:
         title = issue.get("title")
         if not isinstance(title, str) or not title.strip():
             raise IssueLookupUnavailable(f"malformed issue list entry: {issue!r}")
-    return list(issues)
+    return [issue for issue in issues if isinstance(issue, Mapping)]
 
 
 def _find_run_scoped_issue(creator: object, title: str) -> int | None:
@@ -888,7 +888,7 @@ def _find_run_scoped_issue(creator: object, title: str) -> int | None:
     for issue in _list_needs_human_issues(creator):
         issue_id = _issue_id(issue)
         issue_title = issue.get("title")
-        if issue_title.strip() == wanted:
+        if isinstance(issue_title, str) and issue_title.strip() == wanted:
             return issue_id
     return None
 

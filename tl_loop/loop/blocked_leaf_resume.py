@@ -302,16 +302,10 @@ def validate_role_route_provenance(
     required_text = required - {"policy_fingerprint"}
     if (
         set(expected) != required
-        or any(
-            not isinstance(expected.get(key), str) or not expected[key].strip()
-            for key in required_text
-        )
+        or any(_optional_text(expected.get(key)) is None for key in required_text)
         or (
             expected.get("policy_fingerprint") is not None
-            and (
-                not isinstance(expected.get("policy_fingerprint"), str)
-                or not expected["policy_fingerprint"].strip()
-            )
+            and _optional_text(expected.get("policy_fingerprint")) is None
         )
     ):
         raise BlockedLeafRouteProvenanceError(

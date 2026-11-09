@@ -327,17 +327,15 @@ def heartbeat_once(
                 )
                 missing_handoff = bool(evidence.get("missing_handoff"))
                 if missing_handoff:
+                    generation = evidence.get("generation")
+                    if type(generation) is not int or generation < 0:
+                        generation = 0
                     recovery = current_slice.recovery or begin_recovery(
                         cause=ParkCause.HUMAN_DECISION_REQUIRED.value,
                         owner_run_id=current.run_id,
                         slice_attempt=current_slice.attempts,
                         owner_agent_id=current_slice.dispatch_agent_id,
-                        invocation_generation=(
-                            evidence.get("generation")
-                            if type(evidence.get("generation")) is int
-                            and evidence.get("generation") >= 0
-                            else 0
-                        ),
+                        invocation_generation=generation,
                         plan_revision=current.revision,
                         evidence=evidence,
                         next_action="diagnose",
