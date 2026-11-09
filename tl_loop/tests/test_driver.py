@@ -26334,3 +26334,33 @@ def test_legacy_original_spawn_event_scope_validated_after_adoption(
 
     assert proof is None
     assert reason is not None and reason
+
+
+@pytest.mark.parametrize("scenario", ("envelope_only", "data_only"))
+def test_initial_spawn_event_requires_envelope_and_data_invocation_agreement(
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    """The Rust ledger writer derives the envelope invocation from the same data field."""
+    _plan, config, store, _owner_dir, _owner_name, _original_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path, legacy_spawn_result=True)
+    )
+    ledger_path = (
+        Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
+    )
+    rows = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()]
+    spawn = next(row for row in rows if row.get("type") == "agent.spawned")
+    if scenario == "envelope_only":
+        spawn["data"].pop("invocation_id")
+    else:
+        spawn["invocation_id"] = None
+    ledger_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows), encoding="utf-8"
+    )
+
+    proof, reason = driver_module._terminal_initial_spawn_evidence(
+        config, store, 108015, store.load().run_id
+    )
+
+    assert proof is None
+    assert reason == "terminal initial spawn event conflicts with its accepted reporter or run"
