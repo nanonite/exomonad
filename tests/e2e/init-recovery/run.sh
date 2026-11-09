@@ -1601,6 +1601,9 @@ chainlink show 814 --db "$AGG_REPO/.chainlink/issues.db" \
     || e2e_fail "disposable issue #814 is not readable"
 rg -Fq 'Status: open' "$AGG_DIR/chainlink-issue-814.log" \
     || e2e_fail "disposable issue #814 must remain open for routed recovery"
+# The disposable issue database is authoritative for every init/serve process
+# in this phase, including controller status checks.
+export CHAINLINK_DB="$AGG_REPO/.chainlink/issues.db"
 REFERENCE_GITLINKS="$AGG_DIR/reference-gitlinks.json"
 python3 "$SCRIPT_DIR/reference-gitlinks.py" seed \
     --repo "$AGG_REPO" --projects "$AGG_DIR/reference-projects" \
