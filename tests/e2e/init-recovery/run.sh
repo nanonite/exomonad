@@ -1231,6 +1231,12 @@ e2e_init_repo "Exomonad init-recovery E2E" "init-recovery-e2e@example.invalid"
 git remote add origin "$REMOTE_DIR"
 git push -u origin main -q
 e2e_run_exomonad_new
+chainlink init --no-hooks --db "$REPO_DIR/.chainlink/issues.db" \
+    > "$WORK_DIR/chainlink-init.log" 2>&1 \
+    || { cat "$WORK_DIR/chainlink-init.log"; e2e_fail "failed to initialize the scratch Chainlink database"; }
+# Phases 2-6 run every server and controller against this repository's own
+# database instead of inheriting the caller's CHAINLINK_DB.
+export CHAINLINK_DB="$REPO_DIR/.chainlink/issues.db"
 install_verified_wasm_and_roles
 cp "$PROJECT_ROOT/.exo/harness_policy.toml" .exo/harness_policy.toml
 cp "$PROJECT_ROOT/.exo/review-policy.toml" .exo/review-policy.toml
@@ -1409,6 +1415,11 @@ curl -fsS "$MOCK_URL/api/v1/admin/actions/runners" >/dev/null \
 
 cd "$CONT_REPO"
 "$EXOMONAD_BIN" new > "$CONT_DIR/new.log" 2>&1 || { cat "$CONT_DIR/new.log"; e2e_fail "'exomonad new' failed for the continuation fixture"; }
+chainlink init --no-hooks --db "$CONT_REPO/.chainlink/issues.db" \
+    > "$CONT_DIR/chainlink-init.log" 2>&1 \
+    || { cat "$CONT_DIR/chainlink-init.log"; e2e_fail "failed to initialize the continuation Chainlink database"; }
+# The continuation controller reads and writes only this repository's database.
+export CHAINLINK_DB="$CONT_REPO/.chainlink/issues.db"
 # Keep Git operations local while exposing the canonical SSH remote as the
 # repository identity consumed by the controller and merge host.
 git remote set-url origin "git@forgejo-e2e:owner/repo.git"
