@@ -92,12 +92,12 @@ def reconcile_merge_observation(
     CI, publication, and owner handoff all refer to the same head.  The fold
     is deliberately idempotent: unchanged snapshots return the same state.
     """
-    watcher = _as_watcher_observation(watcher)
-    assert watcher is not None
-    head_sha = watcher.head_sha
+    observation = _as_watcher_observation(watcher)
+    assert observation is not None
+    head_sha = observation.head_sha
     if not isinstance(head_sha, str) or not head_sha:
         return state
-    if watcher.merged is True:
+    if observation.merged is True:
         reconciliation = {
             "confirmed_stage": "merge",
             "authoritative_evidence": ["published_pr", "pr_state", "merged"],
@@ -107,7 +107,7 @@ def reconcile_merge_observation(
         }
         if state.status is SliceStatus.MERGED and state.reconciliation == reconciliation:
             return state
-        transitioned = slice_transition(state, MergeCompleted(watcher.pr_number or 0))
+        transitioned = slice_transition(state, MergeCompleted(observation.pr_number or 0))
         return replace(transitioned, reconciliation=reconciliation)
     if state.status is not SliceStatus.IN_REVIEW:
         return state
@@ -117,10 +117,10 @@ def reconcile_merge_observation(
         return state
     if state.verdict not in {Verdict.GO, Verdict.GO_WITH_NITS}:
         return state
-    ci_status = watcher.ci_status or state.ci_state.get(head_sha, "unknown")
+    ci_status = observation.ci_status or state.ci_state.get(head_sha, "unknown")
     if ci_status not in {"success", "neutral"}:
         return state
-    if watcher.pr_state == "closed":
+    if observation.pr_state == "closed":
         return state
     reconciliation = {
         "confirmed_stage": "merge",
@@ -1470,7 +1470,9 @@ def _pr_state(watcher: WatcherObservation | Mapping[str, object] | None) -> str:
     """Return an explicit compatibility state for older watcher payloads."""
     if watcher is None:
         return "unknown"
-    value = _as_watcher_observation(watcher).pr_state
+    observation = _as_watcher_observation(watcher)
+    assert observation is not None
+    value = observation.pr_state
     if isinstance(value, str) and value.lower() in {"open", "closed"}:
         return value.lower()
     return "unknown"
@@ -1487,7 +1489,9 @@ def _publication_ownership_status(
     """
     if watcher is None:
         return True, None
-    return _as_watcher_observation(watcher).ownership_status()
+    observation = _as_watcher_observation(watcher)
+    assert observation is not None
+    return observation.ownership_status()
 
 
 def _as_watcher_observation(
