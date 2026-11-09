@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol, TypeAlias, cast
+from pathlib import Path
+from typing import Protocol, TypeAlias, cast, runtime_checkable
 
 from .transport import DecodeError, JsonObject, JsonValue
 
@@ -22,6 +23,25 @@ class EffectTransport(Protocol):
         arguments: JsonObject,
     ) -> JsonObject:
         """Call a named server-side tool."""
+
+
+@runtime_checkable
+class OrderedSubTLTransport(Protocol):
+    """The transport capability required to provision a nested controller."""
+
+    def provision_ordered_sub_tl(
+        self,
+        parent_name: str,
+        *,
+        agent_name: str,
+        birth_branch: str,
+        parent_branch: str,
+        working_dir: str | Path,
+        slice_id: str,
+        pr_number: int | None = None,
+        head_sha: str | None = None,
+    ) -> str:
+        """Provision one ordered sub-TL and return its invocation ID."""
 
 
 @dataclass(frozen=True)

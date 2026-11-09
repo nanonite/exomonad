@@ -22,7 +22,12 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import NamedTuple, Protocol, cast
 
-from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
+from tl_loop.client.effects import (
+    EffectClient,
+    OrderedSubTLTransport,
+    ToolResult,
+    ToolUnavailableError,
+)
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import (
     DecodeError,
@@ -21130,7 +21135,10 @@ def _run_live_sub_tl(
                 persisted_child = child_store.load()
                 published_pr_number = persisted_child.integration.aggregate_pr_number
                 published_head_sha = persisted_child.integration.aggregate_head_sha
-            invocation_id = effects.transport.provision_ordered_sub_tl(
+            transport = effects.transport
+            if not isinstance(transport, OrderedSubTLTransport):
+                raise TLLoopError("effect transport cannot provision an ordered sub-TL")
+            invocation_id = transport.provision_ordered_sub_tl(
                 effects.name,
                 agent_name=_child_controller_name(task),
                 birth_branch=branch,
