@@ -111,6 +111,7 @@ from tl_loop.fsm.recovery import (
     begin_recovery,
     transition_recovery,
 )
+from tl_loop.fsm.scope import PhaseValue as RecursivePhaseValue
 from tl_loop.fsm.scope import (
     TLAllMerged as RecursiveTLAllMerged,
 )
@@ -2149,7 +2150,7 @@ def _clear_resolved_migration_gate(
     return store.clear_gate(gate_name)
 
 
-def _failure_phase(state: RunState, reason: str) -> PhaseValue:
+def _failure_phase(state: RunState, reason: str) -> PhaseValue | RecursivePhaseValue:
     """Build a failure value in the active FSM domain.
 
     A run that is already failed stays failed, keeping the reason it failed
@@ -2163,7 +2164,20 @@ def _failure_phase(state: RunState, reason: str) -> PhaseValue:
     if phase is not None:
         if isinstance(phase, RecursiveTLFailed):
             return TLFailed(phase.reason)
-        return scope_transition(phase, ScopeFailureRecorded(reason))
+        if isinstance(
+            phase,
+            (
+                RecursiveTLPlanning,
+                RecursiveTLRunning,
+                RecursiveTLAllMerged,
+                RecursiveTLFinalizing,
+                RecursiveTLDone,
+                RecursiveTLPRFiled,
+                RecursiveTLParked,
+            ),
+        ):
+            return scope_transition(phase, ScopeFailureRecorded(reason))
+        raise IllegalTransition(f"no transition for {type(phase).__name__} and FailureRecorded")
     return TLFailed(reason)
 
 
@@ -2328,7 +2342,7 @@ def _canonical_planning_from_manifest(
 
 
 def _canonical_child_record(
-    node: object,
+    node: ManifestNode,
     slice_value: object,
     manifest_revision: int,
 ) -> ChildRecord:
@@ -3169,14 +3183,16 @@ def _rejected_spawn_journal_entry(
         )
     except ActionJournalError:
         return None
-    matching = [
-        entry
-        for entry in entries
-        if entry.get("status") == "rejected"
-        and isinstance(entry.get("arguments"), Mapping)
-        and entry["arguments"].get("name") == slice_id
-        and entry["arguments"].get("intent_id") == intent_id
-    ]
+    def matches(entry: Mapping[str, object]) -> bool:
+        arguments = entry.get("arguments")
+        return (
+            entry.get("status") == "rejected"
+            and isinstance(arguments, Mapping)
+            and arguments.get("name") == slice_id
+            and arguments.get("intent_id") == intent_id
+        )
+
+    matching = [entry for entry in entries if matches(entry)]
     return matching[0] if len(matching) == 1 else None
 
 
@@ -3952,7 +3968,7 @@ def _ordered_sub_tl_completion_coordinate_conflicts(
 
 
 def _checkpoint_scope_phase(
-    phase: PhaseValue,
+    phase: PhaseValue | RecursivePhaseValue,
     state: RunState,
     store: RunStore,
 ) -> RunState:
@@ -6433,12 +6449,14 @@ def _terminal_owner_recovery_proof(
             and current.model == invocation.get("model")
             and current.dispatch_effort == invocation.get("effort")
         )
+        confirmed_result = resume_history.latest_confirmed_result
+        confirmed_invocation = (
+            confirmed_result.result.get("invocation") if confirmed_result is not None else None
+        )
         history_resume_predecessor = (
             invocation.get("trigger") == "resume_blocked"
-            and resume_history.latest_confirmed_result is not None
-            and isinstance(resume_history.latest_confirmed_result.result.get("invocation"), Mapping)
-            and resume_history.latest_confirmed_result.result["invocation"].get("invocation_id")
-            == invocation.get("invocation_id")
+            and isinstance(confirmed_invocation, Mapping)
+            and confirmed_invocation.get("invocation_id") == invocation.get("invocation_id")
         )
         if (
             is_checkpointed_resume or history_resume_predecessor
@@ -9696,12 +9714,13 @@ def _run_loop(
                 effects_log,
                 state.controller_epoch,
             )
+        shadow_event = event.data.get("shadow_event")
         if (
             isinstance(phase, RecursiveTLRunning)
             and isinstance(fsm_event, ChildSpawned)
             and not transitions
-            and isinstance(event.data.get("shadow_event"), Mapping)
-            and event.data["shadow_event"].get("kind") == "child_spawned"
+            and isinstance(shadow_event, Mapping)
+            and shadow_event.get("kind") == "child_spawned"
             and not catching_up
         ):
             _emit_phase_change(
@@ -14706,7 +14725,7 @@ def _recursive_phase_after_slice_update(
     state: RunState,
     slice_id: str,
     current: SliceState,
-) -> PhaseValue | None:
+) -> RecursivePhaseValue | None:
     """Project slice recovery into the canonical recursive scope FSM."""
     phase = state.recursive_fsm
     if not isinstance(phase, RecursiveTLRunning) or current.post_merge is None:
@@ -16360,6 +16379,10 @@ def _retire_rejected_merge_results(
                 and observation.head_sha == action.head_sha
             )
             if observation.merged is True and same_head:
+                raw_arguments = entry.get("arguments")
+                merge_arguments = (
+                    dict(raw_arguments) if isinstance(raw_arguments, Mapping) else {}
+                )
                 state = _reconcile_merged_slice(
                     state,
                     slice_id,
@@ -16371,7 +16394,7 @@ def _retire_rejected_merge_results(
                     effects_log,
                     boundary="rejected_journal_remote_merge_reconciled",
                     merge_evidence={
-                        **dict(entry.get("arguments") or {}),
+                        **merge_arguments,
                         **_watcher_merge_evidence(observation),
                     },
                 )
@@ -18118,7 +18141,7 @@ def _uncheckpointed_spawn_slice_hint(
     """Find one pending declared slice whose spawn row can restore its checkpoint."""
     if not _is_spawn_confirmation_event(event):
         return None, False
-    declared = {task.name for task in (*plan.workers, *plan.leaves)}
+    declared = {task.name for task in plan.workers} | {task.name for task in plan.leaves}
     pending = {
         name: current
         for name, current in state.slices.items()
@@ -19636,13 +19659,16 @@ def _scope_handoff_is_unresolved(effects_log: list[EffectIntent], handoff_id: st
     """Prevent a changed snapshot from bypassing a prior ambiguous commit."""
     if not isinstance(effects_log, EffectJournal):
         return False
-    return any(
-        entry.get("operation") == "prepare_scope_handoff"
-        and entry.get("status") in {"intended", "unknown"}
-        and isinstance(entry.get("arguments"), Mapping)
-        and entry["arguments"].get("handoff_id") == handoff_id
-        for entry in effects_log.snapshot()
-    )
+    def unresolved(entry: Mapping[str, object]) -> bool:
+        arguments = entry.get("arguments")
+        return (
+            entry.get("operation") == "prepare_scope_handoff"
+            and entry.get("status") in {"intended", "unknown"}
+            and isinstance(arguments, Mapping)
+            and arguments.get("handoff_id") == handoff_id
+        )
+
+    return any(unresolved(entry) for entry in effects_log.snapshot())
 
 
 _SHUTDOWN_REOPEN_ATTEMPTS = 3
@@ -22804,15 +22830,18 @@ def _aggregate_file_pr_effect_is_unresolved(
     title = _aggregate_pr_title(task.name, config.branch)
     if isinstance(effects_log, EffectJournal):
         records = effects_log.snapshot()
-        return any(
-            record.get("operation") == "file_pr"
-            and record.get("target") == task.name
-            and isinstance(record.get("arguments"), Mapping)
-            and record["arguments"].get("title") == title
-            and record["arguments"].get("base_branch") == config.branch
-            and record.get("status") in {"intended", "unknown", "confirmed", "reconciled"}
-            for record in records
-        )
+        def unresolved(record: Mapping[str, object]) -> bool:
+            arguments = record.get("arguments")
+            return (
+                record.get("operation") == "file_pr"
+                and record.get("target") == task.name
+                and isinstance(arguments, Mapping)
+                and arguments.get("title") == title
+                and arguments.get("base_branch") == config.branch
+                and record.get("status") in {"intended", "unknown", "confirmed", "reconciled"}
+            )
+
+        return any(unresolved(record) for record in records)
     return any(
         intent.operation == "file_pr"
         and intent.target == task.name
@@ -23196,11 +23225,13 @@ def _aggregate_resume_record_matches(
 
 def _aggregate_resume_pr_coordinates_present(record: Mapping[str, object]) -> bool:
     """Require a resume record anchored to a concrete existing PR head."""
+    pr_number = record.get("pr_number")
+    head_sha = record.get("head_sha")
     return bool(
-        type(record.get("pr_number")) is int
-        and record.get("pr_number", 0) > 0
-        and isinstance(record.get("head_sha"), str)
-        and record.get("head_sha")
+        type(pr_number) is int
+        and pr_number > 0
+        and isinstance(head_sha, str)
+        and head_sha
     )
 
 
@@ -30451,14 +30482,12 @@ def _completed_no_push_sync_proof(
         attempt,
         require_correlation=stable_identity,
     )
+    completed_steps = validated.get("completed_steps")
+    steps = set(completed_steps) if isinstance(completed_steps, list) else set()
     if (
         validated.get("sync_outcome") != "confirmed"
         or validated.get("sync_phase") != "complete"
-        or not {"fetch", "fast_forward"}.issubset(
-            set(validated.get("completed_steps", ()))
-            if isinstance(validated.get("completed_steps"), list)
-            else set()
-        )
+        or not {"fetch", "fast_forward"}.issubset(steps)
         or validated.get("parent_commit_sha") != evidence.get("parent_commit_sha")
         or validated.get("remote_head_sha") != reconciliation.get("remote_head_sha")
         or validated.get("ancestry_proof") != reconciliation.get("ancestry_proof")
