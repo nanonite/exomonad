@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import TypeAlias
 
 from .child import TLOrchestrationEvent
 from .post_merge_evidence import PushReceipt
@@ -193,6 +194,24 @@ class PostMergeRebuildRequested(TLOrchestrationEvent):
     reason: str
 
 
+PostMergeEvent: TypeAlias = (
+    MergeAdopted
+    | ParentBranchSynced
+    | IssueClosePending
+    | IssueCloseConfirmed
+    | IssueCloseAlreadyClosed
+    | IssueCloseFailed
+    | IssueCloseRetryAuthorized
+    | ChangelogPending
+    | ChangelogCommitted
+    | ParentPushPending
+    | PostMergeComplete
+    | PostMergeNotApplicable
+    | PostMergeRebuildRequested
+    | UnlinkedChangelogJudged
+)
+
+
 __all__ = [
     "UNLINKED_CHANGELOG_DECISIONS",
     "UNLINKED_CHANGELOG_OUTCOMES",
@@ -207,6 +226,7 @@ __all__ = [
     "MergeAdopted",
     "ParentBranchSynced",
     "ParentPushPending",
+    "PostMergeEvent",
     "PostMergeComplete",
     "PostMergeNotApplicable",
     "PostMergeRebuildRequested",

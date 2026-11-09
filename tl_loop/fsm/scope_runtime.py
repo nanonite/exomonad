@@ -7,12 +7,16 @@ from dataclasses import replace
 
 from .child import ChildKind, ChildRecord
 from .post_merge import PostMergePhase, PostMergeState
+from .post_merge_events import PostMergeEvent
 from .post_merge_transition import advance_post_merge
 from .scope import (
+    LeafCompleted,
     PhaseValue,
+    StageReleased,
     TLAllMerged,
     TLPlanning,
     TLRunning,
+    WorkerCompleted,
 )
 
 
@@ -20,7 +24,7 @@ class IllegalTransition(ValueError):
     """An event is not legal for the current target phase."""
 
 
-def release_first_stage(phase: TLPlanning, event: object) -> PhaseValue:
+def release_first_stage(phase: TLPlanning, event: StageReleased) -> PhaseValue:
     """Release only the first ordered stage or the direct parallel block."""
     if phase.ordered_children:
         order, records = phase.ordered_children[0]
@@ -63,7 +67,7 @@ def running_from_plan(
     )
 
 
-def complete_worker(phase: TLRunning, event: object) -> PhaseValue:
+def complete_worker(phase: TLRunning, event: WorkerCompleted) -> PhaseValue:
     """Record a worker result and remove that worker from parallel work."""
     record = active_record(phase, event.child_id)
     if record.kind is not ChildKind.WORKER:
@@ -80,7 +84,7 @@ def complete_worker(phase: TLRunning, event: object) -> PhaseValue:
     return remove_active(phase, event.child_id, post, evidence)
 
 
-def complete_leaf(phase: TLRunning, event: object) -> PhaseValue:
+def complete_leaf(phase: TLRunning, event: LeafCompleted) -> PhaseValue:
     """Record a direct leaf result without granting worker completion rights."""
     record = active_record(phase, event.child_id)
     if record.kind is not ChildKind.LEAF:
@@ -97,7 +101,7 @@ def complete_leaf(phase: TLRunning, event: object) -> PhaseValue:
     return remove_active(phase, event.child_id, post, evidence)
 
 
-def post_merge_transition(phase: TLRunning, event: object) -> PhaseValue:
+def post_merge_transition(phase: TLRunning, event: PostMergeEvent) -> PhaseValue:
     """Advance one active PR child through the post-merge reducer."""
     current = phase.post_merge.get(event.child_id)
     if current is None:
