@@ -21000,7 +21000,7 @@ def _supervise_live_sub_tl(
         child_state = child_store.load()
     except (OSError, ValueError):
         return None
-    recursive_fsm = child_state.recursive_fsm
+    recursive_fsm = getattr(child_state, "recursive_fsm", None)
     if isinstance(recursive_fsm, RecursiveTLFailed):
         _record_child_exit_reason(
             child_store,
