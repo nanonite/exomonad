@@ -7,7 +7,7 @@ import re
 import unicodedata
 
 from .plan_manifest import PlanManifest
-from .plan_revision_types import PlanRevisionBlocker
+from .plan_revision_types import PlanRevisionBlocker, PlanRevisionNodeChange
 from .schema import RunState, SliceStatus
 
 _SECRET = re.compile(
@@ -43,7 +43,9 @@ def _persisted_stages(state: RunState) -> tuple[tuple[int, tuple[str, ...]], ...
     return tuple((stage.order, tuple(stage.sub_tls)) for stage in state.ordered_stages)
 
 
-def _safe_changes(changes: tuple[object, ...]) -> tuple[dict[str, object], ...]:
+def _safe_changes(
+    changes: tuple[PlanRevisionNodeChange, ...],
+) -> tuple[dict[str, object], ...]:
     return tuple(
         {
             "scope_id": _safe_text(change.scope_id),

@@ -108,7 +108,8 @@ def _snapshot_omits_aggregate_review_owner(
     plan: Mapping[str, object],
     node: ManifestNode,
 ) -> bool:
-    scope = plan.get("plan") if isinstance(plan.get("plan"), Mapping) else plan
+    nested_plan = plan.get("plan")
+    scope = nested_plan if isinstance(nested_plan, Mapping) else plan
     kind_key = {"worker": "workers", "leaf": "leaves", "sub_tl": "sub_tls"}.get(node.kind)
     entries = scope.get(kind_key, ()) if kind_key is not None else ()
     if not isinstance(entries, list | tuple):

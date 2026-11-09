@@ -143,7 +143,7 @@ def _child_coordinates_match(
         and _is_commit_sha(evidence["base_sha"])
         and aggregate_base == evidence["base_sha"]
         and isinstance(patch_digest, str)
-        and patch_digest
+        and bool(patch_digest)
         and _child_owner_coordinates_match(integration, evidence, state, patch_digest)
     )
 

@@ -74,7 +74,7 @@ class SliceSpec:
 
     def to_mapping(self) -> JsonObject:
         """Return the JSON shape consumed by state and spawn adapters."""
-        result = {
+        result: JsonObject = {
             "id": self.id,
             "title": self.title,
             "paths": list(self.paths),

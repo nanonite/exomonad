@@ -222,7 +222,7 @@ def _snapshot_file_changes(
         snapshot_path: analysis.candidate_plan_bytes,
         digest_path: f"{candidate_digest}\n".encode("ascii"),
     }
-    expected_before = {
+    expected_before: dict[Path, str | None] = {
         plan_path: candidate_digest,
         snapshot_path: analysis.previous_plan_sha256,
         digest_path: hashlib.sha256(snapshot_digest).hexdigest(),

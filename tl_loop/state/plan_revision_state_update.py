@@ -251,8 +251,8 @@ def _running_projections(
 ) -> tuple[
     dict[str, ChildRecord],
     dict[str, PostMergeState],
-    dict[str, object],
-    dict[str, object],
+    dict[str, str],
+    dict[str, str],
 ]:
     completed_projection = _completed_projection(candidate, records, completed)
     dispatch_intents, lane_bindings = _retained_running_maps(phase, candidate)
@@ -275,7 +275,7 @@ def _completed_projection(
 def _retained_running_maps(
     phase: TLRunning,
     candidate: PlanManifest,
-) -> tuple[dict[str, object], dict[str, object]]:
+) -> tuple[dict[str, str], dict[str, str]]:
     names = {node.name for node in candidate.nodes}
     dispatch = {name: item for name, item in phase.dispatch_intents.items() if name in names}
     lanes = {name: item for name, item in phase.lane_bindings.items() if name in names}

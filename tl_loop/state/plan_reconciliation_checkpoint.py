@@ -6,6 +6,7 @@ import copy
 import json
 from collections.abc import Mapping
 
+from .plan_manifest import PlanManifest
 from .plan_reconciliation_models import ReconciliationScope
 from .plan_revision_state import decode_checkpoint_bytes
 from .plan_revision_state_update import _update_changed_declaration_fields
@@ -55,8 +56,8 @@ def _decode_document(raw: bytes, checkpoint: str) -> dict[str, object]:
 
 def _reconcile_slice_declarations(
     document: dict[str, object],
-    current: object,
-    target: object,
+    current: PlanManifest,
+    target: PlanManifest,
 ) -> None:
     slices = document.get("slices")
     if not isinstance(slices, dict):
