@@ -1252,16 +1252,20 @@ window_count() {
 }
 
 run_init() {
+    local label="$1"
+    shift
     # exomonad init is expected to fail here: the seeded plan has no work,
     # so the TL controller exits during startup and the whole invocation
     # returns nonzero even though Server/Watcher recovery already
     # succeeded. That failure is intentional and tolerated everywhere this
     # helper is used — only tmux window state is asserted.
-    "$EXOMONAD_BIN" init --session "$SESSION" > "$WORK_DIR/init-$1.log" 2>&1 || true
+    "$EXOMONAD_BIN" init "$@" --session "$SESSION" > "$WORK_DIR/init-$label.log" 2>&1 || true
 }
 
 e2e_phase "Phase 2" "Running exomonad init to create Server, Watcher, and TL windows..."
-run_init "first"
+# A fresh scratch project states fresh-run intent; --continue would require
+# .exo/tl-loop/root/run.json from a previous run.
+run_init "first" --start
 for name in Server Watcher TL; do
     [[ "$(window_count "$name")" == "1" ]] || {
         cat "$WORK_DIR/init-first.log"
