@@ -20,7 +20,7 @@ from fnmatch import fnmatchcase
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import NamedTuple, Protocol, cast
+from typing import NamedTuple, NoReturn, Protocol, cast
 
 from tl_loop.client.effects import (
     EffectClient,
@@ -8208,7 +8208,7 @@ def _blocked_leaf_dispatch_attempt(
         model=model if isinstance(model, str) else None,
         requested_harness=current.requested_harness,
         route_reconciliation_source=route_source,
-        attempt=int(arguments["dispatch_attempt"]),
+        attempt=_required_int(arguments, "dispatch_attempt", "dispatch attempt"),
         role=cast(str | None, fields.get("role")),
         effort=cast(str | None, fields.get("effort")),
         route_configuration_fingerprint=cast(
@@ -8218,8 +8218,12 @@ def _blocked_leaf_dispatch_attempt(
         route_manifest_digest=cast(str | None, fields.get("route_manifest_digest")),
         route_fingerprint=cast(str | None, fields.get("route_fingerprint")),
         controller_epoch=cast(str | None, arguments.get("controller_epoch")),
-        dispatch_generation=int(arguments["dispatch_generation"]),
-        ledger_floor=int(arguments["dispatch_ledger_floor"]),
+        dispatch_generation=_required_int(
+            arguments, "dispatch_generation", "dispatch generation", allow_zero=True
+        ),
+        ledger_floor=_required_int(
+            arguments, "dispatch_ledger_floor", "dispatch ledger floor", allow_zero=True
+        ),
     )
 
 
@@ -9105,6 +9109,22 @@ def _run_loop(
             if recovery_pending:
                 continue
             if config.heartbeat is not None and not recovery_pending:
+                def replay_review(
+                    replay_state: RunState,
+                    replay_slice: SliceState,
+                    replay_watcher: WatcherObservation,
+                ) -> RunState:
+                    return _replay_watcher_review_if_needed(
+                        plan,
+                        replay_state,
+                        replay_slice,
+                        replay_watcher,
+                        config,
+                        effects,
+                        store,
+                        effects_log,
+                    )
+
                 heartbeat = heartbeat_once(
                     state,
                     store,
@@ -9113,18 +9133,7 @@ def _run_loop(
                     project_root=config.project_root,
                     active_work=active_work_clock,
                     controller_agent_id=config.agent_id or config.run_id,
-                    review_replay=lambda replay_state, replay_slice, replay_watcher, replay_config=config: (
-                        _replay_watcher_review_if_needed(
-                            plan,
-                            replay_state,
-                            replay_slice,
-                            replay_watcher,
-                            replay_config,
-                            effects,
-                            store,
-                            effects_log,
-                        )
-                    ),
+                    review_replay=replay_review,
                 )
                 if heartbeat.fired:
                     before_phase = phase
@@ -12967,7 +12976,7 @@ def _parent_sync_arguments(
     forgejo_merge_commit_tree_sha = evidence.get("forgejo_merge_commit_tree_sha")
     prospective_tree = evidence.get("prospective_merge_tree_sha")
     reviewed_tree = evidence.get("reviewed_pr_head_tree_sha")
-    complete_forgejo_binding = (
+    if (
         isinstance(forgejo_pr_number, str)
         and forgejo_pr_number.isdigit()
         and isinstance(forgejo_merged, str)
@@ -12982,8 +12991,7 @@ def _parent_sync_arguments(
         and bool(prospective_tree)
         and isinstance(reviewed_tree, str)
         and bool(reviewed_tree)
-    )
-    if complete_forgejo_binding:
+    ):
         arguments.update(
             {
                 "forgejo_pr_number": int(forgejo_pr_number),
@@ -13714,7 +13722,7 @@ def _run_parent_push(
         return _recover_remote_advance(
             state,
             current,
-            pr_number=int(evidence["pr_number"]),
+            pr_number=_required_int(evidence, "pr_number", "PR number"),
             evidence=evidence,
             push_arguments=arguments,
             failed_result=result,
@@ -19387,7 +19395,7 @@ def _scope_handoff_identity(
     if state.owner_branch is not None and state.owner_branch != config.branch:
         return "controller branch differs from its persisted owner branch"
     node = declarations[0]
-    coordinates = {
+    coordinates: dict[str, object] = {
         "controller_id": effects.name,
         "parent_run_id": store.run_id,
         "parent_scope_id": manifest.scope_id,
@@ -20217,7 +20225,7 @@ def _optional_sub_tl_completion_updates(
     state: RunState,
     store: RunStore,
 ) -> (
-    tuple[dict[str, SliceState], IntegrationRuntimeState, tuple[str, ...]]
+    tuple[Mapping[str, SliceState], IntegrationRuntimeState, tuple[str, ...]]
     | OrderedCompletionEvidenceError
 ):
     """Assess completed optional children without trusting their parent label."""
@@ -20984,10 +20992,11 @@ def _supervise_live_sub_tl(
         child_state = child_store.load()
     except (OSError, ValueError):
         return None
-    if isinstance(getattr(child_state, "recursive_fsm", None), RecursiveTLFailed):
+    recursive_fsm = child_state.recursive_fsm
+    if isinstance(recursive_fsm, RecursiveTLFailed):
         _record_child_exit_reason(
             child_store,
-            child_state.recursive_fsm.reason,
+            recursive_fsm.reason,
             outcome="supervisor_observed_failure",
             expected_revision=child_state.revision,
         )
@@ -23582,7 +23591,7 @@ def _raise_aggregate_watcher_unavailable(
     pr_number: int,
     publication_attempt: int,
     error: Exception | None = None,
-) -> None:
+) -> NoReturn:
     """Record an actionable watcher failure without copying raw error text."""
     failure = _aggregate_reconciliation_rejected(
         slice_id,
@@ -31162,9 +31171,9 @@ def _bind_publication_evidence(
     return {**slices, target_id: updated}
 
 
-def _complete_legacy_direct_children(phase: RecursiveTLRunning) -> PhaseValue:
+def _complete_legacy_direct_children(phase: RecursiveTLRunning) -> RecursivePhaseValue:
     """Translate the legacy aggregate signal into typed direct completions."""
-    next_phase: PhaseValue = phase
+    next_phase: RecursivePhaseValue = phase
     for record in phase.parallel_pending:
         if record.kind is ChildKind.WORKER:
             next_phase = scope_transition(
