@@ -1,0 +1,542 @@
+{
+  "errors": {
+    "scripts/check_tl_loop_archive.py": {
+      "no-any-return": 1
+    },
+    "tl_loop/__main__.py": {
+      "no-redef": 1
+    },
+    "tl_loop/client/effects.py": {
+      "assignment": 1
+    },
+    "tl_loop/client/readonly.py": {
+      "no-any-return": 1,
+      "redundant-cast": 1
+    },
+    "tl_loop/client/transport.py": {
+      "redundant-cast": 1
+    },
+    "tl_loop/events/reader.py": {
+      "arg-type": 1
+    },
+    "tl_loop/events/recovery.py": {
+      "arg-type": 2
+    },
+    "tl_loop/fsm/post_merge_steps.py": {
+      "assignment": 1
+    },
+    "tl_loop/fsm/transition.py": {
+      "arg-type": 1
+    },
+    "tl_loop/loop/abandon.py": {
+      "arg-type": 1
+    },
+    "tl_loop/loop/driver.py": {
+      "arg-type": 194,
+      "assignment": 30,
+      "call-arg": 1,
+      "comparison-overlap": 1,
+      "dict-item": 1,
+      "no-any-return": 1,
+      "redundant-cast": 7,
+      "return": 1,
+      "type-arg": 1,
+      "union-attr": 106
+    },
+    "tl_loop/loop/escalate.py": {
+      "arg-type": 2,
+      "no-untyped-def": 1
+    },
+    "tl_loop/loop/heartbeat.py": {
+      "arg-type": 2
+    },
+    "tl_loop/loop/integration_lineage.py": {
+      "assignment": 1
+    },
+    "tl_loop/loop/journal.py": {
+      "redundant-cast": 1
+    },
+    "tl_loop/loop/nested_recovery.py": {
+      "arg-type": 3,
+      "assignment": 1
+    },
+    "tl_loop/loop/recovery_control.py": {
+      "arg-type": 1,
+      "redundant-cast": 1,
+      "union-attr": 23
+    },
+    "tl_loop/loop/redispatch.py": {
+      "arg-type": 2
+    },
+    "tl_loop/loop/review.py": {
+      "arg-type": 16
+    },
+    "tl_loop/loop/shadow.py": {
+      "arg-type": 2,
+      "index": 2,
+      "union-attr": 1
+    },
+    "tl_loop/loop/startup_handoff.py": {
+      "arg-type": 7,
+      "index": 1,
+      "no-any-return": 1,
+      "union-attr": 1
+    },
+    "tl_loop/loop/task_budget.py": {
+      "redundant-cast": 3
+    },
+    "tl_loop/plan_validation.py": {
+      "arg-type": 6,
+      "var-annotated": 1
+    },
+    "tl_loop/preflight.py": {
+      "arg-type": 1,
+      "assignment": 1
+    },
+    "tl_loop/rlm/call.py": {
+      "redundant-cast": 1
+    },
+    "tl_loop/rlm/live_smoke.py": {
+      "arg-type": 1,
+      "no-any-return": 1
+    },
+    "tl_loop/rlm/plan_acceptance.py": {
+      "redundant-cast": 1
+    },
+    "tl_loop/select/agent_type.py": {
+      "redundant-cast": 2
+    },
+    "tl_loop/select/learned_policy.py": {
+      "redundant-cast": 2
+    },
+    "tl_loop/select/ledger.py": {
+      "redundant-cast": 2
+    },
+    "tl_loop/state/aggregate_approval.py": {
+      "arg-type": 1
+    },
+    "tl_loop/state/diagnostics.py": {
+      "assignment": 1,
+      "no-any-return": 3
+    },
+    "tl_loop/state/legacy_manifest.py": {
+      "assignment": 1,
+      "no-any-return": 14,
+      "no-untyped-def": 2
+    },
+    "tl_loop/state/plan_manifest.py": {
+      "arg-type": 6,
+      "assignment": 1,
+      "type-arg": 1
+    },
+    "tl_loop/state/plan_reconciliation_declarations.py": {
+      "union-attr": 1
+    },
+    "tl_loop/state/plan_reconciliation_emitter.py": {
+      "arg-type": 2,
+      "union-attr": 1
+    },
+    "tl_loop/state/plan_reconciliation_execution.py": {
+      "arg-type": 6
+    },
+    "tl_loop/state/plan_reconciliation_legacy.py": {
+      "union-attr": 2
+    },
+    "tl_loop/state/plan_reconciliation_legacy_dispatch.py": {
+      "arg-type": 2
+    },
+    "tl_loop/state/plan_reconciliation_scope.py": {
+      "redundant-cast": 2
+    },
+    "tl_loop/state/plan_revision_state_update.py": {
+      "arg-type": 1
+    },
+    "tl_loop/state/reference_verification.py": {
+      "arg-type": 6,
+      "no-untyped-def": 1
+    },
+    "tl_loop/state/repository_identity_migration.py": {
+      "arg-type": 2
+    },
+    "tl_loop/state/schema.py": {
+      "arg-type": 4,
+      "assignment": 1,
+      "redundant-cast": 1
+    },
+    "tl_loop/state/store.py": {
+      "arg-type": 6,
+      "dict-item": 11,
+      "no-redef": 1,
+      "redundant-cast": 3
+    },
+    "tl_loop/tests/checkpoint_fixtures.py": {
+      "attr-defined": 1,
+      "call-overload": 1
+    },
+    "tl_loop/tests/fixtures/aggregate_approval_producer.py": {
+      "arg-type": 6
+    },
+    "tl_loop/tests/replay.py": {
+      "arg-type": 17,
+      "assignment": 3,
+      "method-assign": 2
+    },
+    "tl_loop/tests/test_abandon.py": {
+      "arg-type": 3
+    },
+    "tl_loop/tests/test_action_journal_reconciliation.py": {
+      "arg-type": 4,
+      "index": 12,
+      "no-untyped-call": 8,
+      "no-untyped-def": 13,
+      "union-attr": 1,
+      "unused-ignore": 1,
+      "var-annotated": 1
+    },
+    "tl_loop/tests/test_agent_type.py": {
+      "no-untyped-call": 9,
+      "no-untyped-def": 1
+    },
+    "tl_loop/tests/test_aggregate_approval.py": {
+      "no-untyped-def": 1,
+      "union-attr": 1
+    },
+    "tl_loop/tests/test_chainlink_issue_binding.py": {
+      "arg-type": 11,
+      "attr-defined": 1,
+      "index": 2,
+      "union-attr": 2
+    },
+    "tl_loop/tests/test_convergence.py": {
+      "type-var": 1,
+      "union-attr": 2
+    },
+    "tl_loop/tests/test_direct_leaf_scope_completion.py": {
+      "attr-defined": 1,
+      "no-untyped-def": 1
+    },
+    "tl_loop/tests/test_dispatch_provenance.py": {
+      "redundant-cast": 1
+    },
+    "tl_loop/tests/test_driver.py": {
+      "arg-type": 207,
+      "assignment": 1,
+      "attr-defined": 76,
+      "call-overload": 65,
+      "dict-item": 18,
+      "func-returns-value": 1,
+      "index": 196,
+      "list-item": 4,
+      "misc": 2,
+      "no-any-return": 1,
+      "no-redef": 1,
+      "no-untyped-call": 1,
+      "no-untyped-def": 67,
+      "operator": 23,
+      "override": 5,
+      "redundant-cast": 3,
+      "type-var": 5,
+      "union-attr": 169,
+      "var-annotated": 4
+    },
+    "tl_loop/tests/test_effects.py": {
+      "arg-type": 1,
+      "call-overload": 9,
+      "index": 18,
+      "redundant-cast": 3
+    },
+    "tl_loop/tests/test_envelope.py": {
+      "attr-defined": 1
+    },
+    "tl_loop/tests/test_escalate.py": {
+      "arg-type": 4,
+      "dict-item": 1,
+      "union-attr": 2
+    },
+    "tl_loop/tests/test_golden.py": {
+      "redundant-cast": 6
+    },
+    "tl_loop/tests/test_haskell_guest_contract.py": {
+      "call-overload": 2
+    },
+    "tl_loop/tests/test_heartbeat.py": {
+      "arg-type": 17,
+      "attr-defined": 20,
+      "call-overload": 2,
+      "index": 14,
+      "no-untyped-def": 10,
+      "operator": 3,
+      "union-attr": 2
+    },
+    "tl_loop/tests/test_identity.py": {
+      "arg-type": 16,
+      "index": 1,
+      "no-untyped-def": 4
+    },
+    "tl_loop/tests/test_integration_lineage.py": {
+      "arg-type": 1,
+      "syntax": 1
+    },
+    "tl_loop/tests/test_intent.py": {
+      "attr-defined": 1,
+      "call-overload": 9,
+      "index": 18,
+      "operator": 1
+    },
+    "tl_loop/tests/test_journal.py": {
+      "arg-type": 5,
+      "func-returns-value": 1,
+      "no-untyped-def": 11
+    },
+    "tl_loop/tests/test_leaf_dependencies.py": {
+      "arg-type": 2,
+      "attr-defined": 1,
+      "unused-ignore": 3
+    },
+    "tl_loop/tests/test_ledger.py": {
+      "attr-defined": 1
+    },
+    "tl_loop/tests/test_legacy_manifest.py": {
+      "arg-type": 10,
+      "index": 1,
+      "no-untyped-call": 32,
+      "no-untyped-def": 15
+    },
+    "tl_loop/tests/test_legacy_manifest_convergence.py": {
+      "no-untyped-call": 2,
+      "no-untyped-def": 4,
+      "type-arg": 3,
+      "union-attr": 2
+    },
+    "tl_loop/tests/test_main.py": {
+      "arg-type": 1,
+      "attr-defined": 1,
+      "call-overload": 4,
+      "index": 8,
+      "no-untyped-def": 9,
+      "operator": 1
+    },
+    "tl_loop/tests/test_mealy_fsm.py": {
+      "attr-defined": 1,
+      "union-attr": 1
+    },
+    "tl_loop/tests/test_merge_policy.py": {
+      "attr-defined": 1
+    },
+    "tl_loop/tests/test_merge_rejection_reconciliation.py": {
+      "arg-type": 28,
+      "attr-defined": 1,
+      "call-arg": 1,
+      "call-overload": 3,
+      "index": 11,
+      "no-untyped-def": 4,
+      "union-attr": 14
+    },
+    "tl_loop/tests/test_migration.py": {
+      "index": 2,
+      "no-untyped-call": 1,
+      "no-untyped-def": 11
+    },
+    "tl_loop/tests/test_nested_generation_recreate.py": {
+      "no-untyped-def": 1
+    },
+    "tl_loop/tests/test_ordered_continuation_recovery.py": {
+      "arg-type": 16,
+      "attr-defined": 7,
+      "call-overload": 2,
+      "index": 5,
+      "no-untyped-def": 5,
+      "union-attr": 5
+    },
+    "tl_loop/tests/test_plan_authoring.py": {
+      "attr-defined": 1,
+      "redundant-cast": 1
+    },
+    "tl_loop/tests/test_plan_manifest.py": {
+      "arg-type": 4,
+      "attr-defined": 4,
+      "call-overload": 3,
+      "index": 9,
+      "no-untyped-def": 19,
+      "operator": 3,
+      "union-attr": 1
+    },
+    "tl_loop/tests/test_plan_reconciliation.py": {
+      "arg-type": 16,
+      "attr-defined": 35,
+      "index": 10,
+      "misc": 3,
+      "no-untyped-def": 1,
+      "type-var": 4,
+      "union-attr": 3
+    },
+    "tl_loop/tests/test_plan_revision.py": {
+      "arg-type": 4,
+      "attr-defined": 1,
+      "index": 3
+    },
+    "tl_loop/tests/test_plan_validation.py": {
+      "unused-ignore": 2
+    },
+    "tl_loop/tests/test_post_merge_squash.py": {
+      "arg-type": 10,
+      "dict-item": 9,
+      "index": 1,
+      "no-untyped-def": 4,
+      "union-attr": 5
+    },
+    "tl_loop/tests/test_preflight.py": {
+      "attr-defined": 1,
+      "index": 3,
+      "no-untyped-def": 1
+    },
+    "tl_loop/tests/test_read_model.py": {
+      "redundant-cast": 4
+    },
+    "tl_loop/tests/test_reader.py": {
+      "operator": 1
+    },
+    "tl_loop/tests/test_reconcile.py": {
+      "arg-type": 1,
+      "attr-defined": 1,
+      "no-untyped-def": 1,
+      "union-attr": 6
+    },
+    "tl_loop/tests/test_recovery_control.py": {
+      "attr-defined": 5,
+      "union-attr": 1
+    },
+    "tl_loop/tests/test_recovery_policy.py": {
+      "no-untyped-def": 1
+    },
+    "tl_loop/tests/test_recreated_publication_replay.py": {
+      "call-overload": 1,
+      "no-any-return": 2
+    },
+    "tl_loop/tests/test_recursive_migration_model.py": {
+      "attr-defined": 3,
+      "unused-ignore": 8
+    },
+    "tl_loop/tests/test_recursive_model.py": {
+      "arg-type": 2,
+      "union-attr": 7
+    },
+    "tl_loop/tests/test_recursive_orchestration_contract.py": {
+      "arg-type": 2,
+      "assignment": 22,
+      "return-value": 1,
+      "union-attr": 69
+    },
+    "tl_loop/tests/test_recursive_replay_model.py": {
+      "no-untyped-def": 4
+    },
+    "tl_loop/tests/test_recursive_slice_model.py": {
+      "arg-type": 8,
+      "unused-ignore": 1
+    },
+    "tl_loop/tests/test_redispatch.py": {
+      "arg-type": 4
+    },
+    "tl_loop/tests/test_reference_verification.py": {
+      "arg-type": 2,
+      "index": 1,
+      "no-untyped-def": 2
+    },
+    "tl_loop/tests/test_reference_verification_driver.py": {
+      "arg-type": 3,
+      "attr-defined": 1,
+      "no-untyped-def": 4,
+      "unused-ignore": 1
+    },
+    "tl_loop/tests/test_repair.py": {
+      "arg-type": 1,
+      "func-returns-value": 1
+    },
+    "tl_loop/tests/test_replay.py": {
+      "arg-type": 21,
+      "attr-defined": 5,
+      "index": 2,
+      "misc": 1,
+      "no-any-return": 1,
+      "no-untyped-call": 2,
+      "no-untyped-def": 3,
+      "override": 2,
+      "return-value": 1,
+      "type-var": 1,
+      "union-attr": 1
+    },
+    "tl_loop/tests/test_repository_identity_migration.py": {
+      "attr-defined": 3,
+      "index": 9,
+      "no-any-return": 1,
+      "no-untyped-def": 6,
+      "operator": 4
+    },
+    "tl_loop/tests/test_repository_identity_resolution.py": {
+      "arg-type": 2,
+      "attr-defined": 2,
+      "no-untyped-call": 2,
+      "no-untyped-def": 4
+    },
+    "tl_loop/tests/test_review.py": {
+      "attr-defined": 1,
+      "dict-item": 4,
+      "no-untyped-def": 1
+    },
+    "tl_loop/tests/test_review_stuck.py": {
+      "arg-type": 45,
+      "index": 4,
+      "misc": 1,
+      "no-untyped-def": 1,
+      "operator": 5,
+      "union-attr": 1
+    },
+    "tl_loop/tests/test_review_validation.py": {
+      "arg-type": 6
+    },
+    "tl_loop/tests/test_rlm.py": {
+      "arg-type": 3,
+      "assignment": 1,
+      "attr-defined": 1
+    },
+    "tl_loop/tests/test_schema.py": {
+      "assignment": 3,
+      "attr-defined": 1
+    },
+    "tl_loop/tests/test_shadow.py": {
+      "redundant-cast": 1
+    },
+    "tl_loop/tests/test_slice_transition.py": {
+      "arg-type": 32,
+      "type-var": 4
+    },
+    "tl_loop/tests/test_startup_reconciliation.py": {
+      "arg-type": 83,
+      "attr-defined": 4,
+      "dict-item": 36,
+      "index": 4,
+      "no-untyped-def": 37,
+      "operator": 2,
+      "union-attr": 19
+    },
+    "tl_loop/tests/test_status.py": {
+      "no-untyped-def": 6
+    },
+    "tl_loop/tests/test_task_budget.py": {
+      "arg-type": 1
+    },
+    "tl_loop/tests/test_terminal_checkpoint_recovery.py": {
+      "union-attr": 2
+    },
+    "tl_loop/tests/test_topic_vocabulary.py": {
+      "attr-defined": 1
+    },
+    "tl_loop/tests/test_unlinked_changelog.py": {
+      "arg-type": 1
+    },
+    "tl_loop/tests/test_write.py": {
+      "attr-defined": 1
+    }
+  },
+  "schema_version": 1
+}

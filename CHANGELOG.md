@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Gate TL-loop strict type checking behind a shrink-only ratchet baseline (#1323)
 - Reconcile configured worker and reviewer harnesses during init continuation (#1283)
 - Add commit-all tidying before TL handoff to the next scope (#1267)
 - Document and verify commit-all handoffs through disposable init recovery (#1270)

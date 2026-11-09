@@ -754,6 +754,7 @@ All Haskell packages live under `haskell/`. See `haskell/CLAUDE.md` for full det
 cabal build all            # Build Haskell
 cargo test --workspace     # Rust tests (from repo root)
 just pre-commit            # Run all checks
+just tl-loop-typecheck     # Strict mypy ratchet for the TL loop
 cabal test all             # Haskell tests
 
 # E2E tests (interactive — launches tmux session, you observe)
@@ -780,7 +781,14 @@ set, so the WASM integration target has its plugin available. New Rust test
 targets must be reachable from `just test`. `just rust-test` is the fast
 library-only Rust loop. `just rust-test-all` runs the full Rust workspace test
 set, including native integration targets. New Rust tests must also remain
-reachable from `just rust-test-all`. Run the tmux first-window environment integration tests with
+reachable from `just rust-test-all`. `just test` also runs
+`just tl-loop-typecheck`, which applies the strict mypy configuration in
+`tl_loop/pyproject.toml` through `scripts/check_typecheck_ratchet.py`. Its
+checked-in `tl_loop/typecheck-baseline.json` records per-file, per-error-code
+counts and may only shrink; run
+`tl_loop/.venv/bin/python scripts/check_typecheck_ratchet.py --update` after
+fixing errors, and pass `--allow-increase` only when deliberately accepting new
+type debt. Run the tmux first-window environment integration tests with
 `just tmux-session-environment-test [inside_nix] [tmpdir]`; the default is
 `true /tmp`. Pass `false` to use the host Rust toolchain and tmux binary.
 

@@ -13,6 +13,36 @@ All I/O stays in Rust. Python owns controller decisions and pure state/event
 transitions, while Rust remains responsible for sockets, processes, files,
 ledger access, agent lifecycle, and every other external effect.
 
+## Strict type-checking ratchet
+
+The type-checking contract is the strict configuration in
+`tl_loop/pyproject.toml`:
+
+```bash
+mypy --config-file tl_loop/pyproject.toml tl_loop
+```
+
+Run it through `just tl-loop-typecheck` from the repository root. The recipe
+invokes `scripts/check_typecheck_ratchet.py`, which runs exactly that command
+and compares the result with `tl_loop/typecheck-baseline.json`. The baseline
+stores error counts per `(file, mypy error code)` pair, never line numbers or
+messages. It is a ceiling that may only shrink: a new pair, a higher count, or
+a stale baseline higher than the current count all fail the check. `just test`
+and `just pre-commit` include the recipe, so a regression blocks the normal
+gates. The target is the whole `tl_loop` package, including its tests;
+`scripts/` is not checked as a separate target, although mypy follows imports
+into it.
+
+After fixing errors, lower the ceiling with:
+
+```bash
+tl_loop/.venv/bin/python scripts/check_typecheck_ratchet.py --project-root . --update
+```
+
+The normal update refuses to raise any count. `--allow-increase` exists only
+for a deliberate, reviewed exception. Do not add `# type: ignore`, per-file
+`ignore_errors`, or line-number baselines to satisfy this check.
+
 The runtime creates per-run state under `.exo/tl-loop/<run_id>/`. That directory
 is runtime state, not Python source, and must never be used as the package code
 location.

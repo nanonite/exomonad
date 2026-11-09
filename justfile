@@ -214,9 +214,9 @@ tool-surface-check:
 controller-event-contract-check:
     python3 scripts/check_controller_event_contract.py --project-root .
 
-# Type-check the programmatic TL controller
+# Ratchet strict mypy errors against the checked-in per-file baseline
 tl-loop-typecheck:
-    mypy tl_loop
+    {{py}} scripts/check_typecheck_ratchet.py --project-root .
 
 # Regenerate the Haskell-sourced TL FSM parity fixture
 tl-loop-golden:
@@ -293,7 +293,7 @@ wasm-guest-test:
     @nix develop .#wasm --command bash -c 'set -euo pipefail; WASM=$(find dist-newstyle -name wasm-guest-tests.wasm -type f -print -quit); test -n "$WASM"; wasmtime --dir=haskell/wasm-guest/test/fixtures::contract-fixtures "$WASM"'
 
 # Run tests: Python checks, formatting, Rust check, WASM build/tests, Rust tests, proto freshness
-test: tl-loop-replay tl-loop-test tl-loop-lint watcher-projection-check tl-loop-archive-test tool-surface-check controller-event-contract-check
+test: tl-loop-replay tl-loop-test tl-loop-lint tl-loop-typecheck watcher-projection-check tl-loop-archive-test tool-surface-check controller-event-contract-check
     #!/usr/bin/env bash
     set -euo pipefail
     echo ">>> [1/8] Observability contract checks..."
@@ -359,7 +359,7 @@ check-no-gemini:
 
 # Pre-commit: deprecation gate plus the full repository checks
 # `test` includes the TL-loop smoke test and lint checks.
-pre-commit:
+pre-commit: tl-loop-typecheck
     just check-no-$(printf 'ge%s' mini)
     just test
 
