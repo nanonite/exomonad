@@ -68,6 +68,24 @@ def test_project_root_resolves_to_the_repository_root() -> None:
     )
 
 
+def test_the_controller_interpreter_defaults_to_the_running_interpreter() -> None:
+    """A checkout-local virtualenv may not be the default controller interpreter.
+
+    ``CONTROLLER_INTERPRETER`` is exec'd for the built ``tl_loop.pyz`` and
+    exported as ``EXOMONAD_TL_LOOP_PYTHON``; it never imports ``tl_loop``. A
+    default naming one operator's checkout would make the scenario runnable on
+    one machine layout only, so the default is ``sys.executable`` and
+    ``EXOMONAD_TL_LOOP_PYTHON`` is the only alternative.
+    """
+    source = Path(scenario.__file__).read_text(encoding="utf-8")
+    assert ".venv" not in source
+    assert re.search(
+        r"CONTROLLER_INTERPRETER = Path\(\s*os\.environ\.get\(\s*"
+        r'"EXOMONAD_TL_LOOP_PYTHON"\s*,\s*sys\.executable\s*\)\s*\)',
+        source,
+    ), "the interpreter default must be sys.executable"
+
+
 def test_fixture_stage_routes_survive_manifest_reconstruction() -> None:
     """A resumed run rebuilds the plan without sources; the guard must still pass."""
     from tl_loop.loop.driver import _plan_consumes_events, _validate_stage_event_routes

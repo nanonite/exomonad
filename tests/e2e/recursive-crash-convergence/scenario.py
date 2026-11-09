@@ -46,11 +46,10 @@ LEAF_ACTOR = HARNESS_DIR / "leaf_publication_agent.py"
 #: The controller interpreter. ``exomonad init`` resolves the controller archive
 #: from ``$HOME/.exo/tl_loop.pyz`` and refuses to fall back, so the run supplies
 #: the archive its own build produced instead of the operator's installed one.
+#: Its default is the interpreter running this acceptance; the environment
+#: variable is the only override.
 CONTROLLER_INTERPRETER = Path(
-    os.environ.get(
-        "EXOMONAD_TL_LOOP_PYTHON",
-        "/home/goya/agent-workspace/exomonad/tl_loop/.venv/bin/python",
-    )
+    os.environ.get("EXOMONAD_TL_LOOP_PYTHON", sys.executable)
 )
 
 #: The archive this worktree's build produced, embedded in the binary anyway.
@@ -204,7 +203,11 @@ def _leaf_branch(leg: str) -> str:
 
 def _plan_document(leg: str) -> dict[str, Any]:
     """Return the closed-key WorkPlan document this leg launches with."""
-    leaf = {"name": LEAF_SLICE, "task": "Publish the recreated publication leaf"}
+    leaf = {
+        "name": LEAF_SLICE,
+        "task": "Publish the recreated publication leaf",
+        "chainlink_issue_id": None,
+    }
     if leg != "child":
         return {"run_id": "root", "plan": {"leaves": [leaf]}}
     return {
@@ -313,6 +316,10 @@ def _environment(
     Codex *user* config, so an unset variable would send that write to whatever
     ``codex_user_config_path()`` resolves. The ``codex`` binary here is the
     deterministic actor beside this file, so no auth artifacts are copied.
+
+    ``EXOMONAD_CODEX_MODEL`` is the scaffold's explicit model override. The
+    isolated ``CODEX_HOME`` carries no config, and every agent type resolves
+    through this run's shim, so the name is never sent to an account.
     """
     environment = tmuxio.child_env(
         scope.root,
@@ -321,6 +328,7 @@ def _environment(
             "HOME": str(scope.root / "home"),
             "PATH": f"{scope.root / 'bin'}:{os.environ.get('PATH', '')}",
             "EXOMONAD_TL_LOOP_PYTHON": str(CONTROLLER_INTERPRETER),
+            "EXOMONAD_CODEX_MODEL": "e2e-unused-model",
             "CHAINLINK_DB": str(database),
         },
     )

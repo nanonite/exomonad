@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - Make the init-recovery E2E harness run from a fresh checkout: ripgrep in the dev shell, `--start` for the first init, plain-text logs, no virtualenv dependency, and every phase pinned to its disposable repository's Chainlink database
+- Default the recursive-crash-convergence controller interpreter to the interpreter running the acceptance instead of a checkout-local virtualenv (#1320)
 - Require exact legacy spawn coordinates and projection shape before continuation (#1318)
 - Resolve legacy initial spawn responses from the exact accepted spawn event (#1318)
 - Bind shutdown reopening to the exact accepted controller invocation and preserve concurrent checkpoints (#1314)

@@ -821,7 +821,9 @@ All E2E tests live in `tests/e2e/{name}/` and follow the same structure:
 - Start a fresh scratch project with `exomonad init --start`; the default
   `--continue` requires an existing `.exo/tl-loop/root/run.json`.
 - Do not depend on a checkout-local virtualenv; run tl_loop as
-  `PYTHONPATH="$PROJECT_ROOT" python3 -m tl_loop`.
+  `PYTHONPATH="$PROJECT_ROOT" python3 -m tl_loop`, and default an interpreter
+  used to exec a built controller archive to `sys.executable`, with
+  `EXOMONAD_TL_LOOP_PYTHON` as the only override.
 - Avoid bash builtins missing from the dev shell's bash, such as `compgen`.
 - A harness never inherits the caller's `CHAINLINK_DB`: it initializes and
   exports each disposable repository's own `.chainlink/issues.db` before any
