@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import overload
 
+from .child import TLOrchestrationEvent
 from .event import (
     AllChildrenDone,
     ChildBlocked,
@@ -27,18 +29,30 @@ from .phase import (
     TLPRFiled,
     TLWaiting,
 )
+from .scope import PhaseValue as RecursivePhaseValue
 
 
 class IllegalTransition(Exception):
     """Raised when an event has no transition arm for the current phase."""
 
-    def __init__(self, phase: Phase, event: TLEvent) -> None:
+    def __init__(self, phase: Phase | RecursivePhaseValue, event: TLEvent) -> None:
         self.phase = phase
         self.event = event
         super().__init__(f"No TL transition for {type(phase).__name__} and {type(event).__name__}")
 
 
-def transition(phase: PhaseValue, event: TLEvent) -> PhaseValue:
+@overload
+def transition(phase: PhaseValue, event: TLEvent) -> PhaseValue: ...
+
+
+@overload
+def transition(phase: RecursivePhaseValue, event: TLEvent) -> RecursivePhaseValue: ...
+
+
+def transition(
+    phase: PhaseValue | RecursivePhaseValue,
+    event: TLEvent,
+) -> PhaseValue | RecursivePhaseValue:
     """Apply one pure, total TL transition or raise ``IllegalTransition``.
 
     The wildcard arms in the Haskell table are intentional: spawning, failing,
@@ -88,7 +102,7 @@ def transition(phase: PhaseValue, event: TLEvent) -> PhaseValue:
         from .orchestration import transition as recursive_transition
 
         try:
-            return recursive_transition(phase, to_orchestration_event(phase, event))  # type: ignore[arg-type]
+            return recursive_transition(phase, to_orchestration_event(phase, event))
         except RecursiveIllegalTransition as error:
             raise IllegalTransition(phase, event) from error
     if isinstance(event, ChildSpawned):
@@ -120,7 +134,7 @@ def transition(phase: PhaseValue, event: TLEvent) -> PhaseValue:
     raise IllegalTransition(phase, event)
 
 
-def to_orchestration_event(phase: object, event: TLEvent) -> object:
+def to_orchestration_event(phase: object, event: TLEvent) -> TLOrchestrationEvent:
     """Map compatibility wire events into the canonical scope union."""
     from .scope import TLRunning
     from .scope_events import ChildSpawned as RecursiveChildSpawned
