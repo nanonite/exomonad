@@ -404,10 +404,10 @@ def slice_transition(state: SliceState, event: SliceEvent) -> SliceState:
         )
     if isinstance(event, ReviewValidated):
         _validate_review_validation_event(state, event)
-        current = state.review_evidence
+        existing_evidence = state.review_evidence
         submitted_at = (
-            current.submitted_at
-            if current is not None
+            existing_evidence.submitted_at
+            if existing_evidence is not None
             else event.submitted_at
             or event.observation.submitted_at
             or event.observation.observed_at
