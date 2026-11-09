@@ -19,6 +19,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Fixed
+- Fix continuation of a legacy failed root checkpoint that stores its failure text in the phase message (#1322)
+- Report malformed ordered-stage members as schema errors instead of crashing run-state validation (#1322)
+- Fail closed when a confirmed repair action has no recorded attempt instead of comparing it with an integer (#1322)
+- Require a bookkeeping lane epoch before advancing it instead of adding one to null (#1322)
 - Treat predecessor spawn rows proven by a recreate archive as historical during startup catch-up instead of opening the recovery consistency gate (#1321)
 - Make the init-recovery E2E harness run from a fresh checkout: ripgrep in the dev shell, `--start` for the first init, plain-text logs, no virtualenv dependency, and every phase pinned to its disposable repository's Chainlink database
 - Default the recursive-crash-convergence controller interpreter to the interpreter running the acceptance instead of a checkout-local virtualenv (#1320)
