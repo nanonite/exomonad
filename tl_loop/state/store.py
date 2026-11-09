@@ -199,7 +199,8 @@ def _validate_task_blocked_dispositions(value: object) -> None:
         seen.add(disposition_id)
         if entry.get("decision") != "superseded_by_durable_completion":
             raise ValueError("decision must be superseded_by_durable_completion")
-        if type(entry.get("run_seq")) is not int or entry.get("run_seq") < 0:
+        run_seq = entry.get("run_seq")
+        if type(run_seq) is not int or run_seq < 0:
             raise ValueError("run_seq must be a non-negative integer")
         for name in ("event_type", "subject_slice_id"):
             if not isinstance(entry.get(name), str) or not entry.get(name):

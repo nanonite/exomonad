@@ -33,11 +33,14 @@ def order_events(events: Iterable[EventEnvelope]) -> list[EventEnvelope]:
     must observe duplicate delivery and prove that it is a no-op.  Stable
     sorting preserves the source order for equal-sequence rows.
     """
-    ordered = list(events)
-    for event in ordered:
-        if type(event.run_seq) is not int or event.run_seq < 0:
-            raise ValueError("replay events require a non-negative run_seq")
-    return sorted(ordered, key=lambda event: event.run_seq)
+    return sorted(events, key=_event_run_seq)
+
+
+def _event_run_seq(event: EventEnvelope) -> int:
+    run_seq = event.run_seq
+    if type(run_seq) is not int or run_seq < 0:
+        raise ValueError("replay events require a non-negative run_seq")
+    return run_seq
 
 
 @dataclass
@@ -55,7 +58,9 @@ class ReplayEventSource:
         if type(self.start_cursor) is not int or self.start_cursor < 0:
             raise ValueError("replay start_cursor must be a non-negative integer")
         self.events = [
-            event for event in order_events(self.events) if event.run_seq > self.start_cursor
+            event
+            for event in order_events(self.events)
+            if _event_run_seq(event) > self.start_cursor
         ]
         self._cursor = self.start_cursor
 

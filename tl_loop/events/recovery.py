@@ -12,7 +12,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal
+from typing import Literal, TypeGuard
 
 from tl_loop.select.classify import Difficulty
 
@@ -101,10 +101,15 @@ def _attempt_bucket(value: int) -> str:
     return _counter_bucket(value)
 
 
+def _is_duration(value: object) -> TypeGuard[int | float]:
+    """Accept exactly the JSON number types, excluding bool."""
+    return type(value) is int or type(value) is float
+
+
 def _duration_bucket(value: object) -> str:
     if value is None:
         return "unknown"
-    if type(value) not in (int, float) or isinstance(value, bool):
+    if not _is_duration(value):
         raise RecoveryTelemetryError("durations must be non-negative numbers or null")
     if not math.isfinite(float(value)) or value < 0:
         raise RecoveryTelemetryError("durations must be finite and non-negative")
