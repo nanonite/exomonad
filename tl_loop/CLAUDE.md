@@ -163,6 +163,31 @@ merged, or its head became reachable again -- is left exactly as it is.
 Reconciliation never resurrects a parked slice on an observation that no longer
 supports the decision.
 
+## Startup recovery consistency gate
+
+Startup catch-up can replay a spawn row that belongs to the run generation
+`exomonad init --recreate` replaced. A confirmed recreate renames the whole
+active root directory to a top-level sibling named `root.invalid-*`, so the
+predecessor root checkpoint and every nested child checkpoint stay readable as
+archived evidence.
+
+A spawn row that carries no `controller_epoch` is classified as historical only
+when every intent it names is a `dispatch_intent_id` recorded by an archived
+checkpoint whose `run_id` is the current run. The row is retained in the audit
+log as `spawn_history_audit` with reason `controller_generation_mismatch` and
+acknowledged; it confirms no dispatch for the new generation. This is the same
+outcome as a row that names a different `controller_epoch`.
+
+The gate still opens with `spawn_confirmation_intent_mismatch` when the row
+names an intent that matches neither the current generation nor any archived
+generation of the run, and when a row that names the current controller epoch
+carries any other intent. Archived evidence never overrides a current-generation
+claim.
+
+An archive that exists but cannot be read or parsed fails closed with
+`spawn_confirmation_archive_unreadable`; it is never treated as historical
+evidence. The controller reads archives without migrating or rewriting them.
+
 ## Terminal owner recovery from legacy spawn responses
 
 A terminal provider-failure recovery proves the original invocation from the
