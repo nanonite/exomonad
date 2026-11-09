@@ -26266,6 +26266,36 @@ def test_legacy_initial_spawn_rejects_unrecognized_projection_fields(
     assert reason is not None and "modern" in reason.casefold()
 
 
+def test_legacy_initial_spawn_accepts_historical_incidental_fields(tmp_path: Path) -> None:
+    """The historical Haskell projection also emitted tab, issue, and pane fields."""
+    plan, config, store, _owner_dir, _owner_name, _original_id = (
+        _seed_terminal_provider_failure_leaf(
+            tmp_path,
+            omit_initial_spawn_effort=True,
+            legacy_spawn_result=True,
+        )
+    )
+    journal_path = store.run_dir / "action-journal.json"
+    rows = json.loads(journal_path.read_text(encoding="utf-8"))
+    spawn = next(
+        row
+        for row in rows
+        if row.get("operation") == "spawn_leaf" and row.get("target") == plan.leaves[0].name
+    )
+    spawn["result"]["result"].update(
+        {
+            "tab_name": "historical-tab",
+            "issue_title": "Issue 814",
+            "pane_id": "historical-pane",
+        }
+    )
+    journal_path.write_text(json.dumps(rows), encoding="utf-8")
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
+
+    assert proof is not None, reason
+
+
 @pytest.mark.parametrize("legacy_spawn_result", (True, False))
 @pytest.mark.parametrize(
     "scenario",
