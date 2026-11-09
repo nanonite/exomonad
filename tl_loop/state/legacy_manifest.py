@@ -91,7 +91,7 @@ def reconcile_legacy_manifest(
     previous: PlanManifest,
     candidate: PlanManifest,
     state: RunState,
-    journal: JournalSnapshot,
+    journal: JournalSnapshot | Sequence[Mapping[str, object]],
     *,
     child_checkpoint_root: Path | None = None,
 ) -> LegacyManifestReconciliation:
@@ -106,7 +106,7 @@ def reconcile_legacy_manifest(
         return _failure((), "duplicate legacy or candidate node names", ambiguous=True)
     extra_names = sorted(set(candidate_nodes) - set(old_nodes))
     if extra_names:
-        proofs = tuple(
+        extra_proofs = tuple(
             LegacyNodeProof(
                 old_node_id=f"{previous.scope_id}/unknown/{name}",
                 new_node_id=candidate_nodes[name].node_id,
@@ -119,7 +119,7 @@ def reconcile_legacy_manifest(
         return LegacyManifestReconciliation(
             disposition=LegacyManifestDisposition.CONFLICTING_EVIDENCE,
             bindings={},
-            proofs=proofs,
+            proofs=extra_proofs,
             reason="candidate adds undeclared active node(s): " + ", ".join(extra_names),
         )
     entries = journal.snapshot() if hasattr(journal, "snapshot") else tuple(journal)
