@@ -7,6 +7,8 @@ stable import surface while composing their guarded transitions.
 
 from __future__ import annotations
 
+from typing import overload
+
 from .child import ChildKind, ChildRecord, TLOrchestrationEvent
 from .evidence import require_text as _require_text
 from .lane import (
@@ -101,6 +103,14 @@ def stable_integration_order(child_ids: tuple[str, ...] | list[str]) -> tuple[st
     if len(set(child_ids)) != len(child_ids):
         raise ValueError("integration child IDs must be unique")
     return tuple(sorted(child_ids))
+
+
+@overload
+def transition(phase: TLAllMerged, event: FinalizationRequested) -> TLFinalizing: ...
+
+
+@overload
+def transition(phase: PhaseValue, event: TLOrchestrationEvent) -> PhaseValue: ...
 
 
 def transition(phase: PhaseValue, event: TLOrchestrationEvent) -> PhaseValue:
