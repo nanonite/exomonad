@@ -41,7 +41,7 @@
       "redundant-cast": 7,
       "return": 1,
       "type-arg": 1,
-      "union-attr": 106
+      "union-attr": 105
     },
     "tl_loop/loop/escalate.py": {
       "arg-type": 2,
