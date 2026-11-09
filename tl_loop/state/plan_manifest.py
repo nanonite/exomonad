@@ -6,6 +6,7 @@ import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
+from typing import NamedTuple
 
 from tl_loop.compatibility import (
     MINIMUM_SUPPORTED_PLAN_COMPATIBILITY_VERSION,
@@ -542,7 +543,7 @@ def build_legacy_manifest(document: Mapping[str, object], *, run_id: str) -> Pla
     _reject_ambiguous_nested_slices(raw_slices)
     stages = document.get("ordered_stages", [])
     normalized_stages = _legacy_stages(stages)
-    ordered_sequence = tuple(name for stage in normalized_stages for name in stage["sub_tls"])
+    ordered_sequence = tuple(name for stage in normalized_stages for name in stage.sub_tls)
     if len(set(ordered_sequence)) != len(ordered_sequence):
         raise ManifestError("legacy ordered stages repeat a sub-TL name")
     ordered_names = set(ordered_sequence)
@@ -854,19 +855,26 @@ def _digest(payload: Mapping[str, object]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+class _LegacyStage(NamedTuple):
+    """One validated ordered-stage declaration from a legacy plan."""
+
+    order: object
+    sub_tls: tuple[str, ...]
+
+
 def _legacy_order(stages: object, name: str) -> int:
     for stage in _legacy_stages(stages):
-        if name in stage["sub_tls"]:
-            value = stage.get("order")
+        if name in stage.sub_tls:
+            value = stage.order
             if type(value) is int and value > 0:
                 return value
     return 1
 
 
-def _legacy_stages(stages: object) -> tuple[dict[str, object], ...]:
+def _legacy_stages(stages: object) -> tuple[_LegacyStage, ...]:
     if not isinstance(stages, list):
         raise ManifestError("legacy ordered_stages must be an array")
-    normalized: list[dict[str, object]] = []
+    normalized: list[_LegacyStage] = []
     for index, value in enumerate(stages):
         if not isinstance(value, Mapping):
             raise ManifestError(f"legacy ordered_stages[{index}] must be an object")
@@ -875,7 +883,12 @@ def _legacy_stages(stages: object) -> tuple[dict[str, object], ...]:
             not isinstance(name, str) or not name for name in members
         ):
             raise ManifestError(f"legacy ordered_stages[{index}].sub_tls must be an array of names")
-        normalized.append({**value, "sub_tls": list(members)})
+        normalized.append(
+            _LegacyStage(
+                value.get("order"),
+                tuple(name for name in members if isinstance(name, str) and name),
+            )
+        )
     return tuple(normalized)
 
 
