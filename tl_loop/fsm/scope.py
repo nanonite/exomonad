@@ -293,7 +293,6 @@ __all__ = [
     "FinalizationRequested",
     "Heartbeat",
     "IntegrationValidated",
-    "is_phase_value",
     "LeafCompleted",
     "MergeRequested",
     "ParkRequested",
@@ -315,4 +314,5 @@ __all__ = [
     "TLPlanning",
     "TLRunning",
     "WorkerCompleted",
+    "is_phase_value",
 ]

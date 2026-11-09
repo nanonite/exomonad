@@ -1,14 +1,13 @@
 """Controller loops for the programmatic TL."""
 
+from tl_loop.ordered import IntegrationContract, OrderedStage, ReviewOwner
+
 from .driver import (
     DepthLimitExceeded,
     EffectFailed,
     EffectIntent,
-    IntegrationContract,
     LeafTask,
     LoopLimitExceeded,
-    OrderedStage,
-    ReviewOwner,
     SubTLTask,
     TLLoopConfig,
     TLLoopError,
