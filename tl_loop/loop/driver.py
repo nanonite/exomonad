@@ -13849,9 +13849,12 @@ def _recover_remote_advance(
     repository, parent_branch = _candidate_lane_key(state, current)
     lane_key = f"{repository}:{parent_branch}"
     lane = state.integration.lanes.get(lane_key)
-    prior_epoch = (
-        lane.lane_epoch if lane is not None else _required_int(evidence, "lane_epoch", "lane epoch")
-    )
+    if lane is not None:
+        if lane.lane_epoch is None:
+            raise ValueError("bookkeeping lane is missing its epoch")
+        prior_epoch = lane.lane_epoch
+    else:
+        prior_epoch = _required_int(evidence, "lane_epoch", "lane epoch")
     next_epoch = prior_epoch + 1
     if committed_slice.post_merge is None:
         raise ValueError("remote rebuild did not preserve post-merge state")
