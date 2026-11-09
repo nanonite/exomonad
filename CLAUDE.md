@@ -813,6 +813,16 @@ All E2E tests live in `tests/e2e/{name}/` and follow the same structure:
 - Testrunner uses only `notify_parent` MCP tool + read-only bash observation
 - Scenario harnesses configure their required agents; the programmatic TL
   controller consumes the plan and ledger without an interactive coordinator.
+- Run harnesses from `nix develop`, and list every external command the
+  harness uses in the Phase 0 `e2e_require_commands` call so a missing tool
+  fails before any build.
+- Set `NO_COLOR=1` before matching log fields literally; tracing otherwise
+  writes ANSI escapes into redirected logs.
+- Start a fresh scratch project with `exomonad init --start`; the default
+  `--continue` requires an existing `.exo/tl-loop/root/run.json`.
+- Do not depend on a checkout-local virtualenv; run tl_loop as
+  `PYTHONPATH="$PROJECT_ROOT" python3 -m tl_loop`.
+- Avoid bash builtins missing from the dev shell's bash, such as `compgen`.
 
 **Adding a new E2E test:**
 1. Create `tests/e2e/{name}/run.sh` following the pattern above
