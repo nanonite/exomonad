@@ -32,6 +32,9 @@ source "$SCRIPT_DIR/tl-window-state.sh"
 # This recovery fixture never invokes a model. Keep project scaffolding
 # deterministic when the isolated Codex home has no host model configuration.
 export EXOMONAD_CODEX_MODEL="${EXOMONAD_CODEX_MODEL:-e2e-unused-model}"
+# Tracing writes ANSI escapes into redirected logs unless colour is disabled,
+# which would defeat literal matches on startup fields.
+export NO_COLOR=1
 
 SESSION="e2e-init-recovery"
 CONTINUATION_SESSION="e2e-init-recovery-continuation"
