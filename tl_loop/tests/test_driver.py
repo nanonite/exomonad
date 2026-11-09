@@ -19226,6 +19226,7 @@ def test_recreated_controller_does_not_open_recovery_gate_for_archived_spawn(
         for gate in result.final_state.gates
     ), result.diagnostics
     assert 23 in source.acknowledged
+    assert any(name == "spawn_worker" for name, _ in transport.calls)
 
 
 @pytest.mark.parametrize(
