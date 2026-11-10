@@ -144,7 +144,14 @@ def _read_and_match_owner(
 
 
 def _owner_identity_matches(owner: dict[str, Any], run_id: str, epoch: str) -> bool:
-    return owner["run_id"] == run_id and owner["controller_epoch"] == epoch
+    owner_run_id = owner.get("run_id")
+    controller_epoch = owner.get("controller_epoch")
+    return (
+        isinstance(owner_run_id, str)
+        and owner_run_id == run_id
+        and isinstance(controller_epoch, str)
+        and controller_epoch == epoch
+    )
 
 
 def _valid_owner_record(owner: dict[str, Any]) -> bool:

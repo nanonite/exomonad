@@ -7010,8 +7010,8 @@ def _terminal_owner_ledger_proof(
     if canonical_runtime is None:
         return None, "accepted spawn ledger row contains an unsupported runtime label"
     spawn_route = (canonical_runtime, spawn_route[1], spawn_route[2])
-    blocked = [
-        event
+    blocked_event_sequences = [
+        event.run_seq
         for event in rows.events
         if event.event_type == "agent.task_blocked"
         and event.run_seq is not None
@@ -7028,9 +7028,9 @@ def _terminal_owner_ledger_proof(
         and event.task_blocked.retryable is True
         and event.task_blocked.invocation_id is None
     ]
-    if len(blocked) != 1:
+    if len(blocked_event_sequences) != 1:
         return None, "matching post-launch human-blocked event is missing or ambiguous"
-    blocked_event = blocked[0]
+    blocked_event_seq = blocked_event_sequences[0]
     if (
         recovery.evidence.get("invocation_id") != current.dispatch_invocation_id
         or recovery.evidence.get("attempt") != current.attempts
@@ -7050,9 +7050,9 @@ def _terminal_owner_ledger_proof(
         return None, "terminal-owner dispatch identity is incomplete"
     return (
         _TerminalOwnerLedgerProof(
-            cast(int, spawn_seq),
-            cast(int, blocked_event.run_seq),
-            cast(tuple[object, object, object], spawn_route),
+            spawn_seq,
+            blocked_event_seq,
+            spawn_route,
             dispatch_invocation_id,
             dispatch_agent_id,
             dispatch_intent_id,
@@ -14284,7 +14284,7 @@ def _execute_direct_merge_intent(
         ActionKind.MERGE,
         ActionPhase.IN_FLIGHT,
         intent_id=stable_action_key(state.run_id, "merge_pr", current.id, arguments),
-        head_sha=cast(str, evidence["head_sha"]),
+        head_sha=evidence["head_sha"],
         attempt=max(1, current.attempts),
     )
     state = _checkpoint_slice_action(store, state, current.id, action)
@@ -14306,10 +14306,10 @@ def _execute_direct_merge_intent(
                 pr_number=pr_number,
                 strategy=config.merge_strategy,
                 working_dir=_relative_process_working_dir(config),
-                expected_base_sha=cast(str, evidence["base_sha"]),
-                expected_head_sha=cast(str, evidence["head_sha"]),
-                expected_patch_digest=cast(str, evidence["patch_digest"]),
-                expected_merge_tree_sha=cast(str, evidence["merge_tree_sha"]),
+                expected_base_sha=evidence["base_sha"],
+                expected_head_sha=evidence["head_sha"],
+                expected_patch_digest=evidence["patch_digest"],
+                expected_merge_tree_sha=evidence["merge_tree_sha"],
             ),
             effects_log,
             raise_on_failure=False,
@@ -21707,11 +21707,8 @@ def _exit_marker_matches_checkpoint(
     bound_revision = diagnostic.get("checkpoint_revision")
     if type(bound_revision) is not int:
         return False
-    load = getattr(child_store, "load", None)
-    if load is None:
-        return False
     try:
-        state = load()
+        state = child_store.load()
     except (OSError, ValueError):
         return False
     return bound_revision == state.revision
@@ -32131,7 +32128,7 @@ def _budget_root(
         raise TypeError("budgets must be a BudgetLedger or object")
     raw = copy.deepcopy(dict(budgets))
     if "ledger" in raw:
-        return cast(dict[str, object], raw)
+        return raw
     return {"ledger": raw}
 
 

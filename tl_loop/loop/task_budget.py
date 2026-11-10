@@ -7,7 +7,6 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import cast
 
 from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
 from tl_loop.fsm.scope import TLRunning as RecursiveTLRunning
@@ -79,7 +78,7 @@ class TaskBudgetResetRequest:
             task_type=_text(value, "task_type"),
             operator_reason=_text(value, "operator_reason"),
             idempotency_key=_text(value, "idempotency_key"),
-            observed_tokens=cast(int | None, observed),
+            observed_tokens=observed,
         )
         _validate_request(request)
         return request
@@ -361,8 +360,8 @@ def _adjust_budget_charge(
         harness_spent[charge.harness] = harness_spent.get(charge.harness, 0) + new_applied - old_applied
         total_tokens += new_applied - old_applied
         actual = request.observed_tokens if request.observed_tokens is not None else charge.actual
-        delta = None if actual == "unknown" else cast(int, actual) - request.new_estimated_tokens
-        warning = actual == "unknown" or abs(cast(int, delta or 0)) / max(request.new_estimated_tokens, 1) > 0.20
+        delta = None if actual == "unknown" else actual - request.new_estimated_tokens
+        warning = actual == "unknown" or abs(delta or 0) / max(request.new_estimated_tokens, 1) > 0.20
         charges[index] = replace(
             charge,
             estimated_tokens=request.new_estimated_tokens,

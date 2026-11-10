@@ -7,7 +7,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from tl_loop.client.effects import ToolResult
 from tl_loop.fsm.recovery import (
@@ -168,7 +168,7 @@ class EffectJournal(list[Any]):
         }:
             raise ActionJournalError(f"invalid action journal status {raw_status!r}")
         result = self.replay(entry) if raw_status in {"confirmed", "rejected"} else None
-        return EffectProbe(cast(EffectProbeStatus, raw_status), entry, result)
+        return EffectProbe(raw_status, entry, result)
 
     def append(self, intent: Any) -> None:
         if isinstance(intent, RecoveryIntent):
