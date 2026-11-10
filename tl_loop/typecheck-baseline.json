@@ -32,7 +32,7 @@
       "arg-type": 1
     },
     "tl_loop/loop/driver.py": {
-      "arg-type": 192,
+      "arg-type": 107,
       "assignment": 27,
       "call-arg": 1,
       "comparison-overlap": 1,

@@ -20,7 +20,7 @@ from fnmatch import fnmatchcase
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import NamedTuple, NoReturn, Protocol, cast
+from typing import NamedTuple, NoReturn, Protocol, TypedDict, cast
 
 from tl_loop.client.effects import (
     EffectClient,
@@ -791,6 +791,13 @@ def _require_plan_manifest(state: RunState) -> PlanManifest:
     if manifest is None:
         raise TLLoopError("run checkpoint has no plan manifest")
     return manifest
+
+
+def _require_manifest_digest(manifest: PlanManifest) -> str:
+    """Return the manifest's computed digest or fail closed."""
+    if manifest.digest is None:
+        raise TLLoopError("plan manifest has no digest")
+    return manifest.digest
 
 
 class LoopLimitExceeded(TLLoopError):
@@ -3946,8 +3953,11 @@ def _ordered_sub_tl_complete_receipt_error(
         _validate_completed_push_receipt(current, evidence, missing)
     if missing:
         return "post-merge completion evidence conflicts: " + ", ".join(sorted(set(missing)))
+    pr_number = current.pr_number
+    if pr_number is None:
+        return "completed aggregate slice has no PR number"
     journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
-    return _aggregate_completion_sync_error(state, current, current.pr_number, candidate, journal)
+    return _aggregate_completion_sync_error(state, current, pr_number, candidate, journal)
 
 
 def _ordered_sub_tl_completion_coordinate_conflicts(
@@ -6274,12 +6284,14 @@ def _terminal_owner_recovery_proof(
         return None, "terminal-owner recovery requires the project and authoritative ledger"
     if state.plan_manifest is None:
         return None, "terminal-owner recovery requires the accepted plan manifest"
+    manifest = state.plan_manifest
+    manifest_digest = _require_manifest_digest(manifest)
     if not _is_role_route_configuration_fingerprint(config.role_route_configuration_fingerprint):
         return (
             None,
             "terminal-owner recovery requires the current accepted role-route configuration fingerprint",
         )
-    node = next((item for item in state.plan_manifest.nodes if item.name == leaf.name), None)
+    node = next((item for item in manifest.nodes if item.name == leaf.name), None)
     if (
         node is None
         or node.node_id != current.manifest_node_id
@@ -6637,12 +6649,12 @@ def _terminal_owner_recovery_proof(
         prior_model,
         prior_effort,
         gate_authorization,
-        state.plan_manifest.digest,
+        manifest_digest,
         route_authorization_supersedes_digest,
     )
     route_authorization = _terminal_route_authorization_record(
         config,
-        state.plan_manifest.digest,
+        manifest_digest,
         choice.harness,
         route.agent_type,
         desired_model,
@@ -6681,7 +6693,7 @@ def _terminal_owner_recovery_proof(
             saved_authorization,
             route_authorization,
             config,
-            state.plan_manifest.digest,
+            manifest_digest,
         ):
             return (
                 None,
@@ -6705,12 +6717,12 @@ def _terminal_owner_recovery_proof(
             route_authorization,
             evidence,
             config,
-            state.plan_manifest.digest,
+            manifest_digest,
         ) or _saved_terminal_launch_authorization_matches(
             saved_authorization,
             route_authorization,
             config,
-            state.plan_manifest.digest,
+            manifest_digest,
         ):
             # A routine recovery round clears the human-gate evidence that held
             # the previous supersession link, but the exact saved authorization
@@ -6888,7 +6900,7 @@ def _terminal_owner_recovery_proof(
                     latest_resume_entry,
                     current,
                     owner,
-                    state.plan_manifest.digest,
+                    manifest_digest,
                     route_authorization,
                     fresh_gate_authorization,
                     spawn_event_seq,
@@ -7001,15 +7013,26 @@ def _terminal_owner_ledger_proof(
         or recovery.evidence.get("slice_id") != current.id
     ):
         return None, "human recovery binding conflicts with the accepted launch and blocker"
+    dispatch_invocation_id = current.dispatch_invocation_id
+    dispatch_agent_id = current.dispatch_agent_id
+    dispatch_intent_id = current.dispatch_intent_id
+    branch = current.branch
+    if (
+        dispatch_invocation_id is None
+        or dispatch_agent_id is None
+        or dispatch_intent_id is None
+        or branch is None
+    ):
+        raise TLLoopError("terminal-owner dispatch identity is incomplete")
     return (
         _TerminalOwnerLedgerProof(
             cast(int, spawn_seq),
             cast(int, blocked_event.run_seq),
             cast(tuple[object, object, object], spawn_route),
-            current.dispatch_invocation_id,
-            current.dispatch_agent_id,
-            current.dispatch_intent_id,
-            current.branch,
+            dispatch_invocation_id,
+            dispatch_agent_id,
+            dispatch_intent_id,
+            branch,
         ),
         None,
     )
@@ -10762,7 +10785,7 @@ def _refresh_post_merge_evidence(
 def _record_confirmed_merge_reconciliation(
     current: SliceState,
     pr_number: int,
-    journal_key: str,
+    journal_key: str | None,
     effects_log: list[EffectIntent],
     *,
     boundary: str,
@@ -10903,7 +10926,7 @@ def _reconcile_merged_slice(
     state: RunState,
     slice_id: str,
     pr_number: int,
-    merge_journal_id: str,
+    merge_journal_id: str | None,
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
     store: RunStore,
@@ -11053,7 +11076,7 @@ def _adopt_post_merge_slice(
     current: SliceState,
     state: RunState,
     pr_number: int,
-    merge_journal_id: str,
+    merge_journal_id: str | None,
     boundary: str,
     merge_evidence: Mapping[str, object] | None,
 ) -> SliceState:
@@ -12708,7 +12731,11 @@ def _sync_decision_payload(
         return _unresolved_sync_decision(
             sync_id,
             attempt,
-            result.error if result is not None else "synchronization was not dispatched",
+            (
+                result.error or "synchronization failed without a diagnostic"
+                if result is not None
+                else "synchronization was not dispatched"
+            ),
         )
     payload = _merge_result_payload(result)
     if payload is None or payload.get("sync_outcome") not in {
@@ -14702,7 +14729,7 @@ def _adopt_direct_merge_result(
         return _reconcile_merged_slice(
             store.load(),
             slice_id,
-            current.pr_number,
+            current.pr_number or 0,
             action.intent_id,
             config,
             effects,
@@ -17938,7 +17965,16 @@ def _dispatch_payload(
     return payload
 
 
-def _dispatch_route_state_fields(attempt: DispatchAttempt) -> dict[str, str | None]:
+class _DispatchRouteStateFields(TypedDict):
+    dispatch_role: str | None
+    dispatch_effort: str | None
+    dispatch_route_configuration_fingerprint: str | None
+    dispatch_route_policy_fingerprint: str | None
+    dispatch_route_manifest_digest: str | None
+    dispatch_route_fingerprint: str | None
+
+
+def _dispatch_route_state_fields(attempt: DispatchAttempt) -> _DispatchRouteStateFields:
     return {
         "dispatch_role": attempt.role,
         "dispatch_effort": attempt.effort,
@@ -24628,9 +24664,10 @@ def _verified_child_completion_evidence(
     repository: str | Path | None,
 ) -> IntegrationReadinessEvidence | None:
     """Prove completed child receipts are in the authoritative aggregate head."""
+    child_manifest = child_state.plan_manifest
     if (
         child_state.run_id != task.name
-        or child_state.plan_manifest is None
+        or child_manifest is None
         or not _child_handoff_ready(child_state, child_state.parent_run_id or "")
         or isinstance(child_state.recursive_fsm, (RecursiveTLFailed, RecursiveTLParked))
     ):
@@ -24657,7 +24694,8 @@ def _verified_child_completion_evidence(
     receipts: list[Mapping[str, object]] = []
     reviewed_leaf_ids: list[str] = []
     lineage_commits: list[str] = []
-    for node in child_state.plan_manifest.nodes:
+    child_manifest_digest = _require_manifest_digest(child_manifest)
+    for node in child_manifest.nodes:
         current = child_state.slices.get(node.name)
         if current is None or current.status is not SliceStatus.MERGED:
             _log_readiness_refusal(
@@ -24720,7 +24758,7 @@ def _verified_child_completion_evidence(
         return None
     payload = {
         "child_run_id": child_state.run_id,
-        "child_manifest_digest": child_state.plan_manifest.digest,
+        "child_manifest_digest": child_manifest_digest,
         "receipts": receipts,
         "aggregate": {
             "pr_number": aggregate.pr_number,
@@ -24737,7 +24775,7 @@ def _verified_child_completion_evidence(
     ).hexdigest()
     return IntegrationReadinessEvidence(
         child_run_id=child_state.run_id,
-        child_manifest_digest=child_state.plan_manifest.digest,
+        child_manifest_digest=child_manifest_digest,
         aggregate_pr_number=aggregate.pr_number,
         aggregate_head_sha=aggregate.head_sha,
         aggregate_base_sha=aggregate.original_base_sha,
@@ -26050,7 +26088,13 @@ def _integrate_one_candidate(
     )
     merge_tree_sha = _snapshot_text(first, "merge_tree_sha")
     ci_status = _snapshot_text(first, "ci_status")
-    if not all((head_sha, base_sha, patch_digest, merge_tree_sha, ci_status)):
+    if (
+        head_sha is None
+        or base_sha is None
+        or patch_digest is None
+        or merge_tree_sha is None
+        or ci_status is None
+    ):
         return state
     if head_sha != aggregate_identity.head_sha or patch_digest != aggregate_identity.patch_digest:
         return state
@@ -26079,6 +26123,9 @@ def _integrate_one_candidate(
             expected_revision=state.revision,
         )
         current = state.slices[task.name]
+    pr_number = current.pr_number
+    if pr_number is None:
+        return state
     transitioned_integration = (
         state.integration
         if candidate_runtime.lifecycle is IntegrationLifecycle.INTEGRATION_VALIDATED
@@ -26120,7 +26167,7 @@ def _integrate_one_candidate(
         effects,
         effects_log,
     )
-    second = _watcher_snapshot(current.pr_number, config, effects, effects_log)
+    second = _watcher_snapshot(pr_number, config, effects, effects_log)
     if second is None:
         return state
     if _watcher_publication_refused(current, second, publication_owner) or (
@@ -26168,7 +26215,12 @@ def _integrate_one_candidate(
     live_patch_digest = _snapshot_text(second, "patch_digest")
     live_merge_tree_sha = _snapshot_text(second, "merge_tree_sha")
     live_ci_status = _snapshot_text(second, "ci_status")
-    if not all((live_head_sha, live_patch_digest, live_merge_tree_sha, live_ci_status)):
+    if (
+        live_head_sha is None
+        or live_patch_digest is None
+        or live_merge_tree_sha is None
+        or live_ci_status is None
+    ):
         return state
     try:
         verify_integration(
@@ -26233,7 +26285,7 @@ def _integrate_one_candidate(
             readiness,
             store,
             config,
-            pr_number=current.pr_number,
+            pr_number=pr_number,
             head_sha=live_head_sha,
             head_tree_sha=readiness.aggregate_head_tree_sha,
             base_sha=base_sha,
@@ -26293,7 +26345,7 @@ def _integrate_one_candidate(
     )
     _emit_merge_decision(
         task.name,
-        current.pr_number,
+        pr_number,
         "merge",
         head_sha,
         config,
@@ -28587,7 +28639,7 @@ def _reset_integration_failure_attempts(
 def _ci_status(event: EventEnvelope) -> str:
     value = event.ci_status
     aliases = {"passed": "success", "error": "failure", "cancelled": "failure"}
-    status = aliases.get(value, value)
+    status = aliases.get(value, value) if value is not None else None
     if status not in CI_STATUS_VALUES:
         raise TLLoopError(f"{event.event_type!r} has unsupported CI status {value!r}")
     return status
