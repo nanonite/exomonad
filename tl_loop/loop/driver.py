@@ -21069,8 +21069,18 @@ def _adopt_live_child_controller_invocation(
     return
 
 
+class _SupervisedProcess(Protocol):
+    """The process surface used while supervising one sub-TL."""
+
+    def is_alive(self) -> bool: ...
+
+    def terminate(self) -> None: ...
+
+    def join(self, timeout: float | None = None) -> None: ...
+
+
 def _supervise_live_sub_tl(
-    process: multiprocessing.process.BaseProcess,
+    process: _SupervisedProcess,
     child_store: RunStore,
     config: TLLoopConfig,
     *,

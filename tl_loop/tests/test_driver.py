@@ -23370,7 +23370,9 @@ def test_terminal_owner_ledger_proof_refuses_incomplete_dispatch_identity(
     plan, config, store, _owner_dir, _owner_name, _invocation_id = (
         _seed_terminal_provider_failure_leaf(tmp_path)
     )
-    segments = sorted((config.project_root / ".exo" / "ledger" / "segments").glob("*.jsonl"))
+    project_root = config.project_root
+    assert project_root is not None
+    segments = sorted((Path(project_root) / ".exo" / "ledger" / "segments").glob("*.jsonl"))
     assert len(segments) == 1
     events = [
         json.loads(line) for line in segments[0].read_text(encoding="utf-8").splitlines()
