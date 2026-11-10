@@ -25,8 +25,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Run the TL-loop typecheck ratchet once in `just pre-commit` through `just test` (#1326)
 - Pin TL-loop's mypy to the baseline-producing version and document regenerating the baseline with the pin (#1326)
 - Narrow TL-loop recovery and plan-manifest state for strict type checking without ignores or casts (#1324)
+- Narrow the TL-loop driver and run-store decode boundary for strict type checking without ignores or casts (#1327)
 
 ### Fixed
+- Keep a failed synchronization without an error as an unresolved decision instead of crashing while redacting its diagnostic (#1327)
+- Reject malformed recursive post-merge entries during run-state decode instead of storing a null state (#1327)
 - Distinguish a present non-phase recursive scope FSM from a missing one in TL transition diagnostics (#1325)
 - Cover the bookkeeping-lane epoch guard with a regression test (#1325)
 - Fix continuation of a legacy failed root checkpoint that stores its failure text in the phase message (#1322)
