@@ -115,6 +115,12 @@ class _ExitedProcess:
     def is_alive(self) -> bool:
         return False
 
+    def terminate(self) -> None:
+        pass
+
+    def join(self, timeout: float | None = None) -> None:
+        del timeout
+
 
 def _failed_ordered_run(
     tmp_path: Path,

@@ -2171,6 +2171,9 @@ def test_live_supervisor_waits_for_approved_blocked_leaf_successor_checkpoint(
         def is_alive(self) -> bool:
             return self.alive
 
+        def terminate(self) -> None:
+            self.alive = False
+
         def join(self, timeout: float | None = None) -> None:
             self.join_calls.append(timeout)
             current_state = store.load()
@@ -2387,6 +2390,9 @@ def test_exited_waiting_child_is_failed_as_process_loss() -> None:
 
         def is_alive(self) -> bool:
             return self.alive
+
+        def terminate(self) -> None:
+            self.alive = False
 
     reasons: list[str] = []
     child_store = SimpleNamespace(
@@ -7276,7 +7282,7 @@ def test_parent_sync_attempt_identity_survives_optional_evidence_and_retries_ref
                 "post_merge_parent_sync_reconcile" if is_reconcile else tool_name
             )
             if is_reconcile:
-                result: dict[str, object] = {
+                reconcile_result: dict[str, object] = {
                     **arguments,
                     "sync_outcome": "safe_to_retry",
                     "sync_phase": "reconcile_complete",
@@ -7292,7 +7298,7 @@ def test_parent_sync_attempt_identity_survives_optional_evidence_and_retries_ref
                         "local_is_ancestor_remote": True,
                     },
                 }
-                return {"success": True, "result": result}
+                return {"success": True, "result": reconcile_result}
             assert tool_name == "post_merge_parent_sync"
             outcome = "known_partial_progress" if len(self.calls) == 1 else "confirmed"
             result: dict[str, object] = {

@@ -345,7 +345,7 @@ def replay_fixture(
         return original_checkpoint(store, *args, **kwargs)
 
     if crash_after is not None:
-        RunStore.checkpoint = crash_checkpoint
+        setattr(RunStore, "checkpoint", crash_checkpoint)
     try:
         try:
             run_result = tl_run(
