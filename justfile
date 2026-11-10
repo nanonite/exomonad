@@ -358,8 +358,8 @@ check-no-gemini:
     fi
 
 # Pre-commit: deprecation gate plus the full repository checks
-# `test` includes the TL-loop smoke test and lint checks.
-pre-commit: tl-loop-typecheck
+# `test` includes the TL-loop smoke test, lint checks and typecheck ratchet.
+pre-commit:
     just check-no-$(printf 'ge%s' mini)
     just test
 
