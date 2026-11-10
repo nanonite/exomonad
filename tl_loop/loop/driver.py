@@ -9868,7 +9868,7 @@ def _run_loop(
             )
     if not _is_terminal_phase(phase):
         raise TLLoopError("TL controller exited without an authoritative terminal phase")
-    if phase is TLFailed:
+    if isinstance(phase, TLFailed):
         reason = next(
             (current.dispatch_error for current in state.slices.values() if current.dispatch_error),
             "TL reached the failed terminal phase",
