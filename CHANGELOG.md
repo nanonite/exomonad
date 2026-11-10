@@ -21,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 - Pin TL-loop's mypy to the baseline-producing version and document regenerating the baseline with the pin (#1326)
+- Narrow TL-loop recovery and plan-manifest state for strict type checking without ignores or casts (#1324)
 
 ### Fixed
 - Distinguish a present non-phase recursive scope FSM from a missing one in TL transition diagnostics (#1325)

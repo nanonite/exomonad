@@ -321,8 +321,8 @@ class PlanManifest:
                 raise ManifestError("only sub-TL nodes may have child manifests")
             if node.kind != "sub_tl" and node.node_id in children:
                 raise ManifestError("only sub-TL nodes may have child manifests")
-            child = children.get(node.node_id)
-            if child is not None and child.digest != expected:
+            persisted_child = children.get(node.node_id)
+            if persisted_child is not None and persisted_child.digest != expected:
                 raise ManifestError("child manifest digest does not match its persisted document")
         _validate_unique_chainlink_bindings(nodes, children)
         object.__setattr__(self, "nodes", nodes)

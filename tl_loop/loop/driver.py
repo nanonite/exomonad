@@ -785,6 +785,14 @@ class OrderedCompletionEvidenceError(TLLoopError):
         self.reason = reason
 
 
+def _require_plan_manifest(state: RunState) -> PlanManifest:
+    """Return the checkpoint's immutable plan manifest or fail closed."""
+    manifest = state.plan_manifest
+    if manifest is None:
+        raise TLLoopError("run checkpoint has no plan manifest")
+    return manifest
+
+
 class LoopLimitExceeded(TLLoopError):
     """The loop reached its event ceiling before reaching a terminal state."""
 
@@ -1809,7 +1817,7 @@ def run_tl_loop(
                     if isinstance(plan, WorkPlan)
                     else WorkPlan.from_mapping(plan)
                     if plan is not None
-                    else _work_plan_from_manifest(existing_state.plan_manifest)
+                    else _work_plan_from_manifest(_require_plan_manifest(existing_state))
                 )
                 dispatch_failed = any(
                     item.status is SliceStatus.DISPATCH_FAILED
@@ -3784,7 +3792,8 @@ def _ordered_sub_tl_completion_state(
     """Retain verified completion evidence for one declared ordered subTL."""
     if task is None or task.name != record.child_id:
         raise OrderedCompletionEvidenceError(record.child_id, "no matching accepted declaration")
-    node = next((node for node in state.plan_manifest.nodes if node.name == task.name), None)
+    manifest = _require_plan_manifest(state)
+    node = next((node for node in manifest.nodes if node.name == task.name), None)
     if node is None or record.manifest_node_id != node.node_id:
         raise OrderedCompletionEvidenceError(
             task.name, "manifest binding is missing or conflicting"
@@ -5282,6 +5291,7 @@ def _terminal_resume_authorization_matches(
     arguments = entry.get("arguments")
     if not isinstance(arguments, Mapping):
         return False
+    manifest = _require_plan_manifest(state)
     evidence = current.recovery.evidence if current.recovery is not None else {}
     history = evidence.get("configured_route_authorization_history", [])
     records = (
@@ -5311,7 +5321,7 @@ def _terminal_resume_authorization_matches(
             )
         base_matches = (
             record.get("source") == "accepted_operator_role_configuration"
-            and record.get("manifest_digest") == state.plan_manifest.digest
+            and record.get("manifest_digest") == manifest.digest
             and record.get("slice_id") == leaf.name
             and record.get("issue_id") == leaf.chainlink_issue_id
             and record.get("owner_agent_id") == current.dispatch_agent_id
@@ -21086,7 +21096,7 @@ def _ensure_ordered_parent_ready_for_provision(
     if config.ordered_recovery_child != task.name and not gate_approved:
         return config
     decision = _failed_ordered_parent_recovery(task, config, store, state)
-    plan = _work_plan_from_manifest(state.plan_manifest)
+    plan = _work_plan_from_manifest(_require_plan_manifest(state))
     reopened = _reopen_ordered_scope(
         state,
         plan,
@@ -23008,7 +23018,8 @@ def _collect_nested_leaf_provenance(
     current = state.slices.get(node.name)
     if current is None or current.status is not SliceStatus.MERGED:
         return
-    child_manifest = state.plan_manifest.child_manifests.get(node.node_id)
+    manifest = _require_plan_manifest(state)
+    child_manifest = manifest.child_manifests.get(node.node_id)
     if child_manifest is None:
         return
     child_store = RunStore(node.name, store.run_dir)

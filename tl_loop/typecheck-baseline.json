@@ -32,7 +32,7 @@
       "arg-type": 1
     },
     "tl_loop/loop/driver.py": {
-      "arg-type": 194,
+      "arg-type": 192,
       "assignment": 30,
       "call-arg": 1,
       "comparison-overlap": 1,
@@ -41,7 +41,7 @@
       "redundant-cast": 7,
       "return": 1,
       "type-arg": 1,
-      "union-attr": 105
+      "union-attr": 102
     },
     "tl_loop/loop/escalate.py": {
       "arg-type": 2,
@@ -121,7 +121,6 @@
     },
     "tl_loop/state/plan_manifest.py": {
       "arg-type": 6,
-      "assignment": 1,
       "type-arg": 1
     },
     "tl_loop/state/plan_reconciliation_declarations.py": {
