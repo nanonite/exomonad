@@ -23317,6 +23317,53 @@ def test_terminal_provider_recovery_holds_unproven_or_conflicting_evidence(
     assert leaf.recovery.evidence.get("terminal_owner_recovery_hold")
 
 
+def test_terminal_owner_ledger_proof_refuses_incomplete_dispatch_identity(
+    tmp_path: Path,
+) -> None:
+    plan, config, store, _owner_dir, _owner_name, _invocation_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    segments = sorted((config.project_root / ".exo" / "ledger" / "segments").glob("*.jsonl"))
+    assert len(segments) == 1
+    events = [
+        json.loads(line) for line in segments[0].read_text(encoding="utf-8").splitlines()
+    ]
+    spawn = next(event for event in events if event["type"] == "agent.spawned")
+    spawn["invocation_id"] = None
+    for key in ("intent_id", "invocation_id", "child_agent", "branch"):
+        spawn["data"].pop(key)
+    segments[0].write_text(
+        "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    state = store.load()
+    leaf = state.slices[plan.leaves[0].name]
+    assert leaf.recovery is not None
+    recovery = replace(
+        leaf.recovery,
+        evidence={**leaf.recovery.evidence, "invocation_id": None},
+    )
+    current = replace(
+        leaf,
+        branch=None,
+        dispatch_agent_id=None,
+        dispatch_invocation_id=None,
+        dispatch_intent_id=None,
+        recovery=recovery,
+    )
+
+    proof, reason = driver_module._terminal_owner_ledger_proof(
+        current,
+        recovery,
+        replace(state, slices={**state.slices, leaf.id: current}),
+        config,
+        store,
+    )
+
+    assert proof is None
+    assert reason == "terminal-owner dispatch identity is incomplete"
+
+
 def test_terminal_provider_recovery_adopts_response_lost_successor_once(
     tmp_path: Path,
 ) -> None:

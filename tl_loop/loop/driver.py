@@ -7035,7 +7035,7 @@ def _terminal_owner_ledger_proof(
         or dispatch_intent_id is None
         or branch is None
     ):
-        raise TLLoopError("terminal-owner dispatch identity is incomplete")
+        return None, "terminal-owner dispatch identity is incomplete"
     return (
         _TerminalOwnerLedgerProof(
             cast(int, spawn_seq),
