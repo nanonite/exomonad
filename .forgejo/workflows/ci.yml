@@ -12,3 +12,19 @@ jobs:
       - name: Run retired-provider gate
         run: |
           just check-no-$(printf 'ge%s' mini)
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install TL loop dev dependencies
+        run: |
+          python3 -m venv .venv-typecheck
+          .venv-typecheck/bin/python -m pip install './tl_loop[dev]'
+
+      - name: Run TL loop strict typecheck ratchet
+        env:
+          EXOMONAD_PY: .venv-typecheck/bin/python
+        run: just tl-loop-typecheck
