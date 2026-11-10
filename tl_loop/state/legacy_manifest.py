@@ -303,7 +303,7 @@ def _prove_spawn(
     args = _mapping(entry.get("arguments"))
     if entry.get("status") != "confirmed":
         return _missing("confirmed spawn result")
-    required = {"name": new.name, "task": new.task}
+    required: dict[str, object] = {"name": new.name, "task": new.task}
     if new.kind == "leaf":
         required["boundary"] = list(new.boundary)
     conflicts = tuple(

@@ -7,6 +7,8 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
+from tl_loop.client.transport import JsonObject
+
 
 class AggregateApprovalError(ValueError):
     """An approval policy or receipt is not safe to use."""
@@ -174,7 +176,7 @@ def _new_parent_approval(
 
 def approval_reference(
     receipt: AggregateApprovalReceipt, controller_epoch: str
-) -> dict[str, object]:
+) -> JsonObject:
     """Build the non-authoritative lookup reference checked by the host."""
     if not isinstance(controller_epoch, str) or not controller_epoch.strip():
         raise AggregateApprovalError("current controller epoch is required for merge authorization")
@@ -346,7 +348,28 @@ def _decode_receipt(value: Mapping[str, object]) -> AggregateApprovalReceipt:
     if type(revision) is not int or type(pr_number) is not int:
         raise AggregateApprovalError("receipt revision and PR number must be integers")
     return AggregateApprovalReceipt(
-        **text_values,
+        receipt_id=text_values["receipt_id"],
+        parent_run_id=text_values["parent_run_id"],
+        parent_manifest_scope_id=text_values["parent_manifest_scope_id"],
+        candidate_key=text_values["candidate_key"],
+        child_run_id=text_values["child_run_id"],
+        child_manifest_node_id=text_values["child_manifest_node_id"],
+        child_manifest_scope_id=text_values["child_manifest_scope_id"],
+        parent_agent_id=text_values["parent_agent_id"],
+        parent_branch=text_values["parent_branch"],
+        repository_url=text_values["repository_url"],
+        plan_manifest_digest=text_values["plan_manifest_digest"],
+        approval_policy_digest=text_values["approval_policy_digest"],
+        child_manifest_digest=text_values["child_manifest_digest"],
+        head_sha=text_values["head_sha"],
+        head_tree_sha=text_values["head_tree_sha"],
+        base_sha=text_values["base_sha"],
+        patch_digest=text_values["patch_digest"],
+        merge_tree_sha=text_values["merge_tree_sha"],
+        ci_status=text_values["ci_status"],
+        readiness_receipt_digest=text_values["readiness_receipt_digest"],
+        lineage_proof_digest=text_values["lineage_proof_digest"],
+        created_at=text_values["created_at"],
         parent_scope_path=path,
         lineage_commit_shas=commits,
         reviewed_leaf_ids=leaves,

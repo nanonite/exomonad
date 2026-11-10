@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import NamedTuple
 
@@ -569,15 +569,13 @@ def build_legacy_manifest(document: Mapping[str, object], *, run_id: str) -> Pla
     # visible to operators; it is never treated as a new worker authorization.
     manifest = build_plan_manifest(plan, scope_id=run_id, owned_branch="legacy")
     legacy_nodes = tuple(
-        ManifestNode(
-            **{
-                **node.to_document(),
-                "kind": "sub_tl" if node.name in ordered_names else "legacy",
-                "order": node.order if node.name in ordered_names else None,
-                "child_manifest_digest": (
-                    node.child_manifest_digest if node.name in ordered_names else None
-                ),
-            }
+        replace(
+            node,
+            kind="sub_tl" if node.name in ordered_names else "legacy",
+            order=node.order if node.name in ordered_names else None,
+            child_manifest_digest=(
+                node.child_manifest_digest if node.name in ordered_names else None
+            ),
         )
         for node in manifest.nodes
     )

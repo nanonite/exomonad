@@ -37,12 +37,15 @@ def _declaration_changes(
             )
         if not fields:
             continue
+        target_node = observed or proposed
+        if target_node is None:
+            continue
         observed_doc = observed.to_document() if observed else {}
         proposed_doc = proposed.to_document() if proposed else {}
         changes.append(
             {
                 "node_id": _safe_text(node_id),
-                "node_name": _safe_text((observed or proposed).name),
+                "node_name": _safe_text(target_node.name),
                 "protected": node_id in protected_node_ids,
                 "disposition": "blocked"
                 if node_id in blocked_node_ids

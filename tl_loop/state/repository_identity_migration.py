@@ -193,15 +193,19 @@ def validate_audit_record(value: object) -> dict[str, object]:
     shape = value.get("source_shape")
     if not isinstance(run_id, str) or not run_id:
         raise RepositoryIdentityMigrationError("malformed", "migration audit run id is invalid")
-    for name, digest in (
-        ("source checkpoint", source_sha),
-        ("target identity", target_sha),
-        ("transition", value.get("transition_id")),
-    ):
-        if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
-            raise RepositoryIdentityMigrationError(
-                "malformed", f"migration audit {name} digest is invalid"
-            )
+    if not isinstance(source_sha, str) or not _SHA256.fullmatch(source_sha):
+        raise RepositoryIdentityMigrationError(
+            "malformed", "migration audit source checkpoint digest is invalid"
+        )
+    if not isinstance(target_sha, str) or not _SHA256.fullmatch(target_sha):
+        raise RepositoryIdentityMigrationError(
+            "malformed", "migration audit target identity digest is invalid"
+        )
+    transition_sha = value.get("transition_id")
+    if not isinstance(transition_sha, str) or not _SHA256.fullmatch(transition_sha):
+        raise RepositoryIdentityMigrationError(
+            "malformed", "migration audit transition digest is invalid"
+        )
     if not isinstance(shape, str) or shape not in {"missing", "legacy"}:
         raise RepositoryIdentityMigrationError(
             "malformed", "migration audit source shape is invalid"

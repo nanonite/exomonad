@@ -30,7 +30,7 @@ def revise_scope_checkpoint(
     """Rebind pending runtime declarations while preserving execution evidence."""
     document = _decode_run_document(raw, path)
     state = read_checkpoint(path)
-    if state.recursive_fsm is None:
+    if not isinstance(state.recursive_fsm, (TLPlanning, TLRunning)):
         raise PlanRevisionError(
             "runtime_rebase_unsupported",
             f"RunStore {path} has no canonical recursive state to rebase",

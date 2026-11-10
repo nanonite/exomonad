@@ -1321,13 +1321,13 @@ def _validate_plan_manifest(
                 (f"{path}.manifest_node_id", "is required when a plan manifest is present")
             )
             continue
-        node = nodes.get(node_id)
-        if node is None:
+        resolved_node = nodes.get(node_id)
+        if resolved_node is None:
             errors.append((f"{path}.manifest_node_id", "does not resolve to the plan manifest"))
             continue
-        if node.name != slice_id:
+        if resolved_node.name != slice_id:
             errors.append((f"{path}.manifest_node_id", "resolves to a different slice name"))
-        if record.get("chainlink_issue_id") != node.chainlink_issue_id:
+        if record.get("chainlink_issue_id") != resolved_node.chainlink_issue_id:
             errors.append(
                 (
                     f"{path}.chainlink_issue_id",
@@ -2758,7 +2758,7 @@ def _nullable_enum_value(
 
 
 def _non_empty_string(
-    holder: dict[str, object], key: str, path: str, errors: list[tuple[str, str]]
+    holder: Mapping[str, object], key: str, path: str, errors: list[tuple[str, str]]
 ) -> None:
     value = holder.get(key)
     if not isinstance(value, str) or not value:
@@ -2766,7 +2766,7 @@ def _non_empty_string(
 
 
 def _nullable_string(
-    holder: dict[str, object], key: str, path: str, errors: list[tuple[str, str]]
+    holder: Mapping[str, object], key: str, path: str, errors: list[tuple[str, str]]
 ) -> None:
     value = holder.get(key)
     if value is not None and (not isinstance(value, str) or not value):

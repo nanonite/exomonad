@@ -166,7 +166,9 @@ def child_scope_emitter(
                 parent_slice.attempts, proof_complete=False
             ),
         )
-    invocation_id = record["invocation_id"]
+    invocation_id = record.get("invocation_id")
+    trigger = record.get("trigger")
+    parent_proof = parent.scope_emitter_proof
     evidence = (
         "accepted_sub_tl_controller_declaration",
         "parent_scope_dispatch_record",
@@ -177,13 +179,19 @@ def child_scope_emitter(
         "scope_id": _safe_text(child.current.scope_id),
         "scope_run_id": _safe_text(child.state.run_id),
         "scope_controller_agent_id": _safe_text(expected),
-        "scope_controller_invocation_id": _safe_text(invocation_id),
+        "scope_controller_invocation_id": _safe_text(
+            invocation_id if isinstance(invocation_id, str) else None
+        ),
         "scope_controller_invocation_sha256": hashlib.sha256(raw).hexdigest(),
-        "scope_controller_invocation_trigger": _safe_text(record.get("trigger")),
+        "scope_controller_invocation_trigger": _safe_text(
+            trigger if isinstance(trigger, str) else None
+        ),
         "scope_controller_branch_sha256": _text_digest(child.state.owner_branch),
         "scope_controller_worktree_sha256": _text_digest(child.state.owner_worktree),
         "parent_scope_run_id": _safe_text(parent.state.run_id),
-        "parent_scope_controller_agent_id": _safe_text(parent.scope_emitter_proof.agent_id),
+        "parent_scope_controller_agent_id": _safe_text(
+            parent_proof.agent_id if parent_proof is not None else None
+        ),
         "parent_dispatch_intent_id": _safe_text(parent_slice.dispatch_intent_id),
         "parent_dispatch_invocation_id": _safe_text(parent_slice.dispatch_invocation_id),
         "parent_dispatch_event_seq": parent_slice.dispatch_authoritative_event_seq,

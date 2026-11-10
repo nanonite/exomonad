@@ -21,7 +21,7 @@ def legacy_leaf_spawn_journal_matches(
 ) -> bool:
     """Bind a legacy receipt to the accepted declaration, journal, and ledger event."""
     accepted = scope.accepted.node(node.node_id) if scope.accepted is not None else None
-    if not _journal_is_eligible(scope, slice_state, accepted):
+    if accepted is None or not _journal_is_eligible(scope, slice_state, accepted):
         return False
     entries = [
         entry
@@ -107,12 +107,14 @@ def _event_matches_slice(
     emitter: str,
 ) -> bool:
     data = event.get("data")
+    sequence = slice_state.dispatch_authoritative_event_seq
     return bool(
-        isinstance(data, Mapping)
-        and scope.dispatch_event_status.get(slice_state.dispatch_authoritative_event_seq) == "found"
+        sequence is not None
+        and isinstance(data, Mapping)
+        and scope.dispatch_event_status.get(sequence) == "found"
         and event.get("type", event.get("event_type")) == "agent.spawned"
         and event.get("run_id") == scope.state.ledger_run_id
-        and event.get("run_seq") == slice_state.dispatch_authoritative_event_seq
+        and event.get("run_seq") == sequence
         and event.get("agent_id") == emitter
         and event.get("invocation_id") is None
         and data.get("intent_id") == slice_state.dispatch_intent_id

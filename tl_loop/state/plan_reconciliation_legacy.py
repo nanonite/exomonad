@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeGuard
 
 from tl_loop.fsm.child import ChildRecord
 from tl_loop.state.plan_revision_diff import changed_node_fields
@@ -170,7 +170,7 @@ def _has_accepted_dispatch(
     record: ChildRecord | None,
     target: ManifestNode,
     manifest_revision: int,
-) -> bool:
+) -> TypeGuard[ChildRecord]:
     if record is None:
         return False
     return (

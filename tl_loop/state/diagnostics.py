@@ -438,7 +438,7 @@ def project_scope(state: RunState) -> ScopeReadModel:
     if isinstance(fsm, TLPlanning):
         parallel = _child_ids(fsm.parallel_children)
         pending = {str(order): _child_ids(children) for order, children in fsm.ordered_children}
-        current_order = 0 if parallel else next(iter(pending), None)
+        current_order = 0 if parallel else (int(next(iter(pending))) if pending else None)
         waiting = parallel + tuple(child for ids in pending.values() for child in ids)
         records = _child_documents(
             fsm.parallel_children

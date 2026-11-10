@@ -199,7 +199,7 @@ def _dispatch_identity_is_durable(
     scope: ReconciliationScope,
     node: ManifestNode,
     slice_state: SliceState,
-    intent_id: str,
+    intent_id: str | None,
 ) -> bool:
     matches = [
         record for record in _records_for(scope.state.recursive_fsm) if record.child_id == node.name
@@ -218,7 +218,7 @@ def _dispatch_record_matches(
     node: ManifestNode,
     slice_state: SliceState,
     record: ChildRecord,
-    intent_id: str,
+    intent_id: str | None,
 ) -> bool:
     return (
         record.kind.value == node.kind
@@ -234,7 +234,7 @@ def _confirmed_spawn_entry(
     current: ManifestNode,
     accepted: ManifestNode,
     slice_state: SliceState,
-    intent_id: str,
+    intent_id: str | None,
 ) -> tuple[Mapping[str, object] | None, str]:
     if scope.action_journal_status == "invalid":
         return None, "action_journal_invalid"
@@ -276,7 +276,7 @@ def _spawn_entry_failure(
 
 
 def _entry_targets_dispatch(
-    entry: Mapping[str, object], run_id: str, slice_id: str, intent_id: str
+    entry: Mapping[str, object], run_id: str, slice_id: str, intent_id: str | None
 ) -> bool:
     arguments = _arguments(entry)
     return (
@@ -518,7 +518,8 @@ def _legacy_correlation(
     proof = scope.scope_emitter_proof
     if proof is not None:
         values.update(dict(proof.correlation))
-        events = scope.dispatch_event_records.get(slice_state.dispatch_authoritative_event_seq, ())
+        sequence = slice_state.dispatch_authoritative_event_seq
+        events = scope.dispatch_event_records.get(sequence, ()) if sequence is not None else ()
         observed = events[0].get("agent_id") if len(events) == 1 else None
         values["dispatch_event_expected_emitter_agent_id"] = _safe_text(proof.agent_id)
         values["dispatch_event_observed_emitter_agent_id"] = (
@@ -577,14 +578,18 @@ def _legacy_invocation_fields(
     sequence = slice_state.dispatch_authoritative_event_seq
     events = scope.dispatch_event_records.get(sequence, ()) if type(sequence) is int else ()
     event = events[0] if len(events) == 1 else {}
+    event_agent_id = event.get("agent_id")
+    entry_key = entry.get("key")
     return {
         "dispatch_intent_id": _safe_text(slice_state.dispatch_intent_id),
         "dispatch_invocation_id": None,
         "dispatch_invocation_status": "unavailable_in_legacy_records",
         "dispatch_event_seq": slice_state.dispatch_authoritative_event_seq,
         "dispatch_event_sha256": _json_digest(event),
-        "dispatch_event_emitter_agent_id": _safe_text(event.get("agent_id")),
-        "spawn_action_key": _safe_text(entry.get("key")),
+        "dispatch_event_emitter_agent_id": _safe_text(
+            event_agent_id if isinstance(event_agent_id, str) else None
+        ),
+        "spawn_action_key": _safe_text(entry_key if isinstance(entry_key, str) else None),
         "spawn_result_agent_id": None,
         "spawn_result_invocation_id": None,
     }
@@ -704,7 +709,8 @@ def _scope_emitter_failure_correlation(
         if proof is not None and proof.agent_id is not None
         else values.get("expected")
     )
-    events = scope.dispatch_event_records.get(slice_state.dispatch_authoritative_event_seq, ())
+    sequence = slice_state.dispatch_authoritative_event_seq
+    events = scope.dispatch_event_records.get(sequence, ()) if sequence is not None else ()
     observed = events[0].get("agent_id") if len(events) == 1 else None
     values.update(
         {

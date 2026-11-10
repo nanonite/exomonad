@@ -243,28 +243,32 @@ class ReferenceVerificationEvidence:
         recorded_at: datetime,
     ) -> ReferenceVerificationEvidence:
         stamp = _utc_timestamp(recorded_at)
-        values = {
+        identity = {
             "run_id": run_id,
             "scope_id": scope_id,
             "path": path,
             "remote_url": remote_url,
             "commit_sha": commit_sha,
-            "source_state": source_state,
-            "kind": kind,
-            "command": command,
-            "outcome": outcome,
-            "provenance": provenance,
-            "recorded_at": stamp,
-        }
-        identity = {
-            **values,
             "source_state": source_state.value,
             "kind": kind.value,
+            "command": command,
             "outcome": outcome.value,
             "provenance": provenance.to_document(),
         }
-        identity.pop("recorded_at")
-        return cls(**values, evidence_id=_evidence_id(identity))
+        return cls(
+            run_id=run_id,
+            scope_id=scope_id,
+            path=path,
+            remote_url=remote_url,
+            commit_sha=commit_sha,
+            source_state=source_state,
+            kind=kind,
+            command=command,
+            outcome=outcome,
+            provenance=provenance,
+            recorded_at=stamp,
+            evidence_id=_evidence_id(identity),
+        )
 
     def identity_document(self) -> dict[str, object]:
         return {
