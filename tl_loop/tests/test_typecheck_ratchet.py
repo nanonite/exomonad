@@ -219,16 +219,196 @@ def test_baseline_writes_deterministically(tmp_path: Path) -> None:
     first = tmp_path / "first.json"
     second = tmp_path / "second.json"
 
-    CHECKER.write_baseline(first, baseline)
-    CHECKER.write_baseline(second, baseline)
+    CHECKER.write_baseline(first, baseline, "2.3.0")
+    CHECKER.write_baseline(second, baseline, "2.3.0")
 
     first_text = first.read_text(encoding="utf-8")
     assert first_text == second.read_text(encoding="utf-8")
     payload = json.loads(first_text)
+    assert payload["schema_version"] == 2
+    assert payload["mypy_version"] == "2.3.0"
     assert payload["errors"] == baseline
     assert list(payload["errors"]) == ["tl_loop/a.py", "tl_loop/z.py"]
     assert list(payload["errors"]["tl_loop/z.py"]) == ["assignment", "return-value"]
     assert first_text.endswith("\n")
+
+
+def test_baseline_rejects_schema_one(tmp_path: Path) -> None:
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(
+        json.dumps({"schema_version": 1, "mypy_version": "2.3.0", "errors": {}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(CHECKER.BaselineError, match="schema_version 2"):
+        CHECKER.load_baseline(baseline_path)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"schema_version": 2, "errors": {}},
+        {"schema_version": 2, "mypy_version": 2, "errors": {}},
+        {"schema_version": 2, "mypy_version": "", "errors": {}},
+    ],
+)
+def test_baseline_rejects_missing_or_non_string_version(
+    tmp_path: Path, payload: dict[str, object]
+) -> None:
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CHECKER.BaselineError, match="mypy_version string"):
+        CHECKER.load_baseline(baseline_path)
+
+
+def test_version_mismatch_fails_before_count_comparison(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    baseline_path = tmp_path / "baseline.json"
+    CHECKER.write_baseline(
+        baseline_path, {"tl_loop/a.py": {"assignment": 1}}, "0.0.1"
+    )
+    monkeypatch.setattr(
+        CHECKER,
+        "run_mypy",
+        _constant_report({("tl_loop/a.py", "assignment"): 2}),
+    )
+    monkeypatch.setattr(CHECKER, "installed_mypy_version", lambda: "0.0.2")
+
+    exit_code = CHECKER.main(
+        ["--project-root", str(tmp_path), "--baseline", str(baseline_path)]
+    )
+
+    assert exit_code == 1
+    stderr = capsys.readouterr().err
+    assert "0.0.1" in stderr
+    assert "0.0.2" in stderr
+    assert "pyproject.toml" in stderr
+    assert "--update" in stderr
+    assert "over baseline" not in stderr
+
+
+def test_matching_version_compares_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    baseline_path = tmp_path / "baseline.json"
+    CHECKER.write_baseline(
+        baseline_path, {"tl_loop/a.py": {"assignment": 1}}, "0.0.1"
+    )
+    monkeypatch.setattr(
+        CHECKER,
+        "run_mypy",
+        _constant_report({("tl_loop/a.py", "assignment"): 1}),
+    )
+    monkeypatch.setattr(CHECKER, "installed_mypy_version", lambda: "0.0.1")
+
+    exit_code = CHECKER.main(
+        ["--project-root", str(tmp_path), "--baseline", str(baseline_path)]
+    )
+
+    assert exit_code == 0
+    assert "typecheck ratchet passed" in capsys.readouterr().out
+
+
+def test_update_records_installed_version_across_a_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    baseline_path = tmp_path / "baseline.json"
+    CHECKER.write_baseline(
+        baseline_path, {"tl_loop/a.py": {"assignment": 2}}, "0.0.1"
+    )
+    monkeypatch.setattr(
+        CHECKER,
+        "run_mypy",
+        _constant_report({("tl_loop/a.py", "assignment"): 1}),
+    )
+    monkeypatch.setattr(CHECKER, "installed_mypy_version", lambda: "0.0.2")
+
+    exit_code = CHECKER.main(
+        [
+            "--project-root",
+            str(tmp_path),
+            "--baseline",
+            str(baseline_path),
+            "--update",
+        ]
+    )
+
+    assert exit_code == 0
+    payload = json.loads(baseline_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 2
+    assert payload["mypy_version"] == "0.0.2"
+    assert payload["errors"] == {"tl_loop/a.py": {"assignment": 1}}
+    assert "baseline written" in capsys.readouterr().out
+
+
+def test_update_refuses_increase_across_a_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    baseline_path = tmp_path / "baseline.json"
+    CHECKER.write_baseline(
+        baseline_path, {"tl_loop/a.py": {"assignment": 1}}, "0.0.1"
+    )
+    monkeypatch.setattr(
+        CHECKER,
+        "run_mypy",
+        _constant_report({("tl_loop/a.py", "assignment"): 2}),
+    )
+    monkeypatch.setattr(CHECKER, "installed_mypy_version", lambda: "0.0.2")
+
+    exit_code = CHECKER.main(
+        [
+            "--project-root",
+            str(tmp_path),
+            "--baseline",
+            str(baseline_path),
+            "--update",
+        ]
+    )
+
+    assert exit_code == 1
+    assert "--allow-increase" in capsys.readouterr().err
+    payload = json.loads(baseline_path.read_text(encoding="utf-8"))
+    assert payload["mypy_version"] == "0.0.1"
+    assert payload["errors"] == {"tl_loop/a.py": {"assignment": 1}}
+
+
+def test_missing_mypy_reports_import_failure_before_reading_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    baseline_path = tmp_path / "baseline.json"
+    CHECKER.write_baseline(
+        baseline_path, {"tl_loop/a.py": {"assignment": 1}}, "2.3.0"
+    )
+
+    def fail_run(_root: Path, _config: Path, _target: Path) -> object:
+        raise CHECKER.MypyOutputError(
+            "unparsable mypy output line: '/usr/bin/python3: No module named mypy'"
+        )
+
+    def unexpected_version() -> str:
+        raise AssertionError("metadata must not be read when mypy is missing")
+
+    monkeypatch.setattr(CHECKER, "run_mypy", fail_run)
+    monkeypatch.setattr(CHECKER, "installed_mypy_version", unexpected_version)
+
+    exit_code = CHECKER.main(
+        ["--project-root", str(tmp_path), "--baseline", str(baseline_path)]
+    )
+
+    assert exit_code == 1
+    assert "No module named mypy" in capsys.readouterr().err
 
 
 def test_main_reports_baseline_violation_and_update_refusal(
@@ -237,7 +417,10 @@ def test_main_reports_baseline_violation_and_update_refusal(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     baseline_path = tmp_path / "baseline.json"
-    CHECKER.write_baseline(baseline_path, {"tl_loop/a.py": {"assignment": 1}})
+    CHECKER.write_baseline(
+        baseline_path, {"tl_loop/a.py": {"assignment": 1}}, "2.3.0"
+    )
+    monkeypatch.setattr(CHECKER, "installed_mypy_version", lambda: "2.3.0")
     monkeypatch.setattr(
         CHECKER,
         "run_mypy",
@@ -279,9 +462,9 @@ def test_main_reports_baseline_violation_and_update_refusal(
     )
 
     assert allow_exit == 0
-    assert json.loads(baseline_path.read_text(encoding="utf-8"))["errors"] == {
-        "tl_loop/a.py": {"assignment": 2}
-    }
+    payload = json.loads(baseline_path.read_text(encoding="utf-8"))
+    assert payload["errors"] == {"tl_loop/a.py": {"assignment": 2}}
+    assert payload["mypy_version"] == "2.3.0"
     assert "baseline written" in capsys.readouterr().out
 
 
