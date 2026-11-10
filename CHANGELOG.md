@@ -26,6 +26,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Pin TL-loop's mypy to the baseline-producing version and document regenerating the baseline with the pin (#1326)
 - Narrow TL-loop recovery and plan-manifest state for strict type checking without ignores or casts (#1324)
 - Narrow the TL-loop driver and run-store decode boundary for strict type checking without ignores or casts (#1327)
+- Require a persisted PR number before TL-loop merge and watcher actions instead of substituting PR 0 (#1328)
+- Report an incomplete terminal-owner dispatch identity as a recovery refusal instead of raising through the controller (#1328)
+- Name a completed aggregate's missing PR number directly instead of listing it as a coordinate conflict (#1328)
+- Accept a raw mapping sub-TL plan wherever ordered recovery reads its leaves (#1328)
+- Narrow the remaining TL-loop production type errors to zero in the default mypy form (#1328)
 
 ### Fixed
 - Keep a failed synchronization without an error as an unresolved decision instead of crashing while redacting its diagnostic (#1327)
