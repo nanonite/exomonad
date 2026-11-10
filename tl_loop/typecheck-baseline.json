@@ -3,69 +3,17 @@
     "scripts/check_tl_loop_archive.py": {
       "no-any-return": 1
     },
-    "tl_loop/client/readonly.py": {
-      "no-any-return": 1,
-      "redundant-cast": 1
-    },
-    "tl_loop/client/transport.py": {
-      "redundant-cast": 1
-    },
     "tl_loop/loop/driver.py": {
-      "no-any-return": 1,
-      "redundant-cast": 7,
       "type-arg": 1
     },
     "tl_loop/loop/escalate.py": {
       "no-untyped-def": 1
     },
-    "tl_loop/loop/journal.py": {
-      "redundant-cast": 1
-    },
-    "tl_loop/loop/startup_handoff.py": {
-      "no-any-return": 1
-    },
-    "tl_loop/loop/task_budget.py": {
-      "redundant-cast": 3
-    },
-    "tl_loop/rlm/call.py": {
-      "redundant-cast": 1
-    },
-    "tl_loop/rlm/live_smoke.py": {
-      "no-any-return": 1
-    },
-    "tl_loop/rlm/plan_acceptance.py": {
-      "redundant-cast": 1
-    },
-    "tl_loop/select/agent_type.py": {
-      "redundant-cast": 2
-    },
-    "tl_loop/select/learned_policy.py": {
-      "redundant-cast": 2
-    },
-    "tl_loop/select/ledger.py": {
-      "redundant-cast": 2
-    },
-    "tl_loop/state/diagnostics.py": {
-      "no-any-return": 3
-    },
-    "tl_loop/state/legacy_manifest.py": {
-      "no-any-return": 14,
-      "no-untyped-def": 2
-    },
     "tl_loop/state/plan_manifest.py": {
       "type-arg": 1
     },
-    "tl_loop/state/plan_reconciliation_scope.py": {
-      "redundant-cast": 2
-    },
     "tl_loop/state/reference_verification.py": {
       "no-untyped-def": 1
-    },
-    "tl_loop/state/schema.py": {
-      "redundant-cast": 1
-    },
-    "tl_loop/state/store.py": {
-      "redundant-cast": 3
     },
     "tl_loop/tests/checkpoint_fixtures.py": {
       "attr-defined": 1,
