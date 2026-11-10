@@ -76,8 +76,8 @@
     },
     "tl_loop/tests/replay.py": {
       "arg-type": 17,
-      "assignment": 3,
-      "method-assign": 2
+      "assignment": 2,
+      "method-assign": 1
     },
     "tl_loop/tests/test_abandon.py": {
       "arg-type": 3
@@ -117,7 +117,7 @@
       "redundant-cast": 1
     },
     "tl_loop/tests/test_driver.py": {
-      "arg-type": 204,
+      "arg-type": 202,
       "assignment": 1,
       "attr-defined": 76,
       "call-overload": 65,
@@ -127,7 +127,6 @@
       "list-item": 4,
       "misc": 2,
       "no-any-return": 1,
-      "no-redef": 1,
       "no-untyped-call": 1,
       "no-untyped-def": 67,
       "operator": 23,
@@ -239,7 +238,7 @@
       "no-untyped-def": 1
     },
     "tl_loop/tests/test_ordered_continuation_recovery.py": {
-      "arg-type": 16,
+      "arg-type": 14,
       "attr-defined": 7,
       "call-overload": 2,
       "index": 5,
