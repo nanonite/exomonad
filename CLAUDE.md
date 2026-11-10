@@ -785,10 +785,13 @@ reachable from `just rust-test-all`. `just test` also runs
 `just tl-loop-typecheck`, which applies the strict mypy configuration in
 `tl_loop/pyproject.toml` through `scripts/check_typecheck_ratchet.py`. Its
 checked-in `tl_loop/typecheck-baseline.json` records per-file, per-error-code
-counts and may only shrink; run
+counts and the mypy version that produced them, and may only shrink; run
 `tl_loop/.venv/bin/python scripts/check_typecheck_ratchet.py --update` after
 fixing errors, and pass `--allow-increase` only when deliberately accepting new
-type debt. Run the tmux first-window environment integration tests with
+type debt. CI runs the same recipe in the `typecheck` job of
+`.forgejo/workflows/ci.yml`, which installs the pinned `dev` extra from
+`tl_loop/pyproject.toml` into a throwaway virtualenv and points `EXOMONAD_PY`
+at its python. Run the tmux first-window environment integration tests with
 `just tmux-session-environment-test [inside_nix] [tmpdir]`; the default is
 `true /tmp`. Pass `false` to use the host Rust toolchain and tmux binary.
 

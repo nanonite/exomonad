@@ -27,11 +27,14 @@ invokes `scripts/check_typecheck_ratchet.py`, which runs exactly that command
 and compares the result with `tl_loop/typecheck-baseline.json`. The baseline
 stores error counts per `(file, mypy error code)` pair, never line numbers or
 messages. It is a ceiling that may only shrink: a new pair, a higher count, or
-a stale baseline higher than the current count all fail the check. `just test`
-and `just pre-commit` include the recipe, so a regression blocks the normal
-gates. The target is the whole `tl_loop` package, including its tests;
-`scripts/` is not checked as a separate target, although mypy follows imports
-into it.
+a stale baseline higher than the current count all fail the check. Counts are
+per `(file, code)`, so swapping one error for another of the same code in the
+same file passes, and a fix plus a new error of the same code in the same file
+cancel out; that tolerance is a property of the design. `just test` includes
+the recipe, and `just pre-commit` reaches it through `test`, so a regression
+blocks the normal gates and the ratchet runs once. The target is the whole
+`tl_loop` package, including its tests; `scripts/` is not checked as a
+separate target, although mypy follows imports into it.
 
 After fixing errors, lower the ceiling with:
 
@@ -40,13 +43,24 @@ tl_loop/.venv/bin/python scripts/check_typecheck_ratchet.py --project-root . --u
 ```
 
 The normal update refuses to raise any count. `--allow-increase` exists only
-for a deliberate, reviewed exception. Do not add `# type: ignore`, per-file
+for a deliberate, reviewed exception. `--update` records the installed mypy
+version in the baseline. Do not add `# type: ignore`, per-file
 `ignore_errors`, or line-number baselines to satisfy this check.
 
 The baseline is only valid for the pinned `mypy==2.3.0` in
-`tl_loop/pyproject.toml`. Raising that pin must happen in the same commit that
-regenerates the baseline, with `--update --allow-increase` only if the new mypy
-reports more errors, and the commit message must say why.
+`tl_loop/pyproject.toml`. The baseline records that version in
+`mypy_version`, and the check fails before comparing counts when the installed
+mypy differs, naming both versions. The version in `tl_loop/pyproject.toml`,
+the baseline's `mypy_version`, and the installed mypy must agree. Raising the
+pin must happen in the same commit that regenerates the baseline, with
+`--update --allow-increase` only if the new mypy reports more errors, and the
+commit message must say why.
+
+CI runs the recipe in the `typecheck` job of `.forgejo/workflows/ci.yml`: it
+creates a throwaway virtualenv, installs the `dev` extra from
+`tl_loop/pyproject.toml` (which supplies the pinned mypy), and runs
+`just tl-loop-typecheck` with `EXOMONAD_PY` pointing at that virtualenv's
+python.
 
 The runtime creates per-run state under `.exo/tl-loop/<run_id>/`. That directory
 is runtime state, not Python source, and must never be used as the package code

@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Run the TL-loop strict typecheck ratchet in CI from the pinned dev extra (#1326)
 - Gate TL-loop strict type checking behind a shrink-only ratchet baseline (#1323)
 - Reconcile configured worker and reviewer harnesses during init continuation (#1283)
 - Add commit-all tidying before TL handoff to the next scope (#1267)
@@ -20,6 +21,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
 ### Changed
+- Fail the TL-loop typecheck ratchet when the installed mypy differs from the baseline's recorded version (#1326)
+- Run the TL-loop typecheck ratchet once in `just pre-commit` through `just test` (#1326)
 - Pin TL-loop's mypy to the baseline-producing version and document regenerating the baseline with the pin (#1326)
 - Narrow TL-loop recovery and plan-manifest state for strict type checking without ignores or casts (#1324)
 
