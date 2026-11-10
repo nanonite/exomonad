@@ -411,9 +411,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     update_command = f"{Path(sys.argv[0]).name} --update"
 
     try:
-        report = run_mypy(project_root, config_file, target)
-        mypy_version = installed_mypy_version()
         if args.update:
+            report = run_mypy(project_root, config_file, target)
+            mypy_version = installed_mypy_version()
             baseline = load_baseline(baseline_path) if baseline_path.exists() else None
             updated = updated_baseline(
                 report.counts,
@@ -427,7 +427,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
         baseline = load_baseline(baseline_path)
+        mypy_version = installed_mypy_version()
         check_mypy_version(mypy_version, baseline.mypy_version)
+        report = run_mypy(project_root, config_file, target)
         violations = compare_counts(report.counts, baseline.errors)
     except RatchetError as exc:
         print(f"typecheck ratchet failed: {exc}", file=sys.stderr)

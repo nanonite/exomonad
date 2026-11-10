@@ -271,11 +271,14 @@ def test_version_mismatch_fails_before_count_comparison(
     CHECKER.write_baseline(
         baseline_path, {"tl_loop/a.py": {"assignment": 1}}, "0.0.1"
     )
-    monkeypatch.setattr(
-        CHECKER,
-        "run_mypy",
-        _constant_report({("tl_loop/a.py", "assignment"): 2}),
-    )
+    run_mypy = _constant_report({("tl_loop/a.py", "assignment"): 2})
+    calls: list[tuple[Path, Path, Path]] = []
+
+    def record_mypy(root: Path, config: Path, target: Path) -> object:
+        calls.append((root, config, target))
+        return run_mypy(root, config, target)
+
+    monkeypatch.setattr(CHECKER, "run_mypy", record_mypy)
     monkeypatch.setattr(CHECKER, "installed_mypy_version", lambda: "0.0.2")
 
     exit_code = CHECKER.main(
@@ -283,6 +286,7 @@ def test_version_mismatch_fails_before_count_comparison(
     )
 
     assert exit_code == 1
+    assert calls == []
     stderr = capsys.readouterr().err
     assert "0.0.1" in stderr
     assert "0.0.2" in stderr
@@ -382,7 +386,7 @@ def test_update_refuses_increase_across_a_mismatch(
     assert payload["errors"] == {"tl_loop/a.py": {"assignment": 1}}
 
 
-def test_missing_mypy_reports_import_failure_before_reading_metadata(
+def test_missing_mypy_reports_version_failure_before_running_mypy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -393,22 +397,22 @@ def test_missing_mypy_reports_import_failure_before_reading_metadata(
     )
 
     def fail_run(_root: Path, _config: Path, _target: Path) -> object:
-        raise CHECKER.MypyOutputError(
-            "unparsable mypy output line: '/usr/bin/python3: No module named mypy'"
-        )
+        raise AssertionError("mypy must not run when its installed version is unavailable")
 
-    def unexpected_version() -> str:
-        raise AssertionError("metadata must not be read when mypy is missing")
+    def missing_version(distribution: str) -> str:
+        raise CHECKER.importlib.metadata.PackageNotFoundError(distribution)
 
     monkeypatch.setattr(CHECKER, "run_mypy", fail_run)
-    monkeypatch.setattr(CHECKER, "installed_mypy_version", unexpected_version)
+    monkeypatch.setattr(CHECKER.importlib.metadata, "version", missing_version)
 
     exit_code = CHECKER.main(
         ["--project-root", str(tmp_path), "--baseline", str(baseline_path)]
     )
 
     assert exit_code == 1
-    assert "No module named mypy" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "cannot determine the installed mypy version" in error
+    assert "No module named mypy" in error
 
 
 def test_main_reports_baseline_violation_and_update_refusal(

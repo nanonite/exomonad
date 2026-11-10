@@ -25,17 +25,19 @@ from tl_loop.rlm.subprocess_backend import SubprocessRlmBackend
 def test_parse_harness_arguments_refuses_a_malformed_parser_value(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def malformed_arguments(
-        _parser: argparse.ArgumentParser,
-        _args: Sequence[str] | None = None,
-        _namespace: argparse.Namespace | None = None,
-    ) -> argparse.Namespace:
-        return argparse.Namespace(harness=object())
+    for malformed_value in (object(), [object()]):
+        def malformed_arguments(
+            _parser: argparse.ArgumentParser,
+            _args: Sequence[str] | None = None,
+            _namespace: argparse.Namespace | None = None,
+            value: object = malformed_value,
+        ) -> argparse.Namespace:
+            return argparse.Namespace(harness=value)
 
-    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", malformed_arguments)
+        monkeypatch.setattr(argparse.ArgumentParser, "parse_args", malformed_arguments)
 
-    with pytest.raises(RlmCallError, match="harness arguments must be a list of strings"):
-        _parse_harness_arguments(())
+        with pytest.raises(RlmCallError, match="harness arguments must be a list of strings"):
+            _parse_harness_arguments(())
 
 
 def test_installed_harnesses_only_includes_supported_binaries(
