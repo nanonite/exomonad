@@ -11,11 +11,13 @@ from typing import cast
 import pytest
 
 import tl_loop.loop.driver as driver_module
+import tl_loop.loop.heartbeat as heartbeat_module
 from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.transport import JsonObject
 from tl_loop.events.types import BlockCause
 from tl_loop.fsm.recovery import begin_recovery
 from tl_loop.loop.abandon import abandon_slice
+from tl_loop.loop.nested_recovery import NestedRecoveryAssessment
 from tl_loop.loop.heartbeat import (
     HeartbeatConfig,
     HeartbeatError,
@@ -34,6 +36,7 @@ from tl_loop.state.schema import (
     GateStatus,
     ParkCause,
     RunState,
+    SliceState,
     SliceStatus,
 )
 from tl_loop.state.store import RunStore
@@ -2143,3 +2146,54 @@ def test_heartbeat_clears_timer_when_slice_becomes_parked_before_poll(
 
     assert result.fired is False
     assert active_work.snapshot() == {}
+
+
+def test_nested_hold_refuses_present_non_phase_recursive_fsm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    invalid_state = replace(state, recursive_fsm="malformed-phase")
+    assessment = NestedRecoveryAssessment(
+        True,
+        False,
+        "checkpoint_unavailable",
+        "child checkpoint cannot be loaded",
+    )
+    checkpoint_calls: list[bool] = []
+
+    def load_invalid(_store: RunStore) -> RunState:
+        return invalid_state
+
+    def checkpoint_without_writing(
+        _store: RunStore,
+        *_args: object,
+        **_kwargs: object,
+    ) -> RunState:
+        checkpoint_calls.append(True)
+        return invalid_state
+
+    def fixed_assessment(
+        _parent: RunState,
+        _parent_slice: SliceState,
+        _parent_store: RunStore,
+        *,
+        parent_controller_agent_id: str | None = None,
+        project_root: Path | str | None = None,
+    ) -> NestedRecoveryAssessment:
+        del parent_controller_agent_id, project_root
+        return assessment
+
+    monkeypatch.setattr(RunStore, "load", load_invalid)
+    monkeypatch.setattr(RunStore, "checkpoint", checkpoint_without_writing)
+    monkeypatch.setattr(heartbeat_module, "assess_nested_recovery_wait", fixed_assessment)
+
+    with pytest.raises(HeartbeatError, match="recursive_fsm.*str"):
+        heartbeat_module._reconcile_nested_recovery_hold(
+            "slice-a",
+            store,
+            controller_agent_id=None,
+            project_root=tmp_path,
+        )
+
+    assert checkpoint_calls == []

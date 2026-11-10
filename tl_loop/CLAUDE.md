@@ -455,6 +455,11 @@ watcher_pr_state effects, then persists reconciled slice state through the
 shared writer. Synthetic heartbeat events are deterministic observations; they
 do not consume ledger sequence numbers or charge budgets.
 
+Nested recovery hold checkpoints use `current.recursive_fsm` when it contains a
+canonical phase accepted by `is_phase_value`. A `None` recursive phase uses the
+legacy `current.fsm`; a present non-canonical value raises `HeartbeatError` and
+names its runtime type instead of checkpointing through the legacy phase.
+
 Task-budget enforcement is invocation-scoped and active-work-scoped. Each
 invocation constructs one monotonic `ActiveWorkClock`; `_enforce_task_budget`
 charges only that clock's elapsed time for slices the controller has proven to

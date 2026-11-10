@@ -966,8 +966,14 @@ def _reconcile_nested_recovery_hold(
         if updated_slice == slice_state:
             return current, assessment, False
         checkpoint_phase: FSMInput = current.fsm
-        if current.recursive_fsm is not None and is_phase_value(current.recursive_fsm):
-            checkpoint_phase = current.recursive_fsm
+        recursive_fsm = current.recursive_fsm
+        if recursive_fsm is not None:
+            if not is_phase_value(recursive_fsm):
+                raise HeartbeatError(
+                    "recursive_fsm must be a canonical phase when present; "
+                    f"found {type(recursive_fsm).__name__}"
+                )
+            checkpoint_phase = recursive_fsm
         try:
             updated_state = store.checkpoint(
                 checkpoint_phase,
