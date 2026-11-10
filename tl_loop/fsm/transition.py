@@ -20,7 +20,6 @@ from .event import (
 )
 from .phase import (
     ChildHandle,
-    Phase,
     PhaseValue,
     TLAllMerged,
     TLDone,
@@ -35,10 +34,16 @@ from .scope import PhaseValue as RecursivePhaseValue
 class IllegalTransition(Exception):
     """Raised when an event has no transition arm for the current phase."""
 
-    def __init__(self, phase: Phase | RecursivePhaseValue, event: TLEvent) -> None:
+    def __init__(
+        self,
+        phase: object,
+        event: TLEvent,
+        reason: str | None = None,
+    ) -> None:
         self.phase = phase
         self.event = event
-        super().__init__(f"No TL transition for {type(phase).__name__} and {type(event).__name__}")
+        message = reason or f"No TL transition for {type(phase).__name__} and {type(event).__name__}"
+        super().__init__(message)
 
 
 @overload
@@ -180,7 +185,11 @@ def to_orchestration_event(phase: object, event: TLEvent) -> TLOrchestrationEven
     if isinstance(event, (PRFiled, PRUpdated, PRMerged)):
         slug = getattr(event, "slice_id", None) or getattr(event, "slug", None)
         if not isinstance(slug, str) or not slug:
-            raise TypeError(f"legacy event {type(event).__name__} names no slice")
+            raise IllegalTransition(
+                phase,
+                event,
+                f"legacy event {type(event).__name__} names no slice",
+            )
         return PublicationFiled(
             slug,
             getattr(event, "pr_number", 1),

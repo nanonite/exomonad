@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
 import tl_loop.fsm.event as event_module
 import tl_loop.fsm.phase as phase_module
 import tl_loop.fsm.transition as transition_module
+from tl_loop.fsm.transition import to_orchestration_event
 from tl_loop.fsm import (
     AllChildrenDone,
     ChildCompleted,
@@ -95,6 +98,20 @@ def test_pr_lifecycle_transitions_preserve_the_current_tl_phase() -> None:
     phase = TLWaiting({"a": HANDLE_A})
     assert transition(phase, PRFiled(10, "head-a", "a")) == phase
     assert transition(phase, PRUpdated(10, "head-b", "a")) == phase
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        PRFiled(10, "head-a"),
+        PRUpdated(10, "head-b"),
+        PRMerged(10, ""),
+    ],
+    ids=("pr-filed", "pr-updated", "pr-merged"),
+)
+def test_legacy_pr_event_requires_a_slice_name(event: TLEvent) -> None:
+    with pytest.raises(IllegalTransition, match="names no slice"):
+        to_orchestration_event(TLWaiting({}), event)
 
 
 def test_all_children_done_and_own_pr_filed_are_explicit_wildcard_arms() -> None:

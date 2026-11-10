@@ -27,6 +27,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Narrow TL-loop recovery and plan-manifest state for strict type checking without ignores or casts (#1324)
 - Narrow the TL-loop driver and run-store decode boundary for strict type checking without ignores or casts (#1327)
 - Require a persisted PR number before TL-loop merge and watcher actions instead of substituting PR 0 (#1328)
+- Reject legacy PR lifecycle events without a slice name instead of routing them through the ambiguous `child` name (#1329)
 - Report an incomplete terminal-owner dispatch identity as a recovery refusal instead of raising through the controller (#1328)
 - Name a completed aggregate's missing PR number directly instead of listing it as a coordinate conflict (#1328)
 - Accept a raw mapping sub-TL plan wherever ordered recovery reads its leaves (#1328)
