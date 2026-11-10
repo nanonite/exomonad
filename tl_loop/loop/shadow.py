@@ -43,6 +43,9 @@ from tl_loop.fsm.phase import (
 )
 from tl_loop.fsm.recovery import begin_recovery
 from tl_loop.fsm.scope import (
+    PhaseValue as RecursivePhaseValue,
+)
+from tl_loop.fsm.scope import (
     TLAllMerged as RecursiveTLAllMerged,
 )
 from tl_loop.fsm.scope import (
@@ -475,7 +478,9 @@ def _update_slices(
                 if candidate.pr_number == event.pr_number
             ]
             target_id = matches[0] if len(matches) == 1 else None
-        current = updated.get(target_id) if target_id is not None else None
+        if target_id is None:
+            return updated
+        current = updated.get(target_id)
         if current is None:
             return updated
         recovery_generation = (
@@ -563,12 +568,11 @@ def _update_slices(
                     next_action=event.recovery_action or "diagnose",
                 ),
             )
+            recovery = updated[event.slug].recovery
             updated = suspend_dependents(
                 updated,
                 event.slug,
-                updated[event.slug].recovery.recovery_round
-                if updated[event.slug].recovery is not None
-                else 0,
+                recovery.recovery_round if recovery is not None else 0,
             )
     return updated
 
@@ -606,7 +610,7 @@ def _phase_from_state(state: RunState) -> PhaseValue:
     return constructors[phase]
 
 
-def _phase_tag(phase: PhaseValue) -> TLPhase:
+def _phase_tag(phase: PhaseValue | RecursivePhaseValue) -> TLPhase:
     if isinstance(
         phase,
         (

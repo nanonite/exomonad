@@ -32,6 +32,7 @@ from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import (
     DecodeError,
     JsonObject,
+    JsonValue,
     ServerTimeout,
     ServerUnreachable,
     TransportClient,
@@ -52,7 +53,7 @@ from tl_loop.events.reader import (
     LedgerSnapshot,
     SequenceStatus,
 )
-from tl_loop.fsm.child import ChildKind, ChildRecord
+from tl_loop.fsm.child import ChildKind, ChildRecord, TLOrchestrationEvent
 from tl_loop.fsm.event import (
     AllChildrenDone,
     ChildCompleted,
@@ -106,6 +107,7 @@ from tl_loop.fsm.post_merge_events import (
     ParentBranchSynced,
     ParentPushPending,
     PostMergeComplete,
+    PostMergeEvent,
     PostMergeNotApplicable,
     PostMergeRebuildRequested,
     UnlinkedChangelogJudged,
@@ -293,6 +295,7 @@ from tl_loop.state.schema import (
     ActionPhase,
     ActionState,
     BudgetLedger,
+    FSMState,
     GateState,
     GateStatus,
     GoalState,
@@ -1667,6 +1670,7 @@ def run_tl_loop(
             or (not selected.active and selected.repository_identity is not None)
             else None
         )
+        resolution: RepositoryIdentity | None
         if inherited_identity is not None:
             resolution, failure_code = inherited_identity, None
         else:
@@ -1945,7 +1949,7 @@ def run_tl_loop(
                     legacy_manifest_migration=proof.to_document() if proof else None,
                 )
             generated = _initial_slices(supplied_plan, selected, root_dir, run_id)
-            initial_slices = {
+            rebound_slices: dict[str, SliceState | Mapping[str, object]] = {
                 **rebound,
                 **{
                     name: value
@@ -1956,7 +1960,7 @@ def run_tl_loop(
             try:
                 existing_state = store.set_plan_manifest(
                     candidate,
-                    slices=initial_slices,
+                    slices=rebound_slices,
                 )
             except ManifestError as error:
                 if "chainlink_issue_id" in str(error):
@@ -2604,7 +2608,7 @@ def _reconcile_fresh_continue_stalls(
             if updated is not None and updated != current_slice:
                 changed[slice_id] = updated
                 changed_any = True
-        phase = _phase_from_state(current)
+        phase: PhaseValue | RecursivePhaseValue | None = _phase_from_state(current)
         if (
             prior_terminal_reason is not None
             and current.plan_manifest.role == "root"
@@ -3668,13 +3672,13 @@ def _reopen_ordered_scope(
     elif pending_by_order:
         current_order = min(pending_by_order)
     else:
-        complete = RecursiveTLAllMerged(
+        completed_phase = RecursiveTLAllMerged(
             scope_path=planning.scope_path,
             plan_digest=planning.plan_digest,
             completed_children=post_merge,
         )
         return store.checkpoint(
-            complete,
+            completed_phase,
             state.slices,
             state.budgets,
             state.events.last_consumed_offset,
@@ -4078,21 +4082,24 @@ def _maybe_finalize_root_scope(
     payload = _merge_result_payload(result)
     if payload is None:
         return store.set_gate("tl-root-finalization", GateStatus.PENDING)
+    local_head_sha = payload.get("local_head_sha")
+    remote_head_sha = payload.get("remote_head_sha")
+    ancestry_proof = payload.get("ancestry_proof")
     if (
         payload.get("branch") != branch
         or payload.get("fast_forward") is not True
-        or not isinstance(payload.get("local_head_sha"), str)
-        or not isinstance(payload.get("remote_head_sha"), str)
-        or payload["local_head_sha"] != payload["remote_head_sha"]
-        or not isinstance(payload.get("ancestry_proof"), str)
-        or not payload["ancestry_proof"]
+        or not isinstance(local_head_sha, str)
+        or not isinstance(remote_head_sha, str)
+        or local_head_sha != remote_head_sha
+        or not isinstance(ancestry_proof, str)
+        or not ancestry_proof
     ):
         return store.set_gate("tl-root-finalization", GateStatus.PENDING)
     completion_evidence = {
         **evidence,
-        "local_head_sha": payload["local_head_sha"],
-        "remote_head_sha": payload["remote_head_sha"],
-        "ancestry_proof": payload["ancestry_proof"],
+        "local_head_sha": local_head_sha,
+        "remote_head_sha": remote_head_sha,
+        "ancestry_proof": ancestry_proof,
         "fast_forward": "true",
     }
     completed = scope_transition(
@@ -4671,7 +4678,7 @@ def _hold_reassessed_ordered_completion_evidence(
     effects_log: list[EffectIntent],
 ) -> tuple[RunState, bool, OrderedCompletionEvidenceError | None]:
     """Retry a completion hold only after fresh proof still requires it."""
-    latest_error = initial_error
+    latest_error: OrderedCompletionEvidenceError | None = initial_error
     for _attempt in range(MAX_OPTIONAL_SUB_TL_RECONCILIATION_ATTEMPTS):
         latest = store.load()
         latest_error = _completed_ordered_sub_tl_evidence_error(latest, plan, store)
@@ -5236,7 +5243,7 @@ def _validate_terminal_resume_route_receipts(
     payload = result.result
     agent = payload.get("agent") if isinstance(payload, Mapping) else None
     response_invocation = payload.get("invocation") if isinstance(payload, Mapping) else None
-    receipts = (
+    receipts: tuple[tuple[object, str], ...] = (
         (agent.get("role_route") if isinstance(agent, Mapping) else None, "agent response"),
         (
             response_invocation.get("role_route")
@@ -5966,13 +5973,21 @@ def _terminal_resume_history_proof(
     )
 
 
+def _accepted_work_plan(plan: WorkPlan | Mapping[str, object]) -> WorkPlan:
+    """Return the declared plan, parsing a raw mapping through the closed schema."""
+    if isinstance(plan, WorkPlan):
+        return plan
+    return WorkPlan.from_mapping(plan)
+
+
 def _blocked_leaf_resume_proof(
-    plan: WorkPlan,
+    plan: WorkPlan | Mapping[str, object],
     state: RunState,
     config: TLLoopConfig,
     store: RunStore,
 ) -> tuple[_BlockedLeafResumeProof | None, str | None]:
     """Bind one approved human-gated leaf to its old owner and rejected spawn."""
+    plan = _accepted_work_plan(plan)
     blocked = [
         leaf
         for leaf in plan.leaves
@@ -6245,8 +6260,11 @@ def _resolve_blocked_leaf_owner(
     )
 
 
-def _terminal_owner_recovery_candidate(plan: WorkPlan, state: RunState) -> bool:
+def _terminal_owner_recovery_candidate(
+    plan: WorkPlan | Mapping[str, object], state: RunState
+) -> bool:
     """Identify a launched human-gated leaf without treating it as a preflight retry."""
+    plan = _accepted_work_plan(plan)
     return any(
         (current := state.slices.get(leaf.name)) is not None
         and current.status is SliceStatus.SPAWNED
@@ -6497,8 +6515,11 @@ def _terminal_owner_recovery_proof(
             and current.dispatch_effort == invocation.get("effort")
         )
         confirmed_result = resume_history.latest_confirmed_result
+        confirmed_payload = confirmed_result.result if confirmed_result is not None else None
         confirmed_invocation = (
-            confirmed_result.result.get("invocation") if confirmed_result is not None else None
+            confirmed_payload.get("invocation")
+            if isinstance(confirmed_payload, Mapping)
+            else None
         )
         history_resume_predecessor = (
             invocation.get("trigger") == "resume_blocked"
@@ -6764,7 +6785,7 @@ def _terminal_owner_recovery_proof(
             )
     intent_id = blocked_resume_intent_id(owner)
     if isinstance(existing_args, Mapping):
-        expected_arguments = (
+        expected_arguments: tuple[tuple[str, object], ...] = (
             ("chainlink_issue_id", leaf.chainlink_issue_id),
             ("expected_invocation_id", owner.prior_invocation_id),
             ("expected_branch", owner.branch),
@@ -7892,7 +7913,7 @@ def _resume_approved_blocked_leaf(
             raise ActionJournalError("blocked-leaf resume requires a durable action journal")
         existing = journal.existing(intent)
         status = existing.get("status") if existing is not None else None
-        if status == "confirmed" or status == "rejected":
+        if existing is not None and (status == "confirmed" or status == "rejected"):
             result = journal.replay(existing)
         else:
             if not _reference_verification_ready(
@@ -8255,7 +8276,7 @@ def _blocked_leaf_dispatch_attempt(
     model = fields.get("model")
     return DispatchAttempt(
         intent_id=cast(str, arguments["dispatch_intent_id"]),
-        started_at=float(arguments["dispatch_started_at"]),
+        started_at=_required_number(arguments["dispatch_started_at"], "dispatch started_at"),
         harness=harness if isinstance(harness, str) else "",
         agent_type=agent_type if isinstance(agent_type, str) else "",
         model=model if isinstance(model, str) else None,
@@ -8711,6 +8732,23 @@ def _recovery_inconsistency(plan: WorkPlan, state: RunState) -> str | None:
     return None
 
 
+def _heartbeat_project_root(config: TLLoopConfig) -> Path | str:
+    """Return the project root required by enabled heartbeat reconciliation."""
+    if config.project_root is None:
+        raise TLLoopError("heartbeat reconciliation requires a project root")
+    return config.project_root
+
+
+def _transition_state_phase(
+    phase: PhaseValue | RecursivePhaseValue,
+    event: TLEvent,
+) -> PhaseValue | RecursivePhaseValue:
+    """Apply one lifecycle event to either phase representation."""
+    if isinstance(phase, RecursivePhaseValue):
+        return phase_transition(phase, event)
+    return phase_transition(phase, event)
+
+
 def _run_loop(
     run_id: str,
     plan: WorkPlan,
@@ -8725,7 +8763,7 @@ def _run_loop(
     continued_failed_root_reason: str | None = None,
 ) -> TLRunResult:
     """Shared loop body; active mode changes only effect execution."""
-    phase = _phase_from_state(state)
+    phase: PhaseValue | RecursivePhaseValue = _phase_from_state(state)
     expected = (
         {task.name for task in plan.workers}
         | {task.name for task in plan.leaves}
@@ -9184,7 +9222,7 @@ def _run_loop(
                     store,
                     effects,
                     config.heartbeat,
-                    project_root=config.project_root,
+                    project_root=_heartbeat_project_root(config),
                     active_work=active_work_clock,
                     controller_agent_id=config.agent_id or config.run_id,
                     review_replay=replay_review,
@@ -9531,9 +9569,11 @@ def _run_loop(
                 if isinstance(agent_type, str) and agent_type
                 else current.agent_type or "unknown"
             )
-            fsm_event = ChildSpawned(ChildHandle(event_slice_id, branch, agent_type))
+            spawn_event = ChildSpawned(ChildHandle(event_slice_id, branch, agent_type))
             try:
-                next_phase = phase_transition(phase, fsm_event)
+                next_phase: PhaseValue | RecursivePhaseValue = _transition_state_phase(
+                    phase, spawn_event
+                )
             except IllegalTransition as error:
                 raise TLLoopError(str(error)) from error
             next_slices = _confirm_dispatch_event(
@@ -9703,7 +9743,7 @@ def _run_loop(
                 state = store.load()
                 continue
         try:
-            next_phase = phase_transition(phase, fsm_event)
+            next_phase = _transition_state_phase(phase, fsm_event)
         except IllegalTransition as error:
             raise TLLoopError(str(error)) from error
         spawn_refusal = _spawn_confirmation_refusal(
@@ -10229,13 +10269,13 @@ def _judge_review_stuck(
     except (RlmError, RepairError, BudgetExceeded, ContextBudgetError) as error:
         LOGGER.error("[TL loop] review-stuck judgment failed slice=%s: %s", target.id, error)
         state = store.load()
-        reserved = state.slices.get(target.id)
-        if reserved is None:
+        reloaded = state.slices.get(target.id)
+        if reloaded is None:
             raise TLLoopError(f"review-stuck slice {target.id!r} disappeared from run state")
         return _park_repair_failed(
             store,
             state,
-            reserved,
+            reloaded,
             state.events.last_consumed_offset,
             error,
             config,
@@ -10243,8 +10283,8 @@ def _judge_review_stuck(
             effects_log,
         )
     state = store.load()
-    reserved = state.slices.get(target.id)
-    if reserved is None:
+    reloaded = state.slices.get(target.id)
+    if reloaded is None:
         raise TLLoopError(f"review-stuck slice {target.id!r} disappeared from run state")
     _record_controller_event(
         target.id,
@@ -10254,7 +10294,7 @@ def _judge_review_stuck(
             "pr_number": target.pr_number,
             "head_sha": _persisted_slice_head(target),
             "action": decision.action,
-            "intervention": reserved.tl_intervention_attempts,
+            "intervention": reloaded.tl_intervention_attempts,
             "ceiling": ceiling,
             "model": choice.model_id,
             "tokens": choice.store.ledger.spent.get(choice.role, 0) - spent_before,
@@ -11377,9 +11417,9 @@ def _checkpoint_post_merge_event(
     store: RunStore,
     state: RunState,
     slice_id: str,
-    event: object,
+    event: PostMergeEvent,
     reconciliation_additions: Mapping[str, object] | None = None,
-    lane_event: object | tuple[object, ...] | None = None,
+    lane_event: TLOrchestrationEvent | tuple[TLOrchestrationEvent, ...] | None = None,
     *,
     expected_revision: int | None = None,
     clear_gates: tuple[str, ...] = (),
@@ -11470,7 +11510,7 @@ def _advance_post_merge_boundary(
             if post_merge.evidence.get("rebuild_reason") and not post_merge.evidence.get(
                 "rebuild_applied"
             ):
-                generation = _required_int(
+                pending_generation = _required_int(
                     post_merge.evidence,
                     "changelog_generation",
                     "changelog generation",
@@ -11487,9 +11527,9 @@ def _advance_post_merge_boundary(
                             "changelog_rebuild",
                             current.id,
                             pr_number,
-                            generation=generation,
+                            generation=pending_generation,
                         ),
-                        generation,
+                        pending_generation,
                     ),
                 )
             return _run_changelog(state, current, evidence, config, effects, effects_log, store)
@@ -11940,7 +11980,7 @@ def _hold_unlinked_completion(
 def _unlinked_completion_lane_decision(
     state: RunState,
     current: SliceState,
-) -> tuple[object | None, str, str | None]:
+) -> tuple[TLOrchestrationEvent | None, str, str | None]:
     """Release only the exact active owner; preserve absent and idle lane records."""
     try:
         repository, parent_branch = _candidate_lane_key(state, current)
@@ -11973,7 +12013,7 @@ def _active_unlinked_lane_decision(
     state: RunState,
     current: SliceState,
     lane: LaneState,
-) -> tuple[object | None, str, str | None]:
+) -> tuple[TLOrchestrationEvent | None, str, str | None]:
     """Require exact child, epoch and merge coordinates before a guarded release."""
     if lane.phase not in {LanePhase.INTEGRATING, LanePhase.BOOKKEEPING}:
         return None, "held", f"lane is unresolved in phase {lane.phase.value}"
@@ -13822,14 +13862,11 @@ def _run_parent_push(
         f"ancestor:{payload['pushed_commit']}->{payload['observed_remote_head']}"
     ):
         raise ValueError("parent-push receipt has unverifiable ancestry evidence")
-    lane_epoch = payload["lane_epoch"]
-    if isinstance(lane_epoch, str) and lane_epoch.isdigit():
-        lane_epoch = int(lane_epoch)
     receipt = PushReceipt(
         repository=payload["repository"],
         parent_branch=payload["parent_branch"],
         child_id=payload["child_id"],
-        lane_epoch=_positive_int(lane_epoch, "lane epoch"),
+        lane_epoch=_required_int(payload, "lane_epoch", "lane epoch"),
         push_intent_id=payload["push_intent_id"],
         push_journal_id=payload["push_journal_id"],
         push_receipt_id=payload["push_receipt_id"],
@@ -13844,9 +13881,9 @@ def _run_parent_push(
         current.id,
         PostMergeComplete(
             current.id,
-            evidence["merge_journal_id"],
-            arguments["push_intent_id"],
-            arguments["pushed_commit"],
+            _required_merge_identity(evidence, ("merge_journal_id",), "merge journal"),
+            _required_text(arguments, "push_intent_id", "parent push arguments"),
+            _required_text(arguments, "pushed_commit", "parent push arguments"),
             receipt,
         ),
         lane_event=LaneReleased(current.id, receipt),
@@ -13950,7 +13987,7 @@ def _recover_remote_advance(
         }
     )
     lane_for_rebuild = lane or LaneState(repository, parent_branch)
-    lane_events: tuple[object, ...] = (
+    lane_events: tuple[TLOrchestrationEvent, ...] = (
         (LaneRecoveryRequested(reason),) if lane is not None else ()
     ) + (
         LaneReserved(current.id, next_epoch, observed_remote_head),
@@ -14078,6 +14115,12 @@ def _positive_int(value: object, name: str) -> int:
     return value
 
 
+def _required_number(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a number")
+    return float(value)
+
+
 def _block_post_merge_recovery(
     store: RunStore,
     state: RunState,
@@ -14156,13 +14199,13 @@ def _execute_direct_merge_intent(
             current.id,
         )
         return state
+    observation = _watcher_result_observation(watcher)
     if (
         watcher is not None
         and watcher.success is True
-        and (_watcher_result_observation(watcher) is not None)
-        and _watcher_result_observation(watcher).merged is True
+        and observation is not None
+        and observation.merged is True
     ):
-        observation = _watcher_result_observation(watcher)
         return _reconcile_merged_slice(
             store.load(),
             current.id,
@@ -14736,13 +14779,13 @@ def _adopt_direct_merge_result(
             slice_id,
         )
         return store.load()
+    observation = _watcher_result_observation(watcher)
     if (
         watcher is not None
         and watcher.success is True
-        and (_watcher_result_observation(watcher) is not None)
-        and _watcher_result_observation(watcher).merged is True
+        and observation is not None
+        and observation.merged is True
     ):
-        observation = _watcher_result_observation(watcher)
         return _reconcile_merged_slice(
             store.load(),
             slice_id,
@@ -17076,6 +17119,7 @@ def _restore_legacy_aggregate_dispatch_owner(
         or not current.dispatch_intent_id
         or not current.dispatch_invocation_id
         or current.dispatch_generation <= 0
+        or node is None
         or child_manifest is None
         or child_manifest.scope_id != node.node_id
         or child_manifest.owned_branch != current.branch
@@ -17780,6 +17824,14 @@ def _request_review_revalidation(
 _ACCEPTED_PUBLICATION_UNSET = object()
 
 
+class _ReconciliationSliceUpdates(TypedDict, total=False):
+    reconciliation: Mapping[str, object] | None
+    publication: PublicationBinding | None
+    pr_number: int | None
+    handoff: HandoffEvidence | None
+    dispatch_agent_id: str | None
+
+
 def _apply_reconciliation_observations(
     current: SliceState,
     result: ReconciliationResult,
@@ -17789,7 +17841,7 @@ def _apply_reconciliation_observations(
     accepted_publication: PublicationBinding | None | object = _ACCEPTED_PUBLICATION_UNSET,
 ) -> SliceState:
     watcher = _as_watcher_observation(watcher)
-    updates: dict[str, object] = {"reconciliation": result.as_state()}
+    updates: _ReconciliationSliceUpdates = {"reconciliation": result.as_state()}
     transitioned = current
     if result.conflicts:
         return replace(current, **updates)
@@ -18005,7 +18057,7 @@ def _dispatch_payload(
     return payload
 
 
-class _DispatchRouteStateFields(TypedDict):
+class _DispatchRouteStateFields(TypedDict, total=False):
     dispatch_role: str | None
     dispatch_effort: str | None
     dispatch_route_configuration_fingerprint: str | None
@@ -18473,7 +18525,7 @@ def _confirmed_spawn_route_state_fields(
     agent_type: str,
     model: str | None,
     choice: HarnessChoice | None,
-) -> tuple[dict[str, str | None], str | None]:
+) -> tuple[_DispatchRouteStateFields, str | None]:
     """Restore route provenance only when the confirmation carried the full binding."""
     route_keys = {
         "role",
@@ -18570,7 +18622,7 @@ def _persist_restored_dispatch(
     model: str | None,
     resolved_harness: str,
     choice: HarnessChoice | None,
-    route_state_fields: Mapping[str, str | None],
+    route_state_fields: _DispatchRouteStateFields,
     store: RunStore,
 ) -> RunState:
     def update(document: dict[str, object]) -> dict[str, object]:
@@ -18635,7 +18687,7 @@ def _record_restored_dispatch_document(
     resolved_harness: str,
     ledger_floor: int,
     controller_epoch: str | None,
-    route_state_fields: Mapping[str, str | None],
+    route_state_fields: _DispatchRouteStateFields,
 ) -> dict[str, object]:
     slices = document.get("slices")
     if not isinstance(slices, dict) or not isinstance(slices.get(slice_id), dict):
@@ -20854,7 +20906,7 @@ def _run_live_sub_tl_batch(
     }
     for task, process in processes:
         child_store = RunStore(task.name, store.run_dir)
-        child_state = _supervise_live_sub_tl(
+        supervised_state = _supervise_live_sub_tl(
             process,
             child_store,
             config,
@@ -20863,9 +20915,11 @@ def _run_live_sub_tl_batch(
             terminal_owner_recovery=task.name in terminal_owner_recovery_tasks,
         )
         phase = (
-            _child_completion_phase(child_state) if child_state is not None else TLPhase.TLFailed
+            _child_completion_phase(supervised_state)
+            if supervised_state is not None
+            else TLPhase.TLFailed
         )
-        outcomes_by_name[task.name] = (task, phase, child_state)
+        outcomes_by_name[task.name] = (task, phase, supervised_state)
     return tuple(outcomes_by_name[task.name] for task in tasks)
 
 
@@ -20927,7 +20981,7 @@ def _adopt_live_child_controller_invocation(
     """Bind the parent to a live controller_restart successor with exact lineage."""
     if config.project_root is None:
         return
-    parent_store = RunStore(config.run_id, config.root_dir)
+    parent_store = RunStore(config.run_id, Path(config.root_dir))
     if not parent_store.path.exists():
         return
     assessed_binding: tuple[object, ...] | None = None
@@ -21016,7 +21070,7 @@ def _adopt_live_child_controller_invocation(
 
 
 def _supervise_live_sub_tl(
-    process: multiprocessing.Process,
+    process: multiprocessing.process.BaseProcess,
     child_store: RunStore,
     config: TLLoopConfig,
     *,
@@ -21123,7 +21177,7 @@ def _blocked_leaf_resume_is_pending(
         gate.name == f"tl-blocked-leaf-resume-proof-{proof.leaf.name}" for gate in child_state.gates
     ):
         return False
-    return any(leaf.name == proof.leaf.name for leaf in task.plan.leaves)
+    return any(leaf.name == proof.leaf.name for leaf in _accepted_work_plan(task.plan).leaves)
 
 
 def _terminal_owner_recovery_is_pending(
@@ -21139,9 +21193,10 @@ def _terminal_owner_recovery_is_pending(
         or not _terminal_owner_recovery_candidate(task.plan, child_state)
     ):
         return False
+    task_plan = _accepted_work_plan(task.plan)
     candidate = next(
         leaf
-        for leaf in task.plan.leaves
+        for leaf in task_plan.leaves
         if (current := child_state.slices.get(leaf.name)) is not None
         and current.status is SliceStatus.SPAWNED
         and current.dispatch_last_boundary == "agent.spawned"
@@ -21734,8 +21789,8 @@ def _complete_sub_tl_batch(
             )
             projection = _child_recovery_projection(child_state, state.run_id)
             if projection is not None:
-                lifecycle, summary = projection
-                sub_tl_states[task.name] = lifecycle
+                projected_lifecycle, summary = projection
+                sub_tl_states[task.name] = projected_lifecycle
                 sub_tl_recovery[task.name] = summary
             elif child_state is not None:
                 # The child resolved its formerly projected human gate during
@@ -22225,15 +22280,15 @@ def _verified_aggregate_merge_journal(
         observed = arguments.get(field_name)
         if observed is not None and observed != expected:
             return "conflict"
-    for field_name, expected in (
+    for payload_field, payload_expected in (
         ("pr_number", pr_number),
         ("head_sha", head_sha),
         ("base_sha", base_sha),
         ("repository", state.repository_identity.remote_url if state.repository_identity else None),
         ("parent_branch", current.publication.base_branch if current.publication else None),
     ):
-        observed = payload.get(field_name)
-        if observed is not None and observed != expected:
+        observed = payload.get(payload_field)
+        if observed is not None and observed != payload_expected:
             return "conflict"
     return "verified"
 
@@ -22401,6 +22456,8 @@ def _reconcile_aggregate_publication_gate(
             current = state.slices.get(task.name)
             if current is not None and current.park_cause is not ParkCause.PUBLICATION_BLOCKED:
                 return store.clear_gate(gate_name), False
+    if current is None:
+        return state, False
     if gate is None:
         state = _restore_aggregate_publication_gate(
             task.name, current, state, config, effects, store, effects_log
@@ -22909,6 +22966,7 @@ def _reuse_verified_aggregate_candidate(
     publication_attempt: int,
 ) -> AggregateCandidate:
     """Require fresh watcher ownership to agree with a saved aggregate PR number."""
+    missing: tuple[str, ...]
     if observed is None:
         reason = "persisted_candidate_not_found"
         missing = ("authoritative_publication",)
@@ -23563,7 +23621,7 @@ def _raise_aggregate_lookup_unavailable(
     slice_id: str,
     publication_attempt: int,
     error: Exception | None = None,
-) -> None:
+) -> NoReturn:
     """Record an actionable unavailable lookup without copying tool error text."""
     failure = _aggregate_reconciliation_rejected(
         slice_id,
@@ -26014,7 +26072,7 @@ def _integrate_one_candidate(
             task.name, "aggregate_candidate_missing", "aggregate PR binding is absent"
         )
         return state
-    first: Mapping[str, object] | None = None
+    first: WatcherObservation | None = None
     if candidate_runtime.lifecycle is IntegrationLifecycle.MERGING:
         first = _watcher_snapshot(current.pr_number, config, effects, effects_log)
         if first is None:
@@ -27141,7 +27199,10 @@ def _publication_record_text(
 ) -> str | None:
     if watcher is None:
         return None
-    record = watcher if hasattr(watcher, key) else _publication_evidence(watcher)
+    if isinstance(watcher, (WatcherObservation, Mapping)):
+        record = watcher if hasattr(watcher, key) else _publication_evidence(watcher)
+    else:
+        record = watcher
     if record is None:
         return None
     value = getattr(record, key, None)
@@ -27167,31 +27228,32 @@ def _handoff_reconciliation_event_payload(
     watcher: WatcherObservation | Mapping[str, object],
     owner_id: str | None,
 ) -> dict[str, object] | None:
-    watcher = _as_watcher_observation(watcher)
-    assert watcher is not None
-    if watcher.found is not True:
+    observation = _as_watcher_observation(watcher)
+    if observation is None:
         return None
-    if watcher.publication_ownership_verified is not True:
-        _, ownership_reason = _publication_ownership_status(watcher)
+    if observation.found is not True:
+        return None
+    if observation.publication_ownership_verified is not True:
+        _, ownership_reason = _publication_ownership_status(observation)
         return {
             "slice_id": current.id,
-            "pr_number": watcher.pr_number,
-            "head_sha": _snapshot_text(watcher, "head_sha") or "",
+            "pr_number": observation.pr_number,
+            "head_sha": _snapshot_text(observation, "head_sha") or "",
             "invocation_id": "",
             "outcome": "skipped",
-            "reason": watcher.publication_ownership_error
+            "reason": observation.publication_ownership_error
             or ownership_reason
             or "publication_ownership_unverified",
             "source": "host_publication",
         }
     publication = reconciled.publication or current.publication
-    head_sha = _snapshot_text(watcher, "head_sha") or (
+    head_sha = _snapshot_text(observation, "head_sha") or (
         publication.head_sha if publication is not None else ""
     )
     pr_number = (
         reconciled.pr_number
         or (publication.pr_number if publication is not None else None)
-        or watcher.pr_number
+        or observation.pr_number
     )
     handoff = reconciled.handoff
     if handoff is not None:
@@ -27204,7 +27266,7 @@ def _handoff_reconciliation_event_payload(
             "reason": "",
             "source": "host_publication",
         }
-    record = _publication_evidence(watcher)
+    record = _publication_evidence(observation)
     expected_owner = current.dispatch_agent_id or owner_id
     record_slice = _publication_record_text(record, "slice_id")
     record_owner = _publication_record_text(record, "author_agent")
@@ -27235,13 +27297,23 @@ def _handoff_reconciliation_event_payload(
     }
 
 
-def _snapshot_bool(snapshot: Mapping[str, object], key: str) -> bool:
+def _snapshot_bool(snapshot: WatcherObservation | Mapping[str, object], key: str) -> bool:
     value = snapshot.get(key)
     return value is True or value == "true"
 
 
 def _now_timestamp() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _event_review_id(event: EventEnvelope) -> int | None:
+    value = event.data.get("review_id")
+    return value if type(value) is int else None
+
+
+def _event_validated_at(event: EventEnvelope) -> str | None:
+    value = event.data.get("validated_at")
+    return value if isinstance(value, str) else event.observed_at
 
 
 def _review_event_submitted_at(event: EventEnvelope) -> str:
@@ -27723,6 +27795,7 @@ def _prepare_spawn(
             )
         raise TLLoopError(f"cannot select harness for {name!r}: {failure.value}; slice parked")
     route = parse_harness_identifier(choice.harness)
+    model_id: str | None
     if config.catalog is not None:
         if config.requested_model:
             model_id = select_model(choice.harness, config.catalog, config.requested_model).model_id
@@ -28048,9 +28121,7 @@ def _record_review_event(
             head_sha=event.head_sha,
             verdict=verdict,
             reviewer_agent_id=current.reviewer_agent_id,
-            review_id=event.data.get("review_id")
-            if type(event.data.get("review_id")) is int
-            else None,
+            review_id=_event_review_id(event),
             findings=tuple(findings or ()),
             source="ledger",
             pr_number=event.pr_number,
@@ -28071,11 +28142,7 @@ def _record_review_event(
                 else None
             ),
             submitted_at=_review_event_submitted_at(event),
-            validated_at=(
-                event.data.get("validated_at")
-                if isinstance(event.data.get("validated_at"), str)
-                else event.observed_at
-            ),
+            validated_at=_event_validated_at(event),
             observed_at=event.observed_at,
             dismissed=event.data.get("dismissed") is True,
             forgejo_stale=event.data.get("forgejo_stale") is True,
@@ -28400,7 +28467,7 @@ def _route_review_event(
             return state
         decision_verdict = incoming_verdict
         decision_head = head_sha
-        decision_reasons = tuple(
+        decision_reasons: tuple[Mapping[str, object], ...] = tuple(
             {
                 "severity": finding["severity"],
                 "file": finding["path"],
@@ -28410,15 +28477,20 @@ def _route_review_event(
             for finding in findings
         )
         if reviewer_agent_id is None:
-            reviewer_agent_id = event.data.get("reviewer_agent_id")
+            event_reviewer_agent_id = event.data.get("reviewer_agent_id")
+            if isinstance(event_reviewer_agent_id, str) and event_reviewer_agent_id:
+                reviewer_agent_id = event_reviewer_agent_id
     else:
+        comments: list[JsonValue] = [
+            {key: value for key, value in finding.items()} for finding in findings
+        ]
         result = adjudicate_review(
             _review_diff(event),
-            findings,
+            comments,
             list(criteria),
             head_sha,
             model_choice=config.review_model_choice,
-            policy_path=config.review_policy_path or Path(".exo/review-policy.toml"),
+            policy_path=str(config.review_policy_path or Path(".exo/review-policy.toml")),
         )
         decision_verdict = result.verdict
         decision_head = result.reviewed_head
@@ -28467,9 +28539,7 @@ def _route_review_event(
             head_sha=decision_head,
             verdict=decision_verdict,
             reviewer_agent_id=reviewer_agent_id,
-            review_id=event.data.get("review_id")
-            if type(event.data.get("review_id")) is int
-            else None,
+            review_id=_event_review_id(event),
             findings=tuple(findings),
             source=(
                 "watcher_snapshot" if event.data.get("source") == "watcher_snapshot" else "ledger"
@@ -28484,11 +28554,7 @@ def _route_review_event(
             stall_classification=next_stall_classification,
             requires_authenticated_evidence=direct_reviewer_event,
             submitted_at=_review_event_submitted_at(event),
-            validated_at=(
-                event.data.get("validated_at")
-                if isinstance(event.data.get("validated_at"), str)
-                else event.observed_at
-            ),
+            validated_at=_event_validated_at(event),
             observed_at=event.observed_at,
             dismissed=event.data.get("dismissed") is True,
             forgejo_stale=event.data.get("forgejo_stale") is True,
@@ -28701,7 +28767,7 @@ def _ci_reason_file(event: EventEnvelope) -> str:
 def _route_repair(
     store: RunStore,
     state: RunState,
-    phase: PhaseValue,
+    phase: FSMState | PhaseValue,
     event_seq: int,
     slice_id: str,
     config: TLLoopConfig,
@@ -28804,7 +28870,13 @@ def _route_repair(
                 resume_arguments,
                 True,
                 live,
-                lambda client: client.resume_pr(**resume_arguments),
+                lambda client: client.resume_pr(
+                    pr_number=_required_int(resume_arguments, "pr_number", "resume PR number"),
+                    expected_head_sha=_required_text(
+                        resume_arguments, "expected_head_sha", "resume arguments"
+                    ),
+                    task=_required_text(resume_arguments, "task", "resume arguments"),
+                ),
                 effects_log,
                 raise_on_failure=False,
             )
@@ -28991,8 +29063,8 @@ def _review_verdict(event: EventEnvelope) -> Verdict | None:
 
 def _emit_phase_change(
     run_id: str,
-    before: PhaseValue,
-    after: PhaseValue,
+    before: PhaseValue | RecursivePhaseValue,
+    after: PhaseValue | RecursivePhaseValue,
     config: TLLoopConfig,
     effects: EffectClient | ReadOnlyEffectClient,
     effects_log: list[EffectIntent],
@@ -29151,8 +29223,9 @@ def _invoke(
                 f"lifecycle effect {operation} for {target!r} was reconciled from external "
                 "evidence and must be adopted by its owning state transition"
             )
-        if status in {"intended", "unknown"}:
-            key = prior.get("key", journal.key_for(intent))
+        if status in {"intended", "unknown"} and journal is not None:
+            recorded_key = prior.get("key")
+            key = recorded_key if isinstance(recorded_key, str) else journal.key_for(intent)
             gate_name = _action_journal_gate_name(key, _action_journal_compensation_attempt(prior))
             raise TLLoopError(
                 f"lifecycle effect {operation} for {target!r} has unknown outcome "
@@ -29160,8 +29233,9 @@ def _invoke(
                 f"open gate={gate_name}, then answer it with `tl_loop gate --name "
                 f"{gate_name} --approve|--reject`"
             )
-        if status != "compensated":
-            key = prior.get("key", journal.key_for(intent))
+        if status != "compensated" and journal is not None:
+            recorded_key = prior.get("key")
+            key = recorded_key if isinstance(recorded_key, str) else journal.key_for(intent)
             raise TLLoopError(
                 f"lifecycle effect {operation} for {target!r} has unrecognized "
                 f"action journal status {status!r} (key={key})"
@@ -30786,7 +30860,7 @@ def _record_task_blocked_recovery(
     store: RunStore,
     phase: PhaseValue,
     event_seq: int,
-    effects: EffectClient,
+    effects: EffectClient | ReadOnlyEffectClient,
 ) -> RunState:
     """Record one externally blocked slice in nonterminal DIAGNOSING state."""
     blocked = event.task_blocked
@@ -30860,23 +30934,26 @@ def _record_task_blocked_recovery(
     updated = {**state.slices, slice_id: replace(current, recovery=recovery)}
     updated = suspend_dependents(updated, slice_id, recovery.recovery_round)
     checkpointed = store.checkpoint(phase, updated, state.budgets, event_seq)
-    emit_controller_event(
-        effects,
-        "agent.recovery.started",
-        {
-            "slice_id": slice_id,
-            "invocation_id": recovery.evidence.get("invocation_id", current.dispatch_invocation_id),
-            "generation": recovery.invocation_generation,
-            "cause": recovery.cause,
-            "slice_attempt": recovery.slice_attempt,
-            "invocation_generation": recovery.invocation_generation,
-            "recovery_round": recovery.recovery_round,
-            "authorization_source": "policy",
-            "recursive_depth": checkpointed.depth,
-            "parallel_impact": _recovery_parallel_impact(checkpointed, slice_id),
-            "policy_decision": "wait",
-        },
-    )
+    if isinstance(effects, EffectClient):
+        emit_controller_event(
+            effects,
+            "agent.recovery.started",
+            {
+                "slice_id": slice_id,
+                "invocation_id": recovery.evidence.get(
+                    "invocation_id", current.dispatch_invocation_id
+                ),
+                "generation": recovery.invocation_generation,
+                "cause": recovery.cause,
+                "slice_attempt": recovery.slice_attempt,
+                "invocation_generation": recovery.invocation_generation,
+                "recovery_round": recovery.recovery_round,
+                "authorization_source": "policy",
+                "recursive_depth": checkpointed.depth,
+                "parallel_impact": _recovery_parallel_impact(checkpointed, slice_id),
+                "policy_decision": "wait",
+            },
+        )
     return checkpointed
 
 
@@ -30898,7 +30975,7 @@ def _checkpoint_and_ack(
     source: EventQueue,
     event: EventEnvelope,
     state: RunState,
-    phase: PhaseValue,
+    phase: FSMInput,
     *,
     acknowledge: bool = True,
 ) -> None:
@@ -31329,7 +31406,9 @@ def _apply_child_completion(
     return dict(slices)
 
 
-def _duplicate_event(phase: PhaseValue, event: TLEvent, state: RunState) -> bool:
+def _duplicate_event(
+    phase: PhaseValue | RecursivePhaseValue, event: TLEvent, state: RunState
+) -> bool:
     if isinstance(
         phase,
         (
@@ -31370,11 +31449,11 @@ def _duplicate_event(phase: PhaseValue, event: TLEvent, state: RunState) -> bool
             )
         return False
     if isinstance(event, ChildSpawned):
-        active = phase.children if isinstance(phase, (TLWaiting, TLMerging)) else {}
-        return event.handle.slug in active
+        children = phase.children if isinstance(phase, (TLWaiting, TLMerging)) else {}
+        return event.handle.slug in children
     if isinstance(event, (ChildCompleted, ChildFailed, PRMerged)):
-        active = phase.children if isinstance(phase, (TLWaiting, TLMerging)) else {}
-        return event.slug not in active
+        children = phase.children if isinstance(phase, (TLWaiting, TLMerging)) else {}
+        return event.slug not in children
     if isinstance(event, AllChildrenDone):
         return isinstance(phase, (TLDone, TLFailed))
     return False

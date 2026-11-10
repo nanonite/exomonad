@@ -8120,6 +8120,15 @@ def test_unknown_direct_merge_reconciles_authoritative_merged_snapshot(tmp_path:
     assert len(journal.confirmed_entries("merge_pr", "leaf-a")) == 1
 
 
+def test_heartbeat_project_root_fails_closed_when_heartbeat_is_configured() -> None:
+    # TLLoopConfig rejects heartbeat without a project root, so reach the guard directly.
+    config = object.__new__(TLLoopConfig)
+    object.__setattr__(config, "project_root", None)
+
+    with pytest.raises(TLLoopError, match="heartbeat reconciliation requires a project root"):
+        driver_module._heartbeat_project_root(config)
+
+
 def test_require_pr_number_fails_closed_without_a_persisted_pr() -> None:
     current = SliceState(
         id="leaf-a",

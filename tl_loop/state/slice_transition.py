@@ -6,17 +6,7 @@ from dataclasses import dataclass, replace
 from typing import Literal
 
 from tl_loop.fsm.post_merge import PostMergeState
-from tl_loop.fsm.post_merge_events import (
-    ChangelogCommitted,
-    ChangelogPending,
-    IssueCloseConfirmed,
-    IssueClosePending,
-    MergeAdopted,
-    ParentBranchSynced,
-    ParentPushPending,
-    PostMergeComplete,
-    PostMergeRebuildRequested,
-)
+from tl_loop.fsm.post_merge_events import MergeAdopted, PostMergeEvent
 from tl_loop.fsm.post_merge_transition import advance_post_merge
 from tl_loop.state.schema import (
     ActionKind,
@@ -168,17 +158,7 @@ class MergeCompleted(SliceEvent):
 class PostMergeEventObserved(SliceEvent):
     """Apply one typed durable post-merge event to this slice."""
 
-    event: (
-        MergeAdopted
-        | ParentBranchSynced
-        | IssueClosePending
-        | IssueCloseConfirmed
-        | ChangelogPending
-        | ChangelogCommitted
-        | ParentPushPending
-        | PostMergeComplete
-        | PostMergeRebuildRequested
-    )
+    event: PostMergeEvent
 
 
 @dataclass(frozen=True)
