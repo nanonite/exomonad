@@ -19,8 +19,20 @@ from tl_loop.fsm.scope import (
     TLPlanning,
     TLPRFiled,
     TLRunning,
+    is_phase_value,
 )
-from tl_loop.state.schema import ActionPhase, ActionState, RunState, SliceState, SliceStatus
+from tl_loop.state.schema import (
+    ActionPhase,
+    ActionState,
+    IntegrationRuntimeState,
+    RunState,
+    SliceState,
+    SliceStatus,
+)
+
+
+class DiagnosticError(ValueError):
+    """Persisted scope state cannot be represented by the diagnostic model."""
 
 _POST_MERGE_REQUIREMENTS: dict[PostMergePhase, tuple[str, ...]] = {
     PostMergePhase.REMOTE_MERGE_ADOPTED: (
@@ -616,17 +628,27 @@ def scope_next_transition(state: RunState, phase: str, waiting: tuple[str, ...])
 def _scope_phase(fsm: object | None, state: RunState) -> str:
     if fsm is None:
         return state.fsm.phase.value
-    names = {
-        TLPlanning: "tl_planning",
-        TLRunning: "tl_running",
-        TLAllMerged: "tl_all_merged",
-        TLFinalizing: "tl_finalizing",
-        TLDone: "tl_done",
-        TLPRFiled: "tl_pr_filed",
-        TLFailed: "tl_failed",
-        TLParked: "tl_parked",
-    }
-    return names.get(type(fsm), getattr(fsm, "phase", state.fsm.phase).value)
+    if not is_phase_value(fsm):
+        raise DiagnosticError(
+            f"recursive FSM must be a canonical phase for diagnostics; found {type(fsm).__name__}"
+        )
+    if isinstance(fsm, TLPlanning):
+        return "tl_planning"
+    if isinstance(fsm, TLRunning):
+        return "tl_running"
+    if isinstance(fsm, TLAllMerged):
+        return "tl_all_merged"
+    if isinstance(fsm, TLFinalizing):
+        return "tl_finalizing"
+    if isinstance(fsm, TLDone):
+        return "tl_done"
+    if isinstance(fsm, TLPRFiled):
+        return "tl_pr_filed"
+    if isinstance(fsm, TLFailed):
+        return "tl_failed"
+    if isinstance(fsm, TLParked):
+        return "tl_parked"
+    raise DiagnosticError("recursive FSM phase is unsupported by diagnostics")
 
 
 def _child_ids(records: tuple[ChildRecord, ...]) -> tuple[str, ...]:
@@ -679,8 +701,8 @@ def _publication_ownership(state: SliceState) -> str:
     return "bound"
 
 
-def _integration_next_transition(integration: object) -> str:
-    lifecycle = getattr(getattr(integration, "lifecycle", None), "value", "")
+def _integration_next_transition(integration: IntegrationRuntimeState) -> str:
+    lifecycle = integration.lifecycle.value
     if lifecycle == "INTEGRATION_CONFLICT":
         return "resume_aggregate_pr"
     if lifecycle == "NEEDS_BASE_REVALIDATION":
@@ -689,7 +711,7 @@ def _integration_next_transition(integration: object) -> str:
         return "validate_merge_evidence"
     if lifecycle == "MERGED":
         return "complete_ordered_stage"
-    for lane in getattr(integration, "lanes", {}).values():
+    for lane in integration.lanes.values():
         if lane.phase is LanePhase.RECOVERY:
             return "reconcile_lane"
         if lane.phase is LanePhase.BOOKKEEPING:
@@ -697,24 +719,24 @@ def _integration_next_transition(integration: object) -> str:
     return "await_controller"
 
 
-def _integration_merge_receipt(integration: object) -> str | None:
-    for lane in getattr(integration, "lanes", {}).values():
+def _integration_merge_receipt(integration: IntegrationRuntimeState) -> str | None:
+    for lane in integration.lanes.values():
         if lane.merge_journal_id:
             return lane.merge_journal_id
     return None
 
 
-def _integration_bookkeeping_commit(integration: object) -> str | None:
-    for lane in getattr(integration, "lanes", {}).values():
+def _integration_bookkeeping_commit(integration: IntegrationRuntimeState) -> str | None:
+    for lane in integration.lanes.values():
         if lane.changelog_commit:
             return lane.changelog_commit
     return None
 
 
-def _integration_freshness(integration: object) -> str:
-    if getattr(integration, "stage_verification", "") == "passed":
+def _integration_freshness(integration: IntegrationRuntimeState) -> str:
+    if integration.stage_verification == "passed":
         return "verified"
-    if getattr(integration, "validated_base_sha", None):
+    if integration.validated_base_sha:
         return "validated"
     return "unknown"
 

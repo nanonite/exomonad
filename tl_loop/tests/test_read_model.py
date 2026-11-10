@@ -7,6 +7,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from tl_loop.__main__ import _state_document
 from tl_loop.events.envelope import project
 from tl_loop.events.reader import SequenceStatus
@@ -19,6 +21,7 @@ from tl_loop.fsm.scope import TLAllMerged, TLDone, TLFinalizing, TLPRFiled, TLRu
 from tl_loop.fsm.scope_events import ScopeRole
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.read_model import GateReadModel, project_read_model
+from tl_loop.state.diagnostics import project_scope
 from tl_loop.state.schema import (
     ActionKind,
     ActionPhase,
@@ -42,6 +45,15 @@ from tl_loop.state.schema import (
 )
 
 FIXTURE = Path(__file__).parent / "fixtures" / "ledger_projection_events.json"
+
+
+def test_scope_projection_refuses_present_noncanonical_recursive_fsm() -> None:
+    state = replace(_state(), recursive_fsm=object())
+
+    with pytest.raises(ValueError, match="recursive FSM.*object") as raised:
+        project_scope(state)
+
+    assert type(raised.value).__name__ == "DiagnosticError"
 
 
 def test_projection_carries_cursor_and_bounded_operator_evidence() -> None:

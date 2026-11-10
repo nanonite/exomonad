@@ -37,7 +37,7 @@ def _read_scope(
         )
     inputs[checkpoint] = raw
     try:
-        state = decode_checkpoint_bytes(path, cast(bytes, raw))
+        state = decode_checkpoint_bytes(path, raw)
     except PlanRevisionError as error:
         raise PlanRevisionError(
             "runstore_invalid", f"RunStore for {_safe_text(run_id)} failed validation"
@@ -68,7 +68,7 @@ def _read_scope(
     return ReconciliationScope(
         run_dir=path.parent,
         relative_checkpoint=checkpoint,
-        raw_checkpoint=cast(bytes, raw),
+        raw_checkpoint=raw,
         state=state,
         current=manifest,
         accepted=None,

@@ -2594,10 +2594,10 @@ def _encode_budgets(budgets: BudgetInput) -> dict[str, object]:
     if not isinstance(budgets, Mapping):
         raise TypeError("budgets must be a BudgetLedger or object")
     value: dict[str, object] = {
-        key: item for key, item in cast(Mapping[str, object], budgets).items()
+        key: item for key, item in budgets.items()
     }
     if "ledger" in value:
-        return copy.deepcopy(cast(dict[str, object], value))
+        return copy.deepcopy(value)
     return {"ledger": copy.deepcopy(value)}
 
 
@@ -3292,7 +3292,7 @@ def _decode_integration(value: object) -> IntegrationRuntimeState:
     raw_states = value.get("sub_tl_states")
     states = (
         {
-            name: _decode_sub_tl_lifecycle(cast(str, lifecycle))
+            name: _decode_sub_tl_lifecycle(lifecycle)
             for name, lifecycle in raw_states.items()
             if isinstance(name, str) and isinstance(lifecycle, str)
         }

@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeAlias
 
 from .plan_manifest import ManifestNode, PlanManifest
 from .schema import RunState, SliceState, SliceStatus
@@ -26,6 +26,16 @@ class LegacyManifestDisposition(str, Enum):
     AMBIGUOUS = "ambiguous"
     MISSING_EVIDENCE = "missing_evidence"
     CONFLICTING_EVIDENCE = "conflicting_evidence"
+
+
+_LegacyProofResult: TypeAlias = tuple[
+    LegacyManifestDisposition,
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    str | None,
+    str | None,
+]
 
 
 @dataclass(frozen=True)
@@ -524,7 +534,7 @@ def _prove_action(
             (),
         )
     if operation is None or not action.intent_id:
-        return _missing("recognized action identity")
+        return LegacyManifestDisposition.MISSING_EVIDENCE, (), ("recognized action identity",), ()
     matches = [
         entry
         for entry in entries
@@ -533,19 +543,39 @@ def _prove_action(
         and entry.get("key") == action.intent_id
     ]
     if not matches:
-        return _missing("matching action journal entry")
+        return (
+            LegacyManifestDisposition.MISSING_EVIDENCE,
+            (),
+            ("matching action journal entry",),
+            (),
+        )
     if len(matches) != 1:
-        return _conflict("duplicate action journal entries")
+        return (
+            LegacyManifestDisposition.CONFLICTING_EVIDENCE,
+            (),
+            (),
+            ("duplicate action journal entries",),
+        )
     args = _mapping(matches[0].get("arguments"))
     if (
         current.pr_number is not None
         and operation == "merge_pr"
         and args.get("pr_number") != current.pr_number
     ):
-        return _conflict("merge PR identity")
+        return (
+            LegacyManifestDisposition.CONFLICTING_EVIDENCE,
+            (),
+            (),
+            ("merge PR identity",),
+        )
     expected_head = args.get("expected_head_sha")
     if operation == "merge_pr" and expected_head != current.reviewed_head:
-        return _conflict("merge exact-head identity")
+        return (
+            LegacyManifestDisposition.CONFLICTING_EVIDENCE,
+            (),
+            (),
+            ("merge exact-head identity",),
+        )
     return LegacyManifestDisposition.PROVEN, (f"{operation} action journal identity",), (), ()
 
 
@@ -603,11 +633,11 @@ def _failure(
     return LegacyManifestReconciliation(disposition, {}, proofs, reason)
 
 
-def _missing(*values: str):
+def _missing(*values: str) -> _LegacyProofResult:
     return LegacyManifestDisposition.MISSING_EVIDENCE, (), values, (), None, None
 
 
-def _conflict(*values: str):
+def _conflict(*values: str) -> _LegacyProofResult:
     return LegacyManifestDisposition.CONFLICTING_EVIDENCE, (), (), values, None, None
 
 
@@ -624,14 +654,15 @@ def _nested_text(entry: Mapping[str, object], key: str) -> str | None:
             value = None
     if isinstance(value, str) and value:
         return value
-    nested = entry.get("result")
-    if isinstance(nested, Mapping):
+    nested = _mapping(entry.get("result"))
+    if nested:
         value = nested.get(key)
         if isinstance(value, str) and value:
             return value
-        result = nested.get("result")
-        if isinstance(result, Mapping) and isinstance(result.get(key), str):
-            return result[key]
+        result = _mapping(nested.get("result"))
+        value = result.get(key)
+        if isinstance(value, str) and value:
+            return value
     return None
 
 

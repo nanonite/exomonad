@@ -2559,7 +2559,7 @@ def _charges(value: object, path: str, errors: list[tuple[str, str]]) -> None:
         slice_id = charge.get("slice_id")
         attempt = charge.get("attempt")
         if isinstance(slice_id, str) and type(attempt) is int:
-            identity = (slice_id, cast(int, attempt))
+            identity = (slice_id, attempt)
             if identity in seen:
                 errors.append((f"{charge_path}", "duplicate slice_id and attempt"))
             seen.add(identity)
