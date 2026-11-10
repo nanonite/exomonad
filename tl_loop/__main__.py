@@ -427,6 +427,7 @@ def _run_controller(args: argparse.Namespace) -> TLRunResult:
     existing = checkpoint.load() if checkpoint.path.exists() else None
     session_mode = _read_session_mode(project_root)
     expected_plan_digest = getattr(args, "expected_plan_digest", None)
+    plan_document: dict[str, object]
     if session_mode == "recreate":
         expected_plan_digest = _recreate_plan_digest(
             project_root,
@@ -453,7 +454,7 @@ def _run_controller(args: argparse.Namespace) -> TLRunResult:
         and not args.wait_for_plan
         and expected_plan_digest is None
     ):
-        plan_document: dict[str, object] = {"run_id": args.run_id}
+        plan_document = {"run_id": args.run_id}
         plan = None
     elif expected_plan_digest is not None and session_mode == "start":
         plan_document, accepted_plan_bytes = _load_snapshot_plan(project_root, expected_plan_digest)

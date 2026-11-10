@@ -6,6 +6,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import TypeGuard
 
 from tl_loop.fsm.recovery import RecoveryPhase
 from tl_loop.ordered import ChildRecoverySummary, SubTLLifecycle
@@ -269,7 +270,7 @@ def _read_controller_registration(
     return value if isinstance(value, Mapping) else None
 
 
-def _valid_identity(value: str | None) -> bool:
+def _valid_identity(value: str | None) -> TypeGuard[str]:
     return bool(
         isinstance(value, str)
         and value.strip() == value
@@ -314,13 +315,13 @@ def _scope_recovery_projection(
         if error is not None:
             return None, _ProofFailure("child_identity_conflict", error)
         assert recovery is not None
-        lifecycle = (
+        direct_lifecycle = (
             SubTLLifecycle.HUMAN_GATE
             if recovery.phase is RecoveryPhase.HUMAN_GATE
             else SubTLLifecycle.RECOVERING
         )
         return (
-            lifecycle,
+            direct_lifecycle,
             ChildRecoverySummary(
                 owner_run_id=state.run_id,
                 child_path=(parent_run_id, state.run_id, slice_id),

@@ -217,13 +217,19 @@ class RecoveryDimensions:
         generation = payload.get("invocation_generation", envelope_generation)
         if generation is None:
             generation = 0
+        cause = payload.get("cause")
+        if not isinstance(cause, (BlockCause, str)):
+            raise RecoveryTelemetryError("recovery payload cause is invalid")
+        outcome = payload.get("outcome")
+        if not isinstance(outcome, (RecoveryOutcome, str)):
+            raise RecoveryTelemetryError("recovery payload outcome is invalid")
         return cls.from_values(
-            cause=payload.get("cause"),
+            cause=cause,
             slice_attempt=payload.get("slice_attempt", payload.get("attempt", 0)),
             invocation_generation=generation,
             recovery_round=payload.get("recovery_round", 0),
             authorization_source=payload.get("authorization_source", "policy"),
-            outcome=payload.get("outcome"),
+            outcome=outcome,
             recursive_depth=payload.get("recursive_depth", payload.get("depth", 0)),
             parallel_impact=payload.get("parallel_impact", "none"),
             policy_decision=payload.get("policy_decision", "none"),

@@ -178,8 +178,11 @@ def to_orchestration_event(phase: object, event: TLEvent) -> TLOrchestrationEven
     if isinstance(event, AllChildrenDone):
         return Heartbeat("legacy-all-children-done")
     if isinstance(event, (PRFiled, PRUpdated, PRMerged)):
+        slug = getattr(event, "slice_id", None) or getattr(event, "slug", None)
+        if not isinstance(slug, str) or not slug:
+            raise TypeError(f"legacy event {type(event).__name__} names no slice")
         return PublicationFiled(
-            getattr(event, "slice_id", None) or getattr(event, "slug", "child"),
+            slug,
             getattr(event, "pr_number", 1),
             getattr(event, "head_sha", None) or "legacy-head",
             "legacy-base",

@@ -55,7 +55,7 @@ def verify_aggregate_lineage(
     expected_head_tree_sha: str,
     receipt_commits: tuple[str, ...],
     *,
-    runner: GitRunner = subprocess.run,
+    runner: GitRunner | None = None,
 ) -> AggregateLineageProof:
     """Verify exact head tree and prove each receipt commit is present or rebased."""
     repository_path = Path(repository)
@@ -120,7 +120,7 @@ def _commit_relation(
     repository: Path,
     receipt_commit: str,
     aggregate_head: str,
-    runner: GitRunner,
+    runner: GitRunner | None,
 ) -> CommitRelation:
     ancestry = _git(
         repository,
@@ -139,7 +139,7 @@ def _find_rebased_commit(
     repository: Path,
     receipt_commit: str,
     aggregate_head: str,
-    runner: GitRunner,
+    runner: GitRunner | None,
 ) -> str:
     parent_result = _git(repository, ("rev-parse", "--verify", f"{receipt_commit}^1"), runner)
     source_parent = _output_identity(parent_result, "rebase_source_parent_unavailable")
@@ -170,7 +170,7 @@ def _find_rebased_commit(
     return matches[0]
 
 
-def _patch_id(repository: Path, commit: str, runner: GitRunner) -> str | None:
+def _patch_id(repository: Path, commit: str, runner: GitRunner | None) -> str | None:
     parent = _git(repository, ("rev-parse", "--verify", f"{commit}^1"), runner)
     if parent.returncode != 0:
         return None
@@ -188,13 +188,22 @@ def _patch_id(repository: Path, commit: str, runner: GitRunner) -> str | None:
 def _git(
     repository: Path,
     arguments: tuple[str, ...],
-    runner: GitRunner,
+    runner: GitRunner | None,
     *,
     input_bytes: bytes | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
+    command = ("git", "-C", str(repository), *arguments)
     try:
+        if runner is None:
+            return subprocess.run(
+                command,
+                input=input_bytes,
+                capture_output=True,
+                timeout=_GIT_TIMEOUT_SECONDS,
+                check=False,
+            )
         return runner(
-            ("git", "-C", str(repository), *arguments),
+            command,
             input=input_bytes,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

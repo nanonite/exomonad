@@ -1004,7 +1004,9 @@ def _put_role_route(
         "dispatch_intent_id": dispatch_intent_id,
         "scope_id": scope_id,
     }
-    route = {name: value for name, value in values.items() if isinstance(value, str) and value}
+    route: JsonObject = {
+        name: value for name, value in values.items() if isinstance(value, str) and value
+    }
     required = {
         "role",
         "harness",

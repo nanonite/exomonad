@@ -17,6 +17,7 @@ from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.events.reader import LedgerReader, LedgerReadError
 from tl_loop.events.types import BlockCause
 from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState, begin_recovery, transition_recovery
+from tl_loop.fsm.scope import is_phase_value
 from tl_loop.loop.escalate import park
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.nested_recovery import (
@@ -51,7 +52,7 @@ from tl_loop.state.schema import (
 )
 from tl_loop.state.serialization import dumps as dumps_json
 from tl_loop.state.slice_transition import HeadChanged, slice_transition
-from tl_loop.state.store import CheckpointConflict, RunStore
+from tl_loop.state.store import CheckpointConflict, FSMInput, RunStore
 
 JsonMapping: TypeAlias = Mapping[str, object]
 LiveEffects: TypeAlias = EffectClient | ReadOnlyEffectClient
@@ -385,11 +386,12 @@ def heartbeat_once(
                     current.budgets,
                     current.events.last_consumed_offset,
                 )
-                emit_controller_event(
-                    effects,
-                    "worker.missing",
-                    _worker_event_payload(evidence),
-                )
+                if isinstance(effects, EffectClient):
+                    emit_controller_event(
+                        effects,
+                        "worker.missing",
+                        _worker_event_payload(evidence),
+                    )
                 events.append(
                     _event(
                         "worker.missing",
@@ -963,9 +965,12 @@ def _reconcile_nested_recovery_hold(
         updated_slice = _nested_hold_projection(current, slice_state, assessment)
         if updated_slice == slice_state:
             return current, assessment, False
+        checkpoint_phase: FSMInput = current.fsm
+        if current.recursive_fsm is not None and is_phase_value(current.recursive_fsm):
+            checkpoint_phase = current.recursive_fsm
         try:
             updated_state = store.checkpoint(
-                current.recursive_fsm or current.fsm,
+                checkpoint_phase,
                 {**current.slices, slice_id: updated_slice},
                 current.budgets,
                 current.events.last_consumed_offset,

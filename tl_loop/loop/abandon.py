@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from tl_loop.client.effects import EffectClient
-from tl_loop.client.transport import TransportClient
+from tl_loop.client.transport import JsonObject, TransportClient
 from tl_loop.events.reader import LedgerReader
 from tl_loop.loop.driver import _invoke
 from tl_loop.loop.journal import EffectJournal
@@ -141,8 +141,8 @@ def _validate_live_attempt(slice_state: SliceState) -> None:
         )
 
 
-def _abandonment_payload(slice_state: SliceState) -> dict[str, object]:
-    payload: dict[str, object] = {
+def _abandonment_payload(slice_state: SliceState) -> JsonObject:
+    payload: JsonObject = {
         "slice_id": slice_state.id,
         "attempt": slice_state.attempts,
         "operator_source": "cli",

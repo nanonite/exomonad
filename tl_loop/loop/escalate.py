@@ -270,7 +270,7 @@ def park(
             store=store,
             legacy_binding_id=legacy_binding_id,
         )
-        if create_issue
+        if create_issue and issue_creator is not None
         else None
     )
     blocked: list[str] = []
@@ -1078,6 +1078,8 @@ def _create_issue_locked(
         # Proven consistent: prefer the record that carries an issue id and
         # migrate it into the digest path.
         if legacy_recorded is not None or digest_intent is None:
+            if intent_path is None:
+                raise EscalationError("digest escalation intent path is unavailable")
             _write_intent(intent_path, legacy_intent)
             intent = legacy_intent
     if intent is not None:

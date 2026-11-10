@@ -113,14 +113,29 @@ def _validate_clarification(value: object) -> dict[str, object]:
     unknown = sorted(set(value) - fields)
     if unknown:
         raise PlanValidationError(f"clarification contains unknown keys: {', '.join(unknown)}")
+    prior_revision = value.get("prior_revision")
+    proposed_revision = value.get("proposed_revision")
+    invariant_digest = value.get("invariant_digest")
+    continuation_task = value.get("continuation_task")
+    requires_human = value.get("requires_human")
+    if (
+        type(prior_revision) is not int
+        or type(proposed_revision) is not int
+        or not isinstance(invariant_digest, str)
+        or not isinstance(continuation_task, str)
+        or type(requires_human) is not bool
+    ):
+        raise PlanValidationError(
+            "clarification must carry integer revisions, a digest and task, and a boolean decision"
+        )
     try:
         clarification = PlanClarification(
-            prior_revision=value.get("prior_revision"),
-            proposed_revision=value.get("proposed_revision"),
-            invariant_digest=value.get("invariant_digest"),
-            continuation_task=value.get("continuation_task"),
+            prior_revision=prior_revision,
+            proposed_revision=proposed_revision,
+            invariant_digest=invariant_digest,
+            continuation_task=continuation_task,
             changed_fields=tuple(value.get("changed_fields", ())),
-            requires_human=value.get("requires_human"),
+            requires_human=requires_human,
         )
     except (PlanClarificationError, TypeError, ValueError) as error:
         raise PlanValidationError(f"invalid clarification: {error}") from error
@@ -185,13 +200,15 @@ def _normalize_work_plan_mapping(value: Mapping[str, object], path: str) -> dict
     entries = result.get("sub_tls")
     if isinstance(entries, list):
         explicit = [entry for entry in entries if isinstance(entry, Mapping) and "order" in entry]
+        ordered_entries: list[object] = entries
         if explicit:
-            result["sub_tls"] = sorted(
+            ordered_entries = sorted(
                 entries,
                 key=lambda entry: entry.get("order", 1) if isinstance(entry, Mapping) else 1,
             )
+            result["sub_tls"] = ordered_entries
         normalized_entries: list[object] = []
-        for index, entry in enumerate(result["sub_tls"]):
+        for index, entry in enumerate(ordered_entries):
             if not isinstance(entry, Mapping):
                 normalized_entries.append(entry)
                 continue

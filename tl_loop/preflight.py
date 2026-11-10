@@ -61,7 +61,7 @@ def run_preflight(
         )
     _validate_archive_compatibility(fingerprint, expected_plan_compatibility_version)
 
-    required = (config_path, policy_path, review_path)
+    required: tuple[Path, ...] = (config_path, policy_path, review_path)
     if not allow_missing_plan:
         required += (plan_path,)
     _require_files(required)
@@ -227,6 +227,9 @@ def _validate_config(document: object, path: Path) -> None:
 
 def _validate_config_route(value: object, location: str, errors: list[str]) -> None:
     if value is None:
+        return
+    if not isinstance(value, str) or not value:
+        errors.append(f"{location}: must be a non-empty string")
         return
     try:
         route = parse_harness_identifier(value)

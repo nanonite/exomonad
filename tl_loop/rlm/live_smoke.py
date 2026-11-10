@@ -214,7 +214,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         requested = _parse_harness_arguments(argv)
     except SystemExit as error:
-        return int(error.code)
+        code = error.code
+        if type(code) is int:
+            return code
+        if isinstance(code, str) and code.isdigit():
+            return int(code)
+        return 1
     try:
         harnesses = _select_harnesses(requested, installed_harnesses())
     except ValueError as error:

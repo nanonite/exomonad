@@ -10,6 +10,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TypedDict
 
 from tl_loop.client.effects import ToolResult
 from tl_loop.ordered import IntegrationEvidence, IntegrationLifecycle
@@ -309,6 +310,13 @@ def integration_needs_revalidation(
     return None
 
 
+class _InvalidatedIntegrationFields(TypedDict):
+    merge_tree_sha: str | None
+    ci_status: str
+    stage_verification: str
+    integration_evidence_at: str | None
+
+
 def invalidate_integration_evidence(
     state: IntegrationRuntimeState,
     *,
@@ -325,7 +333,7 @@ def invalidate_integration_evidence(
     )
     if reason is None:
         return state
-    common = {
+    common: _InvalidatedIntegrationFields = {
         "merge_tree_sha": None,
         "ci_status": "unknown",
         "stage_verification": "pending",

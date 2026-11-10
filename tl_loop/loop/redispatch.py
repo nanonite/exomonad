@@ -9,7 +9,7 @@ from pathlib import Path
 
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
-from tl_loop.fsm.phase import ChildHandle, TLPlanning, TLWaiting
+from tl_loop.fsm.phase import ChildHandle, PhaseValue, TLPlanning, TLWaiting
 from tl_loop.loop.driver import (
     LeafTask,
     SubTLTask,
@@ -82,7 +82,9 @@ def redispatch_slice(
 
     work_plan = plan if isinstance(plan, WorkPlan) else WorkPlan.from_mapping(plan)
     dispatch_plan = _plan_for_slice(work_plan, slice_id)
-    task = _task_for_slice(dispatch_plan, slice_id) if dispatch_plan is not None else None
+    if dispatch_plan is None:
+        raise RedispatchError(f"slice {slice_id!r} is absent from the supplied plan specification")
+    task = _task_for_slice(dispatch_plan, slice_id)
     if task is None:
         raise RedispatchError(f"slice {slice_id!r} is absent from the supplied plan specification")
     runtime_name = _runtime_name(slice_id, current.attempts + 1)
@@ -183,7 +185,7 @@ def _runtime_name(slice_id: str, attempt: int) -> str:
     return f"{slug}-attempt-{attempt}"
 
 
-def _redispatch_phase(state: RunState) -> object:
+def _redispatch_phase(state: RunState) -> PhaseValue:
     """Keep unrelated active children in the durable waiting set."""
     active = {
         slice_state.id: ChildHandle(

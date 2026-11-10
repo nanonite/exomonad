@@ -56,6 +56,8 @@ def wait_for_root_controller_handoff(
     expected, error = _validate_intent(first_intent, run_id, controller_epoch)
     if error:
         return HandoffWaitResult(False, error)
+    if expected is None:
+        return HandoffWaitResult(False, "controller startup intent is incomplete")
     return _wait_for_commit(
         run_dir, expected, run_id, controller_epoch, cancel_event, timeout_seconds, poll_seconds
     )
@@ -106,6 +108,8 @@ def _inspect_handoff_state(
     validated, error = _validate_intent(current, run_id, epoch)
     if error:
         return HandoffWaitResult(False, error), previous_phase
+    if validated is None:
+        return HandoffWaitResult(False, "controller startup intent is incomplete"), previous_phase
     if not _same_handoff(expected, validated):
         return HandoffWaitResult(
             False, "controller startup handoff identity changed"
@@ -124,6 +128,8 @@ def _read_and_match_owner(
     owner, error = _read_required_object(path, "final controller ownership")
     if error:
         return HandoffWaitResult(False, error)
+    if owner is None:
+        return HandoffWaitResult(False, "final controller ownership is missing")
     if not _valid_owner_record(owner):
         return HandoffWaitResult(False, "final controller ownership is incomplete or malformed")
     if not _owner_identity_matches(owner, run_id, epoch):
@@ -151,6 +157,8 @@ def _validate_intent(
     phase = intent.get("phase")
     target = intent.get("target")
     if not _valid_intent_header(intent, epoch, phase, target):
+        return None, "controller startup intent is incomplete or conflicts with this root run"
+    if not isinstance(phase, str) or not isinstance(target, dict):
         return None, "controller startup intent is incomplete or conflicts with this root run"
     expected_run = intent.get("root_run_id")
     if expected_run is not None and expected_run != run_id:

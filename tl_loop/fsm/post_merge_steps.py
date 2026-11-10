@@ -391,7 +391,11 @@ def _parent_push_pending(state: PostMergeState, event: ParentPushPending) -> Pos
     _require_text(event.expected_base_sha, "parent push expected base SHA")
     _require_text(event.journal_id, "parent push journal ID")
     if state.phase is PostMergePhase.PARENT_PUSH_PENDING:
-        keys = ("parent_push_intent_id", "push_journal_id", "expected_base_sha")
+        keys: tuple[str, ...] = (
+            "parent_push_intent_id",
+            "push_journal_id",
+            "expected_base_sha",
+        )
         if event.lane_epoch is not None:
             keys = (*keys, "lane_epoch")
         _require_same(state, event, keys)

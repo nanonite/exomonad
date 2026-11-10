@@ -361,14 +361,17 @@ class LedgerReader:
             cached = self._segment_cache.get(segment)
             if cached is None or cached.signature != signature:
                 parsed = self._read_segment(segment, active_segment)
-                terminal_matches = tuple(
+                terminal_matches: tuple[
+                    tuple[str | None, str | None, Mapping[str, object]], ...
+                ] = tuple(
                     (
-                        row.document.get("agent_id")
-                        if isinstance(row.document.get("agent_id"), str)
-                        else None,
-                        data.get("slice_id")
-                        if isinstance(data.get("slice_id"), str) and data.get("slice_id")
-                        else None,
+                        agent_id if isinstance((agent_id := row.document.get("agent_id")), str) else None,
+                        (
+                            recorded_slice
+                            if isinstance((recorded_slice := data.get("slice_id")), str)
+                            and recorded_slice
+                            else None
+                        ),
                         data,
                     )
                     for row in parsed.rows
