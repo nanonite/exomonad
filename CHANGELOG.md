@@ -32,6 +32,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Name a completed aggregate's missing PR number directly instead of listing it as a coordinate conflict (#1328)
 - Accept a raw mapping sub-TL plan wherever ordered recovery reads its leaves (#1328)
 - Narrow the remaining TL-loop production type errors to zero in the default mypy form (#1328)
+- Refuse a merged shadow event or watcher observation without a persisted PR number instead of substituting PR 0 (#1329)
+- Raise `HeartbeatError` when a nested recovery hold finds a present non-canonical recursive phase instead of checkpointing through the legacy phase (#1329)
+- Raise `DiagnosticError` for a non-canonical recursive phase in scope diagnostics instead of falling back to an attribute lookup (#1329)
+- Raise `DecodeError` when a read-only effect returns anything other than a `ToolResult` (#1329)
+- Raise `RlmCallError` for malformed live-smoke harness arguments (#1329)
+- Check the installed mypy version before the ratchet runs mypy, so a mismatch fails without a full run (#1329)
+- Remove every redundant cast and `no-any-return` error from `tl_loop/**` in the strict mypy form (#1329)
 
 ### Fixed
 - Keep a failed synchronization without an error as an unresolved decision instead of crashing while redacting its diagnostic (#1327)
