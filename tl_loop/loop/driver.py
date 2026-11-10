@@ -800,6 +800,18 @@ def _require_manifest_digest(manifest: PlanManifest) -> str:
     return manifest.digest
 
 
+def _require_pr_number(current: SliceState, operation: str) -> int:
+    """Return the slice's persisted PR number or fail closed before a PR effect."""
+    if current.pr_number is None:
+        raise TLLoopError(f"{operation} requires a persisted PR number for slice {current.id!r}")
+    return current.pr_number
+
+
+def _optional_identifier_sort_key(value: int | None) -> tuple[bool, int]:
+    """Order optional numeric identifiers with absent values last."""
+    return (value is None, 0 if value is None else value)
+
+
 class LoopLimitExceeded(TLLoopError):
     """The loop reached its event ceiling before reaching a terminal state."""
 
@@ -10764,12 +10776,13 @@ def _refresh_post_merge_evidence(
     effects: EffectClient | ReadOnlyEffectClient,
 ) -> Mapping[str, object] | None:
     """Re-read merged Forgejo identity before recovering an older checkpoint."""
-    if current.pr_number is None:
+    pr_number = current.pr_number
+    if pr_number is None:
         return None
     if not config.active:
         return None
     try:
-        watcher = cast(EffectClient, effects).watcher_pr_state(pr_number=current.pr_number or 0)
+        watcher = cast(EffectClient, effects).watcher_pr_state(pr_number=pr_number)
     except (ConnectionError, IndexError, OSError, RuntimeError, TimeoutError):
         return None
     observation = _watcher_result_observation(watcher)
@@ -14114,16 +14127,17 @@ def _execute_direct_merge_intent(
 ) -> RunState:
     """Compare, journal, merge, and re-read one direct PR before adoption."""
     current = state.slices[intent.target_id]
-    if current.pr_number is None or not config.active:
+    initial_pr_number = current.pr_number
+    if initial_pr_number is None or not config.active:
         return state
     live = cast(EffectClient, effects)
     watcher = _invoke(
         "watcher_pr_state",
         current.id,
-        {"pr_number": current.pr_number},
+        {"pr_number": initial_pr_number},
         True,
         live,
-        lambda client: client.watcher_pr_state(pr_number=current.pr_number or 0),
+        lambda client: client.watcher_pr_state(pr_number=initial_pr_number),
         effects_log,
         raise_on_failure=False,
     )
@@ -14152,7 +14166,7 @@ def _execute_direct_merge_intent(
         return _reconcile_merged_slice(
             store.load(),
             current.id,
-            current.pr_number,
+            initial_pr_number,
             current.action.intent_id if current.action is not None else "",
             config,
             effects,
@@ -14224,8 +14238,9 @@ def _execute_direct_merge_intent(
     if not lane_ready:
         return state
     current = state.slices[current.id]
+    pr_number = _require_pr_number(current, "direct merge")
     arguments = {
-        "pr_number": current.pr_number,
+        "pr_number": pr_number,
         "expected_base_sha": evidence["base_sha"],
         "expected_head_sha": evidence["head_sha"],
         "expected_patch_digest": evidence["patch_digest"],
@@ -14254,7 +14269,7 @@ def _execute_direct_merge_intent(
             True,
             live,
             lambda client: client.merge_pr(
-                pr_number=current.pr_number or 0,
+                pr_number=pr_number,
                 strategy=config.merge_strategy,
                 working_dir=_relative_process_working_dir(config),
                 expected_base_sha=cast(str, evidence["base_sha"]),
@@ -14462,13 +14477,14 @@ def _reconcile_unknown_merge(
 ) -> RunState:
     """Probe Forgejo after a lost merge response before leaving an unknown intent."""
     current = state.slices[intent.target_id]
+    pr_number = _require_pr_number(current, "unknown merge reconciliation")
     watcher = _invoke(
         "watcher_pr_state",
         current.id,
-        {"pr_number": current.pr_number or 0},
+        {"pr_number": pr_number},
         config.active,
         cast(EffectClient, effects) if config.active else None,
-        lambda client: client.watcher_pr_state(pr_number=current.pr_number or 0),
+        lambda client: client.watcher_pr_state(pr_number=pr_number),
         effects_log,
         raise_on_failure=False,
     )
@@ -14499,7 +14515,7 @@ def _reconcile_unknown_merge(
         return _reconcile_merged_slice(
             refreshed,
             current.id,
-            current.pr_number or 0,
+            pr_number,
             action.intent_id,
             config,
             effects,
@@ -14650,6 +14666,7 @@ def _adopt_direct_merge_result(
 ) -> RunState:
     """Adopt a compare-bound merge from its exact journaled effect result."""
     current = state.slices[slice_id]
+    pr_number = _require_pr_number(current, "direct merge adoption")
     if _merge_effect_failed(result):
         cleared = slice_transition(current, ActionChanged(None))
         return _checkpoint_slice_action(
@@ -14662,7 +14679,7 @@ def _adopt_direct_merge_result(
                 state, cleared, state.integration, "merge_failed", "direct merge failed"
             ),
         )
-    merge_entry = _confirmed_merge_entry(effects_log, current, current.pr_number)
+    merge_entry = _confirmed_merge_entry(effects_log, current, pr_number)
     if (
         merge_entry is not None
         and merge_entry.get("key") == action.intent_id
@@ -14677,7 +14694,7 @@ def _adopt_direct_merge_result(
         expected_tree = arguments.get("expected_merge_tree_sha")
         if all(isinstance(value, str) and value for value in (expected_base, expected_head)):
             merge_evidence: dict[str, object] = {
-                "pr_number": current.pr_number,
+                "pr_number": pr_number,
                 "merged": True,
                 "head_sha": expected_head,
                 "base_sha": expected_base,
@@ -14688,7 +14705,7 @@ def _adopt_direct_merge_result(
             return _reconcile_merged_slice(
                 store.load(),
                 slice_id,
-                current.pr_number or 0,
+                pr_number,
                 action.intent_id,
                 config,
                 effects,
@@ -14700,10 +14717,10 @@ def _adopt_direct_merge_result(
     watcher = _invoke(
         "watcher_pr_state",
         slice_id,
-        {"pr_number": current.pr_number or 0},
+        {"pr_number": pr_number},
         config.active,
         cast(EffectClient, effects) if config.active else None,
-        lambda client: client.watcher_pr_state(pr_number=current.pr_number or 0),
+        lambda client: client.watcher_pr_state(pr_number=pr_number),
         effects_log,
         raise_on_failure=False,
     )
@@ -14729,7 +14746,7 @@ def _adopt_direct_merge_result(
         return _reconcile_merged_slice(
             store.load(),
             slice_id,
-            current.pr_number or 0,
+            pr_number,
             action.intent_id,
             config,
             effects,
@@ -14848,7 +14865,7 @@ def _phase_after_slice_merge(
     if isinstance(phase, (TLWaiting, TLMerging)):
         return phase_transition(
             phase,
-            PRMerged(merged_slice.pr_number or 0, slice_id),
+            PRMerged(_require_pr_number(merged_slice, "merge phase transition"), slice_id),
         )
     active = {
         current_id: ChildHandle(
@@ -16760,7 +16777,7 @@ def _reconcile_nonterminal_slices(
                 state = _reconcile_merged_slice(
                     store.load(),
                     current.id,
-                    watcher.pr_number or current.pr_number or 0,
+                    _require_merge_pr_number(current, watcher.pr_number, merge_entry),
                     current.action.intent_id,
                     config,
                     effects,
@@ -16807,7 +16824,7 @@ def _reconcile_nonterminal_slices(
             state = _adopt_authoritative_merged_snapshot(
                 state,
                 current.id,
-                watcher.pr_number or current.pr_number or 0,
+                _require_merge_pr_number(current, watcher.pr_number, merge_entry),
                 merge_entry,
                 config,
                 effects,
@@ -17319,6 +17336,29 @@ def _confirmed_merge_entry(
     return None
 
 
+def _merge_entry_pr_number(merge_entry: Mapping[str, object] | None) -> int | None:
+    """Return the positive PR number recorded by a merge journal entry."""
+    if merge_entry is None:
+        return None
+    arguments = merge_entry.get("arguments")
+    if not isinstance(arguments, Mapping):
+        return None
+    pr_number = arguments.get("pr_number")
+    return pr_number if type(pr_number) is int and pr_number > 0 else None
+
+
+def _require_merge_pr_number(
+    current: SliceState,
+    watcher_pr_number: int | None,
+    merge_entry: Mapping[str, object] | None,
+) -> int:
+    """Return the PR number proven by the watcher, checkpoint, or merge journal."""
+    pr_number = watcher_pr_number or current.pr_number or _merge_entry_pr_number(merge_entry)
+    if pr_number is None:
+        raise TLLoopError(f"merged slice {current.id!r} has no authoritative PR number")
+    return pr_number
+
+
 def _adopt_authoritative_merged_snapshot(
     state: RunState,
     slice_id: str,
@@ -17828,7 +17868,7 @@ def _apply_reconciliation_observations(
                 )
             if watcher.merged is True:
                 transitioned = slice_transition(
-                    transitioned, MergeCompleted(watcher.pr_number or 0)
+                    transitioned, MergeCompleted(publication.pr_number)
                 )
         elif watcher.publication_ownership_verified is True:
             LOGGER.warning(
@@ -22278,7 +22318,10 @@ def _adopt_aggregate_post_merge_recovery(
     }
     updated = current
     if current.status is SliceStatus.PARKED:
-        updated = slice_transition(current, MergeCompleted(current.pr_number or 0))
+        updated = slice_transition(
+            current,
+            MergeCompleted(_require_pr_number(current, "aggregate post-merge recovery")),
+        )
     if current.park_cause is ParkCause.PUBLICATION_BLOCKED:
         updated = replace(
             updated,
@@ -23009,12 +23052,10 @@ def _aggregate_leaf_provenance(
     return tuple(
         sorted(
             set(references),
-            key=lambda ref: (
-                ref.issue_id is None,
-                ref.issue_id or 0,
-                ref.pr_number is None,
-                ref.pr_number or 0,
-            ),
+            key=lambda ref: _optional_identifier_sort_key(
+                ref.issue_id
+            )
+            + _optional_identifier_sort_key(ref.pr_number),
         )
     )
 
@@ -23120,12 +23161,10 @@ def _aggregate_reference_lines(
     lines: list[str] = []
     ordered = sorted(
         set(references),
-        key=lambda ref: (
-            ref.issue_id is None,
-            ref.issue_id or 0,
-            ref.pr_number is None,
-            ref.pr_number or 0,
-        ),
+        key=lambda ref: _optional_identifier_sort_key(
+            ref.issue_id
+        )
+        + _optional_identifier_sort_key(ref.pr_number),
     )
     for reference in ordered:
         parts: list[str] = []
@@ -26314,7 +26353,7 @@ def _integrate_one_candidate(
         integration=_persist_candidate_runtime(state.integration, task.name, approval_runtime),
     )
     merge_arguments = {
-        "pr_number": current.pr_number,
+        "pr_number": pr_number,
         "strategy": config.merge_strategy or task.integration.merge_strategy,
         "working_dir": _relative_process_working_dir(config),
         "base_sha": base_sha,
@@ -26361,7 +26400,7 @@ def _integrate_one_candidate(
         config.active,
         cast(EffectClient, effects),
         lambda client: client.merge_pr(
-            pr_number=current.pr_number or 0,
+            pr_number=pr_number,
             strategy=config.merge_strategy or task.integration.merge_strategy,
             working_dir=_relative_process_working_dir(config),
             expected_base_sha=base_sha,
@@ -27136,7 +27175,7 @@ def _handoff_reconciliation_event_payload(
         _, ownership_reason = _publication_ownership_status(watcher)
         return {
             "slice_id": current.id,
-            "pr_number": watcher.pr_number or 0,
+            "pr_number": watcher.pr_number,
             "head_sha": _snapshot_text(watcher, "head_sha") or "",
             "invocation_id": "",
             "outcome": "skipped",
@@ -27187,7 +27226,7 @@ def _handoff_reconciliation_event_payload(
         reason = "missing " + ", ".join(missing) if missing else "publication_identity"
     return {
         "slice_id": current.id,
-        "pr_number": pr_number or 0,
+        "pr_number": pr_number,
         "head_sha": head_sha,
         "invocation_id": "",
         "outcome": "skipped",

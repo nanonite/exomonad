@@ -8120,6 +8120,113 @@ def test_unknown_direct_merge_reconciles_authoritative_merged_snapshot(tmp_path:
     assert len(journal.confirmed_entries("merge_pr", "leaf-a")) == 1
 
 
+def test_require_pr_number_fails_closed_without_a_persisted_pr() -> None:
+    current = SliceState(
+        id="leaf-a",
+        status=SliceStatus.IN_REVIEW,
+        paths=(),
+        depends_on=(),
+        base_ref="main",
+        test_plan=(),
+        agent_type=None,
+        model=None,
+        branch="main.leaf-a",
+        worktree=None,
+        pr_number=None,
+        reviewed_head=None,
+        attempts=1,
+        verdict=None,
+    )
+
+    with pytest.raises(
+        TLLoopError, match="direct merge requires a persisted PR number for slice 'leaf-a'"
+    ):
+        driver_module._require_pr_number(current, "direct merge")
+
+
+def test_require_pr_number_returns_the_persisted_pr() -> None:
+    current = SliceState(
+        id="leaf-a",
+        status=SliceStatus.IN_REVIEW,
+        paths=(),
+        depends_on=(),
+        base_ref="main",
+        test_plan=(),
+        agent_type=None,
+        model=None,
+        branch="main.leaf-a",
+        worktree=None,
+        pr_number=42,
+        reviewed_head=None,
+        attempts=1,
+        verdict=None,
+    )
+
+    assert driver_module._require_pr_number(current, "direct merge") == 42
+
+
+def test_merge_phase_transition_refuses_a_merged_slice_without_a_pr(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    current = replace(store.load().slices["leaf-a"], status=SliceStatus.MERGED, pr_number=None)
+    state = replace(store.load(), fsm=FSMState(TLPhase.TLWaiting, ("leaf-a",)))
+
+    with pytest.raises(
+        TLLoopError, match="merge phase transition requires a persisted PR number"
+    ):
+        _phase_after_slice_merge(state, "leaf-a", current)
+
+
+def test_direct_merge_adoption_refuses_a_slice_without_a_pr(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    current = replace(store.load().slices["leaf-a"], pr_number=None)
+    state = replace(store.load(), slices={"leaf-a": current})
+    action = ActionState(
+        ActionKind.MERGE,
+        ActionPhase.IN_FLIGHT,
+        intent_id="merge-intent",
+        head_sha="head-a",
+        attempt=1,
+    )
+
+    with pytest.raises(
+        TLLoopError, match="direct merge adoption requires a persisted PR number"
+    ):
+        driver_module._adopt_direct_merge_result(
+            state,
+            "leaf-a",
+            action,
+            None,
+            store,
+            TLLoopConfig(active=False),
+            ReadOnlyEffectClient(EffectClient(RecordingTransport())),
+            EffectJournal("review-run", store.run_dir / "action-journal.json"),
+        )
+
+
+def test_merged_slice_pr_uses_the_exact_merge_journal_identity() -> None:
+    current = SliceState(
+        id="leaf-a",
+        status=SliceStatus.IN_REVIEW,
+        paths=(),
+        depends_on=(),
+        base_ref="main",
+        test_plan=(),
+        agent_type=None,
+        model=None,
+        branch="main.leaf-a",
+        worktree=None,
+        pr_number=None,
+        reviewed_head=None,
+        attempts=1,
+        verdict=None,
+    )
+    merge_entry = {"arguments": {"pr_number": 42}}
+
+    assert driver_module._require_merge_pr_number(current, None, merge_entry) == 42
+    with pytest.raises(TLLoopError, match="has no authoritative PR number"):
+        driver_module._require_merge_pr_number(current, None, None)
+
+
 def test_publication_derives_handoff_without_completion_event(tmp_path: Path) -> None:
     store = _review_store(tmp_path)
     current = replace(
