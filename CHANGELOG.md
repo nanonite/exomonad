@@ -19,6 +19,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - TL judgment: verify CHANGELOG captured unlinked slices' merged work (#1170)
 - Route aggregate parent-branch CI failures through a bounded roles.tl judgment (#1160)
 
+### Changed
+- Pin TL-loop's mypy to the baseline-producing version and document regenerating the baseline with the pin (#1326)
+
 ### Fixed
 - Distinguish a present non-phase recursive scope FSM from a missing one in TL transition diagnostics (#1325)
 - Cover the bookkeeping-lane epoch guard with a regression test (#1325)

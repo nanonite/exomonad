@@ -43,6 +43,11 @@ The normal update refuses to raise any count. `--allow-increase` exists only
 for a deliberate, reviewed exception. Do not add `# type: ignore`, per-file
 `ignore_errors`, or line-number baselines to satisfy this check.
 
+The baseline is only valid for the pinned `mypy==2.3.0` in
+`tl_loop/pyproject.toml`. Raising that pin must happen in the same commit that
+regenerates the baseline, with `--update --allow-increase` only if the new mypy
+reports more errors, and the commit message must say why.
+
 The runtime creates per-run state under `.exo/tl-loop/<run_id>/`. That directory
 is runtime state, not Python source, and must never be used as the package code
 location.
