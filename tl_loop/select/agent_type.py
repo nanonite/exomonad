@@ -6,7 +6,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from math import ceil
-from typing import cast
 
 from tl_loop.select.capability import CapabilityMap, load_capability
 from tl_loop.select.classify import Classification, Difficulty, classify_task

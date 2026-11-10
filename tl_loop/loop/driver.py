@@ -172,8 +172,8 @@ from tl_loop.loop.convergence import (
     ConvergenceInvariantError,
     ConvergenceTracker,
 )
-from tl_loop.loop.escalate import park
 from tl_loop.loop.errors import TLLoopError
+from tl_loop.loop.escalate import park
 from tl_loop.loop.heartbeat import (
     HeartbeatConfig,
     SyntheticHeartbeatEvent,
