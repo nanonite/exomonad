@@ -13149,7 +13149,7 @@ def _run_issue_close(
     journal_entry = effects_log.existing(intent) if isinstance(effects_log, EffectJournal) else None
     journal_status = journal_entry.get("status") if journal_entry else None
     if journal_status == "reconciled":
-        resolution = journal_entry.get("resolution")
+        resolution = journal_entry.get("resolution") if journal_entry is not None else None
         if (
             isinstance(resolution, Mapping)
             and resolution.get("issue_id") == int(issue_id)
@@ -22801,7 +22801,9 @@ def _rehydrate_aggregate_invocation(
 ) -> str | None:
     """Checkpoint a matching host invocation record into the parent slice."""
     record = _read_durable_sub_tl_invocation(project_root, owner_agent)
-    invocation_id = record.get("invocation_id") if record else None
+    if record is None:
+        return None
+    invocation_id = record.get("invocation_id")
     if not (
         isinstance(invocation_id, str)
         and record.get("slice_id") == task.name

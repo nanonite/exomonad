@@ -14,7 +14,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TypeAlias, cast
 
-from tl_loop.fsm.child import ChildKind, ChildRecord
+from tl_loop.fsm.child import ChildKind, ChildRecord, TLOrchestrationEvent
 from tl_loop.fsm.lane import (
     LanePhase,
     LaneState,
@@ -34,6 +34,9 @@ from tl_loop.fsm.phase import (
 )
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.recovery import decode_recovery, encode_recovery
+from tl_loop.fsm.scope import (
+    PhaseValue as RecursivePhaseValue,
+)
 from tl_loop.fsm.scope import (
     TLAllMerged as RecursiveTLAllMerged,
 )
@@ -794,7 +797,7 @@ class RunStore:
         self,
         repository: str,
         parent_branch: str,
-        event: object,
+        event: TLOrchestrationEvent,
     ) -> RunState:
         """Atomically apply one repository-lane event under the run lock."""
         if not repository or not parent_branch:
@@ -1634,8 +1637,9 @@ def checkpoint(
         document["slices"] = copy.deepcopy(encoded_slices)
         if encoded_manifest is not None:
             document["plan_manifest"] = copy.deepcopy(encoded_manifest)
-        if isinstance(document.get("plan_manifest"), dict):
-            manifest = PlanManifest.from_document(document["plan_manifest"])
+        raw_manifest = document.get("plan_manifest")
+        if isinstance(raw_manifest, dict):
+            manifest = PlanManifest.from_document(raw_manifest)
             if any(
                 slice_id not in {node.name for node in manifest.nodes}
                 for slice_id in encoded_slices
@@ -1809,8 +1813,9 @@ def _initial_document(run_id: str, root_spec: RootSpec) -> dict[str, object]:
         created_under = document.get("controller_epoch")
         if isinstance(created_under, str) and created_under:
             document["generation_id"] = created_under
-    if isinstance(document.get("plan_manifest"), dict):
-        manifest = PlanManifest.from_document(document["plan_manifest"])
+    raw_manifest = document.get("plan_manifest")
+    if isinstance(raw_manifest, dict):
+        manifest = PlanManifest.from_document(raw_manifest)
         document["slices"] = _activate_manifest_nodes(document.get("slices"), manifest)
         _bind_slice_records(document.get("slices"), manifest)
     else:
@@ -2002,7 +2007,7 @@ def _identity(document: dict[str, object]) -> dict[str, object]:
     return document
 
 
-def _encode_fsm(fsm: FSMInput) -> dict[str, object]:
+def _encode_fsm(fsm: object) -> dict[str, object]:
     if isinstance(
         fsm,
         (
@@ -2042,7 +2047,7 @@ def _encode_fsm(fsm: FSMInput) -> dict[str, object]:
 def _encode_recursive_fsm(fsm: object) -> dict[str, object]:
     """Encode the complete #1048 scope value behind a stable discriminator."""
     if isinstance(fsm, RecursiveTLPlanning):
-        payload = {
+        payload: dict[str, object] = {
             "kind": "tl_planning",
             "scope_path": list(fsm.scope_path),
             "plan_digest": fsm.plan_digest,
@@ -3012,7 +3017,7 @@ def _decode(document: dict[str, object]) -> RunState:
     )
 
 
-def _decode_recursive_fsm(value: Mapping[str, object]) -> object:
+def _decode_recursive_fsm(value: Mapping[str, object]) -> RecursivePhaseValue:
     """Decode the complete target scope value retained beside legacy fields."""
     payload = value.get("payload")
     if not isinstance(payload, Mapping):
@@ -3045,7 +3050,7 @@ def _decode_recursive_fsm(value: Mapping[str, object]) -> object:
     if kind == "tl_planning":
         ordered = tuple(
             (
-                _recursive_int(stage, "order"),
+                _recursive_int(_recursive_object(stage, "ordered stage"), "order"),
                 tuple(_decode_child_record(child) for child in _recursive_list(stage, "children")),
             )
             for stage in _recursive_list(payload, "ordered_children")
@@ -3084,7 +3089,8 @@ def _decode_recursive_fsm(value: Mapping[str, object]) -> object:
                 child_id: _decode_child_record(child) for child_id, child in completed_raw.items()
             },
             post_merge={
-                child_id: _decode_post_merge_state(state) for child_id, state in post_raw.items()
+                child_id: _decode_required_post_merge_state(state)
+                for child_id, state in post_raw.items()
             },
             dispatch_intents=_recursive_string_map(payload, "dispatch_intents"),
             evidence=_recursive_string_map(payload, "evidence"),
@@ -3095,7 +3101,7 @@ def _decode_recursive_fsm(value: Mapping[str, object]) -> object:
             scope_path=scope_path,
             plan_digest=plan_digest,
             completed_children={
-                child_id: _decode_post_merge_state(state)
+                child_id: _decode_required_post_merge_state(state)
                 for child_id, state in _recursive_mapping(payload, "completed_children").items()
             },
         )
@@ -3140,7 +3146,7 @@ def _decode_child_record(value: object) -> ChildRecord:
     )
 
 
-def _decode_post_merge_state(value: object) -> PostMergeState:
+def _decode_required_post_merge_state(value: object) -> PostMergeState:
     if not isinstance(value, Mapping):
         raise TypeError("recursive post-merge state must be an object")
     return PostMergeState(
@@ -3225,6 +3231,12 @@ def _recursive_order(value: object) -> int:
     if isinstance(value, str) and value.isdigit():
         return int(value)
     raise ValueError("recursive FSM pending order must be an integer key")
+
+
+def _recursive_object(value: object, field_name: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"recursive FSM {field_name} must be an object")
+    return value
 
 
 def _recursive_list(value: object, field_name: str) -> list[object]:

@@ -41,7 +41,7 @@
       "redundant-cast": 7,
       "return": 1,
       "type-arg": 1,
-      "union-attr": 37
+      "union-attr": 31
     },
     "tl_loop/loop/escalate.py": {
       "arg-type": 2,
@@ -158,9 +158,6 @@
       "redundant-cast": 1
     },
     "tl_loop/state/store.py": {
-      "arg-type": 6,
-      "dict-item": 11,
-      "no-redef": 1,
       "redundant-cast": 3
     },
     "tl_loop/tests/checkpoint_fixtures.py": {
