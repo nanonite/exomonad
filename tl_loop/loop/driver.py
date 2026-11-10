@@ -184,7 +184,7 @@ from tl_loop.loop.heartbeat import (
 from tl_loop.loop.integration_lineage import GitLineageError, verify_aggregate_lineage
 from tl_loop.loop.nested_recovery import verified_nested_recovery_wait
 from tl_loop.loop.observability import emit_controller_event
-from tl_loop.loop.pr_number import _require_pr_number
+from tl_loop.loop.pr_number import require_pr_number as _require_pr_number
 from tl_loop.loop.recovery_policy import policy_for_cause
 from tl_loop.loop.reference_verification import observe_reference_project
 from tl_loop.loop.review import (

@@ -314,11 +314,12 @@ remote heads, ancestry proofs, or push receipts. Parent pushes use
 pending when that compare fails, so restart can reconcile the exact durable
 intent without redispatching an already confirmed effect.
 
-`_require_pr_number` in `loop/pr_number.py` raises `TLLoopError` before direct
-merge effect creation, unknown-merge watcher reconciliation, direct-merge
-adoption, merge-phase transition, and aggregate post-merge recovery when the
-slice's persisted PR number is missing. `_execute_direct_merge_intent` returns
-before its watcher call if the initial persisted number is absent.
+`require_pr_number` in `loop/pr_number.py` (imported as `_require_pr_number` by
+the driver) raises `TLLoopError` before direct merge effect creation,
+unknown-merge watcher reconciliation, direct-merge adoption, merge-phase
+transition, and aggregate post-merge recovery when the slice's persisted PR
+number is missing. `_execute_direct_merge_intent` returns before its watcher
+call if the initial persisted number is absent.
 `reconcile_merge_observation` also refuses a merged watcher observation whose
 own PR number is absent.
 

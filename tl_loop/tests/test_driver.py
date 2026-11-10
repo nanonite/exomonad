@@ -38,6 +38,7 @@ from tl_loop.fsm.scope import TLPRFiled as RecursiveTLPRFiled
 from tl_loop.fsm.scope import TLRunning as RecursiveTLRunning
 from tl_loop.loop.abandon import abandon_slice
 from tl_loop.loop.convergence import ConvergenceInvariantError, ConvergenceTracker
+from tl_loop.loop.pr_number import require_pr_number
 from tl_loop.loop.driver import (
     AGGREGATE_PUBLICATION_GATE_PREFIX,
     DISPATCH_ALREADY_CONFIRMED,
@@ -8174,7 +8175,7 @@ def test_require_pr_number_fails_closed_without_a_persisted_pr() -> None:
     with pytest.raises(
         TLLoopError, match="direct merge requires a persisted PR number for slice 'leaf-a'"
     ):
-        driver_module._require_pr_number(current, "direct merge")
+        require_pr_number(current, "direct merge")
 
 
 def test_require_pr_number_returns_the_persisted_pr() -> None:
@@ -8195,7 +8196,7 @@ def test_require_pr_number_returns_the_persisted_pr() -> None:
         verdict=None,
     )
 
-    assert driver_module._require_pr_number(current, "direct merge") == 42
+    assert require_pr_number(current, "direct merge") == 42
 
 
 def test_merge_phase_transition_refuses_a_merged_slice_without_a_pr(tmp_path: Path) -> None:
@@ -15635,7 +15636,7 @@ def _seed_synced_captured_aggregate_with_idle_lane(
     evidence = dict(current.post_merge.evidence)
     sync_arguments = driver_module._parent_sync_arguments(
         current,
-        driver_module._require_pr_number(current, "test parent sync"),
+        require_pr_number(current, "test parent sync"),
         evidence,
         base_sha,
         ".",
@@ -18076,7 +18077,7 @@ def _complete_captured_aggregate_boundary(
         root_store,
         state,
         current,
-        driver_module._require_pr_number(current, "test changelog capture"),
+        require_pr_number(current, "test changelog capture"),
         current.post_merge.evidence,
         "captured",
         "retained judgment already covers the change",
@@ -18324,7 +18325,7 @@ def test_captured_aggregate_refuses_contradictory_entry_added_result(tmp_path: P
         root_store,
         state,
         current,
-        driver_module._require_pr_number(current, "test changelog capture"),
+        require_pr_number(current, "test changelog capture"),
         current.post_merge.evidence,
         "entry_added",
         "contradictory synthetic receipt",

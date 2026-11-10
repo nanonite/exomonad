@@ -73,7 +73,7 @@ from tl_loop.fsm.scope_projection import phase_tag as canonical_phase_tag
 from tl_loop.fsm.transition import IllegalTransition
 from tl_loop.fsm.transition import transition as phase_transition
 from tl_loop.loop.escalate import blocked_gate_name
-from tl_loop.loop.pr_number import _require_pr_number
+from tl_loop.loop.pr_number import require_pr_number
 from tl_loop.loop.schedule import propagate_abandonment, restore_dependents, suspend_dependents
 from tl_loop.state.schema import GateStatus, RepositoryIdentity, RunState, SliceState, SliceStatus
 from tl_loop.state.slice_transition import (
@@ -542,7 +542,7 @@ def _update_slices(
         if current is not None:
             updated[event.slug] = slice_transition(
                 current,
-                MergeCompleted(_require_pr_number(current, "shadow merge")),
+                MergeCompleted(require_pr_number(current, "shadow merge")),
             )
     elif isinstance(event, ChildFailed):
         current = updated.get(event.slug)
