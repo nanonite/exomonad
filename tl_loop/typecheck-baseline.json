@@ -60,11 +60,6 @@
       "arg-type": 3,
       "assignment": 1
     },
-    "tl_loop/loop/recovery_control.py": {
-      "arg-type": 1,
-      "redundant-cast": 1,
-      "union-attr": 23
-    },
     "tl_loop/loop/redispatch.py": {
       "arg-type": 2
     },

@@ -9,7 +9,12 @@ from typing import Literal, cast
 
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.transport import TransportClient
-from tl_loop.fsm.recovery import RecoveryPhase, RecoveryTransitionError, transition_recovery
+from tl_loop.fsm.recovery import (
+    RecoveryPhase,
+    RecoveryState,
+    RecoveryTransitionError,
+    transition_recovery,
+)
 from tl_loop.loop.abandon import abandon_slice
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.observability import emit_controller_event
@@ -83,7 +88,7 @@ class ResumeRecoveryRequest:
             expected_invocation_id=_required_text(value, "expected_invocation_id"),
             expected_generation=_non_negative_int(value, "expected_generation"),
             expected_worktree_fingerprint=_required_text(value, "expected_worktree_fingerprint"),
-            action=cast(RecoveryAction, action),
+            action=action,
             authorization=auth,
             idempotency_key=_required_text(value, "idempotency_key"),
         )
@@ -91,6 +96,14 @@ class ResumeRecoveryRequest:
 
 class RecoveryCommandError(RuntimeError):
     """A recovery command failed closed at the workflow boundary."""
+
+
+def _require_recovery(current: SliceState) -> RecoveryState:
+    """Return the slice's active recovery or fail the command closed."""
+    recovery = current.recovery
+    if recovery is None:
+        raise RecoveryCommandError(f"slice {current.id!r} has no active recovery")
+    return recovery
 
 
 @dataclass(frozen=True)
@@ -152,7 +165,7 @@ def _apply_command(
     request: ResumeRecoveryRequest,
     effects: EffectClient | None,
 ) -> dict[str, object]:
-    recovery = current.recovery
+    recovery = _require_recovery(current)
     evidence = {**dict(recovery.evidence), "authorization": _authorization_document(request)}
     try:
         if request.action == "abandon":
@@ -227,19 +240,20 @@ def _apply_command(
         ordered_stages=state.ordered_stages,
         integration=state.integration,
     )
+    persisted_recovery = _require_recovery(updated.slices[request.slice_id])
     return {
         "status": "accepted",
         "action": request.action,
         "run_id": request.run_id,
         "slice_id": request.slice_id,
-        "recovery_phase": updated.slices[request.slice_id].recovery.phase.value,
-        "recovery_round": updated.slices[request.slice_id].recovery.recovery_round,
+        "recovery_phase": persisted_recovery.phase.value,
+        "recovery_round": persisted_recovery.recovery_round,
         "idempotency_key": request.idempotency_key,
     }
 
 
 def _validate_identity(current: SliceState, request: ResumeRecoveryRequest) -> None:
-    recovery = current.recovery
+    recovery = _require_recovery(current)
     if recovery.owner_run_id != request.run_id:
         raise RecoveryCommandError("recovery owner run changed")
     if (
@@ -263,7 +277,7 @@ def _validate_authorization(
 ) -> None:
     if request.action == "inspect":
         return
-    recovery = current.recovery
+    recovery = _require_recovery(current)
     if isinstance(request.authorization, PolicyAuthorization):
         policy = policy_for_cause(recovery.cause)
         if request.authorization.policy_id != recovery.cause:
@@ -300,17 +314,18 @@ def _validate_next_action(next_action: str, action: RecoveryAction) -> None:
 
 
 def _inspection(state: RunState, current: SliceState) -> dict[str, object]:
+    recovery = _require_recovery(current)
     return {
         "status": "observed",
         "run_id": state.run_id,
         "slice_id": current.id,
         "state_revision": state.revision,
         "recovery": {
-            "phase": current.recovery.phase.value,
-            "cause": current.recovery.cause,
-            "next_action": current.recovery.next_action,
-            "recovery_round": current.recovery.recovery_round,
-            "invocation_generation": current.recovery.invocation_generation,
+            "phase": recovery.phase.value,
+            "cause": recovery.cause,
+            "next_action": recovery.next_action,
+            "recovery_round": recovery.recovery_round,
+            "invocation_generation": recovery.invocation_generation,
         },
     }
 
