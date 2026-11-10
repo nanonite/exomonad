@@ -8120,6 +8120,24 @@ def test_unknown_direct_merge_reconciles_authoritative_merged_snapshot(tmp_path:
     assert len(journal.confirmed_entries("merge_pr", "leaf-a")) == 1
 
 
+def test_accepted_work_plan_parses_a_raw_mapping_plan() -> None:
+    plan = driver_module._accepted_work_plan(
+        {
+            "leaves": [
+                {
+                    "name": "leaf-a",
+                    "task": "run the leaf",
+                    "chainlink_issue_id": None,
+                    "boundary": ["src/leaf.py"],
+                    "verify": ["just tl-loop-test"],
+                }
+            ]
+        }
+    )
+
+    assert tuple(leaf.name for leaf in plan.leaves) == ("leaf-a",)
+
+
 def test_heartbeat_project_root_fails_closed_when_heartbeat_is_configured() -> None:
     # TLLoopConfig rejects heartbeat without a project root, so reach the guard directly.
     config = object.__new__(TLLoopConfig)
