@@ -3,12 +3,6 @@
     "scripts/check_tl_loop_archive.py": {
       "no-any-return": 1
     },
-    "tl_loop/__main__.py": {
-      "no-redef": 1
-    },
-    "tl_loop/client/effects.py": {
-      "assignment": 1
-    },
     "tl_loop/client/readonly.py": {
       "no-any-return": 1,
       "redundant-cast": 1
@@ -16,83 +10,28 @@
     "tl_loop/client/transport.py": {
       "redundant-cast": 1
     },
-    "tl_loop/events/reader.py": {
-      "arg-type": 1
-    },
-    "tl_loop/events/recovery.py": {
-      "arg-type": 2
-    },
-    "tl_loop/fsm/post_merge_steps.py": {
-      "assignment": 1
-    },
-    "tl_loop/fsm/transition.py": {
-      "arg-type": 1
-    },
-    "tl_loop/loop/abandon.py": {
-      "arg-type": 1
-    },
     "tl_loop/loop/driver.py": {
-      "arg-type": 107,
-      "assignment": 27,
-      "call-arg": 1,
       "comparison-overlap": 1,
-      "dict-item": 1,
       "no-any-return": 1,
       "redundant-cast": 7,
-      "return": 1,
-      "type-arg": 1,
-      "union-attr": 31
+      "type-arg": 1
     },
     "tl_loop/loop/escalate.py": {
-      "arg-type": 2,
       "no-untyped-def": 1
-    },
-    "tl_loop/loop/heartbeat.py": {
-      "arg-type": 2
-    },
-    "tl_loop/loop/integration_lineage.py": {
-      "assignment": 1
     },
     "tl_loop/loop/journal.py": {
       "redundant-cast": 1
     },
-    "tl_loop/loop/nested_recovery.py": {
-      "arg-type": 3,
-      "assignment": 1
-    },
-    "tl_loop/loop/redispatch.py": {
-      "arg-type": 2
-    },
-    "tl_loop/loop/review.py": {
-      "arg-type": 16
-    },
-    "tl_loop/loop/shadow.py": {
-      "arg-type": 2,
-      "index": 2,
-      "union-attr": 1
-    },
     "tl_loop/loop/startup_handoff.py": {
-      "arg-type": 7,
-      "index": 1,
-      "no-any-return": 1,
-      "union-attr": 1
+      "no-any-return": 1
     },
     "tl_loop/loop/task_budget.py": {
       "redundant-cast": 3
-    },
-    "tl_loop/plan_validation.py": {
-      "arg-type": 6,
-      "var-annotated": 1
-    },
-    "tl_loop/preflight.py": {
-      "arg-type": 1,
-      "assignment": 1
     },
     "tl_loop/rlm/call.py": {
       "redundant-cast": 1
     },
     "tl_loop/rlm/live_smoke.py": {
-      "arg-type": 1,
       "no-any-return": 1
     },
     "tl_loop/rlm/plan_acceptance.py": {
@@ -107,54 +46,23 @@
     "tl_loop/select/ledger.py": {
       "redundant-cast": 2
     },
-    "tl_loop/state/aggregate_approval.py": {
-      "arg-type": 1
-    },
     "tl_loop/state/diagnostics.py": {
-      "assignment": 1,
       "no-any-return": 3
     },
     "tl_loop/state/legacy_manifest.py": {
-      "assignment": 1,
       "no-any-return": 14,
       "no-untyped-def": 2
     },
     "tl_loop/state/plan_manifest.py": {
-      "arg-type": 6,
       "type-arg": 1
-    },
-    "tl_loop/state/plan_reconciliation_declarations.py": {
-      "union-attr": 1
-    },
-    "tl_loop/state/plan_reconciliation_emitter.py": {
-      "arg-type": 2,
-      "union-attr": 1
-    },
-    "tl_loop/state/plan_reconciliation_execution.py": {
-      "arg-type": 6
-    },
-    "tl_loop/state/plan_reconciliation_legacy.py": {
-      "union-attr": 2
-    },
-    "tl_loop/state/plan_reconciliation_legacy_dispatch.py": {
-      "arg-type": 2
     },
     "tl_loop/state/plan_reconciliation_scope.py": {
       "redundant-cast": 2
     },
-    "tl_loop/state/plan_revision_state_update.py": {
-      "arg-type": 1
-    },
     "tl_loop/state/reference_verification.py": {
-      "arg-type": 6,
       "no-untyped-def": 1
     },
-    "tl_loop/state/repository_identity_migration.py": {
-      "arg-type": 2
-    },
     "tl_loop/state/schema.py": {
-      "arg-type": 4,
-      "assignment": 1,
       "redundant-cast": 1
     },
     "tl_loop/state/store.py": {
@@ -210,7 +118,7 @@
       "redundant-cast": 1
     },
     "tl_loop/tests/test_driver.py": {
-      "arg-type": 207,
+      "arg-type": 204,
       "assignment": 1,
       "attr-defined": 76,
       "call-overload": 65,
