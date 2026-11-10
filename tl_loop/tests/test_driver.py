@@ -8228,7 +8228,7 @@ def test_direct_merge_adoption_refuses_a_slice_without_a_pr(tmp_path: Path) -> N
             state,
             "leaf-a",
             action,
-            None,
+            ToolResult(raw={"success": False}, success=False, result=None, error="merge failed"),
             store,
             TLLoopConfig(active=False),
             ReadOnlyEffectClient(EffectClient(RecordingTransport())),
