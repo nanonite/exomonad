@@ -16659,6 +16659,44 @@ def test_continue_reopens_failed_later_scope_without_replacing_completed_sub_tl_
     assert not any(name in {"merge_pr", "file_pr"} for name, _ in transport.calls)
 
 
+def test_require_manifest_digest_refuses_a_manifest_without_a_digest() -> None:
+    # PlanManifest computes its digest in __post_init__, so reach the guard directly.
+    manifest = object.__new__(PlanManifest)
+    object.__setattr__(manifest, "digest", None)
+
+    with pytest.raises(TLLoopError, match="plan manifest has no digest"):
+        driver_module._require_manifest_digest(manifest)
+
+
+def test_require_manifest_digest_returns_the_computed_digest(tmp_path: Path) -> None:
+    store = _review_store(tmp_path)
+    manifest = store.load().plan_manifest
+    assert manifest is not None
+    assert manifest.digest is not None
+
+    assert driver_module._require_manifest_digest(manifest) == manifest.digest
+
+
+def test_ordered_sub_tl_completion_refuses_a_completed_aggregate_without_a_pr(
+    tmp_path: Path,
+) -> None:
+    plan, root_store, _child_store, _merge_journal_id, _base_sha = (
+        _seed_synced_captured_aggregate_with_idle_lane(
+            tmp_path, "ordered-completion-pr-missing"
+        )
+    )
+    _complete_captured_aggregate_boundary(root_store, tmp_path)
+    state = root_store.load()
+    current = replace(state.slices["architecture"], pr_number=None)
+    task = next(task for task in plan.sub_tls if task.name == "architecture")
+
+    reason = driver_module._ordered_sub_tl_complete_receipt_error(
+        state, task, current, root_store
+    )
+
+    assert reason == "completed aggregate slice has no PR number"
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

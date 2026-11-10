@@ -3941,6 +3941,9 @@ def _ordered_sub_tl_complete_receipt_error(
         return "aggregate publication or candidate identity is missing"
     if state.repository_identity is None or not isinstance(reconciliation, Mapping):
         return "repository identity or merge reconciliation is missing"
+    pr_number = current.pr_number
+    if pr_number is None:
+        return "completed aggregate slice has no PR number"
     evidence = receipt.evidence
     base_sha = candidate.aggregate_original_base_sha
     repository_match = _completed_repository_evidence_match_kind(evidence.get("repository"), state)
@@ -3965,9 +3968,6 @@ def _ordered_sub_tl_complete_receipt_error(
         _validate_completed_push_receipt(current, evidence, missing)
     if missing:
         return "post-merge completion evidence conflicts: " + ", ".join(sorted(set(missing)))
-    pr_number = current.pr_number
-    if pr_number is None:
-        return "completed aggregate slice has no PR number"
     journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
     return _aggregate_completion_sync_error(state, current, pr_number, candidate, journal)
 
