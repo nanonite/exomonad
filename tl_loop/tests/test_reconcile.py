@@ -6,6 +6,7 @@ from dataclasses import replace
 
 import pytest
 
+from tl_loop.loop.driver import TLLoopError
 from tl_loop.loop.reconcile import (
     InternalTransition,
     Quiescent,
@@ -580,10 +581,32 @@ def test_merge_ready_snapshot_queues_merge_once_for_matching_handoff() -> None:
 
 def test_merged_snapshot_is_adopted_without_waiting_for_edge() -> None:
     state = replace(_slice(SliceStatus.IN_REVIEW), reviewed_head="head-a")
-    watcher = {"found": True, "head_sha": "head-a", "merged": True, "pr_state": "open"}
+    watcher = {
+        "found": True,
+        "head_sha": "head-a",
+        "merged": True,
+        "pr_number": 42,
+        "pr_state": "open",
+    }
 
     reconciled = reconcile_merge_observation(state, watcher)
 
     assert reconciled.status is SliceStatus.MERGED
     assert reconciled.reconciliation is not None
     assert reconciled.reconciliation["next_action"] == "adopt_merged"
+
+
+def test_merged_snapshot_refuses_missing_observed_pr_number() -> None:
+    state = replace(_slice(SliceStatus.IN_REVIEW), reviewed_head="head-a")
+
+    with pytest.raises(TLLoopError, match="merged watcher observation requires a PR number"):
+        reconcile_merge_observation(
+            state,
+            _observation(
+                found=True,
+                head_sha="head-a",
+                merged=True,
+                pr_number=None,
+                pr_state="open",
+            ),
+        )

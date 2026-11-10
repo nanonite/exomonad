@@ -10,6 +10,7 @@ from types import MappingProxyType
 from typing import cast
 
 from tl_loop.fsm.post_merge import PostMergePhase
+from tl_loop.loop.errors import TLLoopError
 from tl_loop.loop.observation import WatcherObservation
 from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.repository_identity import repository_api_coordinates
@@ -98,6 +99,10 @@ def reconcile_merge_observation(
     if not isinstance(head_sha, str) or not head_sha:
         return state
     if observation.merged is True:
+        if observation.pr_number is None:
+            raise TLLoopError(
+                f"merged watcher observation requires a PR number for slice {state.id!r}"
+            )
         reconciliation = {
             "confirmed_stage": "merge",
             "authoritative_evidence": ["published_pr", "pr_state", "merged"],
@@ -107,7 +112,7 @@ def reconcile_merge_observation(
         }
         if state.status is SliceStatus.MERGED and state.reconciliation == reconciliation:
             return state
-        transitioned = slice_transition(state, MergeCompleted(observation.pr_number or 0))
+        transitioned = slice_transition(state, MergeCompleted(observation.pr_number))
         return replace(transitioned, reconciliation=reconciliation)
     if state.status is not SliceStatus.IN_REVIEW:
         return state

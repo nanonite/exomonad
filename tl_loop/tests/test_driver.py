@@ -15634,7 +15634,11 @@ def _seed_synced_captured_aggregate_with_idle_lane(
     assert current.post_merge is not None
     evidence = dict(current.post_merge.evidence)
     sync_arguments = driver_module._parent_sync_arguments(
-        current, current.pr_number or 0, evidence, base_sha, "."
+        current,
+        driver_module._require_pr_number(current, "test parent sync"),
+        evidence,
+        base_sha,
+        ".",
     )
     sync_identity = driver_module._parent_sync_identity_fields(sync_arguments)
     sync_id = driver_module.stable_action_key(
@@ -18072,7 +18076,7 @@ def _complete_captured_aggregate_boundary(
         root_store,
         state,
         current,
-        current.pr_number or 0,
+        driver_module._require_pr_number(current, "test changelog capture"),
         current.post_merge.evidence,
         "captured",
         "retained judgment already covers the change",
@@ -18320,7 +18324,7 @@ def test_captured_aggregate_refuses_contradictory_entry_added_result(tmp_path: P
         root_store,
         state,
         current,
-        current.pr_number or 0,
+        driver_module._require_pr_number(current, "test changelog capture"),
         current.post_merge.evidence,
         "entry_added",
         "contradictory synthetic receipt",

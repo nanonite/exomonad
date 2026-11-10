@@ -173,6 +173,7 @@ from tl_loop.loop.convergence import (
     ConvergenceTracker,
 )
 from tl_loop.loop.escalate import park
+from tl_loop.loop.errors import TLLoopError
 from tl_loop.loop.heartbeat import (
     HeartbeatConfig,
     SyntheticHeartbeatEvent,
@@ -183,6 +184,7 @@ from tl_loop.loop.heartbeat import (
 from tl_loop.loop.integration_lineage import GitLineageError, verify_aggregate_lineage
 from tl_loop.loop.nested_recovery import verified_nested_recovery_wait
 from tl_loop.loop.observability import emit_controller_event
+from tl_loop.loop.pr_number import _require_pr_number
 from tl_loop.loop.recovery_policy import policy_for_cause
 from tl_loop.loop.reference_verification import observe_reference_project
 from tl_loop.loop.review import (
@@ -775,10 +777,6 @@ def _ordered_stage_complete(
     return all(_ordered_child_complete(task, slices[task.name]) for task in tasks)
 
 
-class TLLoopError(RuntimeError):
-    """The TL loop cannot continue without operator intervention."""
-
-
 class OrderedCompletionEvidenceError(TLLoopError):
     """Ordered recovery cannot safely reconstruct a completed child scope."""
 
@@ -801,13 +799,6 @@ def _require_manifest_digest(manifest: PlanManifest) -> str:
     if manifest.digest is None:
         raise TLLoopError("plan manifest has no digest")
     return manifest.digest
-
-
-def _require_pr_number(current: SliceState, operation: str) -> int:
-    """Return the slice's persisted PR number or fail closed before a PR effect."""
-    if current.pr_number is None:
-        raise TLLoopError(f"{operation} requires a persisted PR number for slice {current.id!r}")
-    return current.pr_number
 
 
 def _optional_identifier_sort_key(value: int | None) -> tuple[bool, int]:
