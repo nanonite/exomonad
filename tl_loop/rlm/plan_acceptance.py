@@ -308,7 +308,7 @@ def _require_text(value: object, name: str) -> str:
 def _protected_node_ids(state: RunState) -> frozenset[str]:
     """Return nodes whose declaration dispatched work already froze."""
     return frozenset(
-        cast(str, slice_state.manifest_node_id)
+        slice_state.manifest_node_id
         for slice_state in state.slices.values()
         if slice_state.manifest_node_id is not None
         and slice_state.status not in {SliceStatus.PENDING, SliceStatus.READY}

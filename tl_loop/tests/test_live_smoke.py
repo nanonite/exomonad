@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -9,6 +11,7 @@ import pytest
 from tl_loop.rlm.call import RlmCallError
 from tl_loop.rlm.live_smoke import (
     _OPENCODE_FREE_MODEL_GROUPS,
+    _parse_harness_arguments,
     configured_models,
     installed_harnesses,
     main,
@@ -17,6 +20,22 @@ from tl_loop.rlm.live_smoke import (
     smoke_request,
 )
 from tl_loop.rlm.subprocess_backend import SubprocessRlmBackend
+
+
+def test_parse_harness_arguments_refuses_a_malformed_parser_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def malformed_arguments(
+        _parser: argparse.ArgumentParser,
+        _args: Sequence[str] | None = None,
+        _namespace: argparse.Namespace | None = None,
+    ) -> argparse.Namespace:
+        return argparse.Namespace(harness=object())
+
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", malformed_arguments)
+
+    with pytest.raises(RlmCallError, match="harness arguments must be a list of strings"):
+        _parse_harness_arguments(())
 
 
 def test_installed_harnesses_only_includes_supported_binaries(

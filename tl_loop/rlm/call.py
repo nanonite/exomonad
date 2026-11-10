@@ -246,7 +246,7 @@ def _coerce_model_choice(model_choice: object) -> RlmModelChoice:
         store=store,
         replay=replay,
         max_attempts=max_attempts,
-        context_length=cast(int | None, context_length),
+        context_length=context_length,
         token_counter=token_counter,
     )
 

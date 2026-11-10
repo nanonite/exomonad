@@ -158,7 +158,20 @@ def _parse_harness_arguments(argv: Sequence[str] | None) -> Sequence[str] | None
         choices=SUPPORTED_BACKEND_HARNESSES,
         help="test only this harness (repeat to select more than one)",
     )
-    return parser.parse_args(argv).harness
+    return _decode_harness_arguments(parser.parse_args(argv).harness)
+
+
+def _decode_harness_arguments(value: object) -> Sequence[str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise RlmCallError("harness arguments must be a list of strings")
+    arguments: list[str] = []
+    for argument in value:
+        if not isinstance(argument, str):
+            raise RlmCallError("harness arguments must be a list of strings")
+        arguments.append(argument)
+    return tuple(arguments)
 
 
 def _select_harnesses(requested: Sequence[str] | None, installed: Sequence[str]) -> tuple[str, ...]:
