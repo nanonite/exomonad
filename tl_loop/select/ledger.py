@@ -111,7 +111,7 @@ def reconcile(
     harness = _non_empty(cast(str, charge["harness"]), "charge.harness")
     applied = estimate if actual_tokens is None else actual_tokens
     delta = None if actual_tokens is None else actual_tokens - estimate
-    warning = actual_tokens is None or abs(cast(int, delta or 0)) / max(estimate, 1) > RECONCILIATION_WARNING_THRESHOLD
+    warning = actual_tokens is None or abs(delta or 0) / max(estimate, 1) > RECONCILIATION_WARNING_THRESHOLD
 
     role_reserved = _counter(result, "role_reserved")
     harness_reserved = _counter(result, "harness_reserved")
@@ -259,7 +259,7 @@ def _drop_zero(values: dict[str, int], key: str) -> None:
 def _integer(value: object, path: str) -> int:
     if type(value) is not int:
         raise LedgerError(f"{path} must be an integer")
-    return cast(int, value)
+    return value
 
 
 def _non_negative(value: object, path: str) -> int:

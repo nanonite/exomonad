@@ -291,7 +291,7 @@ def _failed_harness(slice: SliceState, role_policy: RolePolicy) -> str | None:
         return None
     for recorded in (slice.resolved_harness, slice.agent_type):
         if recorded in role_policy.allow:
-            return cast(str, recorded)
+            return recorded
     return None
 
 
@@ -373,7 +373,7 @@ def _counter_value(value: object, role: str, harness: str, kind: str, label: str
 def _non_negative(value: object, path: str) -> int:
     if type(value) is not int or value < 0:
         raise ValueError(f"{path} must be a non-negative integer")
-    return cast(int, value)
+    return value
 
 
 __all__ = [

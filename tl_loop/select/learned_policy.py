@@ -335,13 +335,13 @@ def _reject_unknown(table: Mapping[str, object], allowed: frozenset[str], path: 
 def _version(value: object, path: str) -> int:
     if type(value) is not int or value != LEARNED_POLICY_VERSION:
         raise LearnedPolicyInvalid(f"{path}: must equal supported version {LEARNED_POLICY_VERSION}")
-    return cast(int, value)
+    return value
 
 
 def _non_negative_int(value: object, path: str) -> int:
     if type(value) is not int or value < 0:
         raise LearnedPolicyInvalid(f"{path}: must be a non-negative integer")
-    return cast(int, value)
+    return value
 
 
 def _require_non_negative(value: object, path: str) -> int:
