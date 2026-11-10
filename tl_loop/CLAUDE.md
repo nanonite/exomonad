@@ -296,6 +296,11 @@ receipts, then runs the existing base, head, CI, and merge checks. The current
 workflow has no root aggregate reviewer phase; review remains on leaf PRs before
 they merge into the sub-TL branch.
 
+`_ordered_sub_tl_complete_receipt_error` reports a completed aggregate with no
+persisted PR as `completed aggregate slice has no PR number`, before comparing
+its receipt coordinates. The missing identity is distinct from a coordinate
+conflict.
+
 ## Durable post-merge recovery boundaries
 
 Remote merge adoption opens a per-slice recovery FSM; it does not complete the
@@ -308,6 +313,14 @@ remote heads, ancestry proofs, or push receipts. Parent pushes use
 `force-with-lease` against the persisted synchronized remote head and remain
 pending when that compare fails, so restart can reconcile the exact durable
 intent without redispatching an already confirmed effect.
+
+`_require_pr_number` in `loop/pr_number.py` raises `TLLoopError` before direct
+merge effect creation, unknown-merge watcher reconciliation, direct-merge
+adoption, merge-phase transition, and aggregate post-merge recovery when the
+slice's persisted PR number is missing. `_execute_direct_merge_intent` returns
+before its watcher call if the initial persisted number is absent.
+`reconcile_merge_observation` also refuses a merged watcher observation whose
+own PR number is absent.
 
 A linked slice closes only its own persisted `chainlink_issue_id`. Before a
 close dispatch or retry, the controller reads that exact issue: `closed` is
@@ -463,6 +476,9 @@ names its runtime type instead of checkpointing through the legacy phase.
 mode. That client exposes only read effects and blocks `emit_controller_event`,
 so a `worker.missing` observation remains in the heartbeat result while its
 controller event is not emitted.
+When heartbeat reconciliation is enabled (`config.heartbeat` is set),
+`_heartbeat_project_root` requires `config.project_root` and raises `TLLoopError`
+if it is absent.
 
 Task-budget enforcement is invocation-scoped and active-work-scoped. Each
 invocation constructs one monotonic `ActiveWorkClock`; `_enforce_task_budget`
@@ -976,6 +992,13 @@ holds: matching plan manifest, child branch and worktree, parent ownership,
 accepted dispatch intent, an exit diagnostic bound to the exact child
 checkpoint revision, and a retryable exit reason. When any proof fails the run
 keeps `tl_failed` and opens `tl-ordered-child-recovery-<child>`.
+
+During terminal-owner recovery, `_terminal_owner_ledger_proof` returns
+`(None, reason)` when the accepted launch lacks a dispatch invocation ID, agent
+ID, intent ID, or branch. Its caller keeps that proof unresolved. Ordered
+recovery passes plans through `_accepted_work_plan`: a `WorkPlan` is retained,
+and a raw mapping is parsed through `WorkPlan.from_mapping` before recovery
+reads its leaves.
 
 An answer to that gate is a decision, and the two non-approvals are treated
 differently from each other only in what they release, never in what they may
