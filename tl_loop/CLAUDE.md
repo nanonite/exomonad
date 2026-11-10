@@ -459,6 +459,10 @@ Nested recovery hold checkpoints use `current.recursive_fsm` when it contains a
 canonical phase accepted by `is_phase_value`. A `None` recursive phase uses the
 legacy `current.fsm`; a present non-canonical value raises `HeartbeatError` and
 names its runtime type instead of checkpointing through the legacy phase.
+`run_tl_loop` can pass `ReadOnlyEffectClient` into `heartbeat_once` in shadow
+mode. That client exposes only read effects and blocks `emit_controller_event`,
+so a `worker.missing` observation remains in the heartbeat result while its
+controller event is not emitted.
 
 Task-budget enforcement is invocation-scoped and active-work-scoped. Each
 invocation constructs one monotonic `ActiveWorkClock`; `_enforce_task_budget`

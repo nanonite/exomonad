@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import cast
@@ -13,6 +14,7 @@ import pytest
 import tl_loop.loop.driver as driver_module
 import tl_loop.loop.heartbeat as heartbeat_module
 from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
+from tl_loop.client.readonly import MutationBlocked, ReadOnlyEffectClient
 from tl_loop.client.transport import JsonObject
 from tl_loop.events.types import BlockCause
 from tl_loop.fsm.recovery import begin_recovery
@@ -1307,6 +1309,42 @@ def test_missing_worker_row_is_persisted_but_not_failed(tmp_path: Path) -> None:
         "resolve_live_pr_for_slice",
         "watcher_pr_state",
     ]
+
+
+def test_missing_worker_event_is_not_emitted_through_read_only_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
+    transport = HeartbeatTransport(worker_present=False)
+    effects = ReadOnlyEffectClient(EffectClient(transport))
+    emissions: list[str] = []
+
+    def record_emission(
+        _client: EffectClient,
+        event_type: str,
+        payload: Mapping[str, object],
+    ) -> None:
+        del _client, payload
+        emissions.append(event_type)
+
+    monkeypatch.setattr(heartbeat_module, "emit_controller_event", record_emission)
+
+    with pytest.raises(MutationBlocked, match="emit_controller_event"):
+        effects.emit_controller_event(event_type="worker.missing", payload={})
+
+    result = heartbeat_once(
+        state,
+        store,
+        effects,
+        HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=100.0),
+        now=10.0,
+        project_root=tmp_path,
+    )
+
+    assert result.events[0].kind == "worker.missing"
+    assert emissions == []
+    assert not any(name == "emit_controller_event" for name, _ in transport.calls)
 
 
 def test_missing_worker_identity_is_recorded_in_reconciliation_evidence(tmp_path: Path) -> None:
