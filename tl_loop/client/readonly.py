@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import NoReturn, cast
+from typing import NoReturn
 
 from .effects import TOOL_METHODS, EffectClient, ToolResult
+from .transport import DecodeError
 
 
 class MutationBlocked(RuntimeError):
@@ -89,11 +90,12 @@ class ReadOnlyEffectClient:
 
     def __getattr__(self, name: str) -> Callable[..., NoReturn]:
         if name in MUTATING_METHODS:
-            return cast(Callable[..., NoReturn], self._blocked(name))
+            return self._blocked(name)
         raise AttributeError(name)
 
     def _read(self, name: str, arguments: dict[str, object]) -> ToolResult:
-        return getattr(self._client, name)(**arguments)
+        result = getattr(self._client, name)(**arguments)
+        return _require_tool_result(result, name)
 
     @staticmethod
     def _blocked(name: str) -> Callable[..., NoReturn]:
@@ -101,6 +103,12 @@ class ReadOnlyEffectClient:
             raise MutationBlocked(f"shadow mode blocks mutating effect: {name}")
 
         return reject
+
+
+def _require_tool_result(value: object, operation: str) -> ToolResult:
+    if not isinstance(value, ToolResult):
+        raise DecodeError(f"Read effect {operation!r} did not return a ToolResult")
+    return value
 
 
 __all__ = ["MUTATING_METHODS", "READ_METHODS", "MutationBlocked", "ReadOnlyEffectClient"]

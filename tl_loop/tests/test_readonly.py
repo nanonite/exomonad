@@ -7,8 +7,12 @@ from dataclasses import dataclass, field
 import pytest
 
 from tl_loop.client.effects import EffectClient
-from tl_loop.client.readonly import MUTATING_METHODS, MutationBlocked, ReadOnlyEffectClient
-from tl_loop.client.transport import JsonObject
+from tl_loop.client.readonly import (
+    MUTATING_METHODS,
+    MutationBlocked,
+    ReadOnlyEffectClient,
+)
+from tl_loop.client.transport import DecodeError, JsonObject
 
 
 @dataclass
@@ -43,3 +47,12 @@ def test_read_effects_are_forwarded() -> None:
 
     assert result.success is True
     assert transport.calls == ["chainlink_issue_show"]
+
+
+def test_read_effect_result_requires_tool_result() -> None:
+    effect = EffectClient(RecordingTransport())
+    object.__setattr__(effect, "poll_workers", lambda **_arguments: object())
+    client = ReadOnlyEffectClient(effect)
+
+    with pytest.raises(DecodeError, match="did not return a ToolResult"):
+        client.poll_workers()

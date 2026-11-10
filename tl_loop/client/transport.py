@@ -120,7 +120,7 @@ class TransportClient:
         )
         if not isinstance(response, dict):
             raise DecodeError(f"Tool-call response is not an object: {response!r}")
-        return cast(JsonObject, response)
+        return response
 
     def provision_ordered_sub_tl(
         self,
