@@ -5752,10 +5752,13 @@ def _terminal_resume_history_proof(
             result = journal.replay(entry)
         except ActionJournalError:
             return None, "confirmed terminal-owner result is missing or malformed"
-        payload = result.result
-        agent = payload.get("agent") if isinstance(payload, Mapping) else None
-        invocation = payload.get("invocation") if isinstance(payload, Mapping) else None
-        assert isinstance(agent, Mapping) and isinstance(invocation, Mapping)
+        confirmed_payload = _json_mapping(result.result, "confirmed resume result")
+        agent = _json_mapping(
+            confirmed_payload.get("agent"), "confirmed resume result.agent"
+        )
+        invocation = _json_mapping(
+            confirmed_payload.get("invocation"), "confirmed resume result.invocation"
+        )
         successor_id = invocation.get("invocation_id")
         persisted = owner.invocation_record
         persisted_matches = persisted.get("invocation_id") == successor_id
@@ -5859,10 +5862,10 @@ def _terminal_resume_history_proof(
         return None, "terminal owner runtime and model records disagree"
     if latest_result is not None and latest_confirmed_entry is not None:
         payload = latest_result.result
-        agent = payload.get("agent") if isinstance(payload, Mapping) else None
+        result_agent = payload.get("agent") if isinstance(payload, Mapping) else None
         result_invocation = payload.get("invocation") if isinstance(payload, Mapping) else None
         if (
-            not isinstance(agent, Mapping)
+            not isinstance(result_agent, Mapping)
             or not isinstance(result_invocation, Mapping)
             or result_invocation.get("invocation_id") != invocation.get("invocation_id")
             or result_invocation.get("runtime") != invocation.get("runtime")
@@ -5874,9 +5877,9 @@ def _terminal_resume_history_proof(
                 result_invocation.get("effort") is not None
                 and result_invocation.get("effort") != invocation.get("effort")
             )
-            or agent.get("id") != owner.agent_name
-            or agent.get("branch_name") != owner.branch
-            or Path(str(agent.get("worktree_path", ""))).resolve() != owner.worktree
+            or result_agent.get("id") != owner.agent_name
+            or result_agent.get("branch_name") != owner.branch
+            or Path(str(result_agent.get("worktree_path", ""))).resolve() != owner.worktree
         ):
             return None, "confirmed resume result conflicts with the persisted terminal invocation"
         result_route, route_reason = _terminal_resume_result_route(
@@ -32339,6 +32342,12 @@ def _optional_timeout(value: object, label: str) -> float | None:
     if parsed < 0 or not math.isfinite(parsed):
         raise ValueError(f"{label} must be null or a non-negative number")
     return None if parsed == 0 else parsed
+
+
+def _json_mapping(value: object, what: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise TLLoopError(f"{what} must be a JSON object")
+    return value
 
 
 def _string_tuple(value: object, label: str) -> tuple[str, ...]:

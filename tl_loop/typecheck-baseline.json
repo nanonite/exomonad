@@ -33,7 +33,7 @@
     },
     "tl_loop/loop/driver.py": {
       "arg-type": 192,
-      "assignment": 30,
+      "assignment": 27,
       "call-arg": 1,
       "comparison-overlap": 1,
       "dict-item": 1,
@@ -41,7 +41,7 @@
       "redundant-cast": 7,
       "return": 1,
       "type-arg": 1,
-      "union-attr": 102
+      "union-attr": 37
     },
     "tl_loop/loop/escalate.py": {
       "arg-type": 2,
