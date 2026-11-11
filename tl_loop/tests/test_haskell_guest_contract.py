@@ -67,14 +67,18 @@ def test_production_agent_handler_artifact_is_accepted_by_aggregate_lookup_consu
     never_raw = outputs["never_published"]
     never_result = ToolResult.from_raw(cast(JsonObject, never_raw))
     assert _decode_aggregate_publication_lookup("slice-never-published", never_result, 1) is None
-    assert never_result.result["publication"] is None  # type: ignore[index]
+    never_payload = never_result.result
+    assert isinstance(never_payload, dict)
+    assert never_payload["publication"] is None
 
     abandoned_raw = outputs["all_attempts_abandoned"]
     abandoned_result = ToolResult.from_raw(cast(JsonObject, abandoned_raw))
     with pytest.raises(AggregatePublicationRejected) as rejected:
         _decode_aggregate_publication_lookup("slice-abandoned", abandoned_result, 1)
     assert rejected.value.error_kind == "publication_lookup_unresolved"
-    assert abandoned_result.result["publication"] is None  # type: ignore[index]
+    abandoned_payload = abandoned_result.result
+    assert isinstance(abandoned_payload, dict)
+    assert abandoned_payload["publication"] is None
 
 
 def test_compiled_spawn_preflight_artifact_preserves_structured_refusal_for_python() -> None:

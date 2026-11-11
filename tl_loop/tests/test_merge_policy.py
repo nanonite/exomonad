@@ -13,6 +13,7 @@ from tl_loop.loop.reconcile import (
     reconcile_merge_observation,
 )
 from tl_loop.ordered import IntegrationLifecycle
+from tl_loop.fsm.phase import TLPhase
 from tl_loop.state.schema import (
     ActionKind,
     ActionPhase,
@@ -27,7 +28,6 @@ from tl_loop.state.schema import (
     RunState,
     SliceState,
     SliceStatus,
-    TLPhase,
     Verdict,
 )
 from tl_loop.tests.test_reconcile import _slice

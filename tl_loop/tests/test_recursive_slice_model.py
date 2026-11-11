@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import TypedDict
 
 import pytest
 
@@ -41,6 +42,16 @@ from tl_loop.state.slice_transition import (
 )
 
 
+class ReviewEventChanges(TypedDict, total=False):
+    reviewer_account_authenticated: bool
+    reviewer_identity_unresolved: bool
+    self_approval: bool
+    dismissed: bool
+    forgejo_stale: bool
+    review_id: int | None
+    reviewer_agent_id: str | None
+
+
 def _state(status: SliceStatus = SliceStatus.IN_REVIEW) -> SliceState:
     return SliceState(
         id="slice-a",
@@ -76,7 +87,7 @@ def _verdict() -> ReviewVerdictObserved:
         reviewer_agent_id="reviewer",
         review_id=17,
         findings=(),
-        source="ledger",  # type: ignore[arg-type]
+        source="ledger",
         pr_number=43,
         reviewer_account_authenticated=True,
         reviewer_identity_unresolved=False,
@@ -224,7 +235,7 @@ def test_every_slice_event_has_an_oracle_successor_for_every_status(
     ],
 )
 def test_slice_review_matrix_rejects_invalid_evidence_in_every_status(
-    status: SliceStatus, changes: dict[str, object]
+    status: SliceStatus, changes: ReviewEventChanges
 ) -> None:
     with pytest.raises(IllegalSliceTransition):
         slice_transition(_state(status), replace(_verdict(), **changes))

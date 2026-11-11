@@ -24,6 +24,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from tl_loop.client.effects import EffectClient, ToolResult
+from tl_loop.client.transport import JsonObject
 from tl_loop.fsm.post_merge import PostMergePhase
 from tl_loop.loop.convergence import ConvergenceTracker
 from tl_loop.loop.driver import (
@@ -35,8 +36,12 @@ from tl_loop.loop.driver import (
     _reconcile_nonterminal_slices,
 )
 from tl_loop.loop.journal import EffectJournal
-from tl_loop.state.legacy_manifest import LegacyManifestDisposition, reconcile_legacy_manifest
-from tl_loop.state.plan_manifest import build_legacy_manifest, build_plan_manifest
+from tl_loop.state.legacy_manifest import (
+    LegacyManifestDisposition,
+    LegacyManifestReconciliation,
+    reconcile_legacy_manifest,
+)
+from tl_loop.state.plan_manifest import PlanManifest, build_legacy_manifest, build_plan_manifest
 from tl_loop.state.schema import (
     ActionKind,
     ActionPhase,
@@ -45,6 +50,7 @@ from tl_loop.state.schema import (
     HandoffEvidence,
     PublicationBinding,
     RepositoryIdentity,
+    RunState,
     SliceState,
     SliceStatus,
     Verdict,
@@ -79,7 +85,7 @@ def _candidate_plan() -> WorkPlan:
     )
 
 
-def _candidate_manifest():
+def _candidate_manifest() -> PlanManifest:
     return build_plan_manifest(
         {
             "leaves": [
@@ -97,7 +103,7 @@ def _candidate_manifest():
     )
 
 
-def _legacy_manifest():
+def _legacy_manifest() -> PlanManifest:
     return build_legacy_manifest({"slices": {SLICE_ID: {}}}, run_id=RUN_ID)
 
 
@@ -222,7 +228,9 @@ def _merged_watcher_transport() -> IntegrationTransport:
     )
 
 
-def _seed_and_migrate(tmp_path: Path):
+def _seed_and_migrate(
+    tmp_path: Path,
+) -> tuple[RunStore, RunState, LegacyManifestReconciliation]:
     """Build the sanitized legacy-manifest checkpoint and install the migration.
 
     Returns (store, migrated_state, reconciliation) with the legacy manifest
@@ -261,17 +269,23 @@ def _seed_and_migrate(tmp_path: Path):
     return store, migrated, reconciliation
 
 
-def _mutating_call_names(calls: list) -> list[str]:
+def _mutating_call_names(calls: list[tuple[str, JsonObject]]) -> list[str]:
     return [name for name, _ in calls if name != "emit_controller_event"]
 
 
-def _drain_to_complete(store: RunStore, config: TLLoopConfig, effects, effects_log) -> None:
+def _drain_to_complete(
+    store: RunStore,
+    config: TLLoopConfig,
+    effects: EffectClient,
+    effects_log: list[EffectIntent],
+) -> None:
     for _ in range(10):
         state = _apply_convergence(
             store.load(), ConvergenceTracker(), store, config, effects, effects_log
         )
         post_merge = state.slices[SLICE_ID].post_merge
-        if post_merge is not None and post_merge.phase is PostMergePhase.COMPLETE:
+        assert post_merge is not None
+        if post_merge.phase is PostMergePhase.COMPLETE:
             return
     raise AssertionError("post-merge recovery did not reach COMPLETE within the bounded drain")
 
@@ -282,14 +296,18 @@ def test_sanitized_legacy_migration_converges_through_post_merge_complete(
     store, migrated, reconciliation = _seed_and_migrate(tmp_path)
 
     assert reconciliation.bindings == {f"{RUN_ID}/worker/{SLICE_ID}": f"{RUN_ID}/leaf/{SLICE_ID}"}
-    assert migrated.plan_manifest.role == "root"
-    assert migrated.plan_manifest.owned_branch == "main"
-    assert migrated.slices[SLICE_ID].legacy_manifest_migration["disposition"] == "proven"
+    migrated_manifest = migrated.plan_manifest
+    assert migrated_manifest is not None
+    assert migrated_manifest.role == "root"
+    assert migrated_manifest.owned_branch == "main"
+    migration_evidence = migrated.slices[SLICE_ID].legacy_manifest_migration
+    assert migration_evidence is not None
+    assert migration_evidence["disposition"] == "proven"
 
     config = _config()
     transport = _merged_watcher_transport()
     effects = EffectClient(transport)
-    effects_log: list = []
+    effects_log: list[EffectIntent] = []
     journal = EffectJournal(RUN_ID, store.run_dir / "action-journal.json")
 
     reconciled = _reconcile_nonterminal_slices(
@@ -305,7 +323,9 @@ def test_sanitized_legacy_migration_converges_through_post_merge_complete(
     _drain_to_complete(store, config, effects, effects_log)
 
     final = store.load()
-    assert final.slices[SLICE_ID].post_merge.phase is PostMergePhase.COMPLETE
+    final_post_merge = final.slices[SLICE_ID].post_merge
+    assert final_post_merge is not None
+    assert final_post_merge.phase is PostMergePhase.COMPLETE
     assert [name for name, _ in transport.calls if name == "merge_pr"] == []
 
     chainlink_close_calls = [
@@ -327,7 +347,7 @@ def test_sanitized_repeated_continuation_is_a_terminal_no_op(tmp_path: Path) -> 
     config = _config()
     transport = _merged_watcher_transport()
     effects = EffectClient(transport)
-    effects_log: list = []
+    effects_log: list[EffectIntent] = []
     journal = EffectJournal(RUN_ID, store.run_dir / "action-journal.json")
 
     # Continuation 1: adopts the confirmed merge and drains post-merge to
@@ -345,11 +365,15 @@ def test_sanitized_repeated_continuation_is_a_terminal_no_op(tmp_path: Path) -> 
             _candidate_plan(), state, config, effects, store, journal
         )
         assert reconciled.slices[SLICE_ID].status is SliceStatus.MERGED
-        assert reconciled.slices[SLICE_ID].post_merge.phase is PostMergePhase.COMPLETE
+        reconciled_post_merge = reconciled.slices[SLICE_ID].post_merge
+        assert reconciled_post_merge is not None
+        assert reconciled_post_merge.phase is PostMergePhase.COMPLETE
         converged = _apply_convergence(
             store.load(), ConvergenceTracker(), store, config, effects, effects_log
         )
-        assert converged.slices[SLICE_ID].post_merge.phase is PostMergePhase.COMPLETE
+        converged_post_merge = converged.slices[SLICE_ID].post_merge
+        assert converged_post_merge is not None
+        assert converged_post_merge.phase is PostMergePhase.COMPLETE
 
     # Continuations 2 and 3 may still emit informational controller telemetry
     # (e.g. a "no_active_slices" wait-reason observation), but must never

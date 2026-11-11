@@ -59,15 +59,15 @@ def test_python_fsm_matches_every_haskell_golden_row() -> None:
     assert isinstance(rows, list)
     for row_value in rows:
         assert isinstance(row_value, dict)
-        row = cast(JsonObject, row_value)
+        row = row_value
         phase_data = row.get("phase")
         event_data = row.get("event")
         expected = row.get("result")
         assert isinstance(phase_data, dict)
         assert isinstance(event_data, dict)
         assert expected is not None
-        phase = _parse_phase(cast(JsonObject, phase_data))
-        event = _parse_event(cast(JsonObject, event_data))
+        phase = _parse_phase(phase_data)
+        event = _parse_event(event_data)
         actual = _apply_transition(phase, event)
         assert actual == expected, f"{phase_data!r} + {event_data!r}"
 
@@ -121,7 +121,7 @@ def _parse_children(data: JsonObject) -> dict[str, ChildHandle]:
     parsed: dict[str, ChildHandle] = {}
     for slug, value in children.items():
         assert isinstance(value, dict)
-        parsed[slug] = _parse_handle(cast(JsonObject, value))
+        parsed[slug] = _parse_handle(value)
     return parsed
 
 
@@ -141,7 +141,7 @@ def _parse_event(data: JsonObject) -> TLEvent:
     if tag == "child_spawned":
         handle = data.get("handle")
         assert isinstance(handle, dict)
-        return ChildSpawned(_parse_handle(cast(JsonObject, handle)))
+        return ChildSpawned(_parse_handle(handle))
     if tag == "child_completed":
         slug = data.get("slug")
         assert isinstance(slug, str)
@@ -197,7 +197,8 @@ def _phase_json(phase: PhaseValue) -> JsonObject:
         return {"phase": "tl_pr_filed", "pr_number": phase.pr_number, "url": phase.url}
     if isinstance(phase, TLDone):
         return {"phase": "tl_done"}
-    return {"phase": "tl_failed", "message": cast(TLFailed, phase).message}
+    assert isinstance(phase, TLFailed)
+    return {"phase": "tl_failed", "message": phase.message}
 
 
 def _children_json(children: Mapping[str, ChildHandle]) -> JsonObject:

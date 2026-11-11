@@ -1,4 +1,3 @@
-from dataclasses import replace
 from datetime import UTC, datetime
 
 from tl_loop.state.review_validation import (
@@ -16,9 +15,14 @@ NOW = datetime(2026, 8, 29, 0, 0, tzinfo=UTC)
 
 
 def _evidence(
-    *, validated_at: str | None = "2026-08-28T23:55:00Z", **changes: object
+    *,
+    validated_at: str | None = "2026-08-28T23:55:00Z",
+    reviewer_account_authenticated: bool = True,
+    dismissed: bool = False,
+    forgejo_stale: bool = False,
+    reviewer_identity_unresolved: bool = False,
 ) -> DurableReviewEvidence:
-    evidence = DurableReviewEvidence(
+    return DurableReviewEvidence(
         review_id=17,
         pr_number=43,
         head_sha="head-a",
@@ -26,21 +30,30 @@ def _evidence(
         verdict=Verdict.GO,
         submitted_at="2026-08-27T00:00:00Z",
         validated_at=validated_at,
+        reviewer_account_authenticated=reviewer_account_authenticated,
+        dismissed=dismissed,
+        forgejo_stale=forgejo_stale,
+        reviewer_identity_unresolved=reviewer_identity_unresolved,
     )
-    return replace(evidence, **changes)
 
 
-def _observation(**changes: object) -> ReviewValidationObservation:
-    values: dict[str, object] = {
-        "review_id": 17,
-        "pr_number": 43,
-        "head_sha": "head-a",
-        "reviewer_agent_id": "review-invocation",
-        "verdict": Verdict.GO,
-        "observed_at": "2026-08-29T00:00:00Z",
-    }
-    values.update(changes)
-    return ReviewValidationObservation(**values)  # type: ignore[arg-type]
+def _observation(
+    *,
+    review_id: int = 17,
+    verdict: Verdict = Verdict.GO,
+    reviewer_account_authenticated: bool = True,
+    dismissed: bool = False,
+) -> ReviewValidationObservation:
+    return ReviewValidationObservation(
+        review_id=review_id,
+        pr_number=43,
+        head_sha="head-a",
+        reviewer_agent_id="review-invocation",
+        verdict=verdict,
+        observed_at="2026-08-29T00:00:00Z",
+        reviewer_account_authenticated=reviewer_account_authenticated,
+        dismissed=dismissed,
+    )
 
 
 def test_same_identity_expired_validation_is_refreshed() -> None:
@@ -110,15 +123,14 @@ def test_missing_validation_timestamp_is_not_fresh() -> None:
 
 def test_freshness_is_false_for_invalid_or_mismatched_evidence() -> None:
     for changes in (
-        {"reviewer_account_authenticated": False},
-        {"dismissed": True},
-        {"forgejo_stale": True},
-        {"reviewer_identity_unresolved": True},
+        _evidence(reviewer_account_authenticated=False),
+        _evidence(dismissed=True),
+        _evidence(forgejo_stale=True),
+        _evidence(reviewer_identity_unresolved=True),
     ):
-        evidence = _evidence(**changes)
         assert (
             review_validation_is_fresh(
-                evidence,
+                changes,
                 now=NOW,
                 freshness_window_secs=60,
                 expected_pr_number=43,

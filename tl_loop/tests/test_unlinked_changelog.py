@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from tl_loop.client.effects import EffectClient
+from tl_loop.client.transport import JsonObject, JsonValue
 from tl_loop.fsm.lane import LanePhase, LaneState
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.post_merge_events import PostMergeNotApplicable, UnlinkedChangelogJudged
@@ -47,14 +48,14 @@ SYNCED_EVIDENCE = {
 class ChangelogTransport:
     """Records effect calls and answers the two changelog tools."""
 
-    context: dict[str, object] | None = None
+    context: JsonObject | None = None
     context_error: str | None = None
     entry_outcome: str = "entry_added"
-    calls: list[tuple[str, dict[str, object]]] = field(default_factory=list)
+    calls: list[tuple[str, JsonObject]] = field(default_factory=list)
 
     def call_tool(
-        self, role: str, name: str, tool_name: str, arguments: dict[str, object]
-    ) -> dict[str, object]:
+        self, role: str, name: str, tool_name: str, arguments: JsonObject
+    ) -> JsonObject:
         del role, name
         self.calls.append((tool_name, arguments))
         if tool_name == "post_merge_changelog_context":
@@ -84,12 +85,12 @@ class ChangelogTransport:
     def names(self) -> list[str]:
         return [name for name, _ in self.calls if name != "emit_controller_event"]
 
-    def events(self) -> list[dict[str, object]]:
+    def events(self) -> list[JsonObject]:
         return [args for name, args in self.calls if name == "emit_controller_event"]
 
 
-def _context(**overrides: object) -> dict[str, object]:
-    context: dict[str, object] = {
+def _context(**overrides: JsonValue) -> JsonObject:
+    context: JsonObject = {
         "child_id": "leaf",
         "expected_base_sha": "parent-commit",
         "changelog_present": True,

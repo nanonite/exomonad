@@ -13,6 +13,7 @@ import pytest
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.transport import JsonObject
 from tl_loop.events.envelope import EventEnvelope
+from tl_loop.events.reader import LedgerSnapshot
 from tl_loop.loop import driver
 from tl_loop.loop.driver import (
     EffectIntent,
@@ -34,6 +35,7 @@ from tl_loop.loop.schedule import (
     unsatisfiable_dependencies,
     withhold_unsatisfiable_dependents,
 )
+from tl_loop.loop.shadow import _phase_from_state
 from tl_loop.plan_dependencies import DependencyValidationError, validate_leaf_dependencies
 from tl_loop.plan_validation import PlanValidationError, validate_plan_document
 from tl_loop.select.policy import HarnessPolicy, validate_policy
@@ -62,6 +64,10 @@ class _EmptySource:
         del event
         return 0
 
+    def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+        del cursor
+        raise AssertionError("unexpected snapshot request")
+
 
 # --------------------------------------------------------------------------
 # Schema and same-scope DAG validation
@@ -71,7 +77,12 @@ class _EmptySource:
 def test_plan_document_accepts_a_leaf_dag_and_keeps_the_edges() -> None:
     document = _plan_document(leaf_a(), leaf_b("a"), leaf_c("a", "b"))
 
-    leaves = cast(list[dict[str, object]], validate_plan_document(document)["plan"]["leaves"])  # type: ignore[index]
+    plan_value = validate_plan_document(document)["plan"]
+    assert isinstance(plan_value, dict)
+    leaves_value = plan_value["leaves"]
+    assert isinstance(leaves_value, list)
+    leaves = [leaf for leaf in leaves_value if isinstance(leaf, dict)]
+    assert len(leaves) == len(leaves_value)
 
     assert [leaf.get("depends_on", []) for leaf in leaves] == [[], ["a"], ["a", "b"]]
 
@@ -118,7 +129,7 @@ def test_a_nested_scope_resolves_its_edges_within_its_own_plan() -> None:
 
     assert [
         leaf.get("depends_on", []) for leaf in cast(list[dict[str, object]], nested["leaves"])
-    ] == [  # type: ignore[index]
+    ] == [
         [],
         ["a"],
     ]
@@ -456,7 +467,7 @@ def test_blocking_a_dependent_is_durable_and_idempotent(tmp_path: Path) -> None:
         return _block_unsatisfiable_dependents(
             store.load(),
             TLLoopConfig(root_dir=tmp_path),
-            EffectClient(_Transport()),  # type: ignore[arg-type]
+            EffectClient(_Transport()),
             effects_log,
             store,
         )
@@ -904,7 +915,7 @@ def _dispatch_pass(plan: WorkPlan, store: RunStore, transport: _Transport) -> Ru
         plan,
         store.load(),
         config,
-        EffectClient(transport),  # type: ignore[arg-type]
+        EffectClient(transport),
         effects_log,
         store,
     )
@@ -923,7 +934,7 @@ def _merge(store: RunStore, slice_id: str) -> None:
         for name, current in state.slices.items()
     }
     store.checkpoint(
-        driver._phase_from_state(state),
+        _phase_from_state(state),
         slices,
         state.budgets,
         state.events.last_consumed_offset,

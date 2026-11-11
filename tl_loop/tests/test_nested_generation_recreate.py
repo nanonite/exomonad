@@ -30,6 +30,7 @@ from pathlib import Path
 
 import pytest
 
+from tl_loop.events.envelope import EventEnvelope
 from tl_loop.fsm.event import PRFiled
 from tl_loop.loop.driver import (
     TLLoopConfig,
@@ -239,7 +240,7 @@ def test_a_recreated_child_binds_the_current_publication_not_the_predecessors(
     )
     slices = {LEAF_SLICE: confirmed}
 
-    def publication(pr_number: int, invocation: str):
+    def publication(pr_number: int, invocation: str) -> EventEnvelope:
         return project(
             {
                 "schema_version": 1,

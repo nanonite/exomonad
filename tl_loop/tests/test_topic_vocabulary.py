@@ -19,10 +19,17 @@ def test_every_obs_topic_has_an_existing_registry_counterpart() -> None:
     registry = _object(REGISTRY)
     mappings = _object(MAPPINGS)
     events = cast(list[dict[str, object]], registry["event_types"])
-    event_types = {cast(str, event["type"]) for event in events}
+    event_types = {
+        event_type
+        for event in events
+        if isinstance((event_type := event["type"]), str)
+    }
     topics = cast(list[dict[str, object]], mappings["obs_topics"])
 
     assert topics
-    assert all(topic["topic"].startswith("obs/") for topic in topics)
+    assert all(
+        isinstance(topic["topic"], str) and topic["topic"].startswith("obs/")
+        for topic in topics
+    )
     assert all(topic["event_type"] in event_types for topic in topics)
     assert all(topic["topic"] == f"obs/event/{topic['event_type']}" for topic in topics)

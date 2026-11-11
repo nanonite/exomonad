@@ -74,7 +74,9 @@ from tl_loop.tests.checkpoint_fixtures import create
 NOW = datetime(2026, 8, 11, 17, 0, tzinfo=UTC)
 
 
-def test_reviewer_max_rounds_honors_session_override(monkeypatch, tmp_path: Path) -> None:
+def test_reviewer_max_rounds_honors_session_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     policy = tmp_path / "review-policy.toml"
     policy.write_text("reviewer_max_rounds = 7\n", encoding="utf-8")
 
@@ -574,7 +576,7 @@ def test_malformed_ownership_blocks_direct_merge(tmp_path: Path) -> None:
     assert store.load().slices["leaf"].action == before.slices["leaf"].action
 
 
-def _lost_merge_then(second_snapshot: dict[str, object]) -> DirectMergeTransport:
+def _lost_merge_then(second_snapshot: JsonObject) -> DirectMergeTransport:
     """A transport whose merge response is lost, then reports ``second_snapshot``."""
 
     class Transport(DirectMergeTransport):
@@ -601,8 +603,8 @@ def _lost_merge_then(second_snapshot: dict[str, object]) -> DirectMergeTransport
     return Transport()
 
 
-def _second_merge_snapshot(*, merged: bool, ownership: str) -> dict[str, object]:
-    snapshot: dict[str, object] = {
+def _second_merge_snapshot(*, merged: bool, ownership: str) -> JsonObject:
+    snapshot: JsonObject = {
         "merged": merged,
         "pr_number": 42,
         "head_sha": "abc123",
@@ -1319,9 +1321,11 @@ def _document() -> dict[str, object]:
         owned_branch="legacy",
     )
     document["plan_manifest"] = manifest.to_document()
-    cast(dict[str, object], document["slices"])["leaf"].update(
-        {"manifest_node_id": manifest.nodes[0].node_id, "manifest_revision": 1}
-    )
+    raw_slices = document["slices"]
+    assert isinstance(raw_slices, dict)
+    leaf = raw_slices["leaf"]
+    assert isinstance(leaf, dict)
+    leaf.update({"manifest_node_id": manifest.nodes[0].node_id, "manifest_revision": 1})
     return document
 
 
@@ -1343,7 +1347,7 @@ def _state(tmp_path: Path, head: str, verdict_at: str) -> tuple[RunState, RunSto
 
 @dataclass
 class DirectMergeTransport:
-    snapshots: list[dict[str, object]] = field(default_factory=list)
+    snapshots: list[JsonObject] = field(default_factory=list)
     calls: list[tuple[str, JsonObject]] = field(default_factory=list)
 
     def call_tool(
@@ -1368,7 +1372,7 @@ def _snapshot(
     *,
     head_sha: str,
     merge_tree_sha: str | None = "tree-a",
-) -> dict[str, object]:
+) -> JsonObject:
     return {
         "found": True,
         "head_sha": head_sha,

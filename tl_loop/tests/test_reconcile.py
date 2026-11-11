@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
 from tl_loop.loop.driver import TLLoopError
 from tl_loop.loop.reconcile import (
+    ExternalIntent,
     InternalTransition,
     Quiescent,
     derive_next_action,
@@ -15,6 +17,7 @@ from tl_loop.loop.reconcile import (
     reconcile_slice,
     reduce_observation,
 )
+from tl_loop.fsm.phase import TLPhase
 from tl_loop.state.schema import (
     BudgetLedger,
     EventCursor,
@@ -22,9 +25,9 @@ from tl_loop.state.schema import (
     HandoffEvidence,
     ObservationProvenance,
     RunState,
+    ReviewPolicySource,
     SliceState,
     SliceStatus,
-    TLPhase,
     Verdict,
 )
 from tl_loop.state.store import RunStore, _encode_slice
@@ -146,6 +149,7 @@ def test_review_round_ceiling_is_slice_scoped_and_survives_head_change() -> None
     )
     reset_decision = derive_next_action(next_head, reviewer_max_rounds=2)
 
+    assert isinstance(reset_decision, InternalTransition)
     assert reset_decision.name == "in_review"
     assert reset_decision.reason == "head_reset"
     assert next_head.review_rounds == 2
@@ -167,6 +171,7 @@ def test_parked_slice_does_not_starve_parallel_actionable_slice() -> None:
 
     decision = derive_next_action(state, reviewer_max_rounds=2)
 
+    assert isinstance(decision, ExternalIntent)
     assert decision.target_id == "slice-b"
     assert decision.operation == "repair"
 
@@ -188,7 +193,7 @@ def test_persisted_review_ceiling_wins_over_restart_override() -> None:
         gates=(),
         events=EventCursor(0),
         reviewer_max_rounds=3,
-        reviewer_max_rounds_source="environment",
+        reviewer_max_rounds_source=ReviewPolicySource.ENVIRONMENT,
     )
 
     decision = derive_next_action(state, reviewer_max_rounds=1)
@@ -524,7 +529,7 @@ def test_reconciliation_still_reports_missing_pr_number_without_recovered_eviden
     assert result.next_action == "await_authoritative_evidence"
 
 
-def test_reconciliation_evidence_round_trips_through_checkpoint(tmp_path) -> None:
+def test_reconciliation_evidence_round_trips_through_checkpoint(tmp_path: Path) -> None:
     create(
         "reconcile",
         {"slices": {"slice-a": _encode_slice("slice-a", _slice(SliceStatus.SPAWNED))}},

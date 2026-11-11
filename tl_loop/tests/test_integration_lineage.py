@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -126,13 +127,24 @@ def test_aggregate_lineage_reports_missing_receipt_commit_without_type_error(
 ) -> None:
     repository = _repository(tmp_path / "malformed")
     head = _git(repository, "rev-parse", "HEAD")
-    with pytest.raises(GitLineageError, match="malformed_commit_identity"):
-        verify_aggregate_lineage(
-            repository,
-            head,
-            _tree(repository, head),
-            (None,),  # type: ignore[arg-type] - malformed historical receipt input
-        )
+    script = """
+import sys
+from tl_loop.loop.integration_lineage import GitLineageError, verify_aggregate_lineage
+
+try:
+    verify_aggregate_lineage(sys.argv[1], sys.argv[2], sys.argv[3], (None,))
+except GitLineageError as error:
+    print(error.code)
+"""
+    result = subprocess.run(
+        (sys.executable, "-c", script, str(repository), head, _tree(repository, head)),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "malformed_commit_identity"
 
 
 @pytest.mark.parametrize(

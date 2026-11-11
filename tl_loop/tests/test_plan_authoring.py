@@ -19,7 +19,6 @@ from tl_loop.rlm.decompose import DecompositionParked
 from tl_loop.rlm.plan_acceptance import (
     ACCEPTANCE_APPROVED,
     ACCEPTANCE_PENDING,
-    MAX_AUDIT_VIOLATION_CHARS,
     PlanAcceptanceError,
     PlanAcceptanceRequired,
     PlanAuthoringRecordError,
@@ -34,6 +33,7 @@ from tl_loop.rlm.plan_acceptance import (
     recorded_plan,
     require_acceptance,
 )
+from tl_loop.rlm.plan_authoring import MAX_AUDIT_VIOLATION_CHARS
 from tl_loop.rlm.plan_authoring import (
     AuthoredPlan,
     PlanAuthoringError,
@@ -389,7 +389,7 @@ def test_invalid_output_is_repaired_with_specific_feedback() -> None:
     assert [node.name for node in plan.manifest.nodes] == ["api", "tests"]
     assert len(backend.requests) == 2
     retry_sections = cast(
-        "list[dict[str, object]]", cast(JsonObject, backend.requests[1].inputs)["sections"]
+        "list[dict[str, object]]", backend.requests[1].inputs["sections"]
     )
     feedback = next(
         section for section in retry_sections if section["name"] == "validation_feedback"

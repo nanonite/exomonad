@@ -23,19 +23,21 @@ import tl_loop.loop.driver as driver_module
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.transport import JsonObject
 from tl_loop.loop.driver import (
-    REPOSITORY_IDENTITY_GATE_NAME,
     TLLoopConfig,
     TLLoopError,
+    TLRunResult,
     WorkPlan,
     _resolve_repository_identity_detail,
     _validate_aggregate_repository_identity,
     run_tl_loop,
 )
 from tl_loop.loop.journal import EffectJournal
+from tl_loop.loop.reconcile import REPOSITORY_IDENTITY_GATE_NAME
 from tl_loop.state.legacy_manifest import LegacyManifestDisposition, reconcile_legacy_manifest
 from tl_loop.state.plan_manifest import build_plan_manifest
 from tl_loop.state.schema import RepositoryIdentity, SliceStatus
-from tl_loop.state.store import RunStore
+from tl_loop.state.schema import RunState
+from tl_loop.state.store import RootSpec, RunStore, create as create_checkpoint
 from tl_loop.tests.checkpoint_fixtures import (
     create,
     create_legacy_identity_checkpoint,
@@ -54,7 +56,9 @@ from tl_loop.tests.test_legacy_manifest_convergence import (
 )
 
 
-def _seed_without_repository_identity(tmp_path: Path, *, legacy: bool = True):
+def _seed_without_repository_identity(
+    tmp_path: Path, *, legacy_checkpoint: bool = True
+) -> tuple[RunStore, RunState]:
     """Same sanitized fixture as _seed_and_migrate, but the checkpoint's
     repository_identity is left null -- the exact #1062 shape."""
     create(
@@ -64,18 +68,18 @@ def _seed_without_repository_identity(tmp_path: Path, *, legacy: bool = True):
     )
     store = RunStore(RUN_ID, tmp_path)
     merge_intent_id = _seed_action_journal(store)
-    legacy = _legacy_manifest()
+    legacy_manifest = _legacy_manifest()
     state = store.load()
     assert state.repository_identity is not None
     state = store.set_plan_manifest(
-        legacy,
+        legacy_manifest,
         slices={SLICE_ID: _active_legacy_slice(merge_intent_id)},
     )
 
     candidate = _candidate_manifest()
     journal = EffectJournal(RUN_ID, store.run_dir / "action-journal.json")
     reconciliation = reconcile_legacy_manifest(
-        legacy, candidate, state, journal, child_checkpoint_root=store.run_dir
+        legacy_manifest, candidate, state, journal, child_checkpoint_root=store.run_dir
     )
     assert reconciliation.disposition is LegacyManifestDisposition.PROVEN, reconciliation.reason
 
@@ -87,7 +91,7 @@ def _seed_without_repository_identity(tmp_path: Path, *, legacy: bool = True):
         legacy_manifest_migration=proof.to_document(),
     )
     migrated = store.set_plan_manifest(candidate, slices={SLICE_ID: rebound})
-    if legacy:
+    if legacy_checkpoint:
         mark_legacy_identity_checkpoint(store)
     return store, migrated
 
@@ -132,7 +136,9 @@ def _transport_with_identity(
     )
 
 
-def _run_bounded(config: TLLoopConfig, effects: EffectClient, tmp_path: Path):
+def _run_bounded(
+    config: TLLoopConfig, effects: EffectClient, tmp_path: Path
+) -> TLRunResult:
     """Run run_tl_loop with a hard wall-clock cancellation safety net."""
     cancel_event = threading.Event()
     timer = threading.Timer(10.0, cancel_event.set)
@@ -255,7 +261,7 @@ def test_beast_root_missing_identity_adopts_matching_legacy_child_repository(
 
 
 def test_conflicting_supplied_identity_still_raises(tmp_path: Path) -> None:
-    _seed_without_repository_identity(tmp_path, legacy=False)
+    _seed_without_repository_identity(tmp_path, legacy_checkpoint=False)
     config = replace(
         _config(),
         repository_identity=RepositoryIdentity(
@@ -311,19 +317,23 @@ def test_unavailable_identity_does_not_create_a_new_run(tmp_path: Path) -> None:
     assert not store.path.exists()
 
 
-def test_new_run_create_includes_resolved_identity_atomically(tmp_path: Path, monkeypatch) -> None:
+def test_new_run_create_includes_resolved_identity_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     run_id = "identity-before-create"
-    actual_create = driver_module.create
+    actual_create = create_checkpoint
     observed: dict[str, object] = {}
 
-    def create_with_identity(run_id, root_spec, *, root_dir):
+    def create_with_identity(
+        run_id: str, root_spec: RootSpec, *, root_dir: str | Path
+    ) -> RunState:
         observed.update(root_spec)
         assert root_spec["repository_identity"] == {
             "remote_url": "https://forge.example.com/org/repo.git"
         }
         return actual_create(run_id, root_spec, root_dir=root_dir)
 
-    monkeypatch.setattr(driver_module, "create", create_with_identity)
+    monkeypatch.setitem(driver_module.__dict__, "create", create_with_identity)
     transport = _transport_with_identity(resolved=True)
 
     run_tl_loop(

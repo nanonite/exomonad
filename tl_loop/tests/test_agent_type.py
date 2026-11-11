@@ -14,7 +14,7 @@ from tl_loop.select.agent_type import (
 )
 from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
-from tl_loop.select.policy import validate_policy
+from tl_loop.select.policy import HarnessPolicy, validate_policy
 from tl_loop.state.schema import SliceState, SliceStatus, Verdict
 
 CAPABILITIES = CapabilityMap(
@@ -121,7 +121,7 @@ def test_estimated_cost_is_positive_and_difficulty_sensitive() -> None:
     )
 
 
-def _policy():
+def _policy() -> HarnessPolicy:
     role = {
         "allow": ["codex/gpt-luna", "claude/sonnet"],
         "cost_rank": {"codex/gpt-luna": 1, "claude/sonnet": 2},

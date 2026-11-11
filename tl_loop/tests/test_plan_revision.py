@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
-from tl_loop.fsm.scope import TLRunning
+from tl_loop.fsm.scope import TLPlanning, TLRunning
 from tl_loop.loop.driver import WorkPlan, _canonical_planning_from_manifest, _manifest_plan
 from tl_loop.state.lock import LockTimeout, RunLock
 from tl_loop.state.plan_manifest import build_plan_manifest
@@ -54,7 +54,9 @@ def _project(tmp_path: Path, document: dict[str, object]) -> tuple[Path, RunStor
         encoding="ascii",
     )
     (state_root / "plan.json").write_bytes(snapshot)
-    plan = WorkPlan.from_mapping(document["plan"])
+    raw_plan = document["plan"]
+    assert isinstance(raw_plan, dict)
+    plan = WorkPlan.from_mapping(raw_plan)
     manifest = build_plan_manifest(_manifest_plan(plan), scope_id="root", owned_branch="main")
     create("root", {"plan_manifest": manifest.to_document()}, root_dir=state_root)
     store = RunStore("root", state_root)
@@ -194,11 +196,13 @@ def test_apply_updates_snapshot_manifest_runtime_and_audit(tmp_path: Path) -> No
     child = root_manifest.child_manifests["root/sub_tl/stage"]
     assert child.node("root/sub_tl/stage/leaf/leaf").chainlink_issue_id == 812
     assert state.revision == 2
-    assert state.recursive_fsm is not None
+    assert isinstance(state.recursive_fsm, (TLPlanning, TLRunning))
     assert state.recursive_fsm.plan_digest == root_manifest.digest
     audit_lines = (state_root / "plan-revisions.jsonl").read_text("utf-8").splitlines()
     assert len(audit_lines) == 1
-    assert json.loads(audit_lines[0])["transition_id"] == result.audit_record["transition_id"]
+    audit_record = result.audit_record
+    assert audit_record is not None
+    assert json.loads(audit_lines[0])["transition_id"] == audit_record["transition_id"]
 
 
 def test_apply_recovers_interruption_without_duplicate_audit(tmp_path: Path) -> None:
@@ -219,7 +223,9 @@ def test_apply_recovers_interruption_without_duplicate_audit(tmp_path: Path) -> 
     assert result.applied
     assert result.recovered_during_apply
     assert len(audit_lines) == 1
-    assert json.loads(audit_lines[0])["transition_id"] == result.audit_record["transition_id"]
+    audit_record = result.audit_record
+    assert audit_record is not None
+    assert json.loads(audit_lines[0])["transition_id"] == audit_record["transition_id"]
     assert not (state_root / "plan-revision-transition.json").exists()
 
 
@@ -293,22 +299,24 @@ def test_prepare_refuses_changed_precondition_without_writes(tmp_path: Path) -> 
 def test_apply_rebases_running_scope_and_preserves_completed_stage_evidence(
     tmp_path: Path,
 ) -> None:
-    original = {
-        "run_id": "root",
+    first_stage: dict[str, object] = {
+        "name": "stage-one",
+        "order": 1,
+        "plan": {"leaves": []},
+    }
+    second_stage: dict[str, object] = {
+        "name": "stage-two",
+        "order": 2,
         "plan": {
-            "sub_tls": [
-                {"name": "stage-one", "order": 1, "plan": {"leaves": []}},
-                {
-                    "name": "stage-two",
-                    "order": 2,
-                    "plan": {
-                        "leaves": [
-                            {"name": "leaf", "task": "future work", "chainlink_issue_id": None}
-                        ]
-                    },
-                },
+            "leaves": [
+                {"name": "leaf", "task": "future work", "chainlink_issue_id": None}
             ]
         },
+    }
+    original_sub_tls: list[dict[str, object]] = [first_stage, second_stage]
+    original: dict[str, object] = {
+        "run_id": "root",
+        "plan": {"sub_tls": original_sub_tls},
     }
     state_root, store = _project(tmp_path, original)
     state = store.load()
@@ -366,13 +374,13 @@ def test_apply_rebases_running_scope_and_preserves_completed_stage_evidence(
         integration=state.integration,
         plan_manifest=manifest,
     )
-    revised = {
+    revised: dict[str, object] = {
         **original,
         "plan": {
             "sub_tls": [
-                original["plan"]["sub_tls"][0],
+                original_sub_tls[0],
                 {
-                    **original["plan"]["sub_tls"][1],
+                    **original_sub_tls[1],
                     "plan": {
                         "leaves": [
                             {
@@ -403,7 +411,7 @@ def test_apply_rebases_running_scope_and_preserves_completed_stage_evidence(
 
 def test_removed_scopes_are_reported_and_blocked(tmp_path: Path) -> None:
     state_root, _ = _project(tmp_path, _document())
-    candidate = {"run_id": "root", "plan": {"sub_tls": []}}
+    candidate: dict[str, object] = {"run_id": "root", "plan": {"sub_tls": []}}
     _write_candidate(state_root, candidate)
 
     analysis = analyze_plan_revision(tmp_path)

@@ -8,7 +8,7 @@ import pytest
 
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.loop.convergence import ConvergenceInvariantError, ConvergenceTracker
-from tl_loop.loop.reconcile import ExternalIntent, Quiescent
+from tl_loop.loop.reconcile import ExternalIntent, InternalTransition, Quiescent
 from tl_loop.state.schema import SliceStatus
 from tl_loop.tests.test_merge_policy import _mergeable
 
@@ -43,10 +43,13 @@ def test_quiescent_wait_reason_is_emitted_only_when_it_changes() -> None:
 
 def test_internal_transition_increments_run_state_version() -> None:
     tracker = ConvergenceTracker()
-    state = replace(_mergeable(), publication=replace(_mergeable().publication, head_sha="head-b"))
+    publication = _mergeable().publication
+    assert publication is not None
+    state = replace(_mergeable(), publication=replace(publication, head_sha="head-b"))
     # A direct slice has no run-level version; the reducer still emits the
     # transition and leaves the slice immutable for its caller to checkpoint.
     result = tracker.reduce(state)
+    assert isinstance(result.decision, InternalTransition)
     assert result.decision.transition == "in_review"
     assert result.state == state
 

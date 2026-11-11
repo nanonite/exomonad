@@ -22,6 +22,7 @@ from tl_loop.select.ledger import (
 )
 from tl_loop.state.schema import SliceState, SliceStatus, validate
 from tl_loop.state.store import load
+from tl_loop.state.write import Document, Mutator, Validator, WriteHooks, apply as state_apply
 from tl_loop.tests.checkpoint_fixtures import create
 
 
@@ -39,15 +40,34 @@ def test_spawn_and_charge_share_one_atomic_apply(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run_dir = _make_run(tmp_path, budget=100)
-    real_apply = ledger_module.apply
+    real_apply = state_apply
     calls = 0
 
-    def counted_apply(*args: Any, **kwargs: Any) -> dict[str, object]:
+    def counted_apply(
+        run_dir: str | Path,
+        mutator: Mutator,
+        *,
+        lock_timeout: float = 5.0,
+        hooks: WriteHooks | None = None,
+        initial: Document | None = None,
+        target_name: str = "run.json",
+        lock_name: str = "run.lock",
+        validator: Validator = validate,
+    ) -> Document:
         nonlocal calls
         calls += 1
-        return real_apply(*args, **kwargs)
+        return real_apply(
+            run_dir,
+            mutator,
+            lock_timeout=lock_timeout,
+            hooks=hooks,
+            initial=initial,
+            target_name=target_name,
+            lock_name=lock_name,
+            validator=validator,
+        )
 
-    monkeypatch.setattr(ledger_module, "apply", counted_apply)
+    monkeypatch.setitem(ledger_module.__dict__, "apply", counted_apply)
     apply_spawn_and_charge(run_dir, _choice(cost=60, budget=100), _slice(), _record_spawn)
 
     assert calls == 1

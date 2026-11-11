@@ -164,17 +164,18 @@ def test_repair_accepts_legacy_watcher_state_field() -> None:
 def test_repair_uses_supplied_dispatch_boundary() -> None:
     backend = FakeBackend([RlmResponse(_handoff())])
     client = FakeClient()
-    dispatched: list[dict[str, object]] = []
+    dispatched: list[JsonObject] = []
+
+    def record_dispatch(arguments: JsonObject) -> ToolResult:
+        dispatched.append(arguments)
+        return ToolResult.from_raw({"success": True, "result": {"fresh": True}})
 
     result = compose_repair(
         _pr(client),
         Verdict.NO_GO,
         _review(),
         model_choice=_choice(backend),
-        dispatch=lambda arguments: (
-            dispatched.append(arguments)
-            or ToolResult.from_raw({"success": True, "result": {"fresh": True}})
-        ),
+        dispatch=record_dispatch,
     )
 
     assert result.proposed_solution == "Handle the failure in src/owned.py"

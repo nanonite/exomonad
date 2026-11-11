@@ -466,7 +466,7 @@ def _event(run_seq: int, shadow_kind: str, slug: str = "child-a") -> EventEnvelo
             }
         },
     }
-    return project(cast(dict[str, object], raw))
+    return project(raw)
 
 
 def _dispatch_intent(run_id: str, slug: str, epoch: str | None = None) -> str:

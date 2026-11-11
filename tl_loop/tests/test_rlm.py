@@ -6,13 +6,15 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from tl_loop.rlm.call import BudgetExceeded, JudgmentFailed, judgment_hash, rlm
+from tl_loop.client.transport import JsonObject
+from tl_loop.rlm.call import JudgmentFailed, judgment_hash, rlm
 from tl_loop.rlm.store import (
     RlmCallStore,
     RlmModelChoice,
     RlmRequest,
     RlmResponse,
     RlmRoleLedger,
+    BudgetExceeded,
 )
 
 SCHEMA = {
@@ -76,7 +78,7 @@ def test_realized_budget_overrun_is_persisted_before_raising() -> None:
         store=RlmCallStore(ledger=RlmRoleLedger(budgets={"tl": 5}, charge_callback=charge)),
         context_length=1000,
     )
-    emitted: list[dict[str, object]] = []
+    emitted: list[JsonObject] = []
     choice.store.judgment_emitter = emitted.append
 
     with pytest.raises(BudgetExceeded, match="10 > 5"):
@@ -93,7 +95,7 @@ def test_realized_budget_overrun_is_persisted_before_raising() -> None:
     ("decompose", "adjudicate_review", "compose_repair", "interpret_operator_intent"),
 )
 def test_supported_judgments_project_to_aggregate_dimensions(name: str) -> None:
-    emitted: list[dict[str, object]] = []
+    emitted: list[JsonObject] = []
     store = RlmCallStore(judgment_emitter=emitted.append)
     choice = RlmModelChoice(
         model_id="claude-sonnet-4-6",
@@ -119,7 +121,7 @@ def test_supported_judgments_project_to_aggregate_dimensions(name: str) -> None:
 
 
 def test_aggregate_judgment_contains_only_redacted_bounded_result() -> None:
-    emitted: list[dict[str, object]] = []
+    emitted: list[JsonObject] = []
     schema = {
         "type": "object",
         "properties": {
@@ -144,7 +146,7 @@ def test_aggregate_judgment_contains_only_redacted_bounded_result() -> None:
 
 
 def test_aggregate_judgment_emission_is_fail_open(caplog: pytest.LogCaptureFixture) -> None:
-    def fail(_: dict[str, object]) -> None:
+    def fail(_: JsonObject) -> object:
         raise RuntimeError("ledger unavailable")
 
     choice = RlmModelChoice(

@@ -242,6 +242,9 @@ def test_conflicting_create_result_fails_closed_at_the_boundary() -> None:
             del title, description, labels, priority
             return _tool_result({"issue_id": 816, "cicoIssueId": 9001})
 
+        def chainlink_issue_list(self, *, labels: Sequence[str], status: str) -> ToolResult:
+            raise AssertionError(f"unexpected issue lookup: {labels!r}, {status!r}")
+
     with pytest.raises(AmbiguousIssueId, match="conflicting issue IDs"):
         _create_issue(ConflictingCreator(), _slice(), ParkCause.REVIEW_STUCK, {})
 
@@ -258,6 +261,9 @@ def test_create_issue_parses_legacy_cico_issue_id_result() -> None:
         ) -> ToolResult:
             del title, description, labels, priority
             return _tool_result({"cicoIssueId": 816})
+
+        def chainlink_issue_list(self, *, labels: Sequence[str], status: str) -> ToolResult:
+            raise AssertionError(f"unexpected issue lookup: {labels!r}, {status!r}")
 
     assert _create_issue(LegacyCreator(), _slice(), ParkCause.REVIEW_STUCK, {}) == 816
 
@@ -1342,6 +1348,8 @@ def test_park_reuses_durable_intent_for_non_gated_cause(tmp_path: Path) -> None:
     first = park(_slice(), ParkCause.REVIEW_STUCK, store=store, issue_creator=creator)
     second = park(_slice(), ParkCause.REVIEW_STUCK, store=store, issue_creator=creator)
 
+    assert isinstance(first, ParkResult)
+    assert isinstance(second, ParkResult)
     assert first.issue_id == 555
     assert second.issue_id == 555
     assert len(created) == 1, "non-gated causes must also deduplicate"
@@ -1665,7 +1673,7 @@ class ParkingTransport:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, JsonObject]] = []
-        self.chainlink_result: dict[str, object] = {"issue_id": 701}
+        self.chainlink_result: JsonObject = {"issue_id": 701}
 
     def call_tool(
         self,
@@ -1706,11 +1714,20 @@ def test_durable_parking_emits_bounded_observations(tmp_path: Path) -> None:
     ]
 
 
-def _tool_result(value: dict[str, object]) -> ToolResult:
-    raw = cast(JsonObject, {"success": True, "result": value})
-    return ToolResult(
-        raw=raw,
-        success=True,
-        result=cast(JsonValue, value),
-        error=None,
-    )
+def _tool_result(value: object) -> ToolResult:
+    return ToolResult.from_raw({"success": True, "result": _json_value(value)})
+
+
+def _json_value(value: object) -> JsonValue:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, list):
+        return [_json_value(item) for item in value]
+    if isinstance(value, dict):
+        result: JsonObject = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("tool result object keys must be strings")
+            result[key] = _json_value(item)
+        return result
+    raise TypeError(f"tool result value is not JSON-compatible: {type(value).__name__}")

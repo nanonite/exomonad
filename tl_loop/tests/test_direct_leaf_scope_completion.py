@@ -31,13 +31,13 @@ from tl_loop.fsm.scope import TLDone as RecursiveTLDone
 from tl_loop.loop import driver as driver_module
 from tl_loop.loop.convergence import ConvergenceTracker
 from tl_loop.loop.driver import (
-    ExternalIntent,
     LoopCancelled,
     TLLoopConfig,
     TLLoopError,
     _drain_direct_scope_convergence,
     run_tl_loop,
 )
+from tl_loop.loop.reconcile import ExternalIntent
 from tl_loop.state.schema import SliceStatus
 from tl_loop.tests.test_driver import SyntheticQueue
 from tl_loop.tests.test_legacy_manifest_convergence import (
@@ -50,7 +50,9 @@ from tl_loop.tests.test_legacy_manifest_convergence import (
 )
 
 
-def _run_bounded(config: TLLoopConfig, effects: EffectClient, tmp_path: Path):
+def _run_bounded(
+    config: TLLoopConfig, effects: EffectClient, tmp_path: Path
+) -> driver_module.TLRunResult:
     """Run run_tl_loop with a hard wall-clock cancellation safety net.
 
     A regression of #1061 is exactly "blocks/spins forever waiting on ledger
@@ -96,7 +98,9 @@ def test_direct_leaf_plan_reaches_tl_done_in_one_run_tl_loop_call(tmp_path: Path
     assert isinstance(final.recursive_fsm, RecursiveTLDone)
     assert final.slices[SLICE_ID].status is SliceStatus.MERGED
     assert final.slices[SLICE_ID].post_merge is not None
-    assert final.slices[SLICE_ID].post_merge.phase is PostMergePhase.COMPLETE
+    final_post_merge = final.slices[SLICE_ID].post_merge
+    assert final_post_merge is not None
+    assert final_post_merge.phase is PostMergePhase.COMPLETE
 
     assert [name for name, _ in transport.calls if name == "merge_pr"] == []
     chainlink_close_calls = [

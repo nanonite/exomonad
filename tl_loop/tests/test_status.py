@@ -6,14 +6,18 @@ import pytest
 from tl_loop.__main__ import _parser, main
 
 
-def test_status_without_run_reports_waiting_plan(tmp_path: Path, capsys) -> None:
+def test_status_without_run_reports_waiting_plan(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     assert main(["status", "--project-root", str(tmp_path)]) == 0
     output = capsys.readouterr().out
     assert "no run yet; controller is waiting for .exo/tl-loop/plan.json" in output
     assert str(tmp_path / ".exo" / "tl-loop" / "plan.json") in output
 
 
-def test_startup_failure_is_recorded_and_status_reports_it(tmp_path: Path, capsys) -> None:
+def test_startup_failure_is_recorded_and_status_reports_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     assert main(["run", "--project-root", str(tmp_path)]) == 2
     marker = tmp_path / ".exo" / "tl-loop" / "root" / "controller-exit.json"
     payload = json.loads(marker.read_text(encoding="utf-8"))
@@ -23,7 +27,9 @@ def test_startup_failure_is_recorded_and_status_reports_it(tmp_path: Path, capsy
     assert "controller exited:" in capsys.readouterr().out
 
 
-def test_status_reports_durable_controller_failure(tmp_path: Path, capsys) -> None:
+def test_status_reports_durable_controller_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     marker = tmp_path / ".exo" / "tl-loop" / "root" / "controller-exit.json"
     marker.parent.mkdir(parents=True)
     marker.write_text(
@@ -37,7 +43,9 @@ def test_status_reports_durable_controller_failure(tmp_path: Path, capsys) -> No
     assert "controller fingerprint:" in output
 
 
-def test_status_tolerates_partial_checkpoint(tmp_path: Path, capsys) -> None:
+def test_status_tolerates_partial_checkpoint(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     checkpoint = tmp_path / ".exo" / "tl-loop" / "root" / "run.json"
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_text("{", encoding="utf-8")
@@ -45,7 +53,9 @@ def test_status_tolerates_partial_checkpoint(tmp_path: Path, capsys) -> None:
     assert "checkpoint is currently unavailable; retrying:" in capsys.readouterr().out
 
 
-def test_status_renders_live_state_without_watch_controls(tmp_path: Path, capsys) -> None:
+def test_status_renders_live_state_without_watch_controls(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     checkpoint = tmp_path / ".exo" / "tl-loop" / "root" / "run.json"
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_text(
@@ -102,7 +112,11 @@ def test_status_renders_live_state_without_watch_controls(tmp_path: Path, capsys
     assert document["controller_fingerprint"]["status"] == "source"
 
 
-def test_status_watch_redraws_until_interrupted(tmp_path: Path, capsys, monkeypatch) -> None:
+def test_status_watch_redraws_until_interrupted(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class StopWatching(Exception):
         pass
 

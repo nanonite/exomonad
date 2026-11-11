@@ -365,7 +365,7 @@ def _spawn_confirmation(slice_state: SliceState, *, generation: int) -> EventEnv
             "dispatch_generation": generation,
         },
     }
-    return project(cast(dict[str, object], raw))
+    return project(raw)
 
 
 @pytest.mark.parametrize("event_type", BOUNDARY_EVENTS)

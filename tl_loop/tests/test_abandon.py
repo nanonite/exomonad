@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from tl_loop.client.effects import EffectClient
+from tl_loop.client.transport import JsonObject
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop.abandon import AbandonmentError, abandon_slice
 from tl_loop.state.schema import BudgetLedger, SliceState, SliceStatus
@@ -15,15 +16,15 @@ from tl_loop.tests.checkpoint_fixtures import create
 
 @dataclass
 class RecordingTransport:
-    calls: list[tuple[str, dict[str, object]]] = field(default_factory=list)
+    calls: list[tuple[str, JsonObject]] = field(default_factory=list)
 
     def call_tool(
         self,
         role: str,
         name: str,
         tool_name: str,
-        arguments: dict[str, object],
-    ) -> dict[str, object]:
+        arguments: JsonObject,
+    ) -> JsonObject:
         del role, name
         self.calls.append((tool_name, arguments))
         return {"success": True, "result": {"event_id": "event-1", "run_seq": 2}}

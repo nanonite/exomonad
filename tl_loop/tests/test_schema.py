@@ -516,7 +516,7 @@ def test_review_policy_snapshot_accepts_only_producer_values() -> None:
     # Both keys absent is the only supported pre-policy legacy shape.
     validate(_valid_document())
 
-    invalid_pairs = (
+    invalid_pairs: tuple[tuple[object, object], ...] = (
         (3, None),
         (None, "environment"),
         (None, "policy_file"),
@@ -529,12 +529,14 @@ def test_review_policy_snapshot_accepts_only_producer_values() -> None:
         (1.5, "environment"),
         (3, "banana"),
     )
-    for ceiling, source in invalid_pairs:
+    for pair in invalid_pairs:
+        invalid_ceiling = pair[0]
+        invalid_source = pair[1]
         document = _valid_document()
-        if ceiling is not None or source is None:
-            document["reviewer_max_rounds"] = ceiling
-        if source is not None or ceiling is None:
-            document["reviewer_max_rounds_source"] = source
+        if invalid_ceiling is not None or invalid_source is None:
+            document["reviewer_max_rounds"] = invalid_ceiling
+        if invalid_source is not None or invalid_ceiling is None:
+            document["reviewer_max_rounds_source"] = invalid_source
         message = _rejection(document)
         assert "reviewer_max_rounds" in message
         assert "reviewer_max_rounds_source" in message
@@ -560,7 +562,11 @@ def _valid_document() -> dict[str, object]:
         owned_branch="legacy",
     )
     document["plan_manifest"] = manifest.to_document()
-    cast(dict[str, object], document["slices"])["slice-a"].update(
+    slices = document["slices"]
+    assert isinstance(slices, dict)
+    slice_record = slices["slice-a"]
+    assert isinstance(slice_record, dict)
+    slice_record.update(
         {"manifest_node_id": manifest.nodes[0].node_id, "manifest_revision": 1}
     )
     return document

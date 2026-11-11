@@ -11,11 +11,12 @@ from tl_loop.fsm.recovery import RecoveryPhase, transition_recovery
 from tl_loop.loop.recovery_control import (
     HumanAuthorization,
     PolicyAuthorization,
+    RecoveryAction,
     RecoveryCommandError,
     ResumeRecoveryRequest,
     execute_recovery_command,
 )
-from tl_loop.state.schema import GateStatus
+from tl_loop.state.schema import GateStatus, RunState
 from tl_loop.state.store import RunStore
 from tl_loop.tests.checkpoint_fixtures import create
 
@@ -29,7 +30,9 @@ def test_policy_retry_is_durable_and_idempotent(tmp_path: Path) -> None:
 
     assert first == second
     assert first["recovery_phase"] == "resume_intended"
-    assert store.load().slices["leaf"].recovery.phase is RecoveryPhase.RESUME_INTENDED
+    recovery = store.load().slices["leaf"].recovery
+    assert recovery is not None
+    assert recovery.phase is RecoveryPhase.RESUME_INTENDED
     journal = (store.run_dir / "action-journal.json").read_text(encoding="utf-8")
     assert journal.count('"operation":"recovery_command"') == 1
 
@@ -53,10 +56,12 @@ def test_stale_invocation_generation_fails_closed(tmp_path: Path) -> None:
 def test_human_scope_approval_requires_current_gate_revision(tmp_path: Path) -> None:
     store, state = _store(tmp_path)
     current = state.slices["leaf"]
+    current_recovery = current.recovery
+    assert current_recovery is not None
     gated = replace(
         current,
         recovery=transition_recovery(
-            current.recovery,
+            current_recovery,
             RecoveryPhase.HUMAN_GATE,
             next_action="open_human_gate",
             entered_at=20.0,
@@ -95,20 +100,20 @@ def test_inspect_returns_recovery_without_mutating_journal(tmp_path: Path) -> No
     assert not (store.run_dir / "action-journal.json").exists()
 
 
-def _request(key: str, action: str, *, generation: int) -> ResumeRecoveryRequest:
+def _request(key: str, action: RecoveryAction, *, generation: int) -> ResumeRecoveryRequest:
     return ResumeRecoveryRequest(
         run_id="run",
         slice_id="leaf",
         expected_invocation_id="inv",
         expected_generation=generation,
         expected_worktree_fingerprint="fp",
-        action=action,  # type: ignore[arg-type]
+        action=action,
         authorization=PolicyAuthorization("external_dependency", 0),
         idempotency_key=key,
     )
 
 
-def _store(tmp_path: Path) -> tuple[RunStore, object]:
+def _store(tmp_path: Path) -> tuple[RunStore, RunState]:
     record = {
         "id": "leaf",
         "status": "spawned",

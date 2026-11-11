@@ -413,7 +413,9 @@ def test_abandoned_active_tail_eventually_fails_with_context(tmp_path: Path) -> 
         assert cause.line_number == 1
         assert cause.byte_length == len(b'{"abandoned":')
         assert cause.elapsed_seconds is not None
-        assert cause.elapsed_seconds >= cause.timeout_seconds == 0.01
+        timeout_seconds = cause.timeout_seconds
+        assert timeout_seconds is not None
+        assert cause.elapsed_seconds >= timeout_seconds == 0.01
     finally:
         event_queue.close(timeout=2)
 

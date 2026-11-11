@@ -162,7 +162,11 @@ def _make_run(tmp_path: Path) -> Path:
         owned_branch="legacy",
     )
     document["plan_manifest"] = manifest.to_document()
-    cast(dict[str, object], document["slices"])["slice-a"].update(
+    raw_slices = document["slices"]
+    assert isinstance(raw_slices, dict)
+    slice_record = raw_slices["slice-a"]
+    assert isinstance(slice_record, dict)
+    slice_record.update(
         {"manifest_node_id": manifest.nodes[0].node_id, "manifest_revision": 1}
     )
     target = run_dir / "run.json"

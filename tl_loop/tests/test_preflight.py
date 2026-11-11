@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -238,7 +239,14 @@ def test_recreate_plan_digest_comes_from_rust_identity(tmp_path: Path) -> None:
     assert snapshot.read_bytes() == accepted
     assert digest.read_text(encoding="ascii").strip() == hashlib.sha256(accepted).hexdigest()
     document, captured = tl_main._load_recreate_plan(project, hashlib.sha256(accepted).hexdigest())
-    assert document["plan"]["workers"][0]["name"] == "recreated"
+    assert isinstance(document, dict)
+    plan_document = document["plan"]
+    assert isinstance(plan_document, dict)
+    workers = plan_document["workers"]
+    assert isinstance(workers, list)
+    first_worker = workers[0]
+    assert isinstance(first_worker, dict)
+    assert first_worker["name"] == "recreated"
     assert captured == accepted
     plan.unlink()
     assert tl_main._load_recreate_plan(project, hashlib.sha256(accepted).hexdigest())[1] == accepted
@@ -246,7 +254,7 @@ def test_recreate_plan_digest_comes_from_rust_identity(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("pass_expected_digest", [False, True])
 def test_recreate_controller_startup_uses_rust_plan_identity(
-    tmp_path: Path, monkeypatch, pass_expected_digest: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pass_expected_digest: bool
 ) -> None:
     project = _project(tmp_path)
     plan = project / ".exo" / "tl-loop" / "plan.json"
@@ -412,11 +420,15 @@ def test_waiting_controller_rejects_prepared_recreate_without_python_writes(
     monkeypatch.setattr(tl_main, "_validate_captured_plan", lambda _root, _bytes: None)
 
     def reject_recorder(*args: object, **kwargs: object) -> object:
-        assert args[0][1] == "record-plan-snapshot"
+        assert args
+        command = args[0]
+        assert isinstance(command, (tuple, list))
+        assert len(command) > 1
+        assert command[1] == "record-plan-snapshot"
         assert kwargs["input"] == accepted
         return type("Result", (), {"returncode": 1, "stderr": b"plan transition is in progress"})()
 
-    monkeypatch.setattr(tl_main.subprocess, "run", reject_recorder)
+    monkeypatch.setattr(subprocess, "run", reject_recorder)
 
     with pytest.raises(tl_main.LauncherError, match="plan transition is in progress"):
         tl_main._run(
@@ -442,7 +454,10 @@ def test_snapshot_loader_binds_startup_to_immutable_snapshot(tmp_path: Path) -> 
 
     document, captured = tl_main._load_snapshot_plan(project, hashlib.sha256(accepted).hexdigest())
 
-    assert document["plan"]["workers"] == []
+    assert isinstance(document, dict)
+    plan_document = document["plan"]
+    assert isinstance(plan_document, dict)
+    assert plan_document["workers"] == []
     assert captured == accepted
     with pytest.raises(tl_main.LauncherError, match="changed after validation"):
         tl_main._load_snapshot_plan(project, hashlib.sha256(plan.read_bytes()).hexdigest())

@@ -15,10 +15,10 @@ from tl_loop.events.envelope import (
     BlockCause,
     EventEnvelope,
     InvalidLedgerEvent,
-    ReviewStallClassification,
     UnmappedEventType,
     project,
 )
+from tl_loop.events.stall import ReviewStallClassification
 
 FIXTURE = Path(__file__).parent / "fixtures" / "ledger_projection_events.json"
 

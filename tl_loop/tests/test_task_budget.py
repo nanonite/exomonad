@@ -14,6 +14,7 @@ from tl_loop.loop.task_budget import (
     TaskBudgetResetRequest,
     execute_task_budget_reset,
 )
+from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
 from tl_loop.state.schema import (
     BudgetCharge,
     BudgetLedger,
@@ -74,8 +75,10 @@ def _task_budget_case(
             ),
         ),
     )
+    child_phase = child.recursive_fsm
+    assert isinstance(child_phase, RecursiveTLFailed)
     child_store.checkpoint(
-        child.recursive_fsm or child.fsm,
+        child_phase,
         {**child.slices, "leaf": target},
         budgets,
         child.events.last_consumed_offset,

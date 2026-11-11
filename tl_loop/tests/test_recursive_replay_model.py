@@ -4,28 +4,34 @@ from __future__ import annotations
 
 import copy
 import json
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import pytest
 
 from tl_loop.events.replay import ReplayTruncated
+from tl_loop.tests.replay import ReplayResult
 from tl_loop.tests.replay import FIXTURE_ROOT, normalize_durable_state, replay_fixture
 from tl_loop.tests.test_replay import _normalize_recovery_state
 
 
-def _duplicate_review(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+def _duplicate_review(
+    rows: list[Mapping[str, object]],
+) -> list[Mapping[str, object]]:
     """Deliver an identical review after later child evidence."""
     return [*rows, rows[2]]
 
 
-def _delay_ci(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+def _delay_ci(rows: list[Mapping[str, object]]) -> list[Mapping[str, object]]:
     """Delay CI behind the child notifications while preserving all evidence."""
     return [rows[0], rows[1], rows[2], rows[4], rows[3], rows[5]]
 
 
-def _contradictory_duplicate(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+def _contradictory_duplicate(
+    rows: list[Mapping[str, object]],
+) -> list[Mapping[str, object]]:
     """Repeat one event identity with conflicting payload evidence."""
-    duplicate = copy.deepcopy(rows[2])
+    duplicate = copy.deepcopy(dict(rows[2]))
     data = duplicate["data"]
     assert isinstance(data, dict)
     data["verdict"] = "NO-GO"
@@ -36,11 +42,12 @@ def _run(
     root: Path,
     *,
     live_ledger: bool,
-    transform=None,
+    transform: Callable[[list[Mapping[str, object]]], Sequence[Mapping[str, object]]]
+    | None = None,
     capture_initial_events: bool | None = None,
     keep_alive_on_waiting: bool = True,
     allow_truncated: bool = False,
-):
+) -> ReplayResult:
     return replay_fixture(
         FIXTURE_ROOT / "recursive-recovery.json",
         root,
@@ -53,12 +60,17 @@ def _run(
     )
 
 
-def _journal_shape(entries) -> tuple[tuple[object, object, object], ...]:
+def _journal_shape(
+    entries: Sequence[Mapping[str, object]],
+) -> tuple[tuple[object, object, object], ...]:
     return tuple((entry["operation"], entry["target"], entry["status"]) for entry in entries)
 
 
 @pytest.mark.parametrize("transform", [_duplicate_review, _delay_ci, _contradictory_duplicate])
-def test_recursive_replay_disturbances_preserve_durable_position(tmp_path: Path, transform) -> None:
+def test_recursive_replay_disturbances_preserve_durable_position(
+    tmp_path: Path,
+    transform: Callable[[list[Mapping[str, object]]], Sequence[Mapping[str, object]]],
+) -> None:
     baseline = _run(tmp_path / "baseline", live_ledger=False, allow_truncated=True)
     disturbed = _run(
         tmp_path / "disturbed", live_ledger=False, transform=transform, allow_truncated=True
@@ -80,9 +92,16 @@ def test_recursive_startup_holds_duplicate_sequence_before_advancing(tmp_path: P
         keep_alive_on_waiting=False,
     )
     root = live.durable_state
+    assert isinstance(root, Mapping)
+    root_slices = root["slices"]
+    assert isinstance(root_slices, Mapping)
+    stage_a = root_slices["stage-a"]
+    stage_b = root_slices["stage-b"]
+    assert isinstance(stage_a, Mapping)
+    assert isinstance(stage_b, Mapping)
     assert root["current_order"] == 1
-    assert root["slices"]["stage-a"]["status"] == "spawned"
-    assert root["slices"]["stage-b"]["status"] == "pending"
+    assert stage_a["status"] == "spawned"
+    assert stage_b["status"] == "pending"
 
     child = json.loads(
         (tmp_path / "live" / "replay-recovery" / "stage-a" / "run.json").read_text(encoding="utf-8")

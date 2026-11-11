@@ -12,8 +12,19 @@ from pathlib import Path
 import pytest
 
 from tl_loop.client.effects import EffectClient
+from tl_loop.client.transport import JsonObject
 from tl_loop.loop import driver as driver_module
-from tl_loop.loop.driver import SubTLTask, TLLoopConfig, WorkPlan, _dispatch_children, run_tl_loop
+from tl_loop.loop.driver import (
+    LoopCancelled,
+    SubTLTask,
+    TLLoopConfig,
+    WorkPlan,
+    _dispatch_children,
+    run_tl_loop,
+)
+from tl_loop.loop.reference_verification import observe_reference_project
+from tl_loop.events.envelope import EventEnvelope
+from tl_loop.events.reader import LedgerSnapshot, SequenceStatus
 from tl_loop.state.reference_verification import (
     ReferenceSourceState,
     ReferenceVerificationEvidence,
@@ -22,7 +33,7 @@ from tl_loop.state.reference_verification import (
     VerificationOutcome,
     VerificationProvenance,
 )
-from tl_loop.state.schema import RepositoryIdentity
+from tl_loop.state.schema import RepositoryIdentity, RunState
 from tl_loop.state.store import RunStore, create
 
 REMOTE = "https://forge.example.invalid/org/llmlift.git"
@@ -32,11 +43,11 @@ DECLARED_COMMAND = "touch MUST_NOT_BE_EXECUTED"
 
 class RecordingEffects:
     def __init__(self) -> None:
-        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.calls: list[tuple[str, JsonObject]] = []
 
     def call_tool(
-        self, role: str, name: str, tool_name: str, arguments: dict[str, object]
-    ) -> dict[str, object]:
+        self, role: str, name: str, tool_name: str, arguments: JsonObject
+    ) -> JsonObject:
         del role, name
         self.calls.append((tool_name, dict(arguments)))
         if tool_name == "spawn_leaf":
@@ -163,7 +174,9 @@ def _store_for_plan(plan: WorkPlan, root: Path, state_root: Path, run_id: str) -
     return RunStore(run_id, state_root)
 
 
-def _dispatch_once(plan: WorkPlan, store: RunStore, root: Path, effects: RecordingEffects):
+def _dispatch_once(
+    plan: WorkPlan, store: RunStore, root: Path, effects: RecordingEffects
+) -> RunState:
     config = TLLoopConfig(
         active=True,
         project_root=root,
@@ -255,7 +268,9 @@ def test_production_dispatch_rechecks_required_reference_evidence_without_runnin
     assert len([call for call in effects.calls if call[0] == "spawn_leaf"]) == 1
     assert not (workspace / "tools" / "llmlift" / "MUST_NOT_BE_EXECUTED").exists()
 
-    accepted = driver_module._work_plan_from_manifest(store.load().plan_manifest)
+    manifest = store.load().plan_manifest
+    assert manifest is not None
+    accepted = driver_module._work_plan_from_manifest(manifest)
     assert accepted == plan
 
 
@@ -357,7 +372,7 @@ def test_reference_observation_does_not_refresh_project_index(tmp_path: Path) ->
     stat = source.stat()
     os.utime(source, (stat.st_atime, stat.st_mtime + 10))
 
-    observation = driver_module.observe_reference_project(workspace, requirement)
+    observation = observe_reference_project(workspace, requirement)
 
     assert observation.source_state is ReferenceSourceState.CLEAN
     assert index.read_bytes() == indexed_before
@@ -386,36 +401,40 @@ def test_required_reference_verification_holds_ordered_subtl_before_handoff_or_p
     effects = RecordingEffects()
 
     class EmptySource:
-        def get(self, timeout: float | None = None):
+        def get(self, timeout: float | None = None) -> EventEnvelope:
             del timeout
             raise queue.Empty
 
-        def acknowledge(self, event):
+        def acknowledge(self, event: EventEnvelope) -> int:
             raise AssertionError(f"unexpected event {event!r}")
 
-        def capture_snapshot(self, cursor: int):
+        def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
             del cursor
+            return LedgerSnapshot((), 0, SequenceStatus.COMPLETE, ())
 
-    result = run_tl_loop(
-        "reference-subtl",
-        plan,
-        EmptySource(),  # type: ignore[arg-type]
-        EffectClient(effects),
-        config=TLLoopConfig(
-            active=True,
-            project_root=workspace,
-            worktree=workspace,
-            repository_identity=REPOSITORY,
-            root_dir=tmp_path / "state",
-            run_id="reference-subtl",
-            cancel_event=cancel,
-            poll_interval=0.001,
-        ),
-        root_dir=tmp_path / "state",
-    )
+    state_root = tmp_path / "state"
+    with pytest.raises(LoopCancelled):
+        run_tl_loop(
+            "reference-subtl",
+            plan,
+            EmptySource(),
+            EffectClient(effects),
+            config=TLLoopConfig(
+                active=True,
+                project_root=workspace,
+                worktree=workspace,
+                repository_identity=REPOSITORY,
+                root_dir=state_root,
+                run_id="reference-subtl",
+                cancel_event=cancel,
+                poll_interval=0.001,
+            ),
+            root_dir=state_root,
+        )
 
+    final_state = RunStore("reference-subtl", state_root).load()
     operations = [name for name, _ in effects.calls]
-    assert result.final_state.slices["reference-consumer"].status.value == "pending"
+    assert final_state.slices["reference-consumer"].status.value == "pending"
     assert "prepare_scope_handoff" not in operations
     assert "inspect_scope_handoff" not in operations
     assert "provision_ordered_sub_tl" not in operations

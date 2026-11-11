@@ -437,10 +437,10 @@ def test_projection_exposes_recursive_scope_and_durable_blocking_details() -> No
     assert post_document["next_transition"] == "sync_parent_branch"
     assert recovery_document["phase"] == "diagnosing"
     assert recovery_document["owner_run_id"] == "run-1"
-    assert "private_reason" not in cast(str, json.dumps(recovery_document))
-    assert "candidate_body" not in cast(str, json.dumps(document))
-    assert "invalid_payload" not in cast(str, json.dumps(document))
-    assert "reviewer_id" not in cast(str, json.dumps(document))
+    assert "private_reason" not in json.dumps(recovery_document)
+    assert "candidate_body" not in json.dumps(document)
+    assert "invalid_payload" not in json.dumps(document)
+    assert "reviewer_id" not in json.dumps(document)
     ungated_document = project_read_model(replace(state, gates=())).to_document()
     assert ungated_document["next_transition"] == "slice:task-a:reconcile_action:merge-intent"
     assert lane_document["phase"] == "recovery"

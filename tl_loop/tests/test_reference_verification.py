@@ -63,7 +63,7 @@ def _observation(
     *,
     source_state: ReferenceSourceState = ReferenceSourceState.CLEAN,
     commit: str | None = COMMIT,
-):
+) -> ReferenceProjectObservation:
     return ReferenceProjectObservation(
         path="tools/llmlift",
         remote_url=REMOTE,
@@ -154,7 +154,11 @@ def test_missing_or_nonpassing_evidence_gates_only_explicit_required_checks() ->
         ),
     ],
 )
-def test_revision_and_source_mismatches_hold(evidence, observation, message: str) -> None:
+def test_revision_and_source_mismatches_hold(
+    evidence: ReferenceVerificationEvidence,
+    observation: ReferenceProjectObservation,
+    message: str,
+) -> None:
     decision = assess_reference_verification(
         (_requirement(),),
         (evidence,),
@@ -193,7 +197,9 @@ def test_operator_claim_is_retained_but_not_mistaken_for_executed_test() -> None
 
     assert not decision.ready
     assert "operator claim is not executed evidence" in decision.blockers[0]
-    assert claim.to_document()["provenance"]["kind"] == "operator_claim"
+    provenance = claim.to_document()["provenance"]
+    assert isinstance(provenance, dict)
+    assert provenance["kind"] == "operator_claim"
 
 
 def test_imported_evidence_requires_an_artifact_reference_and_digest() -> None:
@@ -273,12 +279,14 @@ def test_requirement_and_observation_identity_inputs_fail_closed(
             path, remote_url, VerificationKind.TEST, "cargo test", required=True
         )
     with pytest.raises(ReferenceVerificationError, match=message):
-        ReferenceProjectObservation(path, remote_url, commit, "clean")
+        ReferenceProjectObservation(path, remote_url, commit, ReferenceSourceState.CLEAN)
 
 
 def test_observation_rejects_non_git_commit_identity() -> None:
     with pytest.raises(ReferenceVerificationError, match="lowercase Git object ID"):
-        ReferenceProjectObservation("tools/llmlift", REMOTE, "not-a-commit", "clean")
+        ReferenceProjectObservation(
+            "tools/llmlift", REMOTE, "not-a-commit", ReferenceSourceState.CLEAN
+        )
 
 
 def test_evidence_identity_digest_detects_record_tampering() -> None:

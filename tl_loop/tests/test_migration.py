@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import json
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Callable
 
 import pytest
 
 import tl_loop.state.migration as migration_module
 from tl_loop.fsm.phase import TLDone
 from tl_loop.state.migration import install_migration, migrate_checkpoint_document
-from tl_loop.state.schema import LEGACY_IDENTITY_CHECKPOINT_VERSION, SCHEMA_VERSION
+from tl_loop.state.schema import LEGACY_IDENTITY_CHECKPOINT_VERSION, RunState, SCHEMA_VERSION
 from tl_loop.state.store import CorruptCheckpoint, RunStore
-from tl_loop.state.store import load as load_checkpoint
+from tl_loop.state.store import load
 from tl_loop.tests.checkpoint_fixtures import create, mark_legacy_identity_checkpoint
+
+load_checkpoint: Callable[[Path], RunState] = load
 
 
 def _legacy_spawned() -> dict[str, object]:
@@ -30,7 +34,7 @@ def _legacy_spawned() -> dict[str, object]:
     }
 
 
-def test_legacy_checkpoint_is_migrated_without_losing_original(tmp_path) -> None:
+def test_legacy_checkpoint_is_migrated_without_losing_original(tmp_path: Path) -> None:
     path = tmp_path / "legacy" / "run.json"
     path.parent.mkdir()
     original = json.dumps(_legacy_spawned(), sort_keys=True)
@@ -52,7 +56,7 @@ def test_legacy_checkpoint_is_migrated_without_losing_original(tmp_path) -> None
 
 
 def test_archived_terminal_legacy_checkpoint_replays_without_becoming_runnable_scope(
-    tmp_path,
+    tmp_path: Path,
 ) -> None:
     create("historical", {}, root_dir=tmp_path)
     source = RunStore("historical", tmp_path)
@@ -76,7 +80,7 @@ def test_archived_terminal_legacy_checkpoint_replays_without_becoming_runnable_s
     assert archived_checkpoint.read_bytes() == legacy_bytes
 
 
-def test_malformed_checkpoint_is_blocked_without_overwriting_evidence(tmp_path) -> None:
+def test_malformed_checkpoint_is_blocked_without_overwriting_evidence(tmp_path: Path) -> None:
     path = tmp_path / "broken" / "run.json"
     path.parent.mkdir()
     original = b"{not-json"
@@ -90,7 +94,7 @@ def test_malformed_checkpoint_is_blocked_without_overwriting_evidence(tmp_path) 
     assert report["status"] == "blocked"
 
 
-def test_deployed_pre_898_version_1_checkpoint_is_migrated(tmp_path) -> None:
+def test_deployed_pre_898_version_1_checkpoint_is_migrated(tmp_path: Path) -> None:
     """Chainlink #906: a checkpoint already stamped version=1 (the shape used
     before #898's identity-routing fields existed) must still be migrated,
     not passed through unchanged as if it were already current. Before this
@@ -130,18 +134,25 @@ def test_deployed_pre_898_version_1_checkpoint_is_migrated(tmp_path) -> None:
 
 def test_legacy_reviewed_head_never_becomes_handoff_evidence() -> None:
     legacy = _legacy_spawned()
-    legacy["slices"]["slice-a"].update({"reviewed_head": "head-from-review", "verdict": "GO"})
+    legacy_slices = legacy["slices"]
+    assert isinstance(legacy_slices, dict)
+    legacy_slice = legacy_slices["slice-a"]
+    assert isinstance(legacy_slice, dict)
+    legacy_slice.update({"reviewed_head": "head-from-review", "verdict": "GO"})
 
     result = migrate_checkpoint_document(legacy, run_id="legacy")
 
-    migrated = result.document["slices"]["slice-a"]
+    raw_slices = result.document["slices"]
+    assert isinstance(raw_slices, dict)
+    migrated = raw_slices["slice-a"]
+    assert isinstance(migrated, dict)
     assert "handoff" not in migrated
     assert migrated["reviewed_head"] == "head-from-review"
     assert migrated["review_validation_required"] is True
 
 
 def test_install_migration_interrupted_before_report_leaves_checkpoint_untouched_and_retries_cleanly(
-    tmp_path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """chainlink #906 follow-up: an interruption between the backup write and
     the report write must not leave the live checkpoint migrated with no
@@ -155,7 +166,7 @@ def test_install_migration_interrupted_before_report_leaves_checkpoint_untouched
     real_atomic_write_json = migration_module._atomic_write_json
     calls: list[object] = []
 
-    def crash_on_report(write_path, payload):
+    def crash_on_report(write_path: Path, payload: object) -> None:
         calls.append(write_path)
         raise OSError("simulated interruption before the report write lands")
 
@@ -180,7 +191,7 @@ def test_install_migration_interrupted_before_report_leaves_checkpoint_untouched
 
 
 def test_install_migration_interrupted_after_report_before_checkpoint_retries_cleanly(
-    tmp_path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An interruption after the report is written but before the live
     checkpoint is overwritten must still be recoverable: the next load sees
@@ -195,7 +206,7 @@ def test_install_migration_interrupted_after_report_before_checkpoint_retries_cl
     real_atomic_write_json = migration_module._atomic_write_json
     call_count = 0
 
-    def crash_on_second_json_write(write_path, payload):
+    def crash_on_second_json_write(write_path: Path, payload: object) -> object:
         nonlocal call_count
         call_count += 1
         if call_count == 2:
@@ -220,7 +231,7 @@ def test_install_migration_interrupted_after_report_before_checkpoint_retries_cl
     assert json.loads((tmp_path / "migration-report.json").read_text())["status"] == "complete"
 
 
-def test_unsupported_checkpoint_version_is_blocked(tmp_path) -> None:
+def test_unsupported_checkpoint_version_is_blocked(tmp_path: Path) -> None:
     path = tmp_path / "future" / "run.json"
     path.parent.mkdir()
     original = {"version": 99, "run_id": "future"}
@@ -233,12 +244,12 @@ def test_unsupported_checkpoint_version_is_blocked(tmp_path) -> None:
     assert (path.parent / "migration-error.json").exists()
 
 
-def test_concurrent_loads_serialize_migration_and_leave_one_checkpoint(tmp_path) -> None:
+def test_concurrent_loads_serialize_migration_and_leave_one_checkpoint(tmp_path: Path) -> None:
     path = tmp_path / "concurrent" / "run.json"
     path.parent.mkdir()
     path.write_text(json.dumps(_legacy_spawned()), encoding="utf-8")
 
-    def load_checkpoint():
+    def load_checkpoint() -> RunState:
         return RunStore("concurrent", tmp_path).load()
 
     with ThreadPoolExecutor(max_workers=2) as executor:

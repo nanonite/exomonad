@@ -17,9 +17,10 @@ from tl_loop.loop.recovery_policy import (
     policy_for_cause,
     schedule_probe,
 )
+from tl_loop.fsm.recovery import RecoveryState
 
 
-def _base_recovery(*, entered_at: float = 0.0):
+def _base_recovery(*, entered_at: float = 0.0) -> RecoveryState:
     return begin_recovery(
         cause=BlockCause.BASE_CI_UNSTABLE.value,
         owner_run_id="run-1",

@@ -134,6 +134,8 @@ def _terminal_failed_checkpoints(
     child_plan = WorkPlan(leaves=(LeafTask(LEAF, "implement the recreated leaf"),))
     plan = WorkPlan(sub_tls=(SubTLTask(CHILD, child_plan, order=1),))
     config = _config(state_root, root)
+    repository_identity = config.repository_identity
+    assert repository_identity is not None
     manifest = _manifest_for_plan(plan, ROOT_RUN, config)
     create(
         ROOT_RUN,
@@ -142,7 +144,7 @@ def _terminal_failed_checkpoints(
             "slices": _bind_initial_slices(
                 _initial_slices(plan, config, state_root, ROOT_RUN), manifest
             ),
-            "repository_identity": config.repository_identity.to_document(),
+            "repository_identity": repository_identity.to_document(),
         },
         root_dir=state_root,
     )
@@ -196,7 +198,7 @@ def _terminal_failed_checkpoints(
             "parent_branch": "main",
             "parent_run_id": ROOT_RUN,
             "session_mode": "continue",
-            "repository_identity": config.repository_identity.to_document(),
+            "repository_identity": repository_identity.to_document(),
         },
         root_dir=parent_store.run_dir,
     )

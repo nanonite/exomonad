@@ -6,8 +6,8 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
-from tl_loop.state.schema import LEGACY_IDENTITY_CHECKPOINT_VERSION
-from tl_loop.state.store import RunState, RunStore, create as create_checkpoint
+from tl_loop.state.schema import LEGACY_IDENTITY_CHECKPOINT_VERSION, RunState
+from tl_loop.state.store import RunStore, create as create_checkpoint
 
 TEST_REPOSITORY_IDENTITY: dict[str, str] = {
     "remote_url": "https://forge.example.test/test/repository.git",
@@ -55,5 +55,7 @@ def mark_legacy_identity_checkpoint(
     if repository_identity is None:
         document.pop("repository_identity", None)
     else:
+        if not isinstance(repository_identity, Mapping):
+            raise TypeError("repository identity must be a mapping")
         document["repository_identity"] = dict(repository_identity)
     checkpoint_path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")

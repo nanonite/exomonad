@@ -109,7 +109,10 @@ def _patched(row_name: str, fields: Mapping[str, Any]) -> Any:
             patched = copy.deepcopy(dict(row))
             for key, value in fields.items():
                 if isinstance(value, Mapping):
-                    nested = dict(patched.get(key, {}))
+                    nested_value = patched.get(key)
+                    if not isinstance(nested_value, Mapping):
+                        raise AssertionError(f"row field {key!r} must be an object")
+                    nested = dict(nested_value)
                     nested.update(value)
                     patched[key] = nested
                 else:
@@ -136,7 +139,12 @@ def _child_row(event_id: str) -> Mapping[str, Any]:
     """The committed ledger row one child event carries."""
     for row in _spec()["child_events"][CHILD_SCOPE]:
         if row["event_id"] == event_id:
-            return row
+            result: dict[str, object] = {}
+            for key, value in row.items():
+                if not isinstance(key, str):
+                    raise AssertionError("fixture event keys must be strings")
+                result[key] = value
+            return result
     raise AssertionError(f"the fixture does not commit the {event_id!r} row")
 
 
@@ -489,7 +497,12 @@ def test_historical_publication_never_mutates_state(tmp_path: Path) -> None:
 def _case(case_name: str) -> Mapping[str, Any]:
     for entry in _spec()["binding_cases"]:
         if entry["case"] == case_name:
-            return entry
+            result: dict[str, object] = {}
+            for key, value in entry.items():
+                if not isinstance(key, str):
+                    raise AssertionError("fixture case keys must be strings")
+                result[key] = value
+            return result
     raise AssertionError(f"the fixture does not commit the {case_name!r} case")
 
 

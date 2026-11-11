@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from tl_loop.state.migration import MigrationError, migrate_checkpoint_document
+from tl_loop.state.migration import MigrationError, MigrationResult, migrate_checkpoint_document
 from tl_loop.state.plan_manifest import PlanManifest
 from tl_loop.state.store import RunStore
 
@@ -28,7 +28,7 @@ def _legacy_checkpoint(
             or (
                 raw.get("state", raw.get("status")) == "merged"
                 and isinstance(raw.get("post_merge"), dict)
-                and raw["post_merge"].get("phase") != "complete"
+                and _string_mapping(raw["post_merge"]).get("phase") != "complete"
             )
         ]
         if phase in waiting_phases
@@ -56,10 +56,20 @@ def _slice(status: str = "pending", **fields: object) -> dict[str, object]:
     return {"state": status, "paths": ["."], **fields}
 
 
-def _manifest(result: object) -> PlanManifest:
-    assert hasattr(result, "document")
-    document = result.document  # type: ignore[attr-defined]
-    return PlanManifest.from_document(document["plan_manifest"])  # type: ignore[arg-type]
+def _string_mapping(value: object) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise AssertionError("expected a mapping")
+    result: dict[str, object] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise AssertionError("mapping keys must be strings")
+        result[key] = item
+    return result
+
+
+def _manifest(result: MigrationResult) -> PlanManifest:
+    document = _string_mapping(result.document)
+    return PlanManifest.from_document(_string_mapping(document["plan_manifest"]))
 
 
 def test_flat_parallel_legacy_plan_binds_every_slice() -> None:
@@ -77,10 +87,13 @@ def test_flat_parallel_legacy_plan_binds_every_slice() -> None:
     assert {node.name for node in manifest.nodes} == {"worker-a", "worker-b", "leaf-a"}
     assert all(node.kind == "legacy" for node in manifest.nodes)
     assert result.document["gates"]
-    for slice_id, state in result.document["slices"].items():  # type: ignore[union-attr]
-        node = manifest.node(state["manifest_node_id"])  # type: ignore[index]
+    for slice_id, raw_state in _string_mapping(result.document["slices"]).items():
+        state = _string_mapping(raw_state)
+        node_id = state["manifest_node_id"]
+        assert isinstance(node_id, str)
+        node = manifest.node(node_id)
         assert node.name == slice_id
-        assert state["manifest_revision"] == manifest.manifest_revision  # type: ignore[index]
+        assert state["manifest_revision"] == manifest.manifest_revision
 
 
 def test_ordered_legacy_plan_preserves_barriers_and_source_order() -> None:
@@ -145,8 +158,8 @@ def test_active_partial_legacy_run_preserves_dispatch_and_completion_evidence() 
     assert result.document["slices"]["merged-leaf"]["status"] == "merged"  # type: ignore[index]
     assert result.document["slices"]["merged-leaf"]["reviewed_head"] == "head-a"  # type: ignore[index]
     assert all(
-        state["manifest_node_id"]
-        for state in result.document["slices"].values()  # type: ignore[union-attr]
+        _string_mapping(state)["manifest_node_id"]
+        for state in _string_mapping(result.document["slices"]).values()
     )
 
 
@@ -185,9 +198,10 @@ def test_every_recursive_legacy_phase_migrates_with_its_slice_binding(
     manifest = _manifest(result)
 
     assert result.document["fsm"]["phase"] == phase  # type: ignore[index]
-    migrated_slice = result.document["slices"]["child"]  # type: ignore[index]
-    assert migrated_slice["manifest_node_id"] == manifest.nodes[0].node_id  # type: ignore[index]
-    assert migrated_slice["manifest_revision"] == manifest.manifest_revision  # type: ignore[index]
+    slices = _string_mapping(result.document["slices"])
+    migrated_slice = _string_mapping(slices["child"])
+    assert migrated_slice["manifest_node_id"] == manifest.nodes[0].node_id
+    assert migrated_slice["manifest_revision"] == manifest.manifest_revision
 
 
 @pytest.mark.parametrize(

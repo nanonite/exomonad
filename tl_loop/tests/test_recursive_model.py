@@ -594,6 +594,7 @@ def test_post_merge_reference_matrix_requires_every_predecessor() -> None:
         if phase_index == len(events) - 1:
             assert isinstance(result, TLAllMerged)
         else:
+            assert isinstance(result, TLRunning)
             assert result.post_merge["child"].phase is phases[phase_index + 1]
         for skipped_event in events[phase_index + 1 :]:
             with pytest.raises(IllegalTransition):
@@ -672,7 +673,7 @@ def _lane_state(phase: LanePhase) -> LaneState:
     )
 
 
-def _lane_events(phase: LanePhase) -> dict[str, object]:
+def _lane_events(phase: LanePhase) -> dict[str, TLOrchestrationEvent]:
     reserve_epoch = 2 if phase is LanePhase.RECOVERY else 1
     return {
         "reserved": LaneReserved("child", reserve_epoch, "base"),

@@ -105,8 +105,12 @@ def test_validation_detaches_the_proposed_plan() -> None:
     cast_plan = proposal["plan"]
     assert isinstance(cast_plan, dict)
 
-    plan["leaves"].append(_leaf("docs", ["docs/**"]))  # type: ignore[union-attr]
-    assert len(cast_plan["leaves"]) == 1  # type: ignore[index]
+    leaves = plan["leaves"]
+    assert isinstance(leaves, list)
+    leaves.append(_leaf("docs", ["docs/**"]))
+    detached_leaves = cast_plan["leaves"]
+    assert isinstance(detached_leaves, list)
+    assert len(detached_leaves) == 1
 
 
 def test_validation_normalizes_explicit_order_without_reordering_legacy_plans() -> None:

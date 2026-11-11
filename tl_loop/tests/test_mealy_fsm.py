@@ -5,6 +5,7 @@ from dataclasses import replace
 import pytest
 
 from tl_loop.events.envelope import EventKind
+from tl_loop.fsm.phase import TLPhase
 from tl_loop.fsm.child import ChildKind, ChildRecord
 from tl_loop.fsm.event import ChildCompleted
 from tl_loop.fsm.phase import TLWaiting
@@ -20,6 +21,7 @@ from tl_loop.fsm.scope_events import (
     WorkerCompleted,
 )
 from tl_loop.loop.fsm import HeartbeatTick, WatcherObservationEvent, step
+from tl_loop.loop.reconcile import ExternalIntent
 from tl_loop.loop.observation import WatcherObservation
 from tl_loop.state.schema import (
     BudgetLedger,
@@ -28,7 +30,6 @@ from tl_loop.state.schema import (
     RunState,
     SliceState,
     SliceStatus,
-    TLPhase,
 )
 
 
@@ -90,7 +91,9 @@ def test_watcher_observation_step_records_typed_reconciliation() -> None:
     transition = step(state, event)
 
     assert transition.state.slices["slice-a"].reconciliation is not None
-    assert transition.actions[0].operation == "park_publication_ownership_unresolved"
+    action = transition.actions[0]
+    assert isinstance(action, ExternalIntent)
+    assert action.operation == "park_publication_ownership_unresolved"
 
 
 def test_watcher_event_kinds_are_part_of_the_closed_alphabet() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from pathlib import Path
 
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop.driver import WorkPlan
@@ -173,7 +174,9 @@ def test_nested_receipt_keeps_runtime_names_separate_from_canonical_scope_ids() 
     assert receipt.parent_run_id == "architecture"
     assert receipt.parent_manifest_scope_id == "root-run/sub_tl/architecture"
     assert receipt.candidate_key == "component"
-    assert receipt.child_manifest_node_id.endswith("/sub_tl/component")
+    node_id = receipt.child_manifest_node_id
+    assert node_id is not None
+    assert node_id.endswith("/sub_tl/component")
 
 
 @pytest.mark.parametrize(
@@ -315,7 +318,7 @@ def test_merge_reference_requires_the_current_controller_epoch() -> None:
         approval_reference(receipt, "")
 
 
-def test_approval_history_survives_runstore_checkpoint_round_trip(tmp_path) -> None:
+def test_approval_history_survives_runstore_checkpoint_round_trip(tmp_path: Path) -> None:
     current_coordinates = _receipt_document()
     legacy_document = _legacy_receipt_document(current_coordinates)
     legacy_receipt = validate_receipt_document(legacy_document)
