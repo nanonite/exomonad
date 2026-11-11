@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import ClassVar
+from collections.abc import Mapping, Sequence
+from typing import ClassVar, TypedDict
 
 import pytest
 
-from tl_loop.client.effects import ToolResult
+from tl_loop.client.effects import EffectClient, ToolResult
+from tl_loop.client.transport import JsonValue
+from tl_loop.loop import escalate as escalate_module
+from tl_loop.loop.escalate import ParkResult
+from tl_loop.client.transport import JsonObject
+from tl_loop.fsm.post_merge import PostMergeState
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop import driver as driver_module
 from tl_loop.loop.convergence import ConvergenceTracker
@@ -26,17 +32,21 @@ from tl_loop.loop.driver import (
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.reconcile import Quiescent, _derive_slice_action
 from tl_loop.state.plan_manifest import build_plan_manifest
+from tl_loop.state.plan_manifest import PlanManifest
 from tl_loop.state.schema import (
     ActionKind,
     ActionPhase,
     ActionState,
+    BudgetLedger,
     DurableReviewEvidence,
     FSMState,
     GateStatus,
     HandoffEvidence,
+    ParkCause,
     RepositoryIdentity,
     ReviewValidationDisposition,
     ReviewValidationObservation,
+    RunState,
     SliceState,
     SliceStatus,
     Verdict,
@@ -46,7 +56,15 @@ from tl_loop.state.slice_transition import (
     ReviewValidationFailed,
     slice_transition,
 )
-from tl_loop.state.store import RunStore, _encode_slice
+from tl_loop.state.store import (
+    BudgetInput,
+    FSMInput,
+    IntegrationInput,
+    OrderedStagesInput,
+    RunStore,
+    SliceInput,
+    _encode_slice,
+)
 from tl_loop.tests.checkpoint_fixtures import create
 
 _PLAN = WorkPlan(
@@ -58,6 +76,24 @@ _PLAN = WorkPlan(
         ),
     )
 )
+
+
+class ReviewEvidence(TypedDict, total=False):
+    review_id: int
+    review_verdict: str
+    review_head_sha: str
+    reviewer_agent_id: str
+    reviewer_identity_error: str
+
+
+class ClosedPullRequest(TypedDict):
+    pr_state: str
+    publication_invocation_id: None
+
+
+class StaleReviewerChanges(TypedDict, total=False):
+    action: ActionState
+    reviewer_attempt: dict[str, int]
 
 
 def _spawned_slice_without_pr() -> SliceState:
@@ -82,11 +118,23 @@ def _spawned_slice_without_pr() -> SliceState:
     )
 
 
+def _required_post_merge(slice_state: SliceState) -> PostMergeState:
+    if slice_state.post_merge is None:
+        raise AssertionError(f"slice {slice_state.id!r} has no post-merge state")
+    return slice_state.post_merge
+
+
+def _required_reconciliation(slice_state: SliceState) -> Mapping[str, object]:
+    if slice_state.reconciliation is None:
+        raise AssertionError(f"slice {slice_state.id!r} has no reconciliation evidence")
+    return slice_state.reconciliation
+
+
 @dataclass
-class FakeClient:
+class FakeClient(EffectClient):
     watcher_calls: list[dict[str, object]] = field(default_factory=list)
     spawn_reviewer_calls: list[dict[str, object]] = field(default_factory=list)
-    merge_calls: list[dict[str, object]] = field(default_factory=list)
+    merge_calls: list[dict[str, JsonValue]] = field(default_factory=list)
     resolved_pr_number: int | None = 99
     review_state: str = "pending"
     pr_state: str = "open"
@@ -105,10 +153,11 @@ class FakeClient:
     review_body: str | None = None
     reviewer_agent_id: str | None = None
     reviewer_identity_error: str | None = None
-    resume_pr_calls: list[dict[str, object]] = field(default_factory=list)
-    chainlink_issue_close_calls: list[dict[str, object]] = field(default_factory=list)
+    resume_pr_calls: list[dict[str, JsonValue]] = field(default_factory=list)
+    chainlink_issue_close_calls: list[JsonObject] = field(default_factory=list)
     chainlink_issue_close_result: ToolResult | None = None
     chainlink_issue_status: str = "open"
+    crash_boundary_calls: list[str] = field(default_factory=list)
 
     def list_agents(self, *, filter_type: str | None = None) -> ToolResult:
         return ToolResult(
@@ -144,7 +193,7 @@ class FakeClient:
     def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
         self.watcher_calls.append({"pr_number": pr_number})
         if pr_number == self.resolved_pr_number and self.resolved_pr_number is not None:
-            result = {
+            result: JsonObject = {
                 "found": True,
                 "pr_number": self.resolved_pr_number,
                 "head_sha": "head-a",
@@ -204,7 +253,7 @@ class FakeClient:
         *,
         pr_number: int,
         head_sha: str,
-        acceptance_criteria: tuple[str, ...],
+        acceptance_criteria: Sequence[str],
         force: bool,
     ) -> ToolResult:
         self.spawn_reviewer_calls.append(
@@ -217,7 +266,7 @@ class FakeClient:
         )
         return ToolResult(raw={"success": True}, success=True, result={}, error=None)
 
-    def merge_pr(self, **arguments: object) -> ToolResult:
+    def merge_pr(self, **arguments: JsonValue) -> ToolResult:
         self.merge_calls.append(arguments)
         self.merged = True
         return ToolResult(
@@ -227,7 +276,7 @@ class FakeClient:
             error=None,
         )
 
-    def resume_pr(self, **arguments: object) -> ToolResult:
+    def resume_pr(self, **arguments: JsonValue) -> ToolResult:
         self.resume_pr_calls.append(arguments)
         return ToolResult(
             raw={"success": True},
@@ -243,7 +292,7 @@ class FakeClient:
         *,
         title: str,
         description: str | None = None,
-        labels: tuple[str, ...] | None = None,
+        labels: Sequence[str] | None = None,
         priority: str | None = None,
     ) -> ToolResult:
         del description, labels, priority
@@ -255,9 +304,18 @@ class FakeClient:
             error=None,
         )
 
-    def chainlink_issue_list(self, *, labels: tuple[str, ...], status: str) -> ToolResult:
+    def chainlink_issue_list(
+        self,
+        *,
+        labels: Sequence[str] | None = None,
+        milestone: str | None = None,
+        priority: str | None = None,
+        status: str | None = None,
+    ) -> ToolResult:
+        assert labels is not None
         assert labels == ("needs-human",)
         assert status == "all"
+        del milestone, priority
         return ToolResult(raw={"success": True}, success=True, result={"issues": []}, error=None)
 
     def chainlink_issue_close(
@@ -302,12 +360,83 @@ class FakeClient:
             error=None,
         )
 
-    def emit_controller_event(self, *, event_type: str, payload: dict[str, object]) -> ToolResult:
+    def emit_controller_event(self, *, event_type: str, payload: JsonObject) -> ToolResult:
         del event_type, payload
         return ToolResult(raw={"success": True}, success=True, result={}, error=None)
 
+    def post_merge_parent_sync(
+        self,
+        *,
+        child_id: str,
+        pr_number: int,
+        repository: str,
+        parent_branch: str,
+        merged_head_sha: str,
+        expected_base_sha: str,
+        lane_epoch: int,
+        sync_operation_id: str,
+        sync_attempt: int,
+        reconcile_only: bool = False,
+        working_dir: str | None = None,
+        forgejo_pr_number: int | None = None,
+        forgejo_merged: bool | None = None,
+        forgejo_head_sha: str | None = None,
+        forgejo_merge_commit_sha: str | None = None,
+        forgejo_merge_commit_tree_sha: str | None = None,
+        prospective_merge_tree_sha: str | None = None,
+        reviewed_pr_head_tree_sha: str | None = None,
+    ) -> ToolResult:
+        del (
+            child_id,
+            pr_number,
+            repository,
+            parent_branch,
+            merged_head_sha,
+            expected_base_sha,
+            lane_epoch,
+            sync_operation_id,
+            sync_attempt,
+            reconcile_only,
+            working_dir,
+            forgejo_pr_number,
+            forgejo_merged,
+            forgejo_head_sha,
+            forgejo_merge_commit_sha,
+            forgejo_merge_commit_tree_sha,
+            prospective_merge_tree_sha,
+            reviewed_pr_head_tree_sha,
+        )
+        return ToolResult.from_raw(
+            {"success": False, "error": "post_merge_parent_sync unavailable in test client"}
+        )
 
-def _load_state(tmp_path, *, chainlink_issue_id: int | None = None):
+    def post_merge_changelog(self, **arguments: JsonValue) -> ToolResult:
+        return ToolResult.from_raw(
+            {"success": True, "result": {**arguments, "commit_sha": "changelog-commit"}}
+        )
+
+    def post_merge_push(self, **arguments: JsonValue) -> ToolResult:
+        pushed_commit = arguments.get("pushed_commit")
+        if not isinstance(pushed_commit, str):
+            raise AssertionError("post-merge push requires a string pushed commit")
+        return ToolResult.from_raw(
+            {
+                "success": True,
+                "result": {
+                    **arguments,
+                    "push_receipt_id": "push-receipt",
+                    "observed_remote_head": pushed_commit,
+                    "ancestry_proof": f"ancestor:{pushed_commit}->{pushed_commit}",
+                },
+            }
+        )
+
+
+def _load_state(
+    tmp_path: Path,
+    *,
+    chainlink_issue_id: int | None = None,
+) -> tuple[RunStore, RunState]:
     create(
         "reconcile",
         {
@@ -337,7 +466,7 @@ def _load_state(tmp_path, *, chainlink_issue_id: int | None = None):
     return store, store.load()
 
 
-def test_reconciliation_recovers_and_persists_missing_pr_number(tmp_path) -> None:
+def test_reconciliation_recovers_and_persists_missing_pr_number(tmp_path: Path) -> None:
     store, state = _load_state(tmp_path)
     state = store.checkpoint(
         state.fsm,
@@ -357,9 +486,13 @@ def test_reconciliation_recovers_and_persists_missing_pr_number(tmp_path) -> Non
     slice_state = new_state.slices["slice-a"]
     assert slice_state.pr_number == 99
     assert slice_state.reconciliation is not None
-    assert "pr_number" not in slice_state.reconciliation["missing_evidence"]
-    assert "published_pr" in slice_state.reconciliation["authoritative_evidence"]
-    assert slice_state.reconciliation["next_action"] != "await_authoritative_evidence"
+    missing_evidence = _required_reconciliation(slice_state)["missing_evidence"]
+    authoritative_evidence = _required_reconciliation(slice_state)["authoritative_evidence"]
+    assert isinstance(missing_evidence, list)
+    assert isinstance(authoritative_evidence, list)
+    assert "pr_number" not in missing_evidence
+    assert "published_pr" in authoritative_evidence
+    assert _required_reconciliation(slice_state)["next_action"] != "await_authoritative_evidence"
 
     # The recovered pr_number is durable, not just an in-memory observation.
     assert store.load().slices["slice-a"].pr_number == 99
@@ -387,7 +520,7 @@ def test_reconciliation_recovers_and_persists_missing_pr_number(tmp_path) -> Non
     assert store.load().slices["slice-a"].reviewer_attempt == {"head-a": 1}
 
 
-def test_reconciliation_preserves_plan_json_bytes_across_restart(tmp_path) -> None:
+def test_reconciliation_preserves_plan_json_bytes_across_restart(tmp_path: Path) -> None:
     store, state = _load_state(tmp_path)
     plan_path = tmp_path / ".exo" / "tl-loop" / "plan.json"
     plan_path.parent.mkdir(parents=True, exist_ok=True)
@@ -408,7 +541,7 @@ def test_reconciliation_preserves_plan_json_bytes_across_restart(tmp_path) -> No
 
 
 def test_reconciliation_adopts_authoritative_publication_handoff_after_restart(
-    tmp_path,
+    tmp_path: Path,
 ) -> None:
     store, state = _load_state(tmp_path)
     restarted_slice = replace(
@@ -446,7 +579,7 @@ def test_reconciliation_adopts_authoritative_publication_handoff_after_restart(
 
 
 def test_reconciliation_rebuilds_publication_and_handoff_when_pr_number_was_lost(
-    tmp_path,
+    tmp_path: Path,
 ) -> None:
     store, state = _load_state(tmp_path)
     restarted_slice = replace(
@@ -477,7 +610,7 @@ def test_reconciliation_rebuilds_publication_and_handoff_when_pr_number_was_lost
 
 
 def test_reconciliation_does_not_respawn_reviewer_when_head_already_claimed(
-    tmp_path,
+    tmp_path: Path,
 ) -> None:
     store, state = _load_state(tmp_path)
     already_claimed = replace(state.slices["slice-a"], reviewer_attempt={"head-a": 1})
@@ -495,7 +628,7 @@ def test_reconciliation_does_not_respawn_reviewer_when_head_already_claimed(
     assert client.spawn_reviewer_calls == []
 
 
-def test_reconciliation_parks_closed_unmerged_pr_without_resurrecting_slice(tmp_path) -> None:
+def test_reconciliation_parks_closed_unmerged_pr_without_resurrecting_slice(tmp_path: Path) -> None:
     store, state = _load_state(tmp_path)
     # No active dispatch invocation is persisted here, so the watcher must not
     # present a publication record it cannot correlate against.
@@ -506,8 +639,10 @@ def test_reconciliation_parks_closed_unmerged_pr_without_resurrecting_slice(tmp_
 
     parked = new_state.slices["slice-a"]
     assert parked.status is SliceStatus.PARKED
+    assert parked.park_cause is not None
     assert parked.park_cause.value == "pr_closed_unmerged"
-    assert parked.reconciliation["next_action"] == "park_closed_unmerged_pr"
+    assert parked.reconciliation is not None
+    assert _required_reconciliation(parked)["next_action"] == "park_closed_unmerged_pr"
     assert client.spawn_reviewer_calls == []
     assert store.load().slices["slice-a"].status is SliceStatus.PARKED
 
@@ -524,10 +659,10 @@ def test_reconciliation_reconfirms_a_park_it_already_recorded(
     """
     store, state = _load_state(tmp_path)
     config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=True)
-    closed = {"pr_state": "closed", "publication_invocation_id": None}
+    closed: ClosedPullRequest = {"pr_state": "closed", "publication_invocation_id": None}
 
     first_client = FakeClient(**closed)
-    first: list[object] = []
+    first: list[EffectIntent] = []
     parked_state = _reconcile_nonterminal_slices(_PLAN, state, config, first_client, store, first)
     assert len(first_client.issue_create_calls) == 1
     parked = parked_state.slices["slice-a"]
@@ -536,15 +671,33 @@ def test_reconciliation_reconfirms_a_park_it_already_recorded(
     assert len(store.load().slices["slice-a"].park_audit or {}) > 0
 
     parks: list[object] = []
-    real_park = driver_module.park
+    real_park = escalate_module.park
 
-    def record_park(slice_state, cause, **kwargs):  # type: ignore[no-untyped-def]
+    def record_park(
+        slice_state: SliceState,
+        cause: ParkCause | str,
+        *,
+        store: RunStore | None = None,
+        issue_creator: EffectClient | None = None,
+        ledger: BudgetLedger | None = None,
+        audit: Mapping[str, object] | None = None,
+        create_issue: bool = True,
+    ) -> SliceState | ParkResult:
         parks.append(cause)
-        return real_park(slice_state, cause, **kwargs)
+        result = real_park(
+            slice_state,
+            cause,
+            store=store,
+            issue_creator=issue_creator,
+            ledger=ledger,
+            audit=audit,
+            create_issue=create_issue,
+        )
+        return result
 
     monkeypatch.setattr(driver_module, "park", record_park)
     client = FakeClient(**closed)
-    second: list[object] = []
+    second: list[EffectIntent] = []
     _reconcile_nonterminal_slices(_PLAN, store.load(), config, client, store, second)
 
     # The boundary is re-emitted for the same cause, the slice stays parked,
@@ -554,7 +707,7 @@ def test_reconciliation_reconfirms_a_park_it_already_recorded(
     assert store.load().slices["slice-a"].status is SliceStatus.PARKED
 
 
-def test_reconciliation_does_not_spawn_reviewer_when_disabled(tmp_path) -> None:
+def test_reconciliation_does_not_spawn_reviewer_when_disabled(tmp_path: Path) -> None:
     store, state = _load_state(tmp_path)
     client = FakeClient()
     config = TLLoopConfig(active=True, ledger_run_id="run-1", enable_reviewer_spawn=False)
@@ -565,7 +718,7 @@ def test_reconciliation_does_not_spawn_reviewer_when_disabled(tmp_path) -> None:
 
 
 def test_reconciliation_leaves_pr_number_missing_when_nothing_was_ever_published(
-    tmp_path,
+    tmp_path: Path,
 ) -> None:
     store, state = _load_state(tmp_path)
     client = FakeClient(resolved_pr_number=None)
@@ -575,12 +728,12 @@ def test_reconciliation_leaves_pr_number_missing_when_nothing_was_ever_published
 
     slice_state = new_state.slices["slice-a"]
     assert slice_state.pr_number is None
-    assert slice_state.reconciliation["missing_evidence"] == ["pr_number"]
-    assert slice_state.reconciliation["next_action"] == "await_authoritative_evidence"
+    assert _required_reconciliation(slice_state)["missing_evidence"] == ["pr_number"]
+    assert _required_reconciliation(slice_state)["next_action"] == "await_authoritative_evidence"
     assert client.spawn_reviewer_calls == []
 
 
-def test_reconciliation_skips_slice_id_lookup_when_ledger_run_id_unset(tmp_path) -> None:
+def test_reconciliation_skips_slice_id_lookup_when_ledger_run_id_unset(tmp_path: Path) -> None:
     store, state = _load_state(tmp_path)
     client = FakeClient()
     config = TLLoopConfig(active=True, ledger_run_id=None, enable_reviewer_spawn=True)
@@ -591,7 +744,7 @@ def test_reconciliation_skips_slice_id_lookup_when_ledger_run_id_unset(tmp_path)
     assert client.spawn_reviewer_calls == []
 
 
-def _review_recovery_state(store: RunStore):
+def _review_recovery_state(store: RunStore) -> RunState:
     state = store.load()
     return store.checkpoint(
         state.fsm,
@@ -611,7 +764,7 @@ def _review_recovery_state(store: RunStore):
     )
 
 
-def test_reconciliation_replays_exact_head_review_when_verdict_was_lost(tmp_path) -> None:
+def test_reconciliation_replays_exact_head_review_when_verdict_was_lost(tmp_path: Path) -> None:
     store, _ = _load_state(tmp_path)
     state = _review_recovery_state(store)
     client = FakeClient(
@@ -633,7 +786,7 @@ def test_reconciliation_replays_exact_head_review_when_verdict_was_lost(tmp_path
     assert slice_state.reviewed_head == "head-a"
     assert slice_state.verdict is not None
     assert slice_state.verdict.value == "GO"
-    assert slice_state.reconciliation["next_action"] == "queue_merge"
+    assert _required_reconciliation(slice_state)["next_action"] == "queue_merge"
     assert client.spawn_reviewer_calls == []
     assert recovered.events.last_consumed_offset == 25446
 
@@ -649,7 +802,7 @@ def test_reconciliation_replays_exact_head_review_when_verdict_was_lost(tmp_path
     assert client.merge_calls[0]["expected_head_sha"] == "head-a"
     assert client.chainlink_issue_close_calls == []
     assert merged.slices["slice-a"].status is SliceStatus.MERGED
-    assert merged.slices["slice-a"].post_merge.phase.value == "remote_merge_adopted"
+    assert _required_post_merge(merged.slices["slice-a"]).phase.value == "remote_merge_adopted"
 
     repeated = _reconcile_nonterminal_slices(
         _PLAN,
@@ -664,11 +817,16 @@ def test_reconciliation_replays_exact_head_review_when_verdict_was_lost(tmp_path
     assert len(client.chainlink_issue_close_calls) == 0
 
 
-def _stale_reviewer_action_state(store: RunStore, **changes: object):
+def _stale_reviewer_action_state(
+    store: RunStore,
+    *,
+    action: ActionState | None = None,
+    reviewer_attempt: dict[str, int] | None = None,
+) -> RunState:
     """The #1042 artifact: exact-head verdict plus a matching terminal action."""
     state = _review_recovery_state(store)
     current = state.slices["slice-a"]
-    action = ActionState(
+    default_action = ActionState(
         ActionKind.REVIEWER_SPAWN,
         ActionPhase.CONFIRMED,
         intent_id="reviewer-intent",
@@ -686,14 +844,16 @@ def _stale_reviewer_action_state(store: RunStore, **changes: object):
         submitted_at="2026-08-27T00:00:00Z",
         validated_at="2026-08-27T00:00:00Z",
     )
-    values: dict[str, object] = {
-        "verdict": Verdict.GO,
-        "verdict_at": "2026-08-27T00:00:00Z",
-        "review_evidence": evidence,
-        "action": action,
-        **changes,
-    }
-    updated = replace(current, **values)
+    updated = replace(
+        current,
+        verdict=Verdict.GO,
+        verdict_at="2026-08-27T00:00:00Z",
+        review_evidence=evidence,
+        action=action if action is not None else default_action,
+        reviewer_attempt=(
+            reviewer_attempt if reviewer_attempt is not None else current.reviewer_attempt
+        ),
+    )
     return store.checkpoint(
         state.fsm,
         {**state.slices, "slice-a": updated},
@@ -712,7 +872,7 @@ def _self_heal_client() -> FakeClient:
     )
 
 
-def test_stale_reviewer_action_self_heals_and_queues_merge_once(tmp_path) -> None:
+def test_stale_reviewer_action_self_heals_and_queues_merge_once(tmp_path: Path) -> None:
     store, _ = _load_state(tmp_path)
     state = _stale_reviewer_action_state(store)
     client = _self_heal_client()
@@ -743,7 +903,7 @@ def test_stale_reviewer_action_self_heals_and_queues_merge_once(tmp_path) -> Non
     assert client.spawn_reviewer_calls == []
 
 
-def test_stale_reviewer_action_heal_does_not_fire_with_pending_journal(tmp_path) -> None:
+def test_stale_reviewer_action_heal_does_not_fire_with_pending_journal(tmp_path: Path) -> None:
     store, _ = _load_state(tmp_path)
     state = _stale_reviewer_action_state(store)
     client = _self_heal_client()
@@ -788,7 +948,7 @@ def test_stale_reviewer_action_heal_does_not_fire_with_pending_journal(tmp_path)
     ],
 )
 def test_stale_reviewer_action_heal_does_not_fire_for_ambiguous_state(
-    tmp_path, changes: dict[str, object]
+      tmp_path: Path, changes: StaleReviewerChanges
 ) -> None:
     store, _ = _load_state(tmp_path)
     state = _stale_reviewer_action_state(store, **changes)
@@ -808,7 +968,7 @@ def test_stale_reviewer_action_heal_does_not_fire_for_ambiguous_state(
     assert decision.reason.startswith("await_")
 
 
-def test_confirmed_merge_is_adopted_atomically_before_review_revalidation(tmp_path) -> None:
+def test_confirmed_merge_is_adopted_atomically_before_review_revalidation(tmp_path: Path) -> None:
     store, state = _load_state(tmp_path)
     state = store.checkpoint(
         FSMState(TLPhase.TLWaiting, ("slice-a",)),
@@ -843,7 +1003,7 @@ def test_confirmed_merge_is_adopted_atomically_before_review_revalidation(tmp_pa
 
     assert recovered.slices["slice-a"].status is SliceStatus.MERGED
     assert recovered.slices["slice-a"].action is None
-    assert recovered.slices["slice-a"].post_merge.phase.value == "remote_merge_adopted"
+    assert _required_post_merge(recovered.slices["slice-a"]).phase.value == "remote_merge_adopted"
     assert recovered.fsm.phase is TLPhase.TLWaiting
     assert recovered.fsm.waiting == ("slice-a",)
     assert client.spawn_reviewer_calls == []
@@ -851,7 +1011,7 @@ def test_confirmed_merge_is_adopted_atomically_before_review_revalidation(tmp_pa
     assert journal.pending_entries() == []
 
 
-def test_malformed_publication_cannot_authorize_durable_merge_fallback(tmp_path) -> None:
+def test_malformed_publication_cannot_authorize_durable_merge_fallback(tmp_path: Path) -> None:
     store, state = _load_state(tmp_path)
     state = store.checkpoint(
         FSMState(TLPhase.TLWaiting, ("slice-a",)),
@@ -895,7 +1055,7 @@ def test_malformed_publication_cannot_authorize_durable_merge_fallback(tmp_path)
 
 
 def test_unknown_merge_with_refused_publication_provenance_is_not_adopted(
-    tmp_path,
+    tmp_path: Path,
 ) -> None:
     store, state = _load_state(tmp_path)
     state = store.checkpoint(
@@ -937,7 +1097,7 @@ def test_unknown_merge_with_refused_publication_provenance_is_not_adopted(
 
 
 def test_confirmed_merge_with_refused_publication_provenance_is_not_adopted(
-    tmp_path,
+    tmp_path: Path,
 ) -> None:
     store, state = _load_state(tmp_path)
     state = store.checkpoint(
@@ -985,7 +1145,7 @@ def test_confirmed_merge_with_refused_publication_provenance_is_not_adopted(
     assert client.merge_calls == []
 
 
-def test_refused_merged_false_snapshot_cannot_set_merge_readiness(tmp_path) -> None:
+def test_refused_merged_false_snapshot_cannot_set_merge_readiness(tmp_path: Path) -> None:
     store, state = _load_state(tmp_path)
     seeded_reconciliation = {
         "confirmed_stage": "review",
@@ -1033,7 +1193,7 @@ def test_refused_merged_false_snapshot_cannot_set_merge_readiness(tmp_path) -> N
     assert store.load().slices["slice-a"].reconciliation == seeded_reconciliation
 
 
-def test_malformed_ownership_snapshot_cannot_set_merge_readiness(tmp_path) -> None:
+def test_malformed_ownership_snapshot_cannot_set_merge_readiness(tmp_path: Path) -> None:
     store, state = _load_state(tmp_path)
     seeded_reconciliation = {
         "confirmed_stage": "review",
@@ -1084,7 +1244,7 @@ def test_malformed_ownership_snapshot_cannot_set_merge_readiness(tmp_path) -> No
     assert store.load().slices["slice-a"].reconciliation == seeded_reconciliation
 
 
-def test_refused_merged_false_snapshot_retains_unknown_merge_action(tmp_path) -> None:
+def test_refused_merged_false_snapshot_retains_unknown_merge_action(tmp_path: Path) -> None:
     store, state = _load_state(tmp_path)
     state = store.checkpoint(
         FSMState(TLPhase.TLWaiting, ("slice-a",)),
@@ -1125,7 +1285,7 @@ def test_refused_merged_false_snapshot_retains_unknown_merge_action(tmp_path) ->
     assert store.load().slices["slice-a"].action == before.action
 
 
-def test_review_validation_failure_reason_round_trips_through_checkpoint(tmp_path) -> None:
+def test_review_validation_failure_reason_round_trips_through_checkpoint(tmp_path: Path) -> None:
     store, state = _load_state(tmp_path)
     failed = slice_transition(
         state.slices["slice-a"],
@@ -1150,7 +1310,7 @@ def test_review_validation_failure_reason_round_trips_through_checkpoint(tmp_pat
     assert restored.stall_classification is None
 
 
-def test_stale_exact_head_review_refreshes_validation_once_before_merge(tmp_path) -> None:
+def test_stale_exact_head_review_refreshes_validation_once_before_merge(tmp_path: Path) -> None:
     store, _ = _load_state(tmp_path)
     state = _review_recovery_state(store)
     current = state.slices["slice-a"]
@@ -1220,7 +1380,7 @@ def test_stale_exact_head_review_refreshes_validation_once_before_merge(tmp_path
     assert len(client.merge_calls) == 1
 
 
-def test_derived_revalidation_and_success_share_one_version_advance(tmp_path) -> None:
+def test_derived_revalidation_and_success_share_one_version_advance(tmp_path: Path) -> None:
     store, _ = _load_state(tmp_path)
     state = _review_recovery_state(store)
     evidence = DurableReviewEvidence(
@@ -1275,7 +1435,7 @@ def test_derived_revalidation_and_success_share_one_version_advance(tmp_path) ->
     assert refreshed.slices["slice-a"].review_validation_required is False
 
 
-def test_out_of_order_snapshot_is_quiescent_while_revalidation_is_pending(tmp_path) -> None:
+def test_out_of_order_snapshot_is_quiescent_while_revalidation_is_pending(tmp_path: Path) -> None:
     store, _ = _load_state(tmp_path)
     state = _review_recovery_state(store)
     evidence = DurableReviewEvidence(
@@ -1319,7 +1479,7 @@ def test_out_of_order_snapshot_is_quiescent_while_revalidation_is_pending(tmp_pa
     assert current.review_rounds == 0
 
 
-def test_newer_same_head_snapshot_supersedes_fresh_verdict(tmp_path) -> None:
+def test_newer_same_head_snapshot_supersedes_fresh_verdict(tmp_path: Path) -> None:
     store, _ = _load_state(tmp_path)
     state = _review_recovery_state(store)
     evidence = DurableReviewEvidence(
@@ -1364,7 +1524,7 @@ def test_newer_same_head_snapshot_supersedes_fresh_verdict(tmp_path) -> None:
     assert current.review_rounds == 1
 
 
-def test_remote_merge_stays_nonterminal_when_bookkeeping_fails(tmp_path) -> None:
+def test_remote_merge_stays_nonterminal_when_bookkeeping_fails(tmp_path: Path) -> None:
     store, _ = _load_state(tmp_path)
     state = _review_recovery_state(store)
     client = FakeClient(
@@ -1399,7 +1559,7 @@ def test_remote_merge_stays_nonterminal_when_bookkeeping_fails(tmp_path) -> None
     assert len(client.merge_calls) == 1
     assert client.chainlink_issue_close_calls == []
     assert after_merge.slices["slice-a"].status is SliceStatus.MERGED
-    assert after_merge.slices["slice-a"].post_merge.phase.value == "remote_merge_adopted"
+    assert _required_post_merge(after_merge.slices["slice-a"]).phase.value == "remote_merge_adopted"
     assert after_merge.slices["slice-a"].action is None
     assert "post_merge_parent_sync" in (after_merge.slices["slice-a"].dispatch_error or "")
     assert journal.pending_entries() == []
@@ -1407,14 +1567,14 @@ def test_remote_merge_stays_nonterminal_when_bookkeeping_fails(tmp_path) -> None
     assert gate.status is GateStatus.PENDING
 
 
-def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(tmp_path) -> None:
+def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(tmp_path: Path) -> None:
     store, _ = _load_state(tmp_path, chainlink_issue_id=1039)
     state = _review_recovery_state(store)
 
     class DurableRecoveryClient(FakeClient):
-        post_merge_calls: ClassVar[list[tuple[str, dict[str, object]]]] = []
+        post_merge_calls: ClassVar[list[tuple[str, JsonObject]]] = []
 
-        def post_merge_parent_sync(self, **arguments: object) -> ToolResult:
+        def post_merge_parent_sync(self, **arguments: JsonValue) -> ToolResult:
             self.post_merge_calls.append(("parent_sync", arguments))
             return ToolResult.from_raw(
                 {
@@ -1443,8 +1603,23 @@ def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(
                 }
             )
 
-        def chainlink_issue_close(self, **arguments: object) -> ToolResult:
-            result = super().chainlink_issue_close(**arguments)
+        def chainlink_issue_close(self, **arguments: JsonValue) -> ToolResult:
+            issue_id = arguments.get("issue_id")
+            force = arguments.get("force")
+            summary = arguments.get("summary")
+            commit_changelog = arguments.get("commit_changelog", False)
+            if not isinstance(issue_id, int) or not isinstance(force, bool):
+                raise AssertionError("issue close arguments must include an integer id and boolean force")
+            if summary is not None and not isinstance(summary, str):
+                raise AssertionError("issue close summary must be a string when present")
+            if not isinstance(commit_changelog, bool):
+                raise AssertionError("issue close changelog flag must be boolean")
+            result = super().chainlink_issue_close(
+                issue_id=issue_id,
+                force=force,
+                summary=summary,
+                commit_changelog=commit_changelog,
+            )
             if result.success is not True:
                 return result
             issue_id = arguments["issue_id"]
@@ -1455,7 +1630,7 @@ def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(
                 }
             )
 
-        def post_merge_changelog(self, **arguments: object) -> ToolResult:
+        def post_merge_changelog(self, **arguments: JsonValue) -> ToolResult:
             self.post_merge_calls.append(("changelog", arguments))
             return ToolResult.from_raw(
                 {
@@ -1464,7 +1639,7 @@ def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(
                 }
             )
 
-        def post_merge_push(self, **arguments: object) -> ToolResult:
+        def post_merge_push(self, **arguments: JsonValue) -> ToolResult:
             self.post_merge_calls.append(("push", arguments))
             return ToolResult.from_raw(
                 {
@@ -1501,9 +1676,9 @@ def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(
             store.load(), ConvergenceTracker(), store, config, client, journal
         )
         persisted = store.load()
-        assert persisted.slices["slice-a"].post_merge == recovered.slices["slice-a"].post_merge
-        phases.append(recovered.slices["slice-a"].post_merge.phase.value)
-        if recovered.slices["slice-a"].post_merge.phase.value == "complete":
+        assert _required_post_merge(persisted.slices["slice-a"]) == _required_post_merge(recovered.slices["slice-a"])
+        phases.append(_required_post_merge(recovered.slices["slice-a"]).phase.value)
+        if _required_post_merge(recovered.slices["slice-a"]).phase.value == "complete":
             break
 
     assert phases == [
@@ -1515,7 +1690,7 @@ def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(
         "parent_push_pending",
         "complete",
     ]
-    assert recovered.slices["slice-a"].post_merge.phase.value == "complete"
+    assert _required_post_merge(recovered.slices["slice-a"]).phase.value == "complete"
     assert [name for name, _ in client.post_merge_calls] == [
         "parent_sync",
         "changelog",
@@ -1538,7 +1713,7 @@ def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(
     restarted = _apply_convergence(
         store.load(), ConvergenceTracker(), store, config, client, journal
     )
-    assert restarted.slices["slice-a"].post_merge.phase.value == "complete"
+    assert _required_post_merge(restarted.slices["slice-a"]).phase.value == "complete"
     assert len(client.merge_calls) == 1
     assert len(client.chainlink_issue_close_calls) == 1
     assert [name for name, _ in client.post_merge_calls] == [
@@ -1548,7 +1723,7 @@ def test_post_merge_recovery_executes_and_checkpoints_each_authoritative_effect(
     ]
 
 
-def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None:
+def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path: Path) -> None:
     store, _ = _load_state(tmp_path, chainlink_issue_id=1039)
     state = _review_recovery_state(store)
 
@@ -1558,7 +1733,7 @@ def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None
         changelog_count: int = 0
         push_count: int = 0
 
-        def post_merge_parent_sync(self, **arguments: object) -> ToolResult:
+        def post_merge_parent_sync(self, **arguments: JsonValue) -> ToolResult:
             self.parent_sync_count += 1
             return ToolResult.from_raw(
                 {
@@ -1587,7 +1762,7 @@ def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None
                 }
             )
 
-        def post_merge_remote_reconcile(self, **arguments: object) -> ToolResult:
+        def post_merge_remote_reconcile(self, **arguments: JsonValue) -> ToolResult:
             self.remote_reconcile_count += 1
             rebuilt_commit = "rebuilt-changelog-head"
             remote_head = "parent-after-remote-advance"
@@ -1608,7 +1783,10 @@ def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None
                 }
             )
 
-        def chainlink_issue_close(self, **arguments: object) -> ToolResult:
+        def chainlink_issue_close(self, **arguments: JsonValue) -> ToolResult:
+            issue_id = arguments.get("issue_id")
+            if not isinstance(issue_id, int):
+                raise AssertionError("issue close arguments must include an integer id")
             self.chainlink_issue_close_calls.append(arguments)
             return ToolResult.from_raw(
                 {
@@ -1620,7 +1798,7 @@ def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None
                 }
             )
 
-        def post_merge_changelog(self, **arguments: object) -> ToolResult:
+        def post_merge_changelog(self, **arguments: JsonValue) -> ToolResult:
             self.changelog_count += 1
             if self.changelog_count > 1:
                 raise AssertionError("rebuilt recovery must not recommit the changelog")
@@ -1634,7 +1812,7 @@ def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None
                 }
             )
 
-        def post_merge_push(self, **arguments: object) -> ToolResult:
+        def post_merge_push(self, **arguments: JsonValue) -> ToolResult:
             self.push_count += 1
             if self.push_count == 1:
                 return ToolResult.from_raw(
@@ -1675,10 +1853,10 @@ def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None
         recovered = _apply_convergence(
             store.load(), ConvergenceTracker(), store, config, client, journal
         )
-        if recovered.slices["slice-a"].post_merge.phase.value == "complete":
+        if _required_post_merge(recovered.slices["slice-a"]).phase.value == "complete":
             break
 
-    post_merge = recovered.slices["slice-a"].post_merge
+    post_merge = _required_post_merge(recovered.slices["slice-a"])
     assert post_merge.phase.value == "complete", (
         post_merge.phase.value,
         dict(post_merge.evidence),
@@ -1703,7 +1881,7 @@ def test_remote_parent_advance_rebuilds_bookkeeping_generation(tmp_path) -> None
 
 @pytest.mark.parametrize("crash_boundary", ["parent_sync", "issue_close", "changelog", "push"])
 def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
-    tmp_path, monkeypatch, crash_boundary
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, crash_boundary: str
 ) -> None:
     store, _ = _load_state(tmp_path, chainlink_issue_id=1039)
     state = _review_recovery_state(store)
@@ -1721,11 +1899,11 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
             )
 
         def _mark_boundary(self, boundary: str) -> None:
-            self.post_merge_calls.append(boundary)
+            self.crash_boundary_calls.append(boundary)
             if boundary == crash_boundary and not crash["observed"]:
                 crash["observed"] = True
 
-        def post_merge_parent_sync(self, **arguments: object) -> ToolResult:
+        def post_merge_parent_sync(self, **arguments: JsonValue) -> ToolResult:
             if arguments.get("reconcile_only") is not True:
                 self._mark_boundary("parent_sync")
             return ToolResult.from_raw(
@@ -1755,9 +1933,24 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
                 }
             )
 
-        def chainlink_issue_close(self, **arguments: object) -> ToolResult:
+        def chainlink_issue_close(self, **arguments: JsonValue) -> ToolResult:
             self._mark_boundary("issue_close")
-            result = super().chainlink_issue_close(**arguments)
+            issue_id = arguments.get("issue_id")
+            force = arguments.get("force")
+            summary = arguments.get("summary")
+            commit_changelog = arguments.get("commit_changelog", False)
+            if not isinstance(issue_id, int) or not isinstance(force, bool):
+                raise AssertionError("issue close arguments must include an integer id and boolean force")
+            if summary is not None and not isinstance(summary, str):
+                raise AssertionError("issue close summary must be a string when present")
+            if not isinstance(commit_changelog, bool):
+                raise AssertionError("issue close changelog flag must be boolean")
+            result = super().chainlink_issue_close(
+                issue_id=issue_id,
+                force=force,
+                summary=summary,
+                commit_changelog=commit_changelog,
+            )
             if result.success is not True:
                 return result
             issue_id = arguments["issue_id"]
@@ -1768,7 +1961,7 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
                 }
             )
 
-        def post_merge_changelog(self, **arguments: object) -> ToolResult:
+        def post_merge_changelog(self, **arguments: JsonValue) -> ToolResult:
             self._mark_boundary("changelog")
             return ToolResult.from_raw(
                 {
@@ -1777,7 +1970,7 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
                 }
             )
 
-        def post_merge_push(self, **arguments: object) -> ToolResult:
+        def post_merge_push(self, **arguments: JsonValue) -> ToolResult:
             self._mark_boundary("push")
             return ToolResult.from_raw(
                 {
@@ -1805,17 +1998,46 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
         enable_reviewer_spawn=True,
         repository_identity=RepositoryIdentity("https://forge.example.com/org/repo.git"),
     )
-    client.post_merge_calls = []
+    client.crash_boundary_calls = []
     journal = EffectJournal("run-1", tmp_path / "action-journal.json")
     _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
 
     checkpoint = RunStore.checkpoint
 
-    def crash_checkpoint(run_store, *args, **kwargs):
+    def crash_checkpoint(
+        run_store: RunStore,
+        fsm: FSMInput,
+        slices: Mapping[str, SliceInput],
+        budgets: BudgetInput,
+        offset: int,
+        *,
+        current_order: int | None = None,
+        ordered_stages: OrderedStagesInput | None = None,
+        integration: IntegrationInput | None = None,
+        state_version: int | None = None,
+        plan_manifest: PlanManifest | None = None,
+        expected_revision: int | None = None,
+        clear_gates: Sequence[str] = (),
+        ensure_gates: Sequence[tuple[str, GateStatus]] = (),
+    ) -> RunState:
         if run_store is store and crash["observed"] and not crash["raised"]:
             crash["raised"] = True
             raise RuntimeError("simulated process death after post-merge boundary")
-        return checkpoint(run_store, *args, **kwargs)
+        return checkpoint(
+            run_store,
+            fsm,
+            slices,
+            budgets,
+            offset,
+            current_order=current_order,
+            ordered_stages=ordered_stages,
+            integration=integration,
+            state_version=state_version,
+            plan_manifest=plan_manifest,
+            expected_revision=expected_revision,
+            clear_gates=clear_gates,
+            ensure_gates=ensure_gates,
+        )
 
     monkeypatch.setattr(RunStore, "checkpoint", crash_checkpoint)
     for _ in range(8):
@@ -1836,11 +2058,11 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
         restarted = _apply_convergence(
             store.load(), ConvergenceTracker(), store, config, client, journal
         )
-        if restarted.slices["slice-a"].post_merge.phase.value == "complete":
+        if _required_post_merge(restarted.slices["slice-a"]).phase.value == "complete":
             break
 
-    assert restarted.slices["slice-a"].post_merge.phase.value == "complete"
-    assert client.post_merge_calls == ["parent_sync", "issue_close", "changelog", "push"]
+    assert _required_post_merge(restarted.slices["slice-a"]).phase.value == "complete"
+    assert client.crash_boundary_calls == ["parent_sync", "issue_close", "changelog", "push"]
     assert len(client.chainlink_issue_close_calls) == 1
     assert len(journal.confirmed_entries("post_merge_parent_sync", "slice-a")) == 1
     assert len(journal.confirmed_entries("post_merge_issue_close", "slice-a")) == 1
@@ -1848,7 +2070,7 @@ def test_post_merge_effect_replays_confirmed_intent_after_checkpoint_crash(
     assert len(journal.confirmed_entries("post_merge_push", "slice-a")) == 1
 
 
-def test_reconciliation_replays_actionable_findings_through_resume_pr_once(tmp_path) -> None:
+def test_reconciliation_replays_actionable_findings_through_resume_pr_once(tmp_path: Path) -> None:
     store, _ = _load_state(tmp_path)
     state = _review_recovery_state(store)
     client = FakeClient(
@@ -1888,11 +2110,11 @@ def test_reconciliation_replays_actionable_findings_through_resume_pr_once(tmp_p
     assert len(client.resume_pr_calls) == 1
 
 
-def test_repair_effect_journal_recovers_unknown_resume_without_duplicate_dispatch(tmp_path) -> None:
+def test_repair_effect_journal_recovers_unknown_resume_without_duplicate_dispatch(tmp_path: Path) -> None:
     import pytest
 
     class UnknownResumeClient(FakeClient):
-        def resume_pr(self, **arguments: object) -> ToolResult:
+        def resume_pr(self, **arguments: JsonValue) -> ToolResult:
             self.resume_pr_calls.append(arguments)
             raise RuntimeError("resume transport connection lost")
 
@@ -1933,6 +2155,8 @@ def test_repair_effect_journal_recovers_unknown_resume_without_duplicate_dispatc
         restarted_journal,
     )
     key = pending[0]["key"]
+    if not isinstance(key, str):
+        raise AssertionError("pending action journal entry has no string key")
     gate_name = _action_journal_gate_name(key)
     gate = next(gate for gate in restarted_state.gates if gate.name == gate_name)
     assert gate.status is GateStatus.PENDING
@@ -1953,8 +2177,8 @@ def test_repair_effect_journal_recovers_unknown_resume_without_duplicate_dispatc
     assert len(client.resume_pr_calls) == 1
 
 
-def test_reconciliation_rejects_stale_or_unresolved_review_evidence(tmp_path) -> None:
-    cases = (
+def test_reconciliation_rejects_stale_or_unresolved_review_evidence(tmp_path: Path) -> None:
+    cases: tuple[ReviewEvidence, ...] = (
         {
             "review_id": 7,
             "review_verdict": "approved",

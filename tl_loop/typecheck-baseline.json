@@ -195,15 +195,6 @@
     "tl_loop/tests/test_shadow.py": {
       "redundant-cast": 1
     },
-    "tl_loop/tests/test_startup_reconciliation.py": {
-      "arg-type": 83,
-      "attr-defined": 4,
-      "dict-item": 36,
-      "index": 4,
-      "no-untyped-def": 37,
-      "operator": 2,
-      "union-attr": 19
-    },
     "tl_loop/tests/test_status.py": {
       "no-untyped-def": 6
     },
