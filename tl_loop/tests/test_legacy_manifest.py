@@ -1,13 +1,17 @@
 """Regression coverage for evidence-bound active manifest migration."""
 
-from types import SimpleNamespace
+from collections.abc import Sequence
+from dataclasses import replace
+from pathlib import Path
 
 from tl_loop.loop.review import ReviewContract
 from tl_loop.state.legacy_manifest import (
     LegacyManifestDisposition,
+    JournalSnapshot,
     reconcile_legacy_manifest,
 )
 from tl_loop.state.plan_manifest import build_legacy_manifest, build_plan_manifest
+from tl_loop.state.plan_manifest import PlanManifest
 from tl_loop.state.schema import (
     ActionKind,
     ActionPhase,
@@ -15,20 +19,26 @@ from tl_loop.state.schema import (
     DurableReviewEvidence,
     HandoffEvidence,
     PublicationBinding,
+    BudgetLedger,
+    EventCursor,
+    FSMState,
+    RunState,
+    SliceState,
     SliceStatus,
     Verdict,
 )
+from tl_loop.fsm.phase import TLPhase
 
 
 class SnapshotJournal:
-    def __init__(self, entries):
+    def __init__(self, entries: Sequence[dict[str, object]]) -> None:
         self.entries = tuple(entries)
 
-    def snapshot(self):
+    def snapshot(self) -> tuple[dict[str, object], ...]:
         return self.entries
 
 
-def _manifests():
+def _manifests() -> tuple[PlanManifest, PlanManifest]:
     legacy = build_legacy_manifest({"slices": {"leaf": {}}}, run_id="run")
     candidate = build_plan_manifest(
         {
@@ -47,10 +57,18 @@ def _manifests():
     return legacy, candidate
 
 
-def _active_slice():
-    return SimpleNamespace(
+def _active_slice() -> SliceState:
+    return SliceState(
         id="leaf",
         status=SliceStatus.IN_REVIEW,
+        paths=("src",),
+        depends_on=(),
+        base_ref=None,
+        test_plan=(),
+        agent_type="opencode",
+        model=None,
+        attempts=1,
+        verdict=Verdict.GO,
         manifest_node_id="run/worker/leaf",
         dispatch_intent_id="spawn-intent",
         dispatch_invocation_id="invocation",
@@ -70,7 +88,7 @@ def _active_slice():
     )
 
 
-def _journal():
+def _journal() -> SnapshotJournal:
     return SnapshotJournal(
         [
             {
@@ -103,12 +121,25 @@ def _journal():
     )
 
 
-def test_active_legacy_binding_requires_and_records_authoritative_evidence():
+def _run_state(current: SliceState) -> RunState:
+    return RunState(
+        version=1,
+        revision=1,
+        run_id="run",
+        fsm=FSMState(TLPhase.TLWaiting, ("leaf",)),
+        slices={"leaf": current},
+        budgets=BudgetLedger(tokens=0, wall_seconds=0),
+        gates=(),
+        events=EventCursor(last_consumed_offset=0),
+    )
+
+
+def test_active_legacy_binding_requires_and_records_authoritative_evidence() -> None:
     legacy, candidate = _manifests()
     result = reconcile_legacy_manifest(
         legacy,
         candidate,
-        SimpleNamespace(slices={"leaf": _active_slice()}),
+        _run_state(_active_slice()),
         _journal(),
     )
 
@@ -119,12 +150,12 @@ def test_active_legacy_binding_requires_and_records_authoritative_evidence():
     assert "confirmed spawn" in proof.evidence
 
 
-def test_active_legacy_binding_fails_closed_without_spawn_journal():
+def test_active_legacy_binding_fails_closed_without_spawn_journal() -> None:
     legacy, candidate = _manifests()
     result = reconcile_legacy_manifest(
         legacy,
         candidate,
-        SimpleNamespace(slices={"leaf": _active_slice()}),
+        _run_state(_active_slice()),
         SnapshotJournal([]),
     )
 
@@ -132,7 +163,7 @@ def test_active_legacy_binding_fails_closed_without_spawn_journal():
     assert "confirmed spawn operation" in result.reason
 
 
-def test_active_legacy_binding_rejects_conflicting_branch_evidence():
+def test_active_legacy_binding_rejects_conflicting_branch_evidence() -> None:
     legacy, candidate = _manifests()
     entries = list(_journal().entries)
     entries[0] = {
@@ -142,7 +173,7 @@ def test_active_legacy_binding_rejects_conflicting_branch_evidence():
     result = reconcile_legacy_manifest(
         legacy,
         candidate,
-        SimpleNamespace(slices={"leaf": _active_slice()}),
+        _run_state(_active_slice()),
         SnapshotJournal(entries),
     )
 
@@ -150,7 +181,7 @@ def test_active_legacy_binding_rejects_conflicting_branch_evidence():
     assert "owned branch" in result.reason
 
 
-def test_active_legacy_binding_rejects_candidate_nodes_not_in_old_manifest():
+def test_active_legacy_binding_rejects_candidate_nodes_not_in_old_manifest() -> None:
     legacy, _ = _manifests()
     candidate = build_plan_manifest(
         {
@@ -175,7 +206,7 @@ def test_active_legacy_binding_rejects_candidate_nodes_not_in_old_manifest():
     result = reconcile_legacy_manifest(
         legacy,
         candidate,
-        SimpleNamespace(slices={"leaf": _active_slice()}),
+        _run_state(_active_slice()),
         _journal(),
     )
 
@@ -184,7 +215,7 @@ def test_active_legacy_binding_rejects_candidate_nodes_not_in_old_manifest():
     assert result.proofs[0].new_node_id == "run/leaf/extra"
 
 
-def test_active_legacy_binding_proves_the_complete_leaf_declaration():
+def test_active_legacy_binding_proves_the_complete_leaf_declaration() -> None:
     candidate = build_plan_manifest(
         {
             "leaves": [
@@ -205,11 +236,16 @@ def test_active_legacy_binding_proves_the_complete_leaf_declaration():
         owned_branch="main",
     )
     state = _active_slice()
-    state.review_contract = ReviewContract.from_criteria(
-        ("DONE CRITERIA: all tests pass",)
-    ).as_mapping()
+    state = replace(
+        state,
+        review_contract=ReviewContract.from_criteria(
+            ("DONE CRITERIA: all tests pass",)
+        ).as_mapping(),
+    )
     entries = list(_journal().entries)
-    entries[0]["arguments"].update(
+    arguments = entries[0]["arguments"]
+    assert isinstance(arguments, dict)
+    arguments.update(
         {
             "context": "preserve the contract",
             "read_first": ["README.md"],
@@ -221,7 +257,7 @@ def test_active_legacy_binding_proves_the_complete_leaf_declaration():
     result = reconcile_legacy_manifest(
         legacy,
         candidate,
-        SimpleNamespace(slices={"leaf": state}),
+        _run_state(state),
         SnapshotJournal(entries),
     )
 
@@ -251,20 +287,23 @@ def test_active_legacy_binding_proves_the_complete_leaf_declaration():
         in reconcile_legacy_manifest(
             legacy,
             changed,
-            SimpleNamespace(slices={"leaf": state}),
+            _run_state(state),
             SnapshotJournal(entries),
         ).reason
     )
 
 
-def test_active_legacy_binding_rejects_publication_from_another_branch():
+def test_active_legacy_binding_rejects_publication_from_another_branch() -> None:
     legacy, candidate = _manifests()
     state = _active_slice()
-    state.publication = PublicationBinding(43, "head-a", "main.other", "main", 1, "invocation")
+    state = replace(
+        state,
+        publication=PublicationBinding(43, "head-a", "main.other", "main", 1, "invocation"),
+    )
     result = reconcile_legacy_manifest(
         legacy,
         candidate,
-        SimpleNamespace(slices={"leaf": state}),
+        _run_state(state),
         _journal(),
     )
 
@@ -272,7 +311,7 @@ def test_active_legacy_binding_rejects_publication_from_another_branch():
     assert "publication head branch" in result.reason
 
 
-def test_migration_proof_projection_is_body_free():
+def test_migration_proof_projection_is_body_free() -> None:
     from tl_loop.state.diagnostics import project_legacy_manifest_migration
 
     projected = project_legacy_manifest_migration(
@@ -291,7 +330,7 @@ def test_migration_proof_projection_is_body_free():
     assert projected["disposition"] == "proven"
 
 
-def test_migration_cleanup_removes_only_the_exact_resolved_gate(tmp_path):
+def test_migration_cleanup_removes_only_the_exact_resolved_gate(tmp_path: Path) -> None:
     from tl_loop.loop.driver import _clear_resolved_migration_gate
     from tl_loop.state.legacy_manifest import LegacyManifestReconciliation
     from tl_loop.state.store import RunStore
@@ -340,7 +379,7 @@ def test_active_legacy_binding_rejects_worker_versus_leaf_kind_mismatch() -> Non
     result = reconcile_legacy_manifest(
         legacy,
         candidate,
-        SimpleNamespace(slices={"leaf": _active_slice()}),
+        _run_state(_active_slice()),
         _journal(),
     )
 
@@ -348,7 +387,7 @@ def test_active_legacy_binding_rejects_worker_versus_leaf_kind_mismatch() -> Non
     assert "confirmed spawn operation" in result.reason
 
 
-def test_active_legacy_binding_rejects_sub_tl_without_nested_checkpoint(tmp_path) -> None:
+def test_active_legacy_binding_rejects_sub_tl_without_nested_checkpoint(tmp_path: Path) -> None:
     legacy, _ = _manifests()
     candidate = build_plan_manifest(
         {"sub_tls": [{"name": "leaf", "order": 1, "plan": {}}]},
@@ -358,7 +397,7 @@ def test_active_legacy_binding_rejects_sub_tl_without_nested_checkpoint(tmp_path
     result = reconcile_legacy_manifest(
         legacy,
         candidate,
-        SimpleNamespace(slices={"leaf": _active_slice()}),
+        _run_state(_active_slice()),
         _journal(),
         child_checkpoint_root=tmp_path,
     )
@@ -373,7 +412,7 @@ def test_active_legacy_binding_rejects_in_flight_merge_without_action_journal_en
     result = reconcile_legacy_manifest(
         legacy,
         candidate,
-        SimpleNamespace(slices={"leaf": _active_slice()}),
+        _run_state(_active_slice()),
         SnapshotJournal(entries),
     )
 
@@ -381,7 +420,7 @@ def test_active_legacy_binding_rejects_in_flight_merge_without_action_journal_en
     assert "matching action journal entry" in result.reason
 
 
-def test_migration_proof_round_trips_through_the_slice_schema(tmp_path):
+def test_migration_proof_round_trips_through_the_slice_schema(tmp_path: Path) -> None:
     from tl_loop.state.plan_manifest import build_plan_manifest
     from tl_loop.state.store import RunStore
     from tl_loop.tests.checkpoint_fixtures import create
@@ -428,4 +467,6 @@ def test_migration_proof_round_trips_through_the_slice_schema(tmp_path):
         root_dir=tmp_path,
     )
     loaded = RunStore("schema", tmp_path).load()
-    assert loaded.slices["worker"].legacy_manifest_migration["disposition"] == "proven"
+    migration = loaded.slices["worker"].legacy_manifest_migration
+    assert migration is not None
+    assert migration["disposition"] == "proven"

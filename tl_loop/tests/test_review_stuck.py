@@ -28,7 +28,7 @@ from tl_loop.loop.escalate import blocked_gate_name
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.rlm.call import RlmCallError, RlmConfigurationError
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
-from tl_loop.rlm.subprocess_backend import SubprocessRlmBackend
+from tl_loop.rlm.subprocess_backend import CommandRunner, SubprocessRlmBackend
 from tl_loop.rlm.tl_judgment import TLModelResolutionError, build_tl_model_choice
 from tl_loop.select.model import ModelCatalog
 from tl_loop.select.policy import validate_policy
@@ -37,6 +37,7 @@ from tl_loop.state.schema import (
     GateStatus,
     ParkCause,
     PublicationBinding,
+    RunState,
     SliceStatus,
     Verdict,
 )
@@ -172,7 +173,7 @@ def _plan() -> WorkPlan:
     )
 
 
-def _owned_store(tmp_path: Path, **slice_changes: object) -> RunStore:
+def _owned_store(tmp_path: Path) -> RunStore:
     store = _review_store(tmp_path)
     current = store.load().slices["leaf-a"]
     store.checkpoint(
@@ -183,7 +184,6 @@ def _owned_store(tmp_path: Path, **slice_changes: object) -> RunStore:
                 reviewer_attempt={"head-a": 1},
                 reviewer_agent_id="review-pr-42-codex",
                 publication=PublicationBinding(42, "head-a", "main.leaf-a", "main", 1, "inv-a"),
-                **slice_changes,
             )
         },
         BudgetLedger(0, 0),
@@ -295,18 +295,22 @@ class _IssueTransport(ReviewRepairTransport):
         return RecordingTransport.call_tool(self, role, name, tool_name, arguments)
 
 
-def _stuck_store(tmp_path: Path, **changes: object) -> RunStore:
-    issue_id = changes.get("chainlink_issue_id")
+def _stuck_store(
+    tmp_path: Path,
+    *,
+    chainlink_issue_id: int | None = None,
+    tl_intervention_attempts: int = 0,
+) -> RunStore:
     store = _review_store(
         tmp_path,
-        chainlink_issue_id=issue_id if type(issue_id) is int else None,
+        chainlink_issue_id=chainlink_issue_id,
     )
     current = replace(
         store.load().slices["leaf-a"],
         verdict=Verdict.NO_GO,
         review_rounds=2,
         reviewer_attempt={"head-a": 1},
-        **changes,
+        tl_intervention_attempts=tl_intervention_attempts,
     )
     store.checkpoint(TLPlanning(), {"leaf-a": current}, BudgetLedger(0, 0), offset=0)
     store.set_review_policy(2, "policy_file")
@@ -320,7 +324,11 @@ def _stuck_config(
     token_budget: int = 120_000,
 ) -> TLLoopConfig:
     policy = _selector_policy(escalate_after)
-    policy["roles"]["tl"]["token_budget"] = token_budget  # type: ignore[index]
+    roles = policy["roles"]
+    assert isinstance(roles, dict)
+    tl_role = roles["tl"]
+    assert isinstance(tl_role, dict)
+    tl_role["token_budget"] = token_budget
     return TLLoopConfig(
         active=True,
         policy=validate_policy(policy),
@@ -334,7 +342,7 @@ def _stuck_config(
     )
 
 
-def _converge(store: RunStore, config: TLLoopConfig, transport: RecordingTransport):
+def _converge(store: RunStore, config: TLLoopConfig, transport: RecordingTransport) -> RunState:
     journal = EffectJournal("review-run", store.run_dir / "action-journal.json")
     return _apply_convergence(
         store.load(),
@@ -347,12 +355,16 @@ def _converge(store: RunStore, config: TLLoopConfig, transport: RecordingTranspo
 
 
 def _judged_events(transport: RecordingTransport) -> list[JsonObject]:
-    return [
-        arguments["payload"]
-        for name, arguments in transport.calls
-        if name == "emit_controller_event"
-        and arguments.get("event_type") == "tl.review_stuck_judged"
-    ]
+    events: list[JsonObject] = []
+    for name, arguments in transport.calls:
+        payload = arguments.get("payload")
+        if (
+            name == "emit_controller_event"
+            and arguments.get("event_type") == "tl.review_stuck_judged"
+            and isinstance(payload, dict)
+        ):
+            events.append(payload)
+    return events
 
 
 def test_rounds_at_ceiling_make_one_tl_judgment_and_guide_resumes_with_fresh_budget(
@@ -380,7 +392,9 @@ def test_rounds_at_ceiling_make_one_tl_judgment_and_guide_resumes_with_fresh_bud
     assert restored.park_cause is None
     resume = next(arguments for name, arguments in transport.calls if name == "resume_pr")
     task = str(resume["task"])
-    assert GUIDE["proposed_solution"] in task
+    proposed_solution = GUIDE["proposed_solution"]
+    assert isinstance(proposed_solution, str)
+    assert proposed_solution in task
     assert "The failure path in src/leaf.py is never exercised" in task
     assert resume["expected_head_sha"] == "head-a"
     assert set(resume) == {"pr_number", "expected_head_sha", "task"}
@@ -439,16 +453,20 @@ def test_review_stuck_budget_is_restored_and_blocks_calls_after_continue(
     )
     second_backend = ReviewBackend([])
     second_config = _stuck_config(second_backend, escalate_after=2, token_budget=15)
+    second_policy = second_config.policy
+    assert second_policy is not None
     second_config = replace(
         second_config,
         tl_model_choice=build_tl_model_choice(
-            second_config.policy,
+            second_policy,
             None,
             backend=second_backend,
             run_store=resumed_store,
         ),
     )
-    assert second_config.tl_model_choice.store.ledger.spent["tl"] == 15
+    choice = second_config.tl_model_choice
+    assert choice is not None
+    assert choice.store.ledger.spent["tl"] == 15
     result = _judge_review_stuck(
         resumed_store.load(),
         next_review,
@@ -651,9 +669,13 @@ def test_pinned_model_and_catalog_both_resolve_a_tl_model() -> None:
     assert choice.role == "tl"
 
     bare = _selector_policy()
-    bare["roles"]["tl"]["allow"] = ["codex"]  # type: ignore[index]
-    bare["roles"]["tl"]["cost_rank"] = {"codex": 1}  # type: ignore[index]
-    bare["roles"]["tl"]["per_harness_budget"] = {"codex": 1000}  # type: ignore[index]
+    roles = bare["roles"]
+    assert isinstance(roles, dict)
+    tl_role = roles["tl"]
+    assert isinstance(tl_role, dict)
+    tl_role["allow"] = ["codex"]
+    tl_role["cost_rank"] = {"codex": 1}
+    tl_role["per_harness_budget"] = {"codex": 1000}
     catalog = ModelCatalog.from_fixture(Path(__file__).parent / "fixtures" / "model_catalog.json")
     resolved = build_tl_model_choice(validate_policy(bare), catalog, backend=object())
     assert resolved.model_id != "codex"
@@ -669,9 +691,13 @@ def test_startup_refuses_when_the_tl_harness_binary_is_missing(
 
 def test_startup_refuses_a_harness_without_a_tool_free_backend() -> None:
     policy = _selector_policy()
-    policy["roles"]["tl"]["allow"] = ["shoal/custom"]  # type: ignore[index]
-    policy["roles"]["tl"]["cost_rank"] = {"shoal/custom": 1}  # type: ignore[index]
-    policy["roles"]["tl"]["per_harness_budget"] = {"shoal/custom": 1000}  # type: ignore[index]
+    roles = policy["roles"]
+    assert isinstance(roles, dict)
+    tl_role = roles["tl"]
+    assert isinstance(tl_role, dict)
+    tl_role["allow"] = ["shoal/custom"]
+    tl_role["cost_rank"] = {"shoal/custom": 1}
+    tl_role["per_harness_budget"] = {"shoal/custom": 1000}
     with pytest.raises(TLModelResolutionError, match="no tool-free RLM backend"):
         build_tl_model_choice(validate_policy(policy), None)
 
@@ -705,7 +731,7 @@ def _request() -> RlmRequest:
 
 
 def _backend(
-    harness: str, runner: _Runner, monkeypatch: pytest.MonkeyPatch
+    harness: str, runner: CommandRunner, monkeypatch: pytest.MonkeyPatch
 ) -> SubprocessRlmBackend:
     monkeypatch.setattr(
         "tl_loop.rlm.subprocess_backend.shutil.which", lambda name: f"/usr/bin/{name}"
@@ -730,10 +756,15 @@ def test_claude_backend_runs_tool_free_and_reads_authoritative_usage(
     response = _backend("claude", runner, monkeypatch).complete(_request())
 
     command = runner.calls[0]["command"]
+    assert isinstance(command, list)
+    assert all(isinstance(part, str) for part in command)
+    command = [part for part in command if isinstance(part, str)]
     assert command[:5] == ["/usr/bin/claude", "-p", "--output-format", "json", "--model"]
     assert command[-2:] == ["--tools", ""]
     assert "model-x" in command
-    assert "OUTPUT SCHEMA" in str(runner.calls[0]["input"])
+    input_text = runner.calls[0]["input"]
+    assert isinstance(input_text, str)
+    assert "OUTPUT SCHEMA" in input_text
     assert response.output == {"action": "escalate", "reason": "r"}
     assert (response.input_tokens, response.output_tokens) == (10, 4)
     assert "exit_code=0" in caplog.text
@@ -748,6 +779,9 @@ def test_codex_backend_reads_the_last_message_file_and_charges_an_estimate(
     response = _backend("codex", runner, monkeypatch).complete(_request())
 
     command = runner.calls[0]["command"]
+    assert isinstance(command, list)
+    assert all(isinstance(part, str) for part in command)
+    command = [part for part in command if isinstance(part, str)]
     assert command[1] == "exec"
     assert "--sandbox" in command and "read-only" in command
     assert "--ephemeral" in command
@@ -763,6 +797,9 @@ def test_opencode_backend_runs_standalone_with_the_model_flag(
     response = _backend("opencode", runner, monkeypatch).complete(_request())
 
     command = runner.calls[0]["command"]
+    assert isinstance(command, list)
+    assert all(isinstance(part, str) for part in command)
+    command = [part for part in command if isinstance(part, str)]
     assert command[1:5] == ["run", "--standalone", "-m", "model-x"]
     assert "--auto" not in command
     assert response.output == {"action": "escalate", "reason": "r"}
@@ -783,7 +820,7 @@ def test_backend_failure_modes_are_explicit_and_logged(
         raise subprocess.TimeoutExpired(command, 1)
 
     with pytest.raises(RlmCallError, match="timed out"):
-        _backend("codex", timeout, monkeypatch).complete(_request())  # type: ignore[arg-type]
+        _backend("codex", timeout, monkeypatch).complete(_request())
 
     with pytest.raises(RlmConfigurationError, match="no tool-free RLM backend"):
         SubprocessRlmBackend("shoal", "m")

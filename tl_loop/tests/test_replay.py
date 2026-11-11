@@ -6,27 +6,40 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from collections.abc import Mapping, Sequence
 
 import pytest
 
 from tl_loop.client.effects import EffectClient, ToolResult
-from tl_loop.events.envelope import project
+from tl_loop.client.transport import JsonObject
+from tl_loop.events.envelope import EventEnvelope, project
 from tl_loop.events.replay import ReplayEventSource, ReplayTruncated
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
-from tl_loop.fsm.scope import ChildKind, ChildRecord, TLRunning
+from tl_loop.fsm.child import ChildKind, ChildRecord
+from tl_loop.fsm.scope import TLRunning
 from tl_loop.loop.driver import EffectIntent, TLLoopConfig, tl_run
 from tl_loop.loop.journal import MUTATING_OPERATIONS, EffectJournal
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmResponse
 from tl_loop.select.policy import load_policy
 from tl_loop.state.schema import (
     DurableReviewEvidence,
+    GateStatus,
     HandoffEvidence,
     PublicationBinding,
     RepositoryIdentity,
+    RunState,
     SliceStatus,
     Verdict,
 )
 from tl_loop.state.store import RunStore
+from tl_loop.state.store import (
+    BudgetInput,
+    FSMInput,
+    IntegrationInput,
+    OrderedStagesInput,
+    SliceInput,
+)
+from tl_loop.state.plan_manifest import PlanManifest
 from tl_loop.tests.replay import (
     FIXTURE_ROOT,
     POLICY_ROOT,
@@ -319,6 +332,8 @@ def test_tl_run_restart_after_confirmed_effect_matches_live_replay(
 def _restart_execution_projection(state: dict[str, object]) -> dict[str, object]:
     """Ignore revision and recovery-only evidence while comparing execution state."""
     projected = json.loads(json.dumps(state))
+    if not isinstance(projected, dict):
+        raise AssertionError("serialized state must be an object")
     projected.pop("revision", None)
     goals = projected.get("goals")
     if isinstance(goals, dict):
@@ -343,26 +358,39 @@ def _restart_execution_projection(state: dict[str, object]) -> dict[str, object]
     return projected
 
 
-def _without_startup_boundary(actions):
+def _action_arguments(action: dict[str, object]) -> dict[str, object]:
+    arguments = action.get("arguments")
+    return arguments if isinstance(arguments, dict) else {}
+
+
+def _recovery_boundary_reason(action: dict[str, object]) -> object:
+    payload = _action_arguments(action).get("payload")
+    return payload.get("reason") if isinstance(payload, dict) else None
+
+
+def _without_startup_boundary(
+    actions: tuple[dict[str, object], ...],
+) -> tuple[dict[str, object], ...]:
     return tuple(
         action
         for action in actions
         if not (
             action.get("operation") == "emit_controller_event"
-            and action.get("arguments", {}).get("event_type") == "tl.recovery_boundary"
-            and action.get("arguments", {}).get("payload", {}).get("reason")
-            == "historical_catch_up_complete"
+            and _action_arguments(action).get("event_type") == "tl.recovery_boundary"
+            and _recovery_boundary_reason(action) == "historical_catch_up_complete"
         )
     )
 
 
-def _without_recovery_boundaries(actions):
+def _without_recovery_boundaries(
+    actions: tuple[dict[str, object], ...],
+) -> tuple[dict[str, object], ...]:
     return tuple(
         action
         for action in actions
         if not (
             action.get("operation") == "emit_controller_event"
-            and action.get("arguments", {}).get("event_type") == "tl.recovery_boundary"
+            and _action_arguments(action).get("event_type") == "tl.recovery_boundary"
         )
     )
 
@@ -379,7 +407,7 @@ def test_restart_holds_when_spawn_confirmation_lacks_invocation_proof(
             crash_after="spawn_worker",
         )
 
-    def remove_leaf_invocation(events):
+    def remove_leaf_invocation(events: list[EventEnvelope]) -> list[EventEnvelope]:
         return [
             replace(event, invocation_id=None) if event.run_seq == 2 else event for event in events
         ]
@@ -391,9 +419,15 @@ def test_restart_holds_when_spawn_confirmation_lacks_invocation_proof(
         event_transform=remove_leaf_invocation,
     )
 
-    assert resumed.state["events"]["last_consumed_offset"] == 1
+    events = resumed.state["events"]
+    assert isinstance(events, dict)
+    assert events["last_consumed_offset"] == 1
     assert resumed.state["gates"] == [{"name": "tl-recovery-consistency", "status": "pending"}]
-    assert resumed.state["slices"]["leaf-a"]["status"] == "pending"
+    slices = resumed.state["slices"]
+    assert isinstance(slices, dict)
+    leaf = slices["leaf-a"]
+    assert isinstance(leaf, dict)
+    assert leaf["status"] == "pending"
     assert not any(action["operation"] == "spawn_leaf" for action in resumed.actions)
 
 
@@ -436,8 +470,8 @@ class _RecoveryTransport(RecordingTransport):
         role: str,
         name: str,
         tool_name: str,
-        arguments: dict[str, object],
-    ) -> dict[str, object]:
+        arguments: JsonObject,
+    ) -> JsonObject:
         if tool_name == "watcher_pr_state":
             self.calls.append((tool_name, dict(arguments)))
             return {
@@ -558,11 +592,15 @@ def _seed_recovery_checkpoint(root: Path, operation: str) -> tuple[Path, str, st
             )
             for child_id, slice_state in slices.items()
         )
+        manifest = state.plan_manifest
+        assert manifest is not None
+        digest = manifest.digest
+        assert digest is not None
         fsm = TLRunning(
             0,
             {},
             scope_path=(run_id,),
-            plan_digest=state.plan_manifest.digest,
+            plan_digest=digest,
             parallel_pending=records,
         )
         store.checkpoint(
@@ -570,7 +608,7 @@ def _seed_recovery_checkpoint(root: Path, operation: str) -> tuple[Path, str, st
             slices,
             state.budgets,
             state.events.last_consumed_offset,
-            plan_manifest=state.plan_manifest,
+            plan_manifest=manifest,
         )
         return run_root, run_id, run_id
 
@@ -640,11 +678,15 @@ def _seed_recovery_checkpoint(root: Path, operation: str) -> tuple[Path, str, st
         reconciliation=reconciliation,
         post_merge=PostMergeState(phase, evidence),
     )
+    post_merge = current.post_merge
+    assert post_merge is not None
     slices = dict(state.slices)
     slices["nested-a"] = current
+    recursive_fsm = state.recursive_fsm
+    assert isinstance(recursive_fsm, TLRunning)
     recursive_fsm = replace(
-        state.recursive_fsm,
-        post_merge={**state.recursive_fsm.post_merge, "nested-a": current.post_merge},
+        recursive_fsm,
+        post_merge={**recursive_fsm.post_merge, "nested-a": post_merge},
     )
     store.checkpoint(
         recursive_fsm,
@@ -677,7 +719,7 @@ def _run_recovery_tl(
     *,
     crash_after: str | None = None,
     monkeypatch: pytest.MonkeyPatch | None = None,
-) -> tuple[_RecoveryTransport, object]:
+) -> tuple[_RecoveryTransport, RunState]:
     """Run the real driver, optionally dying after a confirmed journaled effect."""
     transport = _RecoveryTransport(repair_mode=operation == "resume_pr")
     effects = EffectClient(transport)
@@ -710,7 +752,22 @@ def _run_recovery_tl(
     journal = EffectJournal(run_id, root / run_id / "action-journal.json")
     crashed = False
 
-    def crash_checkpoint(store: RunStore, *args: object, **kwargs: object) -> object:
+    def crash_checkpoint(
+        store: RunStore,
+        fsm: FSMInput,
+        slices: Mapping[str, SliceInput],
+        budgets: BudgetInput,
+        offset: int,
+        *,
+        current_order: int | None = None,
+        ordered_stages: OrderedStagesInput | None = None,
+        integration: IntegrationInput | None = None,
+        state_version: int | None = None,
+        plan_manifest: PlanManifest | None = None,
+        expected_revision: int | None = None,
+        clear_gates: Sequence[str] = (),
+        ensure_gates: Sequence[tuple[str, GateStatus]] = (),
+    ) -> RunState:
         nonlocal crashed
         if (
             not crashed
@@ -723,7 +780,21 @@ def _run_recovery_tl(
         ):
             crashed = True
             raise RuntimeError(f"simulated process death after {crash_after}")
-        return original_checkpoint(store, *args, **kwargs)
+        return original_checkpoint(
+            store,
+            fsm,
+            slices,
+            budgets,
+            offset,
+            current_order=current_order,
+            ordered_stages=ordered_stages,
+            integration=integration,
+            state_version=state_version,
+            plan_manifest=plan_manifest,
+            expected_revision=expected_revision,
+            clear_gates=clear_gates,
+            ensure_gates=ensure_gates,
+        )
 
     if monkeypatch is not None and crash_after is not None:
         monkeypatch.setattr(RunStore, "checkpoint", crash_checkpoint)
@@ -805,7 +876,7 @@ def test_tl_run_crash_resume_matches_live_and_probes_each_recovery_effect(
     assert live_state.reducer_version == resumed_state.reducer_version
     effect_tool = RECOVERY_EFFECT_TO_TOOL.get(operation, operation)
 
-    def mutating_effect_calls(transport: _RecoveryTransport) -> list[tuple[str, dict[str, object]]]:
+    def mutating_effect_calls(transport: _RecoveryTransport) -> list[tuple[str, JsonObject]]:
         return [
             action
             for action in transport.calls

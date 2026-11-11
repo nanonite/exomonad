@@ -101,15 +101,6 @@
     "tl_loop/tests/test_haskell_guest_contract.py": {
       "call-overload": 2
     },
-    "tl_loop/tests/test_heartbeat.py": {
-      "arg-type": 17,
-      "attr-defined": 20,
-      "call-overload": 2,
-      "index": 14,
-      "no-untyped-def": 10,
-      "operator": 3,
-      "union-attr": 2
-    },
     "tl_loop/tests/test_identity.py": {
       "arg-type": 16,
       "index": 1,
@@ -138,12 +129,6 @@
     "tl_loop/tests/test_ledger.py": {
       "attr-defined": 1
     },
-    "tl_loop/tests/test_legacy_manifest.py": {
-      "arg-type": 10,
-      "index": 1,
-      "no-untyped-call": 32,
-      "no-untyped-def": 15
-    },
     "tl_loop/tests/test_legacy_manifest_convergence.py": {
       "no-untyped-call": 2,
       "no-untyped-def": 4,
@@ -165,15 +150,6 @@
     "tl_loop/tests/test_merge_policy.py": {
       "attr-defined": 1
     },
-    "tl_loop/tests/test_merge_rejection_reconciliation.py": {
-      "arg-type": 28,
-      "attr-defined": 1,
-      "call-arg": 1,
-      "call-overload": 3,
-      "index": 11,
-      "no-untyped-def": 4,
-      "union-attr": 14
-    },
     "tl_loop/tests/test_migration.py": {
       "index": 2,
       "no-untyped-call": 1,
@@ -193,24 +169,6 @@
     "tl_loop/tests/test_plan_authoring.py": {
       "attr-defined": 1,
       "redundant-cast": 1
-    },
-    "tl_loop/tests/test_plan_manifest.py": {
-      "arg-type": 4,
-      "attr-defined": 4,
-      "call-overload": 3,
-      "index": 9,
-      "no-untyped-def": 19,
-      "operator": 3,
-      "union-attr": 1
-    },
-    "tl_loop/tests/test_plan_reconciliation.py": {
-      "arg-type": 16,
-      "attr-defined": 35,
-      "index": 10,
-      "misc": 3,
-      "no-untyped-def": 1,
-      "type-var": 4,
-      "union-attr": 3
     },
     "tl_loop/tests/test_plan_revision.py": {
       "arg-type": 4,
@@ -263,12 +221,6 @@
       "arg-type": 2,
       "union-attr": 7
     },
-    "tl_loop/tests/test_recursive_orchestration_contract.py": {
-      "arg-type": 2,
-      "assignment": 22,
-      "return-value": 1,
-      "union-attr": 69
-    },
     "tl_loop/tests/test_recursive_replay_model.py": {
       "no-untyped-def": 4
     },
@@ -294,19 +246,6 @@
       "arg-type": 1,
       "func-returns-value": 1
     },
-    "tl_loop/tests/test_replay.py": {
-      "arg-type": 21,
-      "attr-defined": 5,
-      "index": 2,
-      "misc": 1,
-      "no-any-return": 1,
-      "no-untyped-call": 2,
-      "no-untyped-def": 3,
-      "override": 2,
-      "return-value": 1,
-      "type-var": 1,
-      "union-attr": 1
-    },
     "tl_loop/tests/test_repository_identity_migration.py": {
       "attr-defined": 3,
       "index": 9,
@@ -324,14 +263,6 @@
       "attr-defined": 1,
       "dict-item": 4,
       "no-untyped-def": 1
-    },
-    "tl_loop/tests/test_review_stuck.py": {
-      "arg-type": 45,
-      "index": 4,
-      "misc": 1,
-      "no-untyped-def": 1,
-      "operator": 5,
-      "union-attr": 1
     },
     "tl_loop/tests/test_review_validation.py": {
       "arg-type": 6

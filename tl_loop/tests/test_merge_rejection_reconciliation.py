@@ -10,9 +10,13 @@ never produces.
 from __future__ import annotations
 
 from dataclasses import replace
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from tl_loop.client.effects import ToolResult
+import pytest
+
+from tl_loop.client.effects import EffectClient, StringList, ToolResult
+from tl_loop.client.transport import JsonObject
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop import driver
 from tl_loop.loop.driver import (
@@ -37,9 +41,143 @@ from tl_loop.state.schema import (
     SliceState,
     SliceStatus,
 )
-from tl_loop.tests.test_startup_reconciliation import _PLAN, FakeClient, _load_state
+from tl_loop.state.store import RunStore
+from tl_loop.tests.test_startup_reconciliation import (
+    _PLAN,
+    FakeClient as FakeClientBase,
+    _load_state,
+)
 
 _REJECTION = "No Forgejo reviewer response yet on PR #99."
+
+
+class FakeClient(FakeClientBase, EffectClient):
+    """Existing deterministic client fixture with the production client type."""
+
+    def spawn_reviewer(
+        self, *, pr_number: int, head_sha: str, acceptance_criteria: StringList, force: bool
+    ) -> ToolResult:
+        return super().spawn_reviewer(
+            pr_number=pr_number,
+            head_sha=head_sha,
+            acceptance_criteria=tuple(acceptance_criteria),
+            force=force,
+        )
+
+    def chainlink_issue_create(
+        self,
+        *,
+        title: str,
+        description: str | None = None,
+        labels: StringList | None = None,
+        priority: str | None = None,
+    ) -> ToolResult:
+        return super().chainlink_issue_create(
+            title=title,
+            description=description,
+            labels=tuple(labels) if labels is not None else None,
+            priority=priority,
+        )
+
+    def chainlink_issue_list(
+        self,
+        *,
+        labels: StringList | None = None,
+        milestone: str | None = None,
+        priority: str | None = None,
+        status: str | None = None,
+    ) -> ToolResult:
+        return super().chainlink_issue_list(
+            labels=tuple(labels) if labels is not None else (),
+            status=status or "all",
+        )
+
+    def emit_controller_event(
+        self, *, event_type: str, payload: Mapping[str, object]
+    ) -> ToolResult:
+        del event_type, payload
+        return ToolResult(raw={"success": True}, success=True, result={}, error=None)
+
+    def post_merge_parent_sync(
+        self,
+        *,
+        child_id: str,
+        pr_number: int,
+        repository: str,
+        parent_branch: str,
+        merged_head_sha: str,
+        expected_base_sha: str,
+        lane_epoch: int,
+        sync_operation_id: str,
+        sync_attempt: int,
+        reconcile_only: bool = False,
+        working_dir: str | None = None,
+        forgejo_pr_number: int | None = None,
+        forgejo_merged: bool | None = None,
+        forgejo_head_sha: str | None = None,
+        forgejo_merge_commit_sha: str | None = None,
+        forgejo_merge_commit_tree_sha: str | None = None,
+        prospective_merge_tree_sha: str | None = None,
+        reviewed_pr_head_tree_sha: str | None = None,
+    ) -> ToolResult:
+        del (
+            reconcile_only,
+            working_dir,
+            forgejo_pr_number,
+            forgejo_merged,
+            forgejo_head_sha,
+            forgejo_merge_commit_sha,
+            forgejo_merge_commit_tree_sha,
+            prospective_merge_tree_sha,
+            reviewed_pr_head_tree_sha,
+        )
+        parent_commit_sha = "parent-after-merge"
+        result: JsonObject = {
+            "sync_outcome": "confirmed",
+            "sync_phase": "complete",
+            "completed_steps": ["fetch", "fast_forward"],
+            "retry_safe": False,
+            "diagnostic": "",
+            "sync_operation_id": sync_operation_id,
+            "sync_attempt": sync_attempt,
+            "child_id": child_id,
+            "pr_number": pr_number,
+            "repository": repository,
+            "parent_branch": parent_branch,
+            "merged_head_sha": merged_head_sha,
+            "expected_base_sha": expected_base_sha,
+            "lane_epoch": lane_epoch,
+            "parent_commit_sha": parent_commit_sha,
+            "remote_head_sha": parent_commit_sha,
+            "ancestry_proof": f"ancestor:{merged_head_sha}->{parent_commit_sha}",
+        }
+        return ToolResult.from_raw({"success": True, "result": result})
+
+
+def _intent_id(current: SliceState) -> str:
+    action = current.action
+    assert action is not None
+    intent_id = action.intent_id
+    assert intent_id is not None
+    return intent_id
+
+
+def _entry_status(journal: EffectJournal, key: str) -> object:
+    entry = journal.entry_by_key(key)
+    assert entry is not None
+    return entry["status"]
+
+
+def _retirement_entry(journal: EffectJournal) -> dict[str, object]:
+    for entry in journal.snapshot():
+        arguments = entry.get("arguments")
+        if (
+            entry.get("operation") == "emit_controller_event"
+            and isinstance(arguments, dict)
+            and arguments.get("event_type") == "tl.merge_attempt_retired"
+        ):
+            return entry
+    raise AssertionError("retirement event was not journaled")
 
 
 def _candidate() -> IntegrationCandidateState:
@@ -61,7 +199,9 @@ def _candidate() -> IntegrationCandidateState:
     )
 
 
-def _merging_with_rejected_action(store, state, tmp_path: Path) -> tuple[EffectJournal, SliceState]:
+def _merging_with_rejected_action(
+    store: RunStore, state: RunState, tmp_path: Path
+) -> tuple[EffectJournal, SliceState]:
     journal = EffectJournal("run-1", tmp_path / "action-journal.json")
     intent = EffectIntent("merge_pr", "slice-a", {"pr_number": 99}, True)
     journal.append(intent)
@@ -113,7 +253,7 @@ def _merging_with_rejected_action(store, state, tmp_path: Path) -> tuple[EffectJ
 
 
 def _parked_aggregate_rejection(
-    store, state, tmp_path: Path, *, cause: ParkCause, boundary: str
+    store: RunStore, state: RunState, tmp_path: Path, *, cause: ParkCause, boundary: str
 ) -> tuple[EffectJournal, RunState, SliceState]:
     journal, _current = _merging_with_rejected_action(store, state, tmp_path)
     current = store.load().slices["slice-a"]
@@ -148,7 +288,7 @@ def test_rejected_merge_retires_stale_in_flight_and_derives_eligible_integration
 ) -> None:
     store, state = _load_state(tmp_path)
     journal, current = _merging_with_rejected_action(store, state, tmp_path)
-    key = current.action.intent_id
+    key = _intent_id(current)
     client = FakeClient(merged=False, pr_state="open")
     config = TLLoopConfig(active=True, ledger_run_id="run-1")
 
@@ -163,7 +303,7 @@ def test_rejected_merge_retires_stale_in_flight_and_derives_eligible_integration
         recovered.integration.sub_tl_states["slice-a"] is IntegrationLifecycle.READY_FOR_INTEGRATION
     )
     # History is preserved byte-for-byte: the rejected result is untouched.
-    assert journal.entry_by_key(key)["status"] == "rejected"
+    assert _entry_status(journal, key) == "rejected"
     # A fresh approved attempt is not the retired one.
     assert candidate.merge_attempts == 1
     # No operator gate is opened for an already-proven rejection.
@@ -173,7 +313,7 @@ def test_rejected_merge_retires_stale_in_flight_and_derives_eligible_integration
 def test_rejected_merge_with_unavailable_watcher_holds_without_retiring(tmp_path: Path) -> None:
     store, state = _load_state(tmp_path)
     journal, current = _merging_with_rejected_action(store, state, tmp_path)
-    key = current.action.intent_id
+    key = _intent_id(current)
     client = FakeClient(resolved_pr_number=None)
     config = TLLoopConfig(active=True)
 
@@ -184,21 +324,23 @@ def test_rejected_merge_with_unavailable_watcher_holds_without_retiring(tmp_path
     assert slice_state.action.intent_id == key
     candidate = recovered.integration.candidates["slice-a"]
     assert candidate.lifecycle is IntegrationLifecycle.MERGING
-    assert journal.entry_by_key(key)["status"] == "rejected"
+    assert _entry_status(journal, key) == "rejected"
 
 
 def test_rejected_merge_with_conflicting_merged_head_holds_with_gate(tmp_path: Path) -> None:
     store, state = _load_state(tmp_path)
     journal, current = _merging_with_rejected_action(store, state, tmp_path)
-    key = current.action.intent_id
+    key = _intent_id(current)
 
     class ConflictingClient(FakeClient):
         def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
             payload = super().watcher_pr_state(pr_number=pr_number)
-            if payload.result is not None:
-                payload.result["merged"] = False  # type: ignore[index]
-                payload.result["head_sha"] = "other-head"  # type: ignore[index]
-            return payload
+            if not isinstance(payload.result, dict):
+                return payload
+            result = dict(payload.result)
+            result["merged"] = False
+            result["head_sha"] = "other-head"
+            return replace(payload, result=result)
 
     client = ConflictingClient(merged=False, pr_state="open", resolved_pr_number=99)
     config = TLLoopConfig(active=True, ledger_run_id="run-1")
@@ -206,14 +348,14 @@ def test_rejected_merge_with_conflicting_merged_head_holds_with_gate(tmp_path: P
     recovered = _reconcile_nonterminal_slices(_PLAN, state, config, client, store, journal)
 
     assert any(gate.name.startswith("tl-merge-retirement-") for gate in recovered.gates)
-    assert journal.entry_by_key(key)["status"] == "rejected"
+    assert _entry_status(journal, key) == "rejected"
 
 
 def test_rejected_merge_retirement_is_idempotent_across_restarts(tmp_path: Path) -> None:
     """Retiring the same rejected attempt twice converges without duplication."""
     store, state = _load_state(tmp_path)
     journal, current = _merging_with_rejected_action(store, state, tmp_path)
-    key = current.action.intent_id
+    key = _intent_id(current)
     client = FakeClient(merged=False, pr_state="open")
     config = TLLoopConfig(active=True, ledger_run_id="run-1")
 
@@ -227,11 +369,11 @@ def test_rejected_merge_retirement_is_idempotent_across_restarts(tmp_path: Path)
     # The counter advanced exactly once, not once per restart.
     assert candidate.merge_attempts == 1
     # The original rejected result is preserved byte-for-byte.
-    assert journal.entry_by_key(key)["status"] == "rejected"
+    assert _entry_status(journal, key) == "rejected"
 
 
 def test_retirement_audit_replays_if_checkpoint_fails_after_event(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A crash after disposition emission cannot erase it or duplicate it."""
     store, state = _load_state(tmp_path)
@@ -243,26 +385,45 @@ def test_retirement_audit_replays_if_checkpoint_fails_after_event(
             self.events: list[tuple[str, dict[str, object]]] = []
 
         def emit_controller_event(
-            self, *, event_type: str, payload: dict[str, object]
+            self, *, event_type: str, payload: Mapping[str, object]
         ) -> ToolResult:
-            self.events.append((event_type, payload))
+            self.events.append((event_type, dict(payload)))
             return ToolResult(raw={"success": True}, success=True, result={}, error=None)
 
     client = _EventClient()
     config = TLLoopConfig(active=True, ledger_run_id="run-1")
-    gate_name = driver._merge_retirement_gate_name(state, "slice-a", current.action.intent_id)
+    gate_name = driver._merge_retirement_gate_name(state, "slice-a", _intent_id(current))
     store.set_gate(gate_name)
     approved = store.answer_gate(gate_name, GateStatus.APPROVED)
 
     original_checkpoint = driver._checkpoint_slice_action
     checkpoint_calls = 0
 
-    def crash_after_disposition(*args, **kwargs):
+    def crash_after_disposition(
+        store: RunStore,
+        state: RunState,
+        slice_id: str,
+        action: ActionState | None,
+        *,
+        slice_state: SliceState | None = None,
+        integration: IntegrationRuntimeState | None = None,
+        clear_gates: tuple[str, ...] = (),
+        expected_revision: int | None = None,
+    ) -> RunState:
         nonlocal checkpoint_calls
         checkpoint_calls += 1
         if checkpoint_calls == 1:
             raise RuntimeError("simulated crash before retirement checkpoint")
-        return original_checkpoint(*args, **kwargs)
+        return original_checkpoint(
+            store,
+            state,
+            slice_id,
+            action,
+            slice_state=slice_state,
+            integration=integration,
+            clear_gates=clear_gates,
+            expected_revision=expected_revision,
+        )
 
     monkeypatch.setattr(driver, "_checkpoint_slice_action", crash_after_disposition)
     try:
@@ -279,13 +440,7 @@ def test_retirement_audit_replays_if_checkpoint_fails_after_event(
         for gate in state_after_crash.gates
     )
     assert len(client.events) == 1
-    retirement = next(
-        entry
-        for entry in journal.snapshot()
-        if entry.get("operation") == "emit_controller_event"
-        and isinstance(entry.get("arguments"), dict)
-        and entry["arguments"].get("event_type") == "tl.merge_attempt_retired"
-    )
+    retirement = _retirement_entry(journal)
     assert retirement["status"] == "confirmed"
 
     monkeypatch.setattr(driver, "_checkpoint_slice_action", original_checkpoint)
@@ -295,7 +450,7 @@ def test_retirement_audit_replays_if_checkpoint_fails_after_event(
     assert recovered.integration.candidates["slice-a"].merge_attempts == 1
     assert not any(g.name == gate_name for g in recovered.gates)
     assert len(client.events) == 1
-    assert journal.entry_by_key(current.action.intent_id)["status"] == "rejected"
+    assert _entry_status(journal, _intent_id(current)) == "rejected"
 
 
 def test_old_rejection_does_not_retire_a_newer_merge_action(tmp_path: Path) -> None:
@@ -348,13 +503,15 @@ def test_rejected_merge_with_missing_head_holds(tmp_path: Path) -> None:
     """A missing head is not an exact match; unknown evidence must hold."""
     store, state = _load_state(tmp_path)
     journal, current = _merging_with_rejected_action(store, state, tmp_path)
-    key = current.action.intent_id
+    key = _intent_id(current)
 
     class _MissingHeadClient(FakeClient):
         def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
             payload = super().watcher_pr_state(pr_number=pr_number)
-            if payload.result is not None:
-                payload.result["head_sha"] = ""
+            if isinstance(payload.result, dict):
+                result = dict(payload.result)
+                result["head_sha"] = ""
+                return replace(payload, result=result)
             return payload
 
     client = _MissingHeadClient(merged=False, pr_state="open", resolved_pr_number=99)
@@ -366,14 +523,14 @@ def test_rejected_merge_with_missing_head_holds(tmp_path: Path) -> None:
     assert slice_state.action is not None and slice_state.action.intent_id == key
     assert recovered.integration.candidates["slice-a"].lifecycle is IntegrationLifecycle.MERGING
     assert any(g.name.startswith("tl-merge-retirement-") for g in recovered.gates)
-    assert journal.entry_by_key(key)["status"] == "rejected"
+    assert _entry_status(journal, key) == "rejected"
 
 
 def test_operator_approved_retirement_gate_retires_and_clears_the_gate(tmp_path: Path) -> None:
     """The hold gate is a real decision: approving it retires the attempt."""
     store, state = _load_state(tmp_path)
     journal, current = _merging_with_rejected_action(store, state, tmp_path)
-    key = current.action.intent_id
+    key = _intent_id(current)
     config = TLLoopConfig(active=True)
 
     # First pass with no usable observation opens the hold gate.
@@ -396,7 +553,7 @@ def test_operator_approved_retirement_gate_retires_and_clears_the_gate(tmp_path:
     assert candidate.lifecycle is IntegrationLifecycle.READY_FOR_INTEGRATION
     assert candidate.merge_attempts == 1
     assert not any(g.name == gate.name for g in retired.gates)
-    assert journal.entry_by_key(key)["status"] == "rejected"
+    assert _entry_status(journal, key) == "rejected"
 
 
 def test_live_nonmerge_resolution_bumps_attempt_for_a_distinct_key(tmp_path: Path) -> None:
@@ -424,13 +581,15 @@ def test_rejected_merge_with_indeterminate_outcome_holds(tmp_path: Path) -> None
     """An observation that does not state merged true/false must not act."""
     store, state = _load_state(tmp_path)
     journal, current = _merging_with_rejected_action(store, state, tmp_path)
-    key = current.action.intent_id
+    key = _intent_id(current)
 
     class _IndeterminateClient(FakeClient):
         def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
             payload = super().watcher_pr_state(pr_number=pr_number)
-            if payload.result is not None:
-                payload.result.pop("merged", None)
+            if isinstance(payload.result, dict):
+                result = dict(payload.result)
+                result.pop("merged", None)
+                return replace(payload, result=result)
             return payload
 
     client = _IndeterminateClient(merged=False, pr_state="open", resolved_pr_number=99)
@@ -441,14 +600,14 @@ def test_rejected_merge_with_indeterminate_outcome_holds(tmp_path: Path) -> None
     assert recovered.slices["slice-a"].action is not None
     assert recovered.integration.candidates["slice-a"].lifecycle is IntegrationLifecycle.MERGING
     assert any(g.name.startswith("tl-merge-retirement-") for g in recovered.gates)
-    assert journal.entry_by_key(key)["status"] == "rejected"
+    assert _entry_status(journal, key) == "rejected"
 
 
 def test_rejected_merge_with_matching_merged_remote_is_adopted_once(tmp_path: Path) -> None:
     """A rejection plus a merged remote at the same head adopts the real merge."""
     store, state = _load_state(tmp_path)
     journal, current = _merging_with_rejected_action(store, state, tmp_path)
-    key = current.action.intent_id
+    key = _intent_id(current)
     client = FakeClient(merged=True, pr_state="closed")
     config = TLLoopConfig(active=True)
 
@@ -458,7 +617,7 @@ def test_rejected_merge_with_matching_merged_remote_is_adopted_once(tmp_path: Pa
     assert slice_state.status is SliceStatus.MERGED
     assert slice_state.post_merge is not None
     # The original rejected result remains historical evidence.
-    assert journal.entry_by_key(key)["status"] == "rejected"
+    assert _entry_status(journal, key) == "rejected"
 
 
 def test_exact_open_aggregate_releases_only_the_superseded_timeout_park(
@@ -488,7 +647,7 @@ def test_exact_open_aggregate_releases_only_the_superseded_timeout_park(
     # The old timeout audit remains as historical evidence.
     assert released.park_audit == parked.park_audit
     assert released.action is None
-    assert journal.entry_by_key(parked.action.intent_id)["status"] == "rejected"
+    assert _entry_status(journal, _intent_id(parked)) == "rejected"
 
 
 def test_timeout_park_without_aggregate_open_boundary_remains_parked(

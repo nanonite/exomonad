@@ -8,7 +8,7 @@ from threading import Barrier
 
 import pytest
 
-from tl_loop.fsm.child import ChildKind, ChildRecord
+from tl_loop.fsm.child import ChildKind, ChildRecord, TLOrchestrationEvent
 from tl_loop.fsm.lane import (
     LaneAbandoned,
     LaneBookkeepingStarted,
@@ -48,6 +48,7 @@ from tl_loop.fsm.scope import (
     ParkRequested,
     ScopeRole,
     StageReleased,
+    PhaseValue as ScopePhase,
     TLAllMerged,
     TLDone,
     TLFailed,
@@ -99,6 +100,13 @@ def _running(
     )
 
 
+def _advance_running(phase: ScopePhase, event: TLOrchestrationEvent) -> TLRunning:
+    result = transition(phase, event)
+    if not isinstance(result, TLRunning):
+        raise AssertionError(f"expected running phase, got {type(result).__name__}")
+    return result
+
+
 def _receipt(
     child_id: str,
     commit: str,
@@ -135,22 +143,24 @@ def _adopted(
 
 
 def _complete_pr(phase: TLRunning, child_id: str, pr_number: int) -> TLRunning | TLAllMerged:
-    phase = transition(
+    phase = _advance_running(
         phase, _adopted(child_id, pr_number, f"head-{child_id}", f"merge-{child_id}")
     )
-    phase = transition(phase, ParentBranchSynced(child_id, "parent", f"parent-{child_id}"))
-    phase = transition(phase, IssueClosePending(child_id, f"issue-{child_id}", f"close-{child_id}"))
-    phase = transition(
+    phase = _advance_running(phase, ParentBranchSynced(child_id, "parent", f"parent-{child_id}"))
+    phase = _advance_running(
+        phase, IssueClosePending(child_id, f"issue-{child_id}", f"close-{child_id}")
+    )
+    phase = _advance_running(
         phase,
         IssueCloseConfirmed(
             child_id, f"issue-{child_id}", f"close-{child_id}", f"close-journal-{child_id}"
         ),
     )
-    phase = transition(phase, ChangelogPending(child_id, f"log-{child_id}"))
-    phase = transition(
+    phase = _advance_running(phase, ChangelogPending(child_id, f"log-{child_id}"))
+    phase = _advance_running(
         phase, ChangelogCommitted(child_id, f"log-{child_id}", f"log-commit-{child_id}")
     )
-    phase = transition(
+    phase = _advance_running(
         phase,
         ParentPushPending(
             child_id,
@@ -159,7 +169,7 @@ def _complete_pr(phase: TLRunning, child_id: str, pr_number: int) -> TLRunning |
             f"push-journal-{child_id}",
         ),
     )
-    return transition(
+    result = transition(
         phase,
         PostMergeComplete(
             child_id,
@@ -173,6 +183,9 @@ def _complete_pr(phase: TLRunning, child_id: str, pr_number: int) -> TLRunning |
             ),
         ),
     )
+    if not isinstance(result, (TLRunning, TLAllMerged)):
+        raise AssertionError(f"expected completed phase, got {type(result).__name__}")
+    return result
 
 
 def test_recursive_order_scopes_reset_at_each_nested_plan() -> None:
@@ -208,8 +221,10 @@ def test_recursive_order_scopes_reset_at_each_nested_plan() -> None:
     assert plan.ordered_stages[0].sub_tls == ("also-first", "first")
     assert plan.ordered_stages[1].sub_tls == ("later",)
     nested = next(task.plan for task in plan.sub_tls if task.name == "first")
+    assert isinstance(nested, WorkPlan)
     assert [stage.order for stage in nested.ordered_stages] == [1]
     later_nested = next(task.plan for task in plan.sub_tls if task.name == "later")
+    assert isinstance(later_nested, WorkPlan)
     assert [stage.order for stage in later_nested.ordered_stages] == [1, 2]
 
 
@@ -233,7 +248,7 @@ def test_target_phases_retain_scope_dispatch_and_lane_payloads() -> None:
         scope_path=("root", "integration"),
         plan_digest="plan-sha",
     )
-    running = transition(planning, StageReleased(1, ("sub-a", "sub-z")))
+    running = _advance_running(planning, StageReleased(1, ("sub-a", "sub-z")))
 
     assert running.scope_path == ("root", "integration")
     assert running.plan_digest == "plan-sha"
@@ -255,15 +270,16 @@ def test_direct_worker_and_leaf_pre_stage_is_typed_and_ordered() -> None:
         ((1, (_child("sub-tl"),)),),
         parallel_children=(_child("leaf", ChildKind.LEAF), _child("worker", ChildKind.WORKER)),
     )
-    running = transition(planning, StageReleased(1, ("sub-tl",)))
+    running = _advance_running(planning, StageReleased(1, ("sub-tl",)))
     assert isinstance(running, TLRunning)
-    running = transition(running, WorkerCompleted("worker", "worker-result"))
+    running = _advance_running(running, WorkerCompleted("worker", "worker-result"))
     assert running.current_order == 1
     assert tuple(record.child_id for record in running.parallel_pending) == ("leaf",)
     with pytest.raises(IllegalTransition):
         transition(running, WorkerCompleted("leaf", "wrong-result"))
-    running = _complete_pr(running, "leaf", 7)
-    assert isinstance(running, TLRunning)
+    completed = _complete_pr(running, "leaf", 7)
+    assert isinstance(completed, TLRunning)
+    running = completed
     assert running.current_order == 1
 
 
@@ -520,6 +536,8 @@ def test_review_and_ci_evidence_remain_bound_to_head_and_base() -> None:
         integration=integration,
     )
 
+    assert ready.code_review is not None
+    assert ready.integration is not None
     assert ready.code_review.head_sha == candidate.head_sha
     assert ready.integration.base_sha == candidate.original_base_sha
     assert transition_integration(ready, IntegrationTransition.BASE_INVALIDATED).lifecycle is (
@@ -537,7 +555,7 @@ def test_live_and_replayed_inputs_share_the_same_typed_transition() -> None:
 
     assert live == replayed
     assert transition(running, live) == transition(running, replayed)
-    assert transition(running, live).post_merge["aggregate"].phase is (
+    assert _advance_running(running, live).post_merge["aggregate"].phase is (
         PostMergePhase.REMOTE_MERGE_ADOPTED
     )
 
@@ -549,7 +567,7 @@ def test_numeric_orders_advance_only_after_the_complete_post_merge_sequence() ->
             (2, (_child("sub-tl"),)),
         )
     )
-    running = transition(planning, StageReleased(1, ("sub-a", "sub-z")))
+    running = _advance_running(planning, StageReleased(1, ("sub-a", "sub-z")))
 
     with pytest.raises(IllegalTransition):
         transition(running, ParentBranchSynced("sub-a", "parent", "parent-a"))
@@ -656,17 +674,19 @@ def test_post_merge_events_require_matching_predecessor_evidence() -> None:
 
 def test_rebased_bookkeeping_requires_an_explicit_rebuild_generation() -> None:
     phase: TLRunning | TLAllMerged = _running((1, (_child("aggregate"),)))
-    phase = transition(phase, _adopted("aggregate", 43, "head", "merge-journal"))
-    phase = transition(phase, ParentBranchSynced("aggregate", "parent", "parent-head"))
-    phase = transition(phase, IssueClosePending("aggregate", "issue", "close-intent"))
-    phase = transition(
+    phase = _advance_running(phase, _adopted("aggregate", 43, "head", "merge-journal"))
+    phase = _advance_running(phase, ParentBranchSynced("aggregate", "parent", "parent-head"))
+    phase = _advance_running(phase, IssueClosePending("aggregate", "issue", "close-intent"))
+    phase = _advance_running(
         phase, IssueCloseConfirmed("aggregate", "issue", "close-intent", "close-journal")
     )
-    phase = transition(phase, ChangelogPending("aggregate", "log-intent"))
-    phase = transition(phase, ChangelogCommitted("aggregate", "log-intent", "log-commit"))
-    phase = transition(phase, ParentPushPending("aggregate", "push-intent", "base", "push-journal"))
+    phase = _advance_running(phase, ChangelogPending("aggregate", "log-intent"))
+    phase = _advance_running(phase, ChangelogCommitted("aggregate", "log-intent", "log-commit"))
+    phase = _advance_running(
+        phase, ParentPushPending("aggregate", "push-intent", "base", "push-journal")
+    )
     assert isinstance(phase, TLRunning)
-    rebuilt = transition(
+    rebuilt = _advance_running(
         phase,
         PostMergeRebuildRequested(
             "aggregate",
@@ -684,7 +704,7 @@ def test_rebased_bookkeeping_requires_an_explicit_rebuild_generation() -> None:
     assert rebuilt.post_merge["aggregate"].phase is PostMergePhase.CHANGELOG_PENDING
     with pytest.raises(IllegalTransition, match="fresh changelog intent"):
         transition(rebuilt, ChangelogCommitted("aggregate", "log-intent", "rebuilt-commit"))
-    rebuilt = transition(
+    rebuilt = _advance_running(
         rebuilt,
         ChangelogCommitted("aggregate", "rebuilt-log-intent", "rebuilt-log-commit"),
     )
@@ -700,7 +720,7 @@ def test_rebased_bookkeeping_requires_an_explicit_rebuild_generation() -> None:
             rebuilt,
             ParentPushPending("aggregate", "fresh-intent", "base-after-rebuild", "push-journal"),
         )
-    accepted = transition(
+    accepted = _advance_running(
         rebuilt,
         ParentPushPending("aggregate", "fresh-intent", "base-after-rebuild", "fresh-journal"),
     )
@@ -737,15 +757,15 @@ def test_intermediate_checkpoints_retain_cumulative_predecessor_evidence() -> No
 
 def test_post_merge_completion_rejects_a_mismatched_merge_journal() -> None:
     running = _running((1, (_child("aggregate"),)))
-    running = transition(running, _adopted("aggregate", 43, "head", "merge-journal"))
-    running = transition(running, ParentBranchSynced("aggregate", "parent", "parent-head"))
-    running = transition(running, IssueClosePending("aggregate", "issue", "close-intent"))
-    running = transition(
+    running = _advance_running(running, _adopted("aggregate", 43, "head", "merge-journal"))
+    running = _advance_running(running, ParentBranchSynced("aggregate", "parent", "parent-head"))
+    running = _advance_running(running, IssueClosePending("aggregate", "issue", "close-intent"))
+    running = _advance_running(
         running, IssueCloseConfirmed("aggregate", "issue", "close-intent", "close-journal")
     )
-    running = transition(running, ChangelogPending("aggregate", "log-intent"))
-    running = transition(running, ChangelogCommitted("aggregate", "log-intent", "log-commit"))
-    running = transition(
+    running = _advance_running(running, ChangelogPending("aggregate", "log-intent"))
+    running = _advance_running(running, ChangelogCommitted("aggregate", "log-intent", "log-commit"))
+    running = _advance_running(
         running, ParentPushPending("aggregate", "push-intent", "base", "push-journal")
     )
     with pytest.raises(IllegalTransition, match="evidence mismatch"):
@@ -767,7 +787,7 @@ def test_child_kind_prevents_worker_completion_of_pr_children() -> None:
         current=0,
         parallel=(_child("worker", ChildKind.WORKER),),
     )
-    running = transition(running, WorkerCompleted("worker", "worker-result"))
+    running = _advance_running(running, WorkerCompleted("worker", "worker-result"))
     assert running.current_order == 1
     with pytest.raises(IllegalTransition):
         transition(running, WorkerCompleted("leaf", "wrong-result"))

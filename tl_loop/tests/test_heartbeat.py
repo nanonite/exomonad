@@ -6,8 +6,9 @@ import json
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import cast
+from typing import TypedDict, Unpack
 
 import pytest
 
@@ -15,14 +16,17 @@ import tl_loop.loop.driver as driver_module
 import tl_loop.loop.heartbeat as heartbeat_module
 from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.readonly import MutationBlocked, ReadOnlyEffectClient
-from tl_loop.client.transport import JsonObject
+from tl_loop.client.transport import JsonObject, JsonValue
 from tl_loop.events.types import BlockCause
 from tl_loop.fsm.recovery import begin_recovery
+from tl_loop.fsm.scope import TLRunning
 from tl_loop.loop.abandon import abandon_slice
+from tl_loop.loop.driver import TLLoopConfig
 from tl_loop.loop.nested_recovery import NestedRecoveryAssessment
 from tl_loop.loop.heartbeat import (
     HeartbeatConfig,
     HeartbeatError,
+    HeartbeatResult,
     _classify_missing_handoff,
     _poll_workers,
     _result_object,
@@ -41,7 +45,15 @@ from tl_loop.state.schema import (
     SliceState,
     SliceStatus,
 )
-from tl_loop.state.store import RunStore
+from tl_loop.state.plan_manifest import PlanManifest
+from tl_loop.state.store import (
+    BudgetInput,
+    FSMInput,
+    IntegrationInput,
+    OrderedStagesInput,
+    RunStore,
+    SliceInput,
+)
 from tl_loop.tests.checkpoint_fixtures import create
 from tl_loop.tests.test_driver import _seed_deep_nested_recovery_run
 
@@ -54,6 +66,36 @@ class _MutableClock:
 
     def __call__(self) -> float:
         return self.value
+
+
+class OwnershipTransportKwargs(TypedDict, total=False):
+    omit_ownership_error: bool
+    ownership_error_raw: JsonValue
+    publication_ownership_error: str
+
+
+class CheckpointOptions(TypedDict, total=False):
+    current_order: int | None
+    ordered_stages: OrderedStagesInput | None
+    integration: IntegrationInput | None
+    state_version: int | None
+    plan_manifest: PlanManifest | None
+    expected_revision: int | None
+    clear_gates: Sequence[str]
+    ensure_gates: Sequence[tuple[str, GateStatus]]
+
+
+def _configured_project_root(config: TLLoopConfig) -> Path:
+    project_root = config.project_root
+    assert project_root is not None
+    return Path(project_root)
+
+
+def _recursive_fsm(state: RunState) -> FSMInput:
+    recursive_state = state.recursive_fsm
+    if isinstance(recursive_state, TLRunning):
+        return recursive_state
+    return state.fsm
 
 
 @dataclass
@@ -71,7 +113,7 @@ class HeartbeatTransport:
     publication_ownership_verified: bool | None = None
     publication_ownership_error: str = ""
     omit_ownership_error: bool = False
-    ownership_error_raw: object | None = None
+    ownership_error_raw: JsonValue | None = None
     publication: JsonObject | None = None
     calls: list[tuple[str, JsonObject]] = field(default_factory=list)
 
@@ -91,30 +133,27 @@ class HeartbeatTransport:
                 if isinstance(requested, list) and requested and isinstance(requested[0], str)
                 else "slice-a"
             )
-            worker = {
+            worker: JsonObject = {
                 "name": worker_name,
                 "pane_alive": self.pane_alive,
                 "lifecycle_status": "ACTIVE",
             }
             if self.worker_invocation_id is not None:
                 worker["invocation_id"] = self.worker_invocation_id
-            return cast(
-                JsonObject,
-                {
-                    "success": True,
-                    "result": {
-                        "workers": [worker] if self.worker_present else [],
-                        "dead_workers": [],
-                        "missing_agents": (
-                            [worker_name]
-                            if self.report_missing_agents and not self.worker_present
-                            else []
-                        ),
-                    },
+            return {
+                "success": True,
+                "result": {
+                    "workers": [worker] if self.worker_present else [],
+                    "dead_workers": [],
+                    "missing_agents": (
+                        [worker_name]
+                        if self.report_missing_agents and not self.worker_present
+                        else []
+                    ),
                 },
-            )
+            }
         if tool_name == "watcher_pr_state":
-            result: dict[str, object] = {
+            result: JsonObject = {
                 "pr_number": 42,
                 "head_sha": "head-new",
                 "head_branch": "task/slice-a",
@@ -139,24 +178,21 @@ class HeartbeatTransport:
                 )
             if self.publication is not None:
                 result["publication"] = self.publication
-            return cast(JsonObject, {"success": True, "result": result})
+            return {"success": True, "result": result}
         if tool_name == "resolve_live_pr_for_slice":
-            return cast(
-                JsonObject,
-                {
-                    "success": True,
-                    "result": {
-                        "slice_id": arguments.get("slice_id", "slice-a"),
-                        "resolution": "live",
-                        "pr_number": 42,
-                    },
+            return {
+                "success": True,
+                "result": {
+                    "slice_id": arguments.get("slice_id", "slice-a"),
+                    "resolution": "live",
+                    "pr_number": 42,
                 },
-            )
+            }
         if tool_name == "chainlink_issue_create":
-            return cast(JsonObject, {"success": True, "result": {"issue_id": 7042}})
+            return {"success": True, "result": {"issue_id": 7042}}
         if tool_name == "chainlink_issue_list":
-            return cast(JsonObject, {"success": True, "result": []})
-        return cast(JsonObject, {"success": True, "result": {}})
+            return {"success": True, "result": []}
+        return {"success": True, "result": {}}
 
 
 def test_idle_heartbeat_waits_for_configured_interval_without_polling(
@@ -271,7 +307,7 @@ def test_dead_nested_controller_is_held_when_declared_recovery_proof_is_unavaila
             sub_tl_recovery={"outer": replace(summary, next_probe_at=123.0)},
         )
     state = store.checkpoint(
-        state.recursive_fsm or state.fsm,
+        _recursive_fsm(state),
         {**state.slices, "outer": parent_slice},
         state.budgets,
         state.events.last_consumed_offset,
@@ -292,7 +328,7 @@ def test_dead_nested_controller_is_held_when_declared_recovery_proof_is_unavaila
         effects,
         HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=1.0),
         now=10.0,
-        project_root=config.project_root,
+        project_root=_configured_project_root(config),
         controller_agent_id=config.agent_id or config.run_id,
         active_work=active_work,
     )
@@ -309,7 +345,11 @@ def test_dead_nested_controller_is_held_when_declared_recovery_proof_is_unavaila
         "conflicting": "child_identity_conflict",
         "stale_summary": "summary_conflict",
     }[proof_failure]
-    assert held.reconciliation["nested_recovery_hold"]["reason_code"] == expected_reason
+    held_reconciliation = held.reconciliation
+    assert held_reconciliation is not None
+    held_hold = held_reconciliation["nested_recovery_hold"]
+    assert isinstance(held_hold, dict)
+    assert held_hold["reason_code"] == expected_reason
     held_events = [event for event in result.events if event.kind == "nested_recovery.proof_held"]
     assert len(held_events) == 1
     assert held_events[0].payload["reason_code"] == expected_reason
@@ -326,17 +366,16 @@ def test_dead_nested_controller_is_held_when_declared_recovery_proof_is_unavaila
         EffectClient(HeartbeatTransport(pane_alive=False)),
         HeartbeatConfig(interval_seconds=5.0, stall_threshold_seconds=1.0),
         now=20.0,
-        project_root=config.project_root,
+        project_root=_configured_project_root(config),
         controller_agent_id=config.agent_id or config.run_id,
     )
     assert repeated.state.slices["outer"].status is SliceStatus.SPAWNED
     assert repeated.state.slices["outer"].park_cause is None
     assert repeated.parked_slice_ids == ()
     assert not any(event.kind == "worker.dead" for event in repeated.events)
-    assert (
-        repeated.state.slices["outer"].reconciliation["nested_recovery_hold"]
-        == held.reconciliation["nested_recovery_hold"]
-    )
+    repeated_reconciliation = repeated.state.slices["outer"].reconciliation
+    assert repeated_reconciliation is not None
+    assert repeated_reconciliation["nested_recovery_hold"] == held_hold
     assert not any(event.kind == "nested_recovery.proof_held" for event in repeated.events)
 
 
@@ -366,10 +405,12 @@ def test_nested_recovery_hold_checkpoint_reassesses_concurrent_owner_changes(
             effects,
             HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
             now=100.0,
-            project_root=config.project_root,
+            project_root=_configured_project_root(config),
             controller_agent_id=config.agent_id or config.run_id,
         )
-        assert "nested_recovery_hold" in held.state.slices["outer"].reconciliation
+        held_reconciliation = held.state.slices["outer"].reconciliation
+        assert held_reconciliation is not None
+        assert "nested_recovery_hold" in held_reconciliation
         inner_store.path.write_bytes(inner_bytes)
         state = store.load()
 
@@ -391,14 +432,23 @@ def test_nested_recovery_hold_checkpoint_reassesses_concurrent_owner_changes(
 
     def interleaved_checkpoint(
         checkpoint_store: RunStore,
-        fsm,
-        slices,
-        budgets,
-        offset,
-        **kwargs,
-    ):
+        fsm: FSMInput,
+        slices: Mapping[str, SliceInput],
+        budgets: BudgetInput,
+        offset: int,
+        *,
+        current_order: int | None = None,
+        ordered_stages: OrderedStagesInput | None = None,
+        integration: IntegrationInput | None = None,
+        state_version: int | None = None,
+        plan_manifest: PlanManifest | None = None,
+        expected_revision: int | None = None,
+        clear_gates: Sequence[str] = (),
+        ensure_gates: Sequence[tuple[str, GateStatus]] = (),
+    ) -> RunState:
         nonlocal raced, root_journal_after_concurrent
-        target = slices.get("outer")
+        target_value = slices.get("outer")
+        target = target_value if isinstance(target_value, SliceState) else None
         persisted = (
             store.load().slices["outer"] if checkpoint_store.run_id == store.run_id else None
         )
@@ -424,7 +474,7 @@ def test_nested_recovery_hold_checkpoint_reassesses_concurrent_owner_changes(
                 )
             elif concurrent_operation == "abandon":
                 abandoned = abandon_slice(
-                    config.project_root.parent,
+                    _configured_project_root(config).parent,
                     store.run_id,
                     "outer",
                     effects=EffectClient(HeartbeatTransport()),
@@ -435,7 +485,21 @@ def test_nested_recovery_hold_checkpoint_reassesses_concurrent_owner_changes(
                 inner_store.path.write_bytes(inner_bytes)
             else:
                 inner_store.path.unlink()
-        return original_checkpoint(checkpoint_store, fsm, slices, budgets, offset, **kwargs)
+        return original_checkpoint(
+            checkpoint_store,
+            fsm,
+            slices,
+            budgets,
+            offset,
+            current_order=current_order,
+            ordered_stages=ordered_stages,
+            integration=integration,
+            state_version=state_version,
+            plan_manifest=plan_manifest,
+            expected_revision=expected_revision,
+            clear_gates=clear_gates,
+            ensure_gates=ensure_gates,
+        )
 
     monkeypatch.setattr(RunStore, "checkpoint", interleaved_checkpoint)
     result = heartbeat_once(
@@ -444,7 +508,7 @@ def test_nested_recovery_hold_checkpoint_reassesses_concurrent_owner_changes(
         effects,
         HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
         now=110.0,
-        project_root=config.project_root,
+        project_root=_configured_project_root(config),
         controller_agent_id=config.agent_id or config.run_id,
     )
 
@@ -453,9 +517,11 @@ def test_nested_recovery_hold_checkpoint_reassesses_concurrent_owner_changes(
     outer = latest.slices["outer"]
     if concurrent_operation == "invocation":
         assert outer.dispatch_invocation_id == "confirmed-concurrent-invocation"
+        recursive_state = latest.recursive_fsm
+        assert isinstance(recursive_state, TLRunning)
         record = next(
             record
-            for records in latest.recursive_fsm.pending_by_order.values()
+            for records in recursive_state.pending_by_order.values()
             for record in records
             if record.child_id == "outer"
         )
@@ -463,7 +529,9 @@ def test_nested_recovery_hold_checkpoint_reassesses_concurrent_owner_changes(
     elif concurrent_operation == "abandon":
         assert outer.status is SliceStatus.PARKED
         assert outer.park_cause is ParkCause.ATTEMPT_ABANDONED
-        assert outer.park_audit["reason"] == "operator_requested"
+        park_audit = outer.park_audit
+        assert park_audit is not None
+        assert park_audit["reason"] == "operator_requested"
     assert result.state.revision == latest.revision
     assert latest.budgets == before_budgets
     assert latest.slices["later"] == before_later
@@ -492,11 +560,15 @@ def test_nested_recovery_hold_checkpoint_reassesses_concurrent_owner_changes(
         ) == before_root_journal
     assert not any(name in {"spawn_leaf", "spawn_worker"} for name, _ in transport.calls)
     if hold_operation == "create" and concurrent_operation == "invocation":
-        assert outer.reconciliation["nested_recovery_hold"]["reason_code"] == (
-            "child_dispatch_registration_conflict"
-        )
+        assert outer.reconciliation is not None
+        hold = outer.reconciliation["nested_recovery_hold"]
+        assert isinstance(hold, dict)
+        assert hold["reason_code"] == "child_dispatch_registration_conflict"
     if hold_operation == "clear" and concurrent_operation == "abandon":
-        assert outer.reconciliation["nested_recovery_hold"]["reason_code"] == "checkpoint_missing"
+        assert outer.reconciliation is not None
+        hold = outer.reconciliation["nested_recovery_hold"]
+        assert isinstance(hold, dict)
+        assert hold["reason_code"] == "checkpoint_missing"
     if concurrent_operation == "proof_change":
         if hold_operation == "create":
             assert (
@@ -504,9 +576,10 @@ def test_nested_recovery_hold_checkpoint_reassesses_concurrent_owner_changes(
             )
             assert any(event.kind == "nested_recovery.wait" for event in result.events)
         else:
-            assert outer.reconciliation["nested_recovery_hold"]["reason_code"] == (
-                "checkpoint_missing"
-            )
+            assert outer.reconciliation is not None
+            hold = outer.reconciliation["nested_recovery_hold"]
+            assert isinstance(hold, dict)
+            assert hold["reason_code"] == "checkpoint_missing"
 
 
 def test_full_heartbeat_preserves_operator_abandon_during_nested_hold_clear(
@@ -523,10 +596,12 @@ def test_full_heartbeat_preserves_operator_abandon_during_nested_hold_clear(
         EffectClient(HeartbeatTransport(pane_alive=True)),
         HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
         now=100.0,
-        project_root=config.project_root,
+        project_root=_configured_project_root(config),
         controller_agent_id=config.agent_id or config.run_id,
     )
-    assert "nested_recovery_hold" in first.state.slices["outer"].reconciliation
+    first_reconciliation = first.state.slices["outer"].reconciliation
+    assert first_reconciliation is not None
+    assert "nested_recovery_hold" in first_reconciliation
 
     latest = store.load()
     integration = replace(
@@ -535,7 +610,7 @@ def test_full_heartbeat_preserves_operator_abandon_during_nested_hold_clear(
         sub_tl_recovery={},
     )
     state = store.checkpoint(
-        latest.recursive_fsm or latest.fsm,
+        _recursive_fsm(latest),
         latest.slices,
         latest.budgets,
         latest.events.last_consumed_offset,
@@ -551,13 +626,23 @@ def test_full_heartbeat_preserves_operator_abandon_during_nested_hold_clear(
     journal_after_abandon: bytes | None = None
 
     class AbandonTransport:
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
             del role, name, tool_name, arguments
-            return cast(JsonObject, {"success": True, "result": {}})
+            return {"success": True, "result": {}}
 
-    def interleaved_checkpoint(checkpoint_store, fsm, slices, budgets, offset, **kwargs):
+    def interleaved_checkpoint(
+        checkpoint_store: RunStore,
+        fsm: FSMInput,
+        slices: Mapping[str, SliceInput],
+        budgets: BudgetInput,
+        offset: int,
+        **kwargs: Unpack[CheckpointOptions],
+    ) -> RunState:
         nonlocal abandoned, journal_after_abandon
-        target = slices.get("outer")
+        target_value = slices.get("outer")
+        target = target_value if isinstance(target_value, SliceState) else None
         persisted = (
             store.load().slices["outer"] if checkpoint_store.run_id == store.run_id else None
         )
@@ -587,7 +672,7 @@ def test_full_heartbeat_preserves_operator_abandon_during_nested_hold_clear(
         effects,
         HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
         now=110.0,
-        project_root=config.project_root,
+        project_root=_configured_project_root(config),
         controller_agent_id=config.agent_id or config.run_id,
     )
 
@@ -596,7 +681,9 @@ def test_full_heartbeat_preserves_operator_abandon_during_nested_hold_clear(
     assert abandoned
     assert outer.status is SliceStatus.PARKED
     assert outer.park_cause is ParkCause.ATTEMPT_ABANDONED
-    assert outer.park_audit["reason"] == "operator_requested"
+    park_audit = outer.park_audit
+    assert park_audit is not None
+    assert park_audit["reason"] == "operator_requested"
     assert result.state.revision == latest.revision
     assert result.parked_slice_ids == ()
     assert not any(event.kind == "worker.dead" for event in result.events)
@@ -613,7 +700,7 @@ def test_full_heartbeat_preserves_operator_abandon_during_nested_hold_clear(
         effects,
         HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
         now=120.0,
-        project_root=config.project_root,
+        project_root=_configured_project_root(config),
         controller_agent_id=config.agent_id or config.run_id,
     )
     persisted = store.load().slices["outer"]
@@ -638,10 +725,12 @@ def test_full_heartbeat_defers_predecessor_pane_observation_after_invocation_cha
         EffectClient(HeartbeatTransport(pane_alive=True)),
         HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
         now=100.0,
-        project_root=config.project_root,
+        project_root=_configured_project_root(config),
         controller_agent_id=config.agent_id or config.run_id,
     )
-    assert "nested_recovery_hold" in first.state.slices["outer"].reconciliation
+    first_reconciliation = first.state.slices["outer"].reconciliation
+    assert first_reconciliation is not None
+    assert "nested_recovery_hold" in first_reconciliation
 
     latest = store.load()
     integration = replace(
@@ -650,7 +739,7 @@ def test_full_heartbeat_defers_predecessor_pane_observation_after_invocation_cha
         sub_tl_recovery={},
     )
     state = store.checkpoint(
-        latest.recursive_fsm or latest.fsm,
+        _recursive_fsm(latest),
         latest.slices,
         latest.budgets,
         latest.events.last_consumed_offset,
@@ -665,9 +754,17 @@ def test_full_heartbeat_defers_predecessor_pane_observation_after_invocation_cha
     original_checkpoint = RunStore.checkpoint
     rebound = False
 
-    def interleaved_checkpoint(checkpoint_store, fsm, slices, budgets, offset, **kwargs):
+    def interleaved_checkpoint(
+        checkpoint_store: RunStore,
+        fsm: FSMInput,
+        slices: Mapping[str, SliceInput],
+        budgets: BudgetInput,
+        offset: int,
+        **kwargs: Unpack[CheckpointOptions],
+    ) -> RunState:
         nonlocal rebound
-        target = slices.get("outer")
+        target_value = slices.get("outer")
+        target = target_value if isinstance(target_value, SliceState) else None
         persisted = (
             store.load().slices["outer"] if checkpoint_store.run_id == store.run_id else None
         )
@@ -692,7 +789,7 @@ def test_full_heartbeat_defers_predecessor_pane_observation_after_invocation_cha
         EffectClient(transport),
         HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
         now=110.0,
-        project_root=config.project_root,
+        project_root=_configured_project_root(config),
         controller_agent_id=config.agent_id or config.run_id,
     )
 
@@ -711,7 +808,7 @@ def test_full_heartbeat_defers_predecessor_pane_observation_after_invocation_cha
     assert not any(name in {"spawn_leaf", "spawn_worker"} for name, _ in transport.calls)
 
 
-def _activate_nested_parent(store: RunStore, state):
+def _activate_nested_parent(store: RunStore, state: RunState) -> RunState:
     """Make the retained child scope eligible for the production heartbeat pass."""
     active = replace(
         state.slices["outer"],
@@ -719,8 +816,10 @@ def _activate_nested_parent(store: RunStore, state):
         park_cause=None,
         park_audit=None,
     )
+    recursive_fsm = state.recursive_fsm
+    assert isinstance(recursive_fsm, TLRunning)
     return store.checkpoint(
-        state.recursive_fsm or state.fsm,
+        recursive_fsm,
         {**state.slices, "outer": active},
         state.budgets,
         state.events.last_consumed_offset,
@@ -745,14 +844,23 @@ def test_nested_hold_conflict_retries_are_bounded_and_return_latest_checkpoint(
 
     def keep_conflicting(
         checkpoint_store: RunStore,
-        fsm,
-        slices,
-        budgets,
-        offset,
-        **kwargs,
-    ):
+        fsm: FSMInput,
+        slices: Mapping[str, SliceInput],
+        budgets: BudgetInput,
+        offset: int,
+        *,
+        current_order: int | None = None,
+        ordered_stages: OrderedStagesInput | None = None,
+        integration: IntegrationInput | None = None,
+        state_version: int | None = None,
+        plan_manifest: PlanManifest | None = None,
+        expected_revision: int | None = None,
+        clear_gates: Sequence[str] = (),
+        ensure_gates: Sequence[tuple[str, GateStatus]] = (),
+    ) -> RunState:
         nonlocal checkpoints
-        target = slices.get("outer")
+        target_value = slices.get("outer")
+        target = target_value if isinstance(target_value, SliceState) else None
         persisted_reconciliation = store.load().slices["outer"].reconciliation or {}
         if (
             checkpoint_store.run_id == store.run_id
@@ -763,7 +871,21 @@ def test_nested_hold_conflict_retries_are_bounded_and_return_latest_checkpoint(
         ):
             checkpoints += 1
             concurrent_store.set_gate(f"concurrent-revision-{checkpoints}", GateStatus.PENDING)
-        return original_checkpoint(checkpoint_store, fsm, slices, budgets, offset, **kwargs)
+        return original_checkpoint(
+            checkpoint_store,
+            fsm,
+            slices,
+            budgets,
+            offset,
+            current_order=current_order,
+            ordered_stages=ordered_stages,
+            integration=integration,
+            state_version=state_version,
+            plan_manifest=plan_manifest,
+            expected_revision=expected_revision,
+            clear_gates=clear_gates,
+            ensure_gates=ensure_gates,
+        )
 
     monkeypatch.setattr(RunStore, "checkpoint", keep_conflicting)
     result = heartbeat_once(
@@ -772,7 +894,7 @@ def test_nested_hold_conflict_retries_are_bounded_and_return_latest_checkpoint(
         EffectClient(transport),
         HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
         now=100.0,
-        project_root=config.project_root,
+        project_root=_configured_project_root(config),
         controller_agent_id=config.agent_id or config.run_id,
     )
 
@@ -1016,7 +1138,7 @@ def _heartbeat_in_review(tmp_path: Path, invocation_id: str) -> tuple[RunStore, 
 
 def _run_refused_heartbeat(
     tmp_path: Path, transport: HeartbeatTransport
-) -> tuple[RunStore, object]:
+) -> tuple[RunStore, HeartbeatResult]:
     store, state = _heartbeat_in_review(tmp_path, "inv-current")
     result = heartbeat_once(
         state,
@@ -1153,7 +1275,7 @@ def test_heartbeat_unverified_ownership_does_not_persist_resolved_pr(
     ids=["omitted-error", "non-string-error", "contradictory-error"],
 )
 def test_heartbeat_malformed_ownership_cannot_mutate(
-    tmp_path: Path, transport_kwargs: dict[str, object]
+    tmp_path: Path, transport_kwargs: OwnershipTransportKwargs
 ) -> None:
     store, result = _run_refused_heartbeat(
         tmp_path,
@@ -1425,8 +1547,10 @@ def test_missing_worker_row_after_invocation_finished_enters_recovery_once(tmp_p
         for name, arguments in transport.calls
         if name == "emit_controller_event" and arguments.get("event_type") == "agent.task_blocked"
     ]
-    assert blocked_calls[0]["payload"]["outcome"] == "blocked"
-    assert blocked_calls[0]["payload"]["cause"] == "human_decision_required"
+    payload = blocked_calls[0]["payload"]
+    assert isinstance(payload, dict)
+    assert payload["outcome"] == "blocked"
+    assert payload["cause"] == "human_decision_required"
 
 
 def test_late_authoritative_handoff_wins_over_missing_worker_row(
@@ -1895,11 +2019,15 @@ def test_the_pr_classification_helpers_are_public() -> None:
 
     assert "pr_payload" in heartbeat.__all__
     assert "pr_terminal_cause" in heartbeat.__all__
-    assert driver.pr_payload is heartbeat.pr_payload
-    assert driver.pr_terminal_cause is heartbeat.pr_terminal_cause
+    from tl_loop.loop.heartbeat import pr_payload, pr_terminal_cause
+
+    assert driver.__dict__.get("pr_payload") is pr_payload
+    assert driver.__dict__.get("pr_terminal_cause") is pr_terminal_cause
 
 
-def _spawned_with_historical_dispatch(tmp_path: Path, *, started_at: float, budget: float = 3600.0):
+def _spawned_with_historical_dispatch(
+    tmp_path: Path, *, started_at: float, budget: float = 3600.0
+) -> tuple[RunStore, RunState]:
     store, state = _state(tmp_path, status="spawned", heartbeat_at=0.0)
     current = state.slices["slice-a"]
     updated = replace(

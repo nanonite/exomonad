@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import queue
+import operator
+from collections.abc import Mapping
+from pathlib import Path
 
 import pytest
 
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
+from tl_loop.client.transport import JsonObject
+from tl_loop.events.envelope import EventEnvelope
+from tl_loop.events.reader import LedgerSnapshot, SequenceStatus
 from tl_loop.fsm.child import ChildKind, ChildRecord
 from tl_loop.fsm.scope import TLPlanning, TLRunning
 from tl_loop.loop import driver
-from tl_loop.loop.driver import TLLoopConfig, _work_plan_from_manifest, run_tl_loop
+from tl_loop.loop.driver import TLLoopConfig, WorkPlan, _work_plan_from_manifest, run_tl_loop
 from tl_loop.state.migration import MigrationError, migrate_checkpoint_document
 from tl_loop.state.plan_manifest import (
     ManifestError,
@@ -61,10 +67,28 @@ def _plan() -> dict[str, object]:
     }
 
 
+def _plan_list(plan: Mapping[str, object], key: str) -> list[dict[str, object]]:
+    value = plan[key]
+    assert isinstance(value, list)
+    assert all(isinstance(item, dict) for item in value)
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _mapping(value: object) -> Mapping[str, object]:
+    assert isinstance(value, Mapping)
+    return value
+
+
+def _set_item(target: object, index: int, value: str) -> None:
+    if not isinstance(target, list):
+        raise TypeError("target does not support item assignment")
+    target[index] = value
+
+
 def test_manifest_digest_is_stable_and_recursive_round_trip() -> None:
     manifest = build_plan_manifest(_plan(), scope_id="run-1", owned_branch="main")
     reordered = {
-        "sub_tls": list(reversed(_plan()["sub_tls"])),
+        "sub_tls": list(reversed(_plan_list(_plan(), "sub_tls"))),
         "leaves": _plan()["leaves"],
         "workers": _plan()["workers"],
     }
@@ -77,11 +101,13 @@ def test_manifest_digest_is_stable_and_recursive_round_trip() -> None:
     nested = manifest.child_manifests["run-1/sub_tl/stage-a"]
     assert nested.nodes[0].name == "nested"
     assert nested.nodes[0].task == "nested work"
-    assert (
-        manifest.to_document()["child_manifests"]["run-1/sub_tl/stage-a"]["nodes"][0]["task"]
-        == "nested work"
-    )
+    child_document = _mapping(manifest.to_document()["child_manifests"])["run-1/sub_tl/stage-a"]
+    child_nodes = _mapping(child_document)["nodes"]
+    assert isinstance(child_nodes, list)
+    assert _mapping(child_nodes[0])["task"] == "nested work"
     restored = _work_plan_from_manifest(manifest)
+    assert isinstance(restored, WorkPlan)
+    assert isinstance(restored.sub_tls[0].plan, WorkPlan)
     assert restored.sub_tls[0].plan.leaves[0].task == "nested work"
 
 
@@ -152,13 +178,24 @@ def test_manifest_declarations_are_deeply_immutable() -> None:
     manifest = build_plan_manifest(plan, scope_id="immutable")
     declaration = manifest.node("immutable/leaf/leaf").declaration
 
-    plan["leaves"][0]["steps"].append("mutated input")
+    leaves = _plan_list(plan, "leaves")
+    steps = leaves[0]["steps"]
+    assert isinstance(steps, list)
+    steps.append("mutated input")
     assert declaration["steps"] == ("first",)
+    immutable_steps = declaration["steps"]
+    assert isinstance(immutable_steps, tuple)
     with pytest.raises(TypeError):
-        declaration["steps"][0] = "mutated manifest"
+        _set_item(immutable_steps, 0, "mutated manifest")
 
     document = manifest.to_document()
-    document["nodes"][0]["declaration"]["steps"].append("mutated document")
+    nodes = document["nodes"]
+    assert isinstance(nodes, list)
+    declaration_document = nodes[0]["declaration"]
+    assert isinstance(declaration_document, dict)
+    document_steps = declaration_document["steps"]
+    assert isinstance(document_steps, list)
+    document_steps.append("mutated document")
     assert manifest.node("immutable/leaf/leaf").declaration["steps"] == ("first",)
     assert PlanManifest.from_document(manifest.to_document()) == manifest
 
@@ -166,14 +203,19 @@ def test_manifest_declarations_are_deeply_immutable() -> None:
 def test_manifest_rejects_tampering_and_non_monotonic_revision() -> None:
     manifest = build_plan_manifest(_plan(), scope_id="run-1")
     document = manifest.to_document()
-    document["nodes"][0]["owned_branch"] = "other"
+    nodes = document["nodes"]
+    assert isinstance(nodes, list)
+    node = _mapping(nodes[0])
+    assert isinstance(node, dict)
+    node["owned_branch"] = "other"
     with pytest.raises(ManifestError):
         PlanManifest.from_document(document)
 
     candidate = build_plan_manifest(
         {
             **_plan(),
-            "sub_tls": _plan()["sub_tls"] + [{"name": "stage-c", "order": 3, "plan": {}}],
+            "sub_tls": _plan_list(_plan(), "sub_tls")
+            + [{"name": "stage-c", "order": 3, "plan": {}}],
         },
         scope_id="run-1",
         manifest_revision=2,
@@ -199,7 +241,7 @@ def test_manifest_rejects_tampering_and_non_monotonic_revision() -> None:
 
 
 def test_legacy_migration_binds_slices_and_opens_recovery_gate() -> None:
-    legacy = {
+    legacy: dict[str, object] = {
         "version": 3,
         "revision": 4,
         "run_id": "legacy-run",
@@ -211,8 +253,10 @@ def test_legacy_migration_binds_slices_and_opens_recovery_gate() -> None:
     }
     result = migrate_checkpoint_document(legacy, run_id="legacy-run")
     assert result.migrated
+    assert isinstance(result.document["version"], int)
+    assert isinstance(legacy["version"], int)
     assert result.document["version"] > legacy["version"]
-    assert result.document["plan_manifest"]["digest"]
+    assert _mapping(result.document["plan_manifest"])["digest"]
     assert result.document["gates"] == []
 
     active = {
@@ -220,10 +264,14 @@ def test_legacy_migration_binds_slices_and_opens_recovery_gate() -> None:
         "slices": {"worker": {"state": "pending", "paths": ["."]}},
     }
     active_result = migrate_checkpoint_document(active, run_id="legacy-run")
-    assert active_result.document["slices"]["worker"]["manifest_node_id"]
+    assert _mapping(_mapping(active_result.document["slices"])["worker"])["manifest_node_id"]
+    gates = active_result.document["gates"]
+    assert isinstance(gates, list)
     assert any(
-        gate["name"].startswith("plan-manifest-migration:")
-        for gate in active_result.document["gates"]
+        isinstance(gate, dict)
+        and isinstance(gate.get("name"), str)
+        and gate["name"].startswith("plan-manifest-migration:")
+        for gate in gates
     )
 
     manifest = build_legacy_manifest({"slices": {"unknown": {}}}, run_id="legacy-run")
@@ -231,7 +279,7 @@ def test_legacy_migration_binds_slices_and_opens_recovery_gate() -> None:
     assert manifest.ordered_stages == ()
 
 
-def test_store_round_trip_requires_exact_slice_manifest_binding(tmp_path) -> None:
+def test_store_round_trip_requires_exact_slice_manifest_binding(tmp_path: Path) -> None:
     manifest = build_plan_manifest(
         {"workers": [{"name": "worker", "task": "work"}]},
         scope_id="bound-run",
@@ -272,14 +320,18 @@ def test_store_round_trip_requires_exact_slice_manifest_binding(tmp_path) -> Non
     assert state.plan_manifest == manifest
 
 
-def test_store_refuses_unjournaled_manifest_revisions(tmp_path) -> None:
+def test_store_refuses_unjournaled_manifest_revisions(tmp_path: Path) -> None:
     original = build_plan_manifest(_plan(), scope_id="authority")
     changed = build_plan_manifest(
-        {**_plan(), "sub_tls": list(reversed(_plan()["sub_tls"]))},
+        {**_plan(), "sub_tls": list(reversed(_plan_list(_plan(), "sub_tls")))},
         scope_id="authority",
     )
     revised = build_plan_manifest(
-        {**_plan(), "sub_tls": _plan()["sub_tls"] + [{"name": "stage-c", "order": 3, "plan": {}}]},
+        {
+            **_plan(),
+            "sub_tls": _plan_list(_plan(), "sub_tls")
+            + [{"name": "stage-c", "order": 3, "plan": {}}],
+        },
         scope_id="authority",
         manifest_revision=2,
     )
@@ -331,7 +383,7 @@ def test_malformed_legacy_ordered_stage_fails_as_migration_error() -> None:
 
 
 def test_current_checkpoint_without_manifest_migrates_before_schema_validation() -> None:
-    legacy = {
+    legacy: dict[str, object] = {
         "version": 4,
         "revision": 1,
         "run_id": "legacy-v4",
@@ -346,11 +398,11 @@ def test_current_checkpoint_without_manifest_migrates_before_schema_validation()
 
     assert result.migrated is True
     assert result.document["version"] == 4
-    assert result.document["plan_manifest"]["owned_branch"] == "legacy"
+    assert _mapping(result.document["plan_manifest"])["owned_branch"] == "legacy"
 
 
 def test_current_checkpoint_with_null_manifest_migrates_before_schema_validation() -> None:
-    legacy = {
+    legacy: dict[str, object] = {
         "version": 4,
         "revision": 1,
         "run_id": "legacy-v4-null",
@@ -366,7 +418,7 @@ def test_current_checkpoint_with_null_manifest_migrates_before_schema_validation
 
     assert result.migrated is True
     assert result.document["version"] == 4
-    assert result.document["plan_manifest"]["owned_branch"] == "legacy"
+    assert _mapping(result.document["plan_manifest"])["owned_branch"] == "legacy"
 
 
 def test_schema_rejects_current_checkpoint_without_manifest() -> None:
@@ -394,7 +446,13 @@ def test_manifest_digest_is_unchanged_by_mutating_serialized_copies() -> None:
         scope_id="copy",
     )
     document = manifest.to_document()
-    document["nodes"][0]["declaration"]["steps"][0] = "changed copy"
+    nodes = document["nodes"]
+    assert isinstance(nodes, list)
+    declaration = _mapping(nodes[0])["declaration"]
+    assert isinstance(declaration, dict)
+    steps = declaration["steps"]
+    assert isinstance(steps, list)
+    steps[0] = "changed copy"
 
     assert (
         manifest.digest
@@ -405,7 +463,7 @@ def test_manifest_digest_is_unchanged_by_mutating_serialized_copies() -> None:
     )
 
 
-def test_recursive_fsm_payload_round_trips_without_projection_loss(tmp_path) -> None:
+def test_recursive_fsm_payload_round_trips_without_projection_loss(tmp_path: Path) -> None:
     fsm = TLPlanning(
         scope_path=("root", "stage-a"),
         plan_digest="manifest-digest",
@@ -420,8 +478,8 @@ def test_recursive_fsm_payload_round_trips_without_projection_loss(tmp_path) -> 
 
 
 def test_continuation_reconstructs_work_plan_without_external_plan(
-    tmp_path,
-    monkeypatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest = build_plan_manifest(
         {
@@ -446,14 +504,22 @@ def test_continuation_reconstructs_work_plan_without_external_plan(
     )
 
     class EmptySource:
-        def get(self, timeout=None):
+        def get(self, timeout: float | None = None) -> EventEnvelope:
+            del timeout
             raise queue.Empty
 
-        def acknowledge(self, event):
+        def acknowledge(self, event: EventEnvelope) -> int:
+            assert event.run_seq is not None
             return event.run_seq
 
+        def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+            return LedgerSnapshot((), cursor, SequenceStatus.UNKNOWN, (), None)
+
     class NoopTransport:
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
+            del role, name, arguments
             if tool_name == "repository_identity":
                 return {
                     "success": True,
@@ -480,24 +546,34 @@ def test_continuation_reconstructs_work_plan_without_external_plan(
         root_dir=tmp_path,
     )
 
+    assert isinstance(result, WorkPlan)
+    assert isinstance(result.sub_tls[0].plan, WorkPlan)
     assert result.leaves[0].task == "persisted task"
     assert result.sub_tls[0].plan.leaves[0].task == "deep task"
 
 
-def test_continuation_rejects_reordered_external_plan(tmp_path) -> None:
+def test_continuation_rejects_reordered_external_plan(tmp_path: Path) -> None:
     original = _plan()
     manifest = build_plan_manifest(original, scope_id="reordered")
     create("reordered", {"plan_manifest": manifest.to_document()}, root_dir=tmp_path)
 
     class EmptySource:
-        def get(self, timeout=None):
+        def get(self, timeout: float | None = None) -> EventEnvelope:
+            del timeout
             raise queue.Empty
 
-        def acknowledge(self, event):
+        def acknowledge(self, event: EventEnvelope) -> int:
+            assert event.run_seq is not None
             return event.run_seq
 
+        def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+            return LedgerSnapshot((), cursor, SequenceStatus.UNKNOWN, (), None)
+
     class NoopTransport:
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
+            del role, name, arguments
             if tool_name == "repository_identity":
                 return {
                     "success": True,
@@ -506,9 +582,9 @@ def test_continuation_rejects_reordered_external_plan(tmp_path) -> None:
             return {"success": True, "result": {}}
 
     reordered = {
-        "workers": original["workers"],
-        "leaves": original["leaves"],
-        "sub_tls": list(reversed(original["sub_tls"])),
+        "workers": _plan_list(original, "workers"),
+        "leaves": _plan_list(original, "leaves"),
+        "sub_tls": list(reversed(_plan_list(original, "sub_tls"))),
     }
     with pytest.raises(driver.TLLoopError, match="exomonad plan revise --dry-run"):
         run_tl_loop(
@@ -521,20 +597,28 @@ def test_continuation_rejects_reordered_external_plan(tmp_path) -> None:
         )
 
 
-def test_continuation_rejects_changed_external_plan(tmp_path) -> None:
+def test_continuation_rejects_changed_external_plan(tmp_path: Path) -> None:
     original = _plan()
     manifest = build_plan_manifest(original, scope_id="changed")
     create("changed", {"plan_manifest": manifest.to_document()}, root_dir=tmp_path)
 
     class EmptySource:
-        def get(self, timeout=None):
+        def get(self, timeout: float | None = None) -> EventEnvelope:
+            del timeout
             raise queue.Empty
 
-        def acknowledge(self, event):
+        def acknowledge(self, event: EventEnvelope) -> int:
+            assert event.run_seq is not None
             return event.run_seq
 
+        def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+            return LedgerSnapshot((), cursor, SequenceStatus.UNKNOWN, (), None)
+
     class NoopTransport:
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
+            del role, name, arguments
             if tool_name == "repository_identity":
                 return {
                     "success": True,
@@ -543,9 +627,9 @@ def test_continuation_rejects_changed_external_plan(tmp_path) -> None:
             return {"success": True, "result": {}}
 
     changed = {
-        "workers": original["workers"],
+        "workers": _plan_list(original, "workers"),
         "leaves": [{"name": "leaf", "task": "changed task", "chainlink_issue_id": None}],
-        "sub_tls": original["sub_tls"],
+        "sub_tls": _plan_list(original, "sub_tls"),
     }
     checkpoint = RunStore("changed", tmp_path).path.read_bytes()
     with pytest.raises(driver.TLLoopError, match="exomonad plan revise --dry-run"):
@@ -565,7 +649,7 @@ def test_continuation_rejects_changed_external_plan(tmp_path) -> None:
     assert RunStore("changed", tmp_path).path.read_bytes() == checkpoint
 
 
-def test_terminal_checkpoint_rejects_supplied_plan_drift_before_fast_path(tmp_path) -> None:
+def test_terminal_checkpoint_rejects_supplied_plan_drift_before_fast_path(tmp_path: Path) -> None:
     original = _plan()
     manifest = build_plan_manifest(original, scope_id="terminal-drift")
     create(
@@ -578,14 +662,22 @@ def test_terminal_checkpoint_rejects_supplied_plan_drift_before_fast_path(tmp_pa
     )
 
     class EmptySource:
-        def get(self, timeout=None):
+        def get(self, timeout: float | None = None) -> EventEnvelope:
+            del timeout
             raise queue.Empty
 
-        def acknowledge(self, event):
+        def acknowledge(self, event: EventEnvelope) -> int:
+            assert event.run_seq is not None
             return event.run_seq
 
+        def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+            return LedgerSnapshot((), cursor, SequenceStatus.UNKNOWN, (), None)
+
     class NoopTransport:
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
+            del role, name, arguments
             if tool_name == "repository_identity":
                 return {
                     "success": True,
