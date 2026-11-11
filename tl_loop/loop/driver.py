@@ -27584,7 +27584,7 @@ def _already_dispatched(name: str, state: RunState) -> bool:
 #: Every ``SelectionFailure`` that can park a slice, and the typed cause it parks
 #: with. A refused request and an exhausted budget are different operator actions,
 #: so they are different causes rather than one generic "no harness" park.
-_SELECTION_PARK_CAUSES: MappingProxyType = MappingProxyType(
+_SELECTION_PARK_CAUSES: MappingProxyType[SelectionFailure, ParkCause] = MappingProxyType(
     {
         SelectionFailure.OVER_BUDGET: ParkCause.BUDGET_EXHAUSTED,
         SelectionFailure.NO_CAPABLE_HARNESS: ParkCause.NO_CAPABLE_HARNESS,

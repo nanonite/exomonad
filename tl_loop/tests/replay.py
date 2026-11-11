@@ -9,7 +9,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+
+import pytest
 
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
@@ -25,8 +26,16 @@ from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
 from tl_loop.select.policy import load_policy
 from tl_loop.shadow.diff import normalize_arguments
-from tl_loop.state.schema import ParkCause, RepositoryIdentity
-from tl_loop.state.store import RunStore
+from tl_loop.state.plan_manifest import PlanManifest
+from tl_loop.state.schema import GateStatus, ParkCause, RepositoryIdentity, RunState
+from tl_loop.state.store import (
+    BudgetInput,
+    FSMInput,
+    IntegrationInput,
+    OrderedStagesInput,
+    RunStore,
+    SliceInput,
+)
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "replay"
 POLICY_ROOT = Path(__file__).parent / "fixtures"
@@ -256,7 +265,7 @@ def replay_fixture(
         capture_initial_events=capture_initial_events,
         child_event_transform=child_event_transform,
     )
-    _seed_controller_epochs(root_dir, spec)
+    _seed_controller_epochs(Path(root_dir), spec)
     events = _events(spec["events"])
     if event_transform is not None:
         events = list(event_transform(events))
@@ -264,9 +273,10 @@ def replay_fixture(
         current_head=_string(spec.get("current_head", "head-a"), "current_head")
     )
     queues: list[LedgerQueue] = []
+    source: LedgerQueue | ReplayEventSource
     if live_ledger:
         segments = Path(root_dir) / ".exo" / "ledger" / "segments"
-        _write_ledger_segment(segments, cast(list[Mapping[str, object]], spec["events"]))
+        _write_ledger_segment(segments, _mapping_list(spec["events"], "events"))
         source = LedgerQueue(
             LedgerReader(
                 segments,
@@ -291,7 +301,7 @@ def replay_fixture(
             capture_initial_events=(
                 capture_initial_events
                 if capture_initial_events is not None
-                else RunStore(run_id, root_dir).path.exists()
+                else RunStore(run_id, Path(root_dir)).path.exists()
             ),
         )
     policy = load_policy(POLICY_ROOT / _string(spec["policy"], "policy"))
@@ -329,7 +339,22 @@ def replay_fixture(
     )
     crashed = False
 
-    def crash_checkpoint(store: RunStore, *args: object, **kwargs: object) -> object:
+    def crash_checkpoint(
+        store: RunStore,
+        fsm: FSMInput,
+        slices: Mapping[str, SliceInput],
+        budgets: BudgetInput,
+        offset: int,
+        *,
+        current_order: int | None = None,
+        ordered_stages: OrderedStagesInput | None = None,
+        integration: IntegrationInput | None = None,
+        state_version: int | None = None,
+        plan_manifest: PlanManifest | None = None,
+        expected_revision: int | None = None,
+        clear_gates: tuple[str, ...] = (),
+        ensure_gates: tuple[tuple[str, GateStatus], ...] = (),
+    ) -> RunState:
         nonlocal crashed
         if (
             crash_journal is not None
@@ -342,10 +367,25 @@ def replay_fixture(
         ):
             crashed = True
             raise RuntimeError(f"simulated process death after {crash_after}")
-        return original_checkpoint(store, *args, **kwargs)
+        return original_checkpoint(
+            store,
+            fsm,
+            slices,
+            budgets,
+            offset,
+            current_order=current_order,
+            ordered_stages=ordered_stages,
+            integration=integration,
+            state_version=state_version,
+            plan_manifest=plan_manifest,
+            expected_revision=expected_revision,
+            clear_gates=clear_gates,
+            ensure_gates=ensure_gates,
+        )
 
+    monkeypatch = pytest.MonkeyPatch()
     if crash_after is not None:
-        setattr(RunStore, "checkpoint", crash_checkpoint)
+        monkeypatch.setattr(RunStore, "checkpoint", crash_checkpoint)
     try:
         try:
             run_result = tl_run(
@@ -374,8 +414,7 @@ def replay_fixture(
             if not allow_truncated:
                 raise
     finally:
-        if crash_after is not None:
-            RunStore.checkpoint = original_checkpoint
+        monkeypatch.undo()
         for queue in queues:
             queue.close(timeout=2)
     if crash_after is not None and not crashed:
@@ -383,23 +422,20 @@ def replay_fixture(
     store = RunStore(run_id, root_dir=Path(root_dir))
     state_path = store.path
     document = json.loads(state_path.read_text(encoding="utf-8"))
-    if not isinstance(document, dict):
-        raise TypeError(f"replay state {state_path} is not an object")
-    actions = tuple(
-        cast(
-            dict[str, object],
-            {
+    state_document = _dict(document, f"replay state {state_path}")
+    actions_list: list[dict[str, object]] = []
+    for tool_name, arguments in transport.calls:
+        if tool_name != "repository_identity":
+            action: dict[str, object] = {
                 "operation": tool_name,
                 "arguments": normalize_arguments(arguments),
-            },
-        )
-        for tool_name, arguments in transport.calls
-        if tool_name != "repository_identity"
-    )
-    normalized = normalize_state(cast(dict[str, object], document))
-    durable = normalize_durable_state(cast(dict[str, object], document))
+            }
+            actions_list.append(action)
+    actions = tuple(actions_list)
+    normalized = normalize_state(state_document)
+    durable = normalize_durable_state(state_document)
     if run_result is None:
-        events_document = cast(dict[str, object], document["events"])
+        events_document = _dict(state_document["events"], "state.events")
         journal_entries = (
             EffectJournal(run_id, store.run_dir / "action-journal.json").snapshot()
             if journal
@@ -409,11 +445,11 @@ def replay_fixture(
             actions,
             normalized,
             durable_state=durable,
-            cursor=cast(int, events_document["last_consumed_offset"]),
+            cursor=_integer(events_document["last_consumed_offset"], "events.last_consumed_offset"),
             journal_entries=journal_entries,
             acknowledged=tuple(getattr(source, "acknowledged", ())),
         )
-    transitions = tuple(
+    transitions: tuple[dict[str, object], ...] = tuple(
         {
             "event_seq": transition.event_seq,
             "event_type": transition.event_type,
@@ -440,7 +476,7 @@ def expected_actions(fixture: str | Path) -> tuple[dict[str, object], ...]:
     raw = spec.get("expected_actions")
     if not isinstance(raw, list):
         raise TypeError("fixture.expected_actions must be an array")
-    return tuple(cast(dict[str, object], item) for item in raw)
+    return tuple(_dict(item, "fixture.expected_actions[]") for item in raw)
 
 
 def expected_state(fixture: str | Path) -> dict[str, object]:
@@ -450,19 +486,19 @@ def expected_state(fixture: str | Path) -> dict[str, object]:
     if not isinstance(golden, str):
         raise TypeError("fixture.golden must be a string")
     value = json.loads((FIXTURE_ROOT / golden).read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise TypeError("golden state must be an object")
-    return cast(dict[str, object], value)
+    return _dict(value, "golden state")
 
 
 def normalize_state(document: Mapping[str, object]) -> dict[str, object]:
     """Normalize only run IDs and timestamp fields for byte-stable comparison."""
-    return cast(dict[str, object], _normalize_value("", document))
+    return _dict(_normalize_value("", document), "normalized state")
 
 
 def normalize_durable_state(document: Mapping[str, object]) -> dict[str, object]:
     """Normalize volatile values while retaining every durable replay field."""
-    return cast(dict[str, object], _normalize_value("", document, strip_runtime=False))
+    return _dict(
+        _normalize_value("", document, strip_runtime=False), "normalized durable state"
+    )
 
 
 def _normalize_value(key: str, value: object, *, strip_runtime: bool = True) -> object:
@@ -502,15 +538,41 @@ def _load_fixture(fixture: str | Path) -> dict[str, object]:
     if not path.is_absolute():
         path = FIXTURE_ROOT / path
     value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise TypeError(f"replay fixture {path} must be an object")
-    return cast(dict[str, object], value)
+    return _dict(value, f"replay fixture {path}")
+
+
+def _dict(value: object, label: str) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{label} must be an object")
+    result: dict[str, object] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise TypeError(f"{label} keys must be strings")
+        result[key] = item
+    return result
+
+
+def _mapping_list(value: object, label: str) -> list[Mapping[str, object]]:
+    if not isinstance(value, list):
+        raise TypeError(f"{label} must be an array")
+    result: list[Mapping[str, object]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping):
+            raise TypeError(f"{label}[{index}] must be an object")
+        result.append(_dict(item, f"{label}[{index}]"))
+    return result
+
+
+def _integer(value: object, label: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{label} must be an integer")
+    return value
 
 
 def _events(value: object) -> list[EventEnvelope]:
     if not isinstance(value, list):
         raise TypeError("fixture.events must be an array")
-    return [project(cast(dict[str, object], item)) for item in value]
+    return [project(_dict(item, "fixture.events[]")) for item in value]
 
 
 def _seed_controller_epochs(root_dir: Path, spec: Mapping[str, object]) -> None:
@@ -572,7 +634,7 @@ def _plan_with_replay_sources(
             if source_value is not None:
                 if child_event_transform is not None:
                     source_value = child_event_transform(
-                        cast(list[Mapping[str, object]], source_value)
+                        _mapping_list(source_value, f"child_events.{task.name}")
                     )
                 events = _events(source_value)
                 source = RecordedEventSource(
@@ -624,11 +686,12 @@ def _attach_live_child_sources(
         raw_events = event_map.get(task.name)
         child_state_dir = parent_state_dir / task.name
         child_ledger_dir = ledger_root / task.name
+        source: LedgerQueue | ReplayEventSource
         if isinstance(raw_events, list):
-            rows = raw_events
+            rows = _mapping_list(raw_events, f"child_events.{task.name}")
             if child_event_transform is not None:
-                rows = list(child_event_transform(cast(list[Mapping[str, object]], raw_events)))
-            _write_ledger_segment(child_ledger_dir, cast(list[Mapping[str, object]], rows))
+                rows = list(child_event_transform(rows))
+            _write_ledger_segment(child_ledger_dir, rows)
             source = LedgerQueue(
                 LedgerReader(child_ledger_dir, run_dir=child_state_dir),
                 poll_interval=0.001,

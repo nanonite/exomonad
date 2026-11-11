@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import ClassVar, cast
+from typing import ClassVar
 
 import pytest
 
 from tl_loop.client.effects import EffectClient, ToolResult
+from tl_loop.client.transport import JsonObject, JsonValue
 from tl_loop.fsm.lane import LaneAbandoned, LanePhase, LaneReserved, LaneState
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.loop.driver import (
@@ -30,11 +32,11 @@ from tl_loop.loop.driver import (
 )
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.observation import WatcherObservation
-from tl_loop.state.schema import SliceStatus
+from tl_loop.state.schema import SliceState, SliceStatus
 from tl_loop.tests.test_startup_reconciliation import _load_state, _review_recovery_state
 
 
-def _arguments() -> dict[str, object]:
+def _arguments() -> JsonObject:
     return {
         "child_id": "slice-a",
         "pr_number": 43,
@@ -68,7 +70,7 @@ def _receipt() -> dict[str, str]:
     }
 
 
-def _squash_proof() -> dict[str, object]:
+def _squash_proof() -> JsonObject:
     return {
         "kind": "squash",
         "pr_number": 43,
@@ -86,7 +88,34 @@ def _squash_proof() -> dict[str, object]:
     }
 
 
-def test_issue_close_uses_explicit_slice_issue_id(tmp_path) -> None:
+class _UnusedTransport:
+    def call_tool(
+        self, role: str, name: str, tool_name: str, arguments: JsonObject
+    ) -> JsonObject:
+        raise AssertionError(f"unexpected {tool_name} call for {role}/{name}: {arguments}")
+
+
+def _post_merge(slice_state: SliceState) -> PostMergeState:
+    if slice_state.post_merge is None:
+        raise AssertionError("slice must have post-merge state")
+    return slice_state.post_merge
+
+
+def _json_value(value: object) -> JsonValue:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, list):
+        return [_json_value(item) for item in value]
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        return {key: _json_value(item) for key, item in value.items()}
+    raise AssertionError("value must be JSON")
+
+
+def _json_object(value: Mapping[str, object]) -> JsonObject:
+    return {key: _json_value(item) for key, item in value.items()}
+
+
+def test_issue_close_uses_explicit_slice_issue_id(tmp_path: Path) -> None:
     store, state = _load_state(tmp_path, chainlink_issue_id=811)
     slice_id = "slice-a"
     evidence = {
@@ -113,9 +142,10 @@ def test_issue_close_uses_explicit_slice_issue_id(tmp_path) -> None:
     )
     current = run_state.slices[slice_id]
 
-    class IssueCloseClient:
+    class IssueCloseClient(EffectClient):
         def __init__(self) -> None:
-            self.calls: list[dict[str, object]] = []
+            super().__init__(_UnusedTransport())
+            self.calls: list[JsonObject] = []
 
         def chainlink_issue_show(self, *, issue_id: int) -> ToolResult:
             return ToolResult.from_raw(
@@ -125,9 +155,22 @@ def test_issue_close_uses_explicit_slice_issue_id(tmp_path) -> None:
                 }
             )
 
-        def chainlink_issue_close(self, **arguments: object) -> ToolResult:
+        def chainlink_issue_close(
+            self,
+            *,
+            issue_id: int,
+            force: bool,
+            summary: str | None = None,
+            commit_changelog: bool = False,
+        ) -> ToolResult:
+            arguments: JsonObject = {
+                "issue_id": issue_id,
+                "force": force,
+                "commit_changelog": commit_changelog,
+            }
+            if summary is not None:
+                arguments["summary"] = summary
             self.calls.append(arguments)
-            issue_id = arguments["issue_id"]
             return ToolResult.from_raw(
                 {
                     "success": True,
@@ -135,21 +178,9 @@ def test_issue_close_uses_explicit_slice_issue_id(tmp_path) -> None:
                 }
             )
 
-        def emit_controller_event(
-            self, *, event_type: str, payload: dict[str, object]
-        ) -> ToolResult:
+        def emit_controller_event(self, *, event_type: str, payload: JsonObject) -> ToolResult:
             return ToolResult.from_raw(
                 {"success": True, "result": {"event_type": event_type, "payload": payload}}
-            )
-
-    class MemoryStore:
-        def checkpoint(self, phase, slices, budgets, _offset, **kwargs):
-            return replace(
-                run_state,
-                fsm=phase,
-                slices=slices,
-                budgets=budgets,
-                integration=kwargs.get("integration", run_state.integration),
             )
 
     client = IssueCloseClient()
@@ -164,10 +195,10 @@ def test_issue_close_uses_explicit_slice_issue_id(tmp_path) -> None:
     )
 
     assert client.calls[0]["issue_id"] == 811
-    assert recovered.slices[slice_id].post_merge.phase is PostMergePhase.ISSUE_CLOSE_CONFIRMED
+    assert _post_merge(recovered.slices[slice_id]).phase is PostMergePhase.ISSUE_CLOSE_CONFIRMED
 
 
-def test_parent_push_recovery_binds_new_lane_epoch(tmp_path) -> None:
+def test_parent_push_recovery_binds_new_lane_epoch(tmp_path: Path) -> None:
     store, state = _load_state(tmp_path)
     evidence = {
         "child_id": "slice-a",
@@ -222,20 +253,20 @@ def test_parent_push_recovery_binds_new_lane_epoch(tmp_path) -> None:
         "slice-a",
         43,
         TLLoopConfig(active=False),
-        None,
+        EffectClient(_UnusedTransport()),
         [],
         store,
     )
 
-    assert advanced.slices["slice-a"].post_merge.phase is PostMergePhase.PARENT_PUSH_PENDING
-    assert advanced.slices["slice-a"].post_merge.evidence["lane_epoch"] == "2"
+    assert _post_merge(advanced.slices["slice-a"]).phase is PostMergePhase.PARENT_PUSH_PENDING
+    assert _post_merge(advanced.slices["slice-a"]).evidence["lane_epoch"] == "2"
     assert (
         advanced.integration.lanes["https://forge.example.com/org/repo.git:main"].phase
         is LanePhase.BOOKKEEPING
     )
 
 
-def test_watcher_evidence_persists_and_drives_squash_remote_reconcile(tmp_path) -> None:
+def test_watcher_evidence_persists_and_drives_squash_remote_reconcile(tmp_path: Path) -> None:
     watcher_result = ToolResult.from_raw(
         {
             "success": True,
@@ -270,7 +301,10 @@ def test_watcher_evidence_persists_and_drives_squash_remote_reconcile(tmp_path) 
     store, _ = _load_state(tmp_path)
     state = _review_recovery_state(store)
 
-    class RefreshClient:
+    class RefreshClient(EffectClient):
+        def __init__(self) -> None:
+            super().__init__(_UnusedTransport())
+
         def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
             assert pr_number == 99
             return watcher_result
@@ -294,12 +328,16 @@ def test_watcher_evidence_persists_and_drives_squash_remote_reconcile(tmp_path) 
         state.budgets,
         state.events.last_consumed_offset,
     )
-    persisted_evidence = dict(store.load().slices["slice-a"].post_merge.evidence)
+    persisted_evidence = _json_object(_post_merge(store.load().slices["slice-a"]).evidence)
 
-    class RemoteReconcileClient:
-        calls: ClassVar[list[dict[str, object]]] = []
+    class RemoteReconcileClient(EffectClient):
+        calls: ClassVar[list[JsonObject]] = []
 
-        def post_merge_parent_sync(self, **arguments: object) -> ToolResult:
+        def __init__(self) -> None:
+            super().__init__(_UnusedTransport())
+
+        def post_merge_parent_sync(self, **kwargs: object) -> ToolResult:
+            arguments = _json_object(kwargs)
             self.calls.append(arguments)
             proof = {
                 "kind": "squash",
@@ -335,7 +373,8 @@ def test_watcher_evidence_persists_and_drives_squash_remote_reconcile(tmp_path) 
                 }
             )
 
-        def post_merge_remote_reconcile(self, **arguments: object) -> ToolResult:
+        def post_merge_remote_reconcile(self, **kwargs: object) -> ToolResult:
+            arguments = _json_object(kwargs)
             self.calls.append(arguments)
             proof = {
                 "kind": "squash",
@@ -397,11 +436,13 @@ def test_watcher_evidence_persists_and_drives_squash_remote_reconcile(tmp_path) 
         journal,
         store,
     )
-    assert advanced.slices["slice-a"].post_merge.phase.value == "parent_branch_synced", (
+    assert _post_merge(advanced.slices["slice-a"]).phase.value == "parent_branch_synced", (
         advanced.slices["slice-a"].dispatch_error,
-        advanced.slices["slice-a"].post_merge.evidence,
+        _post_merge(advanced.slices["slice-a"]).evidence,
     )
-    assert advanced.slices["slice-a"].reconciliation["remote_name"] == "forgejo"
+    reconciliation = advanced.slices["slice-a"].reconciliation
+    assert reconciliation is not None
+    assert reconciliation["remote_name"] == "forgejo"
     assert journal.pending_entries() == []
     assert len(journal.confirmed_entries("post_merge_parent_sync", "slice-a")) == 1
 
@@ -462,9 +503,12 @@ def test_remote_advance_recovery_names_missing_bookkeeping_lane_epoch(
         ),
     )
 
-    class RemoteReconcileClient:
-        def post_merge_remote_reconcile(self, **arguments: object) -> ToolResult:
-            del arguments
+    class RemoteReconcileClient(EffectClient):
+        def __init__(self) -> None:
+            super().__init__(_UnusedTransport())
+
+        def post_merge_remote_reconcile(self, **kwargs: object) -> ToolResult:
+            _json_object(kwargs)
             return ToolResult.from_raw(
                 {
                     "success": True,
@@ -503,7 +547,7 @@ def test_remote_advance_recovery_names_missing_bookkeeping_lane_epoch(
             },
             failed_result=ToolResult.from_raw({"success": False, "error": "non-fast-forward"}),
             config=TLLoopConfig(active=True, ledger_run_id="recover"),
-            effects=cast(EffectClient, RemoteReconcileClient()),
+            effects=RemoteReconcileClient(),
             effects_log=[],
             store=store,
         )
@@ -522,7 +566,7 @@ def test_remote_advance_recovery_names_missing_bookkeeping_lane_epoch(
 )
 def test_squash_receipt_rejects_changed_authority_or_tree(field: str, value: object) -> None:
     proof = _squash_proof()
-    proof[field] = value
+    proof[field] = _json_value(value)
     with pytest.raises(ValueError):
         _validate_parent_sync_proof(
             {**_receipt(), "merge_integration_proof": proof},
@@ -658,7 +702,10 @@ def test_advanced_parent_refresh_preserves_historical_squash_tree(tmp_path: Path
     store, _ = _load_state(tmp_path)
     state = _review_recovery_state(store)
 
-    class RefreshClient:
+    class RefreshClient(EffectClient):
+        def __init__(self) -> None:
+            super().__init__(_UnusedTransport())
+
         def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
             assert pr_number == 99
             return watcher_result(trees["advanced_parent"], trees["current_prospective"])
@@ -672,12 +719,12 @@ def test_advanced_parent_refresh_preserves_historical_squash_tree(tmp_path: Path
         watcher_result(trees["advanced_parent"], trees["current_prospective"])
     )
     assert isinstance(observation, WatcherObservation)
-    evidence = {
+    evidence = _json_object({
         **_watcher_merge_evidence(observation),
         "repository": "https://forge.example.com/org/repo.git",
         "parent_branch": "main",
         "lane_epoch": 7,
-    }
+    })
     adopted = _adopt_post_merge_slice(
         state.slices["slice-a"],
         state,
@@ -707,12 +754,16 @@ def test_advanced_parent_refresh_preserves_historical_squash_tree(tmp_path: Path
         state.budgets,
         state.events.last_consumed_offset,
     )
-    persisted = dict(state.slices["slice-a"].post_merge.evidence)
+    persisted = _json_object(_post_merge(state.slices["slice-a"]).evidence)
     assert persisted["prospective_merge_tree_sha"] == trees["historical_prospective"]
     assert persisted["forgejo_merge_commit_tree_sha"] == trees["merge_commit_tree"]
 
-    class RemoteReconcileClient:
-        def post_merge_remote_reconcile(self, **arguments: object) -> ToolResult:
+    class RemoteReconcileClient(EffectClient):
+        def __init__(self) -> None:
+            super().__init__(_UnusedTransport())
+
+        def post_merge_remote_reconcile(self, **kwargs: object) -> ToolResult:
+            arguments = _json_object(kwargs)
             proof = {
                 "kind": "squash",
                 "pr_number": arguments["pr_number"],
@@ -777,7 +828,7 @@ def test_conflicting_refreshed_identity_blocks_recovery(
 ) -> None:
     store, _ = _load_state(tmp_path)
     state = _review_recovery_state(store)
-    evidence = {
+    evidence = _json_object({
         "pr_number": 43,
         "merged": True,
         "head_sha": "pr-head",
@@ -791,7 +842,7 @@ def test_conflicting_refreshed_identity_blocks_recovery(
         "repository": "https://forge.example.com/org/repo.git",
         "parent_branch": "main",
         "lane_epoch": 7,
-    }
+    })
     adopted = _adopt_post_merge_slice(
         state.slices["slice-a"],
         state,
@@ -807,9 +858,12 @@ def test_conflicting_refreshed_identity_blocks_recovery(
         state.events.last_consumed_offset,
     )
 
-    conflicting = {**evidence, field: value}
+    conflicting = {**evidence, field: _json_value(value)}
 
-    class RefreshClient:
+    class RefreshClient(EffectClient):
+        def __init__(self) -> None:
+            super().__init__(_UnusedTransport())
+
         def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
             assert pr_number == 99
             return ToolResult.from_raw(
@@ -836,7 +890,7 @@ def test_conflicting_refreshed_identity_blocks_recovery(
         43,
         "merge-journal",
         TLLoopConfig(active=True),
-        object(),
+        EffectClient(_UnusedTransport()),
         store,
         [],
         boundary="post_merge_recovery",

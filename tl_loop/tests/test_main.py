@@ -5,18 +5,18 @@ from __future__ import annotations
 import argparse
 import io
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from tl_loop import __main__ as launcher
-from tl_loop.client.transport import DEFAULT_TIMEOUT_SECONDS, JsonObject
+from tl_loop.client.transport import DEFAULT_TIMEOUT_SECONDS, JsonObject, JsonValue
 from tl_loop.events.queue import DEFAULT_ACTIVE_TAIL_TIMEOUT_SECONDS
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
 from tl_loop.loop.driver import TLLoopConfig, TLRunResult
+from tl_loop.plan_validation import PlanValidationError
 from tl_loop.state.schema import GateStatus
 from tl_loop.state.store import RunStore
 from tl_loop.tests.checkpoint_fixtures import create
@@ -40,51 +40,86 @@ class RecordingTransport:
         return {"success": True, "result": None}
 
 
-def _launcher_result(phase: TLPhase, recursive_fsm: object | None = None) -> TLRunResult:
-    state = SimpleNamespace(
-        fsm=SimpleNamespace(phase=phase),
-        events=SimpleNamespace(last_consumed_offset=0),
-        current_order=1,
-        integration=SimpleNamespace(lifecycle=SimpleNamespace(value="running")),
-        gates=(),
-        slices={},
-        recursive_fsm=recursive_fsm,
-    )
+def _launcher_result(
+    tmp_path: Path, phase: TLPhase, recursive_fsm: object | None = None
+) -> TLRunResult:
+    create("run", {}, root_dir=tmp_path)
+    state = RunStore("run", tmp_path).load()
+    state = replace(state, fsm=replace(state.fsm, phase=phase), recursive_fsm=recursive_fsm)
     return TLRunResult(state, (), (), ())
+
+
+def _json_value(value: object) -> JsonValue:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, list):
+        return [_json_value(item) for item in value]
+    if isinstance(value, dict) and all(isinstance(key, str) for key in value):
+        return {key: _json_value(item) for key, item in value.items()}
+    raise AssertionError("value must be JSON")
+
+
+def _json_object(value: object) -> JsonObject:
+    normalized = _json_value(value)
+    if not isinstance(normalized, dict):
+        raise TypeError("value must be a JSON object")
+    return normalized
+
+
+def _object_field(value: JsonObject, field_name: str) -> JsonObject:
+    field_value = value[field_name]
+    if not isinstance(field_value, dict):
+        raise TypeError(f"{field_name} must be a JSON object")
+    return field_value
+
+
+def _text_field(value: JsonObject, field_name: str) -> str:
+    field_value = value[field_name]
+    if not isinstance(field_value, str):
+        raise TypeError(f"{field_name} must be a string")
+    return field_value
 
 
 def test_main_records_recursive_failure_and_returns_nonzero(
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    result = _launcher_result(TLPhase.TLFailed, RecursiveTLFailed("child lost its handoff"))
+    result = _launcher_result(
+        tmp_path, TLPhase.TLFailed, RecursiveTLFailed("child lost its handoff")
+    )
     calls: list[str] = []
-    monkeypatch.setattr(launcher, "_run", lambda args: result)
-    monkeypatch.setattr(launcher, "_print_result", lambda value: calls.append("print"))
+    monkeypatch.setattr(launcher, "_run", lambda _args: result)
+    monkeypatch.setattr(launcher, "_print_result", lambda _value: calls.append("print"))
 
     assert launcher.main(["run", "--project-root", str(tmp_path)]) == 2
     assert calls == ["print"]
     marker = tmp_path / ".exo" / "tl-loop" / "root" / "controller-exit.json"
     assert marker.exists()
-    assert json.loads(marker.read_text(encoding="utf-8"))["reason"] == "child lost its handoff"
+    marker_value = _json_object(json.loads(marker.read_text(encoding="utf-8")))
+    assert _text_field(marker_value, "reason") == "child lost its handoff"
 
 
-def test_main_uses_stable_legacy_failure_reason(tmp_path: Path, monkeypatch) -> None:
-    result = _launcher_result(TLPhase.TLFailed)
-    monkeypatch.setattr(launcher, "_run", lambda args: result)
-    monkeypatch.setattr(launcher, "_print_result", lambda value: None)
+def test_main_uses_stable_legacy_failure_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _launcher_result(tmp_path, TLPhase.TLFailed)
+    monkeypatch.setattr(launcher, "_run", lambda _args: result)
+    monkeypatch.setattr(launcher, "_print_result", lambda _value: None)
 
     assert launcher.main(["run", "--project-root", str(tmp_path)]) == 2
     marker = tmp_path / ".exo" / "tl-loop" / "root" / "controller-exit.json"
-    assert json.loads(marker.read_text(encoding="utf-8"))["reason"] == (
+    marker_value = _json_object(json.loads(marker.read_text(encoding="utf-8")))
+    assert _text_field(marker_value, "reason") == (
         "TL reached the failed terminal phase"
     )
 
 
-def test_main_keeps_successful_terminal_result_zero(tmp_path: Path, monkeypatch) -> None:
-    result = _launcher_result(TLPhase.TLDone)
-    monkeypatch.setattr(launcher, "_run", lambda args: result)
-    monkeypatch.setattr(launcher, "_print_result", lambda value: None)
+def test_main_keeps_successful_terminal_result_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _launcher_result(tmp_path, TLPhase.TLDone)
+    monkeypatch.setattr(launcher, "_run", lambda _args: result)
+    monkeypatch.setattr(launcher, "_print_result", lambda _value: None)
 
     assert launcher.main(["run", "--project-root", str(tmp_path)]) == 0
     assert not (tmp_path / ".exo" / "tl-loop" / "root" / "controller-exit.json").exists()
@@ -93,7 +128,7 @@ def test_main_keeps_successful_terminal_result_zero(tmp_path: Path, monkeypatch)
 @pytest.mark.parametrize("source", ("cli", "control"))
 def test_gate_answer_emits_source_dimension(
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
     source: str,
 ) -> None:
     transport = RecordingTransport()
@@ -139,7 +174,7 @@ def test_gate_answer_emits_source_dimension(
 )
 def test_gate_answer_reaches_a_gate_whose_slice_id_contains_a_slash(
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
     gate: str,
     decision: bool,
     status: str,
@@ -191,7 +226,7 @@ def test_gate_answer_reaches_a_gate_whose_slice_id_contains_a_slash(
 
 def test_gate_command_can_answer_a_nested_child_run_gate(
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     transport = RecordingTransport()
     project_root = tmp_path
@@ -261,8 +296,8 @@ def test_a_gate_name_containing_a_slash_is_distinct_from_its_encoded_form(
 
 def test_accepted_plan_proposal_emits_no_plan_body(
     tmp_path: Path,
-    monkeypatch,
-    capsys,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     transport = RecordingTransport()
     monkeypatch.setattr(launcher, "TransportClient", lambda project_root: transport)
@@ -274,22 +309,22 @@ def test_accepted_plan_proposal_emits_no_plan_body(
         "event_type": "tl.plan_proposed",
         "payload": {"run_id": "run", "accepted": True},
     }
-    assert "plan" not in transport.calls[0][1]["payload"]
+    assert "plan" not in _object_field(transport.calls[0][1], "payload")
     assert '"inert": true' in capsys.readouterr().out
 
 
 def test_rejected_plan_proposal_emits_bounded_reason_without_body(
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     transport = RecordingTransport()
     monkeypatch.setattr(launcher, "TransportClient", lambda project_root: transport)
     monkeypatch.setattr("sys.stdin", io.StringIO('{"plan": {"leaves": []}, "body": "secret"}'))
 
-    with pytest.raises(launcher.PlanValidationError):
+    with pytest.raises(PlanValidationError):
         launcher._print_plan_proposal(argparse.Namespace(project_root=tmp_path, run_id="run"))
 
-    payload = transport.calls[0][1]["payload"]
+    payload = _object_field(transport.calls[0][1], "payload")
     assert payload["run_id"] == "run"
     assert payload["accepted"] is False
     assert isinstance(payload["rejection_reason"], str)
@@ -297,7 +332,9 @@ def test_rejected_plan_proposal_emits_bounded_reason_without_body(
     assert "secret" not in str(payload)
 
 
-def test_run_passes_time_budgets_to_constructors(tmp_path: Path, monkeypatch) -> None:
+def test_run_passes_time_budgets_to_constructors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     captured: dict[str, dict[str, object]] = {}
     monkeypatch.setenv("EXOMONAD_AGENT_ID", "root-controller")
     monkeypatch.setenv("EXOMONAD_WORKER_EFFORT_LEVEL", "xhigh")

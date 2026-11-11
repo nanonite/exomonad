@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import fields, replace
 from pathlib import Path
 
 import pytest
 
 from tl_loop.client.effects import EffectClient, ToolResult
-from tl_loop.client.transport import ServerTimeout
+from tl_loop.client.transport import JsonObject, ServerTimeout
+from tl_loop.events.envelope import EventEnvelope
+from tl_loop.events.reader import LedgerSnapshot
 from tl_loop.fsm.lane import LanePhase, LaneState
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.loop.driver import (
     CHAINLINK_BINDING_RECONCILIATION_GATE_NAME,
     ChainlinkIssueBindingError,
     EffectIntent,
-    EffectJournal,
     TLLoopConfig,
     TLLoopError,
     WorkPlan,
@@ -24,12 +26,41 @@ from tl_loop.loop.driver import (
     run_tl_loop,
     tl_run,
 )
+from tl_loop.loop.journal import EffectJournal
 from tl_loop.rlm.plan_authoring import slices_to_plan_document
 from tl_loop.rlm.slice_spec import SliceSpec
 from tl_loop.state.plan_manifest import PlanManifest, build_plan_manifest
 from tl_loop.state.schema import GateStatus, RepositoryIdentity, RunState, SliceStatus
 from tl_loop.state.store import RunStore
 from tl_loop.tests.checkpoint_fixtures import create
+
+
+def _mapping(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"expected mapping, got {type(value).__name__}")
+    return value
+
+
+class _UnusedEventQueue:
+    def get(self, timeout: float | None = None) -> EventEnvelope:
+        del timeout
+        raise AssertionError("invalid plans must be rejected before events are read")
+
+    def acknowledge(self, event: EventEnvelope) -> int:
+        del event
+        raise AssertionError("invalid plans must be rejected before events are acknowledged")
+
+    def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+        del cursor
+        raise AssertionError("invalid plans must be rejected before snapshots are read")
+
+
+class _UnusedTransport:
+    def call_tool(
+        self, role: str, name: str, tool_name: str, arguments: JsonObject
+    ) -> JsonObject:
+        del role, name, tool_name, arguments
+        raise AssertionError("invalid plans must be rejected before effects")
 
 
 def test_binding_round_trips_through_work_plan_manifest_and_child_state(
@@ -72,6 +103,7 @@ def test_binding_round_trips_through_work_plan_manifest_and_child_state(
         }
     )
 
+    assert isinstance(plan.sub_tls[0].plan, WorkPlan)
     assert plan.sub_tls[0].plan.leaves[0].chainlink_issue_id == 1167
     assert (
         restored.child_manifests["root/sub_tl/stage"]
@@ -79,6 +111,7 @@ def test_binding_round_trips_through_work_plan_manifest_and_child_state(
         .chainlink_issue_id
         == 1167
     )
+    assert isinstance(reconstructed.sub_tls[0].plan, WorkPlan)
     assert reconstructed.sub_tls[0].plan.leaves[0].chainlink_issue_id is None
 
     child_manifest = restored.child_manifests["root/sub_tl/stage"]
@@ -161,11 +194,6 @@ def test_malformed_binding_opens_reconciliation_gate(tmp_path: Path) -> None:
 
 
 def test_direct_loop_entrypoint_gates_malformed_binding(tmp_path: Path) -> None:
-    class Transport:
-        def call_tool(self, **arguments: object) -> dict[str, object]:
-            del arguments
-            raise AssertionError("invalid plans must be rejected before effects")
-
     config = TLLoopConfig(
         root_dir=tmp_path,
         run_id="direct-invalid-binding",
@@ -175,8 +203,8 @@ def test_direct_loop_entrypoint_gates_malformed_binding(tmp_path: Path) -> None:
         run_tl_loop(
             "direct-invalid-binding",
             {"leaves": [{"name": "leaf", "task": "work", "chainlink_issue_id": True}]},
-            object(),
-            EffectClient(Transport()),
+            _UnusedEventQueue(),
+            EffectClient(_UnusedTransport()),
             config=config,
             root_dir=tmp_path,
         )
@@ -211,11 +239,11 @@ class IssueCloseTransport:
         self.issue_id = issue_id
         self.issue_status = issue_status
         self.close_mode = close_mode
-        self.calls: list[tuple[str, dict[str, object]]] = []
+        self.calls: list[tuple[str, JsonObject]] = []
 
     def call_tool(
-        self, role: str, name: str, tool_name: str, arguments: dict[str, object]
-    ) -> dict[str, object]:
+        self, role: str, name: str, tool_name: str, arguments: JsonObject
+    ) -> JsonObject:
         del role, name
         self.calls.append((tool_name, arguments))
         if tool_name == "chainlink_issue_show":
@@ -233,7 +261,7 @@ class IssueCloseTransport:
             return {"success": True, "result": {}}
         raise AssertionError(f"unexpected effect {tool_name}")
 
-    def _close_result(self) -> dict[str, object]:
+    def _close_result(self) -> JsonObject:
         close_count = len([name for name, _ in self.calls if name == "chainlink_issue_close"])
         if self.close_mode == "timeout":
             raise ServerTimeout("issue close timed out")
@@ -533,7 +561,7 @@ def test_approved_issue_close_retry_requires_open_status_and_new_intent(
     assert final.evidence["issue_close_attempt"] == "2"
     close_entries = journal.confirmed_entries("post_merge_issue_close", "leaf")
     assert len(close_entries) == 1
-    assert close_entries[0]["arguments"]["retry_attempt"] == 2
+    assert _mapping(close_entries[0]["arguments"])["retry_attempt"] == 2
     assert len([name for name, _ in transport.calls if name == "chainlink_issue_close"]) == 2
 
 
@@ -559,8 +587,8 @@ def test_child_controller_config_has_no_parent_slice_issue_binding(tmp_path: Pat
     child = _child_config(
         TLLoopConfig(root_dir=tmp_path),
         parent_plan.sub_tls[0],
-        object(),
-        object(),
+        _UnusedEventQueue(),
+        EffectClient(_UnusedTransport()),
         store,
         "main.child",
         str(tmp_path / "child"),
@@ -588,4 +616,8 @@ def test_plan_authoring_preserves_explicit_slice_binding() -> None:
 
     document = slices_to_plan_document([authored], run_id="authored")
 
-    assert document["plan"]["leaves"][0]["chainlink_issue_id"] == 702
+    plan_document = _mapping(document["plan"])
+    leaves = plan_document["leaves"]
+    if not isinstance(leaves, list) or not leaves:
+        raise TypeError("expected at least one authored leaf")
+    assert _mapping(leaves[0])["chainlink_issue_id"] == 702

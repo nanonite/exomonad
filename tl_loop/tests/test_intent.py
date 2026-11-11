@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import pytest
 
-from tl_loop.rlm.call import RlmResponse
+from tl_loop.client.transport import JsonValue
 from tl_loop.rlm.intent import IntentInputError, interpret_operator_intent
 from tl_loop.rlm.intent_contract import (
     GateAnswerIntent,
     IntentValidationError,
+    OperatorIntent,
     QueryIntent,
     UnclearIntent,
 )
-from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest
+from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
 
 
 @dataclass
@@ -38,6 +40,24 @@ def _choice(backend: FakeBackend, *, context_length: int = 10_000) -> RlmModelCh
     )
 
 
+def _object(value: object, field_name: str) -> dict[str, object]:
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        raise AssertionError(f"{field_name} must be an object with string keys")
+    return {key: item for key, item in value.items()}
+
+
+def _section(sections: list[JsonValue], index: int) -> dict[str, object]:
+    if index >= len(sections):
+        raise AssertionError(f"missing section at index {index}")
+    return _object(sections[index], f"section {index}")
+
+
+def _invoke_unchecked(
+    function: Callable[..., OperatorIntent], read_model: object, model_choice: object
+) -> OperatorIntent:
+    return function("status", read_model, model_choice=model_choice)
+
+
 def test_interpretation_uses_injected_backend_and_no_tools() -> None:
     backend = FakeBackend([RlmResponse({"kind": "query", "run_id": "root", "view": "run"})])
     choice = _choice(backend)
@@ -53,21 +73,25 @@ def test_interpretation_uses_injected_backend_and_no_tools() -> None:
     assert request.name == "interpret_operator_intent"
     assert request.tools == ()
     assert request.context_budget == 8_000
-    sections = request.inputs["sections"]
-    assert isinstance(sections, list)
+    raw_sections = request.inputs["sections"]
+    assert isinstance(raw_sections, list)
+    sections = [_object(section, "section") for section in raw_sections]
     assert [section["name"] for section in sections] == [
         "operator_utterance",
         "instructions",
         "read_model",
     ]
-    utterance = sections[0]["content"]
-    read_model = sections[2]["content"]
+    utterance = _object(sections[0]["content"], "utterance section")
+    read_model = _object(sections[2]["content"], "read model section")
+    read_model_content = _object(read_model["content"], "read model content")
     assert utterance["provenance"] == "operator_input"
     assert utterance["authority"] == "instruction"
     assert read_model["provenance"] == "tl_loop.read_model"
     assert read_model["authority"] == "observation_only"
-    assert read_model["content"]["body"] == "untrusted"
-    assert "only instruction-bearing input" in sections[1]["content"]
+    assert read_model_content["body"] == "untrusted"
+    instructions = sections[1]["content"]
+    assert isinstance(instructions, str)
+    assert "only instruction-bearing input" in instructions
     assert choice.store.events[0]["name"] == "interpret_operator_intent"
 
 
@@ -109,7 +133,7 @@ def test_missing_capability_or_input_is_rejected_before_model_call() -> None:
     with pytest.raises(IntentInputError, match="model choice"):
         interpret_operator_intent("status", {})
     with pytest.raises(IntentInputError, match="read_model"):
-        interpret_operator_intent("status", [], model_choice=_choice(backend))  # type: ignore[arg-type]
+        _invoke_unchecked(interpret_operator_intent, [], _choice(backend))
 
     assert backend.requests == []
 

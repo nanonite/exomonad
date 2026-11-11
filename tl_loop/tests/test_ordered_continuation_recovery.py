@@ -4,21 +4,43 @@ from __future__ import annotations
 
 import json
 import queue
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import NamedTuple, cast
+from typing import NamedTuple
 
 import pytest
 
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.client.readonly import ReadOnlyEffectClient
-from tl_loop.client.transport import TransportClient
-from tl_loop.events.envelope import EventEnvelope
+from tl_loop.client.transport import JsonObject, TransportClient
+from tl_loop.events.envelope import EventEnvelope, project
 from tl_loop.events.reader import LedgerSnapshot, SequenceStatus
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
-from tl_loop.fsm.scope import TLFailed, TLRunning
+from tl_loop.fsm.scope import (
+    TLAllMerged as RecursiveTLAllMerged,
+)
+from tl_loop.fsm.scope import (
+    TLDone as RecursiveTLDone,
+)
+from tl_loop.fsm.scope import (
+    TLFailed,
+    TLRunning,
+)
+from tl_loop.fsm.scope import (
+    TLFinalizing as RecursiveTLFinalizing,
+)
+from tl_loop.fsm.scope import (
+    TLParked as RecursiveTLParked,
+)
+from tl_loop.fsm.scope import (
+    TLPlanning as RecursiveTLPlanning,
+)
+from tl_loop.fsm.scope import (
+    TLPRFiled as RecursiveTLPRFiled,
+)
+from tl_loop.fsm.scope import TLRunning as RecursiveTLRunning
 from tl_loop.loop import driver
 from tl_loop.loop.driver import (
     RECONCILED_SUB_TL_DISPATCH_BOUNDARIES,
@@ -43,6 +65,7 @@ from tl_loop.loop.driver import (
 )
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.ordered import IntegrationLifecycle
+from tl_loop.select.agent_type import select_agent_type
 from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
 from tl_loop.select.policy import validate_policy
@@ -78,7 +101,9 @@ class EmptyQueue:
 class _RecoveryTestTransport:
     """Transport that must remain unused by the offline failure fixture."""
 
-    def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+    def call_tool(
+        self, role: str, name: str, tool_name: str, arguments: JsonObject
+    ) -> JsonObject:
         del role, name, tool_name, arguments
         raise AssertionError("the offline failure fixture must not call external tools")
 
@@ -87,9 +112,11 @@ class _RetryDispatchTransport:
     """Accept the one authorized retry and expose no unrelated runtime owner."""
 
     def __init__(self) -> None:
-        self.spawn_calls: list[dict[str, object]] = []
+        self.spawn_calls: list[JsonObject] = []
 
-    def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+    def call_tool(
+        self, role: str, name: str, tool_name: str, arguments: JsonObject
+    ) -> JsonObject:
         del role, name
         if tool_name == "spawn_leaf":
             self.spawn_calls.append(arguments)
@@ -116,10 +143,85 @@ class _ExitedProcess:
         return False
 
     def terminate(self) -> None:
-        pass
+        return None
 
     def join(self, timeout: float | None = None) -> None:
         del timeout
+
+
+RecursiveState = (
+    RecursiveTLPlanning
+    | RecursiveTLRunning
+    | RecursiveTLAllMerged
+    | RecursiveTLFinalizing
+    | RecursiveTLDone
+    | RecursiveTLPRFiled
+    | TLFailed
+    | RecursiveTLParked
+)
+
+
+def _recursive_state(value: object | None) -> RecursiveState:
+    if isinstance(
+        value,
+        (
+            RecursiveTLPlanning,
+            RecursiveTLRunning,
+            RecursiveTLAllMerged,
+            RecursiveTLFinalizing,
+            RecursiveTLDone,
+            RecursiveTLPRFiled,
+            TLFailed,
+            RecursiveTLParked,
+        ),
+    ):
+        return value
+    raise RuntimeError("fixture has no valid recursive state")
+
+
+def _failed_recursive_state(value: object | None) -> TLFailed:
+    if isinstance(value, TLFailed):
+        return value
+    raise RuntimeError("fixture is not in a failed recursive state")
+
+
+def _required_mapping(value: object, label: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{label} is not an object")
+    return value
+
+
+def _required_sequence(value: object, label: str) -> Sequence[object]:
+    if not isinstance(value, list):
+        raise TypeError(f"{label} is not a list")
+    return value
+
+
+def _first_dispatch_intent_id(diagnostic: Mapping[str, object]) -> str:
+    failures = _required_sequence(diagnostic.get("dispatch_failures"), "dispatch failures")
+    if not failures:
+        raise RuntimeError("exit diagnostic has no dispatch failure")
+    first = _required_mapping(failures[0], "dispatch failure")
+    return _required_text(first.get("dispatch_intent_id"), "dispatch intent ID")
+
+
+def _required_text(value: object, label: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{label} is not text")
+    return value
+
+
+def _repository_identity(config: TLLoopConfig) -> RepositoryIdentity:
+    identity = config.repository_identity
+    if identity is None:
+        raise RuntimeError("fixture has no repository identity")
+    return identity
+
+
+def _required_work_plan(value: WorkPlan | Mapping[str, object]) -> WorkPlan:
+    if not isinstance(value, WorkPlan):
+        raise TypeError("fixture child plan is not a WorkPlan")
+    return value
 
 
 def _failed_ordered_run(
@@ -151,7 +253,7 @@ def _failed_ordered_run(
         {
             "plan_manifest": manifest.to_document(),
             "slices": parent_slices,
-            "repository_identity": config.repository_identity.to_document(),
+            "repository_identity": _repository_identity(config).to_document(),
         },
         root_dir=state_root,
     )
@@ -207,7 +309,7 @@ def _failed_ordered_run(
             "parent_branch": "main",
             "parent_run_id": "parent",
             "session_mode": "continue",
-            "repository_identity": config.repository_identity.to_document(),
+            "repository_identity": _repository_identity(config).to_document(),
         },
         root_dir=parent_store.run_dir,
     )
@@ -340,7 +442,9 @@ def test_rejected_gate_is_never_re_armed_to_pending(tmp_path: Path) -> None:
     assert result.diagnostics["recovery_gate_status"] == GateStatus.REJECTED.value
     assert isinstance(result.final_state.recursive_fsm, TLFailed)
     assert after.recursive_fsm == result.final_state.recursive_fsm
-    assert after.recursive_fsm.reason != before.recursive_fsm.reason
+    assert _failed_recursive_state(after.recursive_fsm).reason != _failed_recursive_state(
+        before.recursive_fsm
+    ).reason
 
 
 def test_approved_recovery_reopens_the_child_with_a_fresh_invocation(tmp_path: Path) -> None:
@@ -477,7 +581,7 @@ def test_server_invocation_is_checkpointed_before_recovered_child_starts(
     assert parent_store.load().revision == revision
 
     def publication(invocation_id: str) -> EventEnvelope:
-        return driver.project(
+        return project(
             {
                 "type": "pr.filed",
                 "run_seq": 1,
@@ -811,7 +915,7 @@ def test_recovery_keeps_merged_leaf_pending_until_post_merge_completes(
         ),
     )
     child_state = child_store.checkpoint(
-        child_state.recursive_fsm,
+        _recursive_state(child_state.recursive_fsm),
         {"leaf": leaf},
         child_state.budgets,
         child_state.events.last_consumed_offset,
@@ -819,9 +923,10 @@ def test_recovery_keeps_merged_leaf_pending_until_post_merge_completes(
         integration=child_state.integration,
     )
 
+    child_plan = _required_work_plan(parent_plan.sub_tls[0].plan)
     reopened = _reopen_ordered_scope(
         child_state,
-        parent_plan.sub_tls[0].plan,
+        child_plan,
         child_store,
         None,
     )
@@ -906,7 +1011,7 @@ def test_continue_terminal_gate_is_idempotent_and_does_not_consume_events(
 
 def test_continue_recovers_from_manifest_without_reloading_plan(
     tmp_path: Path,
-    monkeypatch,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     parent_store, _plan, config = _failed_ordered_run(tmp_path)
     config = replace(config, active=False)
@@ -915,13 +1020,23 @@ def test_continue_recovers_from_manifest_without_reloading_plan(
     )
     calls: list[str] = []
 
-    def record_sub_tls(_plan, state, *_args):
+    def record_sub_tls(_plan: object, state: object, *_args: object) -> object:
         calls.append("sub_tls")
         return state
 
-    def record_loop(*args):
+    def record_loop(
+        _run_id: str,
+        _plan: WorkPlan,
+        _source: object,
+        _effects: object,
+        _config: TLLoopConfig,
+        _store: RunStore,
+        state: RunState,
+        *_args: object,
+        **_kwargs: object,
+    ) -> driver.TLRunResult:
         calls.append("loop")
-        return driver.TLRunResult(args[6], (), (), ())
+        return driver.TLRunResult(state, (), (), ())
 
     monkeypatch.setattr(driver, "_run_sub_tls", record_sub_tls)
     monkeypatch.setattr(driver, "_run_loop", record_loop)
@@ -1092,7 +1207,7 @@ def _legacy_dirty_preflight_failure(
         dispatch_last_boundary="dispatch_intended",
     )
     child_state = child_store.checkpoint(
-        child_state.recursive_fsm,
+        _recursive_state(child_state.recursive_fsm),
         {**child_state.slices, "leaf": leaf},
         child_state.budgets,
         child_state.events.last_consumed_offset,
@@ -1196,7 +1311,7 @@ def _legacy_dirty_preflight_failure(
             dispatch_last_boundary="spawn_request_accepted",
         )
         child_store.checkpoint(
-            current.recursive_fsm,
+            _recursive_state(current.recursive_fsm),
             {**current.slices, "sibling": sibling},
             current.budgets,
             current.events.last_consumed_offset,
@@ -1225,7 +1340,7 @@ def test_normal_failed_return_records_bound_diagnostic_and_recovers(tmp_path: Pa
     assert diagnostic["outcome"] == "supervisor_observed_failure"
     assert diagnostic["scope_run_id"] == "child"
     assert diagnostic["scope_parent_run_id"] == "parent"
-    assert diagnostic["dispatch_failures"][0]["dispatch_intent_id"] == "legacy-leaf-intent"
+    assert _first_dispatch_intent_id(diagnostic) == "legacy-leaf-intent"
 
     decision = _ordered_terminal_recovery_decision(parent_store.load(), plan, config, parent_store)
 
@@ -1260,21 +1375,21 @@ def test_live_child_normal_return_writes_its_own_diagnostic(
     assert diagnostic["outcome"] == "normal_return"
     assert diagnostic["scope_run_id"] == "child"
     assert diagnostic["checkpoint_revision"] == failed_state.revision
-    assert diagnostic["dispatch_failures"][0]["dispatch_intent_id"] == "legacy-leaf-intent"
+    assert _first_dispatch_intent_id(diagnostic) == "legacy-leaf-intent"
 
 
 def test_exit_diagnostic_writer_skips_a_stale_return_revision(tmp_path: Path) -> None:
     _parent_store, _plan, _config, child_store = _legacy_dirty_preflight_failure(tmp_path)
     old = child_store.load()
     child_store.checkpoint(
-        old.recursive_fsm,
+        _recursive_state(old.recursive_fsm),
         old.slices,
         old.budgets,
         old.events.last_consumed_offset,
     )
 
     written = child_store.record_exit_reason(
-        cast(str, old.recursive_fsm.reason),
+        _failed_recursive_state(old.recursive_fsm).reason,
         outcome="normal_return",
         expected_revision=old.revision,
     )
@@ -1312,18 +1427,21 @@ def test_exact_historical_raw_spawn_refusal_with_null_error_kind_recovers(
     rejected_entry = driver._rejected_spawn_journal_entry(
         child_store, "leaf", failed_leaf.dispatch_intent_id
     )
+    if rejected_entry is None:
+        raise RuntimeError("expected rejected spawn journal entry is missing")
 
     assert failed_leaf.dispatch_error_code == "agent_error"
     assert failed_leaf.dispatch_invocation_id is None
-    assert failed_leaf.dispatch_error == rejected_entry["result"]["error"]
-    assert rejected_entry["result"] == {
+    journal_result = _required_mapping(rejected_entry["result"], "journal result")
+    assert failed_leaf.dispatch_error == journal_result["error"]
+    assert journal_result == {
         "success": False,
         "result": None,
         "error": failed_leaf.dispatch_error,
         "error_kind": None,
         "error_context": None,
     }
-    assert failed_leaf.dispatch_error.startswith(
+    assert _required_text(failed_leaf.dispatch_error, "dispatch error").startswith(
         "BLOCKED: cannot spawn agent into a dirty TL worktree."
     )
     assert child_store.exit_diagnostics() is None
@@ -1342,8 +1460,10 @@ def test_exact_historical_raw_spawn_refusal_with_null_error_kind_recovers(
         None,
         retry_dispatch_slice="leaf",
     )
-    assert reopened.recursive_fsm is not None
-    assert reopened.recursive_fsm.evidence["preexecution_dispatch_refusal_format"] == (
+    recursive_state = reopened.recursive_fsm
+    if not isinstance(recursive_state, RecursiveTLRunning):
+        raise TypeError("reopened scope is not running")
+    assert recursive_state.evidence["preexecution_dispatch_refusal_format"] == (
         "raw_legacy_null_error_kind"
     )
     assert (
@@ -1382,7 +1502,7 @@ def test_unrelated_legacy_agent_error_text_cannot_authorize_dispatch_retry(
         child_store, "leaf", failed_leaf.dispatch_intent_id
     )
     assert entry is not None
-    unrelated_result = dict(entry["result"])
+    unrelated_result = dict(_required_mapping(entry["result"], "journal result"))
     unrelated_result["error"] = failed_leaf.dispatch_error
     assert (
         driver._journal_result_dirty_preflight_format(
@@ -1391,7 +1511,7 @@ def test_unrelated_legacy_agent_error_text_cannot_authorize_dispatch_retry(
         is None
     )
     child_store.checkpoint(
-        state.recursive_fsm,
+        _recursive_state(state.recursive_fsm),
         {**state.slices, "leaf": failed_leaf},
         state.budgets,
         state.events.last_consumed_offset,
@@ -1456,7 +1576,7 @@ def test_raw_legacy_refusal_requires_its_explicit_null_kind_envelope(
         child_store, "leaf", slice_state.dispatch_intent_id
     )
     assert entry is not None
-    raw_result = dict(entry["result"])
+    raw_result = dict(_required_mapping(entry["result"], "journal result"))
     raw_result.pop("error_kind")
 
     assert (
@@ -1481,7 +1601,7 @@ def test_conflicting_exit_diagnostic_cannot_authorize_retry(
     parent_store, plan, config, child_store = _legacy_dirty_preflight_failure(tmp_path)
     child_state = child_store.load()
     child_store.record_exit_reason(
-        cast(str, child_state.recursive_fsm.reason),
+        _failed_recursive_state(child_state.recursive_fsm).reason,
         outcome="normal_return",
         expected_revision=child_state.revision,
     )
@@ -1594,8 +1714,10 @@ def test_recovered_dirty_refusal_dispatches_once_and_replay_does_not_duplicate(
         None,
         retry_dispatch_slice="leaf",
     )
-    assert reopened.recursive_fsm is not None
-    assert reopened.recursive_fsm.evidence["preexecution_dispatch_refusal_format"] == (
+    recursive_state = reopened.recursive_fsm
+    if not isinstance(recursive_state, RecursiveTLRunning):
+        raise TypeError("reopened scope is not running")
+    assert recursive_state.evidence["preexecution_dispatch_refusal_format"] == (
         "raw_legacy_null_error_kind"
     )
     effects_log = EffectJournal("child", child_store.run_dir / "action-journal.json")
@@ -1676,7 +1798,7 @@ def test_proven_preexecution_retry_uses_current_role_route_and_keeps_plan_reques
             config,
             task,
             EmptyQueue(),
-            None,
+            EffectClient(_RecoveryTestTransport()),
             parent_store,
             "main.child",
             child_worktree,
@@ -1689,7 +1811,7 @@ def test_proven_preexecution_retry_uses_current_role_route_and_keeps_plan_reques
         capabilities=capabilities,
     )
     assert (
-        driver.select_agent_type(
+        select_agent_type(
             reopened.slices["leaf"],
             child_config.role,
             reopened.budgets,
@@ -1737,7 +1859,7 @@ def test_child_config_declares_parent_manifest_for_recovery(tmp_path: Path) -> N
         config,
         task,
         EmptyQueue(),
-        None,
+        EffectClient(_RecoveryTestTransport()),
         parent_store,
         "main.child",
         child_worktree,
@@ -1745,12 +1867,14 @@ def test_child_config_declares_parent_manifest_for_recovery(tmp_path: Path) -> N
     )
 
     parent_manifest = parent_store.load().plan_manifest
+    if parent_manifest is None:
+        raise RuntimeError("parent manifest is missing")
     node = next(node for node in parent_manifest.nodes if node.name == "child")
     declared = parent_manifest.child_manifests[node.node_id]
 
     assert child_config.declared_manifest is not None
     assert child_config.declared_manifest.digest == declared.digest
-    candidate = _candidate_manifest(task.plan, task.name, child_config)
+    candidate = _candidate_manifest(_required_work_plan(task.plan), task.name, child_config)
     assert candidate.digest == declared.digest
     # The child checkpoint seeded by the helper carries the declared manifest,
     # which is exactly what recovery verifies.
@@ -1764,7 +1888,7 @@ def test_wrong_controller_identity_is_not_recoverable(tmp_path: Path) -> None:
     state = parent_store.load()
     child = replace(state.slices["child"], dispatch_agent_id="wrong-controller")
     parent_store.checkpoint(
-        state.recursive_fsm,
+        _recursive_state(state.recursive_fsm),
         {"child": child},
         state.budgets,
         state.events.last_consumed_offset,

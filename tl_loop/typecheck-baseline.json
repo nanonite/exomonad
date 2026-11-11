@@ -1,17 +1,5 @@
 {
   "errors": {
-    "tl_loop/loop/driver.py": {
-      "type-arg": 1
-    },
-    "tl_loop/loop/escalate.py": {
-      "no-untyped-def": 1
-    },
-    "tl_loop/state/plan_manifest.py": {
-      "type-arg": 1
-    },
-    "tl_loop/state/reference_verification.py": {
-      "no-untyped-def": 1
-    },
     "tl_loop/tests/checkpoint_fixtures.py": {
       "attr-defined": 1,
       "call-overload": 1
@@ -19,22 +7,8 @@
     "tl_loop/tests/fixtures/aggregate_approval_producer.py": {
       "arg-type": 6
     },
-    "tl_loop/tests/replay.py": {
-      "arg-type": 17,
-      "assignment": 2,
-      "method-assign": 1
-    },
     "tl_loop/tests/test_abandon.py": {
       "arg-type": 3
-    },
-    "tl_loop/tests/test_action_journal_reconciliation.py": {
-      "arg-type": 4,
-      "index": 12,
-      "no-untyped-call": 8,
-      "no-untyped-def": 13,
-      "union-attr": 1,
-      "unused-ignore": 1,
-      "var-annotated": 1
     },
     "tl_loop/tests/test_agent_type.py": {
       "no-untyped-call": 9,
@@ -43,12 +17,6 @@
     "tl_loop/tests/test_aggregate_approval.py": {
       "no-untyped-def": 1,
       "union-attr": 1
-    },
-    "tl_loop/tests/test_chainlink_issue_binding.py": {
-      "arg-type": 11,
-      "attr-defined": 1,
-      "index": 2,
-      "union-attr": 2
     },
     "tl_loop/tests/test_convergence.py": {
       "type-var": 1,
@@ -81,12 +49,6 @@
       "union-attr": 169,
       "var-annotated": 4
     },
-    "tl_loop/tests/test_effects.py": {
-      "arg-type": 1,
-      "call-overload": 9,
-      "index": 18,
-      "redundant-cast": 3
-    },
     "tl_loop/tests/test_envelope.py": {
       "attr-defined": 1
     },
@@ -101,25 +63,9 @@
     "tl_loop/tests/test_haskell_guest_contract.py": {
       "call-overload": 2
     },
-    "tl_loop/tests/test_identity.py": {
-      "arg-type": 16,
-      "index": 1,
-      "no-untyped-def": 4
-    },
     "tl_loop/tests/test_integration_lineage.py": {
       "arg-type": 1,
       "syntax": 1
-    },
-    "tl_loop/tests/test_intent.py": {
-      "attr-defined": 1,
-      "call-overload": 9,
-      "index": 18,
-      "operator": 1
-    },
-    "tl_loop/tests/test_journal.py": {
-      "arg-type": 5,
-      "func-returns-value": 1,
-      "no-untyped-def": 11
     },
     "tl_loop/tests/test_leaf_dependencies.py": {
       "arg-type": 2,
@@ -134,14 +80,6 @@
       "no-untyped-def": 4,
       "type-arg": 3,
       "union-attr": 2
-    },
-    "tl_loop/tests/test_main.py": {
-      "arg-type": 1,
-      "attr-defined": 1,
-      "call-overload": 4,
-      "index": 8,
-      "no-untyped-def": 9,
-      "operator": 1
     },
     "tl_loop/tests/test_mealy_fsm.py": {
       "attr-defined": 1,
@@ -158,14 +96,6 @@
     "tl_loop/tests/test_nested_generation_recreate.py": {
       "no-untyped-def": 1
     },
-    "tl_loop/tests/test_ordered_continuation_recovery.py": {
-      "arg-type": 14,
-      "attr-defined": 7,
-      "call-overload": 2,
-      "index": 5,
-      "no-untyped-def": 5,
-      "union-attr": 5
-    },
     "tl_loop/tests/test_plan_authoring.py": {
       "attr-defined": 1,
       "redundant-cast": 1
@@ -177,13 +107,6 @@
     },
     "tl_loop/tests/test_plan_validation.py": {
       "unused-ignore": 2
-    },
-    "tl_loop/tests/test_post_merge_squash.py": {
-      "arg-type": 10,
-      "dict-item": 9,
-      "index": 1,
-      "no-untyped-def": 4,
-      "union-attr": 5
     },
     "tl_loop/tests/test_preflight.py": {
       "attr-defined": 1,
@@ -246,13 +169,6 @@
       "arg-type": 1,
       "func-returns-value": 1
     },
-    "tl_loop/tests/test_repository_identity_migration.py": {
-      "attr-defined": 3,
-      "index": 9,
-      "no-any-return": 1,
-      "no-untyped-def": 6,
-      "operator": 4
-    },
     "tl_loop/tests/test_repository_identity_resolution.py": {
       "arg-type": 2,
       "attr-defined": 2,
@@ -278,10 +194,6 @@
     },
     "tl_loop/tests/test_shadow.py": {
       "redundant-cast": 1
-    },
-    "tl_loop/tests/test_slice_transition.py": {
-      "arg-type": 32,
-      "type-var": 4
     },
     "tl_loop/tests/test_startup_reconciliation.py": {
       "arg-type": 83,

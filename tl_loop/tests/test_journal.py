@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
+from pathlib import Path
 from types import MappingProxyType
-from types import SimpleNamespace
+from typing import Literal
 
 import pytest
 
-from tl_loop.client.effects import ToolResult
+from tl_loop.client.effects import EffectClient, ToolResult
+from tl_loop.client.transport import JsonObject
 from tl_loop.fsm.recovery import (
     RecoveryIdentity,
     RecoveryIntent,
@@ -18,16 +21,31 @@ from tl_loop.loop.driver import EffectFailed, TLLoopError, _invoke
 from tl_loop.loop.journal import EffectJournal, stable_action_key
 
 
-def _intent(operation: str = "merge_pr") -> SimpleNamespace:
-    return SimpleNamespace(
-        operation=operation,
-        target="slice-a",
-        arguments={"head_sha": "head-a", "pr_number": 42},
-        active=True,
+@dataclass
+class _Intent:
+    operation: str = "merge_pr"
+    target: str = "slice-a"
+    arguments: dict[str, object] = field(
+        default_factory=lambda: {"head_sha": "head-a", "pr_number": 42}
     )
+    active: bool = True
 
 
-def _recovery_intent(action: str = "resume_same_owner") -> RecoveryIntent:
+class _NoopTransport:
+    def call_tool(
+        self, role: str, name: str, tool_name: str, arguments: JsonObject
+    ) -> JsonObject:
+        del role, name, tool_name, arguments
+        return {"success": True}
+
+
+def _intent(operation: str = "merge_pr") -> _Intent:
+    return _Intent(operation=operation)
+
+
+def _recovery_intent(
+    action: Literal["probe", "resume_same_owner", "open_gate", "abandon"] = "resume_same_owner",
+) -> RecoveryIntent:
     return RecoveryIntent(
         intent_id="recovery-intent-1",
         recovery_identity=RecoveryIdentity(
@@ -52,9 +70,9 @@ def test_stable_action_key_is_order_independent() -> None:
     assert first == second
 
 
-def test_nested_mappingproxy_arguments_are_durable(tmp_path) -> None:
+def test_nested_mappingproxy_arguments_are_durable(tmp_path: Path) -> None:
     path = tmp_path / "action-journal.json"
-    intent = SimpleNamespace(
+    intent = _Intent(
         operation="spawn_worker",
         target="slice-a",
         arguments={
@@ -68,7 +86,7 @@ def test_nested_mappingproxy_arguments_are_durable(tmp_path) -> None:
     assert document[0]["arguments"]["payload"]["nested"]["value"] == "preserved"
 
 
-def test_confirmed_action_replays_after_journal_reload(tmp_path) -> None:
+def test_confirmed_action_replays_after_journal_reload(tmp_path: Path) -> None:
     path = tmp_path / "action-journal.json"
     intent = _intent()
     journal = EffectJournal("run-a", path)
@@ -83,7 +101,7 @@ def test_confirmed_action_replays_after_journal_reload(tmp_path) -> None:
     assert reloaded.replay(entry).result == {"merge_id": "m-1"}
 
 
-def test_effect_probe_is_typed_and_never_dispatches(tmp_path) -> None:
+def test_effect_probe_is_typed_and_never_dispatches(tmp_path: Path) -> None:
     path = tmp_path / "action-journal.json"
     journal = EffectJournal("run-a", path)
     intent = _intent()
@@ -106,7 +124,7 @@ def test_effect_probe_is_typed_and_never_dispatches(tmp_path) -> None:
     assert confirmed.result.result == {"id": "m-1"}
 
 
-def test_resume_action_is_journaled_and_replayed_after_reload(tmp_path) -> None:
+def test_resume_action_is_journaled_and_replayed_after_reload(tmp_path: Path) -> None:
     path = tmp_path / "action-journal.json"
     intent = _intent(operation="resume_pr")
     journal = EffectJournal("run-a", path)
@@ -128,7 +146,7 @@ def test_resume_action_is_journaled_and_replayed_after_reload(tmp_path) -> None:
     }
 
 
-def test_unknown_action_cannot_be_retried_blindly(tmp_path) -> None:
+def test_unknown_action_cannot_be_retried_blindly(tmp_path: Path) -> None:
     path = tmp_path / "action-journal.json"
     journal = EffectJournal("run-a", path)
     intent = _intent()
@@ -141,13 +159,13 @@ def test_unknown_action_cannot_be_retried_blindly(tmp_path) -> None:
             intent.target,
             intent.arguments,
             True,
-            SimpleNamespace(),
+            EffectClient(_NoopTransport()),
             lambda _: ToolResult.from_raw({"success": True}),
             journal,
         )
 
 
-def test_pending_entries_lists_only_intended_and_unknown(tmp_path) -> None:
+def test_pending_entries_lists_only_intended_and_unknown(tmp_path: Path) -> None:
     path = tmp_path / "action-journal.json"
     journal = EffectJournal("run-a", path)
 
@@ -166,7 +184,7 @@ def test_pending_entries_lists_only_intended_and_unknown(tmp_path) -> None:
     assert pending_keys == {journal.key_for(intended), journal.key_for(unknown)}
 
 
-def test_resolve_by_key_compensated_clears_the_block_for_retry(tmp_path) -> None:
+def test_resolve_by_key_compensated_clears_the_block_for_retry(tmp_path: Path) -> None:
     path = tmp_path / "action-journal.json"
     journal = EffectJournal("run-a", path)
     intent = _intent()
@@ -175,21 +193,26 @@ def test_resolve_by_key_compensated_clears_the_block_for_retry(tmp_path) -> None
 
     journal.resolve_by_key(journal.key_for(intent), status="compensated")
 
-    dispatched = []
+    dispatched: list[int] = []
+
+    def dispatch(_: EffectClient) -> ToolResult:
+        dispatched.append(1)
+        return ToolResult.from_raw({"success": True})
+
     result = _invoke(
         intent.operation,
         intent.target,
         intent.arguments,
         True,
-        SimpleNamespace(),
-        lambda _: dispatched.append(1) or ToolResult.from_raw({"success": True}),
+        EffectClient(_NoopTransport()),
+        dispatch,
         journal,
     )
     assert dispatched == [1]
     assert result is not None and result.success is True
 
 
-def test_resolve_by_key_rejected_replays_as_a_clean_failure(tmp_path) -> None:
+def test_resolve_by_key_rejected_replays_as_a_clean_failure(tmp_path: Path) -> None:
     path = tmp_path / "action-journal.json"
     journal = EffectJournal("run-a", path)
     intent = _intent()
@@ -208,13 +231,13 @@ def test_resolve_by_key_rejected_replays_as_a_clean_failure(tmp_path) -> None:
             intent.target,
             intent.arguments,
             True,
-            SimpleNamespace(),
+            EffectClient(_NoopTransport()),
             lambda _: pytest.fail("rejected action must not be dispatched again"),
             journal,
         )
 
 
-def test_replayed_rejection_preserves_failure_semantics(tmp_path) -> None:
+def test_replayed_rejection_preserves_failure_semantics(tmp_path: Path) -> None:
     path = tmp_path / "action-journal.json"
     journal = EffectJournal("run-a", path)
     intent = _intent()
@@ -230,13 +253,13 @@ def test_replayed_rejection_preserves_failure_semantics(tmp_path) -> None:
             intent.target,
             intent.arguments,
             True,
-            SimpleNamespace(),
+            EffectClient(_NoopTransport()),
             lambda _: pytest.fail("confirmed rejection must not be dispatched again"),
             journal,
         )
 
 
-def test_recovery_intent_is_durable_and_idempotent(tmp_path) -> None:
+def test_recovery_intent_is_durable_and_idempotent(tmp_path: Path) -> None:
     path = tmp_path / "action-journal.json"
     journal = EffectJournal("run-a", path)
     intent = _recovery_intent()
@@ -249,7 +272,7 @@ def test_recovery_intent_is_durable_and_idempotent(tmp_path) -> None:
     assert journal.load_recovery_intent(entry) == intent
 
 
-def test_recovery_intent_unknown_outcome_is_reconciled_without_replay(tmp_path) -> None:
+def test_recovery_intent_unknown_outcome_is_reconciled_without_replay(tmp_path: Path) -> None:
     path = tmp_path / "action-journal.json"
     journal = EffectJournal("run-a", path)
     intent = _recovery_intent("probe")

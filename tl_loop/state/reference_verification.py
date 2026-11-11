@@ -15,11 +15,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import PurePosixPath
+from typing import TypeVar
 from urllib.parse import urlsplit
 
 from .repository_identity import canonical_repository_url
 
 _OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_EnumT = TypeVar("_EnumT", bound=Enum)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _EVIDENCE_KEYS = frozenset(
     {
@@ -473,7 +475,7 @@ def _enum(value: object, expected: type[Enum], field: str) -> None:
         raise ReferenceVerificationError(f"{field} is not a recognized value")
 
 
-def _enum_value(value: object, expected: type[Enum], field: str):
+def _enum_value(value: object, expected: type[_EnumT], field: str) -> _EnumT:
     try:
         return expected(value)
     except (TypeError, ValueError) as error:

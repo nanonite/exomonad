@@ -1,6 +1,7 @@
 import ast
 from dataclasses import replace
 from pathlib import Path
+from typing import Literal, TypedDict
 
 import pytest
 
@@ -26,6 +27,21 @@ from tl_loop.state.slice_transition import (
     StaleReviewerActionHealed,
     slice_transition,
 )
+
+
+class VerdictChanges(TypedDict, total=False):
+    reviewer_account_authenticated: bool
+    reviewer_identity_unresolved: bool
+    self_approval: bool
+    review_id: int | None
+    reviewer_agent_id: str | None
+
+
+class SliceChanges(TypedDict, total=False):
+    verdict: Verdict | None
+    reviewed_head: str | None
+    reviewer_attempt: dict[str, int]
+    action: ActionState | None
 
 
 def _state(*, reviewed_head: str | None = None) -> SliceState:
@@ -66,14 +82,14 @@ def _state(*, reviewed_head: str | None = None) -> SliceState:
     )
 
 
-def _verdict_event(source: str = "ledger") -> ReviewVerdictObserved:
+def _verdict_event(source: Literal["ledger", "watcher_snapshot"] = "ledger") -> ReviewVerdictObserved:
     return ReviewVerdictObserved(
         head_sha="head-a",
         verdict=Verdict.GO,
         reviewer_agent_id="review-invocation",
         review_id=17,
         findings=(),
-        source=source,  # type: ignore[arg-type]
+        source=source,
         pr_number=43,
         reviewer_account_authenticated=True,
         reviewer_identity_unresolved=False,
@@ -105,7 +121,7 @@ def test_live_and_snapshot_verdicts_share_one_transition() -> None:
         {"reviewer_agent_id": "other-reviewer"},
     ],
 )
-def test_authenticated_exact_head_guards_live_in_reducer(changes: dict[str, object]) -> None:
+def test_authenticated_exact_head_guards_live_in_reducer(changes: VerdictChanges) -> None:
     with pytest.raises(IllegalSliceTransition):
         slice_transition(_state(), replace(_verdict_event(), **changes))
 
@@ -117,9 +133,12 @@ def test_stale_verdict_cannot_clear_current_review_action() -> None:
 
 def test_verdict_for_another_head_does_not_clear_outstanding_reviewer() -> None:
     state = _state()
+    action = state.action
+    if action is None:
+        raise RuntimeError("fixture has no reviewer action")
     state = replace(
         state,
-        action=replace(state.action, head_sha="other-head"),
+        action=replace(action, head_sha="other-head"),
     )
     transitioned = slice_transition(state, _verdict_event())
     assert transitioned.action is not None
@@ -202,12 +221,12 @@ def test_newer_same_head_review_uses_a_new_review_round() -> None:
     assert superseding.review_evidence.review_id == 18
 
 
-def _decided_state(**changes: object) -> SliceState:
+def _decided_state(changes: SliceChanges | None = None) -> SliceState:
     """The #1042 shape: exact-head verdict plus a stale matching action."""
-    values: dict[str, object] = {
+    values: SliceChanges = {
         "verdict": Verdict.GO,
         "reviewed_head": "head-a",
-        **changes,
+        **(changes or {}),
     }
     return replace(_state(), **values)
 
@@ -223,21 +242,28 @@ def test_stale_reviewer_action_heal_clears_matching_terminal_action() -> None:
 
 
 def test_stale_reviewer_action_heal_rejects_live_repair_action() -> None:
-    state = _decided_state(
-        action=replace(_state().action, kind=ActionKind.REPAIR),
-    )
+    action = _state().action
+    if action is None:
+        raise RuntimeError("fixture has no action")
+    state = _decided_state({"action": replace(action, kind=ActionKind.REPAIR)})
     with pytest.raises(IllegalSliceTransition):
         slice_transition(state, StaleReviewerActionHealed("head-a"))
 
 
 def test_stale_reviewer_action_heal_rejects_nonterminal_phase() -> None:
-    state = _decided_state(action=replace(_state().action, phase=ActionPhase.IN_FLIGHT))
+    action = _state().action
+    if action is None:
+        raise RuntimeError("fixture has no action")
+    state = _decided_state({"action": replace(action, phase=ActionPhase.IN_FLIGHT)})
     with pytest.raises(IllegalSliceTransition):
         slice_transition(state, StaleReviewerActionHealed("head-a"))
 
 
 def test_stale_reviewer_action_heal_rejects_other_head() -> None:
-    state = _decided_state(action=replace(_state().action, head_sha="other-head"))
+    action = _state().action
+    if action is None:
+        raise RuntimeError("fixture has no action")
+    state = _decided_state({"action": replace(action, head_sha="other-head")})
     with pytest.raises(IllegalSliceTransition):
         slice_transition(state, StaleReviewerActionHealed("head-a"))
 
@@ -250,10 +276,8 @@ def test_stale_reviewer_action_heal_rejects_other_head() -> None:
         {"reviewer_attempt": {}},
     ],
 )
-def test_stale_reviewer_action_heal_rejects_incomplete_proof(
-    changes: dict[str, object],
-) -> None:
-    state = _decided_state(**changes)
+def test_stale_reviewer_action_heal_rejects_incomplete_proof(changes: SliceChanges) -> None:
+    state = _decided_state(changes)
     with pytest.raises(IllegalSliceTransition):
         slice_transition(state, StaleReviewerActionHealed("head-a"))
 

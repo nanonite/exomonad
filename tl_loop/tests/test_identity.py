@@ -3,18 +3,30 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
+from collections.abc import Mapping
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
+from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
-from tl_loop.events.envelope import project
+from tl_loop.client.transport import JsonObject
+from tl_loop.events.envelope import EventEnvelope, project
 from tl_loop.events.identity import envelope_document, resolve_event_slice
 from tl_loop.events.queue import LedgerQueue
 from tl_loop.events.reader import LedgerReader, LedgerSnapshot
-from tl_loop.fsm.phase import ChildHandle, TLWaiting
+from tl_loop.fsm.phase import ChildHandle, TLPhase, TLWaiting
 from tl_loop.loop.driver import LeafTask, TLLoopConfig, WorkPlan, run_tl_loop
-from tl_loop.state.schema import BudgetLedger, RepositoryIdentity, SliceState, SliceStatus
+from tl_loop.state.schema import (
+    BudgetLedger,
+    EventCursor,
+    FSMState,
+    RepositoryIdentity,
+    RunState,
+    SliceState,
+    SliceStatus,
+)
 from tl_loop.state.store import QuarantineStorageError, RunStore
 from tl_loop.tests.checkpoint_fixtures import create
 
@@ -25,7 +37,7 @@ def _event(
     agent_id: str,
     pr_number: int | None = 42,
     branch: str | None = "main.tunable-operator-body-opencode",
-) -> object:
+) -> EventEnvelope:
     data: dict[str, object] = {}
     if pr_number is not None:
         data["pr_number"] = pr_number
@@ -44,22 +56,61 @@ def _event(
     )
 
 
-def _state(*, duplicate_pr: bool = False) -> SimpleNamespace:
-    first = SimpleNamespace(
+def _mapping(value: object) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"expected mapping, got {type(value).__name__}")
+    return value
+
+
+def _items(value: object) -> list[object]:
+    if not isinstance(value, list):
+        raise TypeError(f"expected list, got {type(value).__name__}")
+    return value
+
+
+def _slice(slice_id: str, *, dispatch_agent_id: str, branch: str) -> SliceState:
+    return SliceState(
+        id=slice_id,
+        status=SliceStatus.IN_REVIEW,
+        paths=(),
+        depends_on=(),
+        base_ref="main",
+        test_plan=(),
+        agent_type="opencode",
+        model=None,
+        branch=branch,
+        worktree=None,
         pr_number=42,
-        dispatch_intent_id="intent-42",
-        dispatch_agent_id="tunable-operator-body-opencode",
-        branch="main.tunable-operator-body-opencode",
+        reviewed_head=None,
+        attempts=1,
+        verdict=None,
+        dispatch_intent_id=f"intent-{slice_id}",
+        dispatch_agent_id=dispatch_agent_id,
     )
-    slices = {"tunable-operator-body": first}
-    if duplicate_pr:
-        slices["other"] = SimpleNamespace(
-            pr_number=42,
-            dispatch_intent_id="intent-other",
-            dispatch_agent_id="other-agent",
-            branch="main.other-agent",
+
+
+def _state(*, duplicate_pr: bool = False) -> RunState:
+    slices = {
+        "tunable-operator-body": _slice(
+            "tunable-operator-body",
+            dispatch_agent_id="tunable-operator-body-opencode",
+            branch="main.tunable-operator-body-opencode",
         )
-    return SimpleNamespace(slices=slices)
+    }
+    if duplicate_pr:
+        slices["other"] = _slice(
+            "other", dispatch_agent_id="other-agent", branch="main.other-agent"
+        )
+    return RunState(
+        version=1,
+        revision=0,
+        run_id="swarm-uuid",
+        fsm=FSMState(TLPhase.TLWaiting, ()),
+        slices=slices,
+        budgets=BudgetLedger(tokens=0, wall_seconds=0),
+        gates=(),
+        events=EventCursor(last_consumed_offset=0),
+    )
 
 
 def test_branch_and_dispatch_agent_aliases_resolve_same_slice() -> None:
@@ -130,7 +181,10 @@ def test_repository_namespace_metadata_is_not_an_independent_identity_gate() -> 
         }
     )
     state = _state()
-    state.repository_identity = RepositoryIdentity("https://forgejo.local/acme/exomonad.git")
+    state = replace(
+        state,
+        repository_identity=RepositoryIdentity("https://forgejo.local/acme/exomonad.git"),
+    )
 
     result = resolve_event_slice(event, state)
 
@@ -155,7 +209,10 @@ def test_repository_url_mismatch_is_rejected_even_with_slice_alias() -> None:
         }
     )
     state = _state()
-    state.repository_identity = RepositoryIdentity("https://forgejo.local/acme/exomonad.git")
+    state = replace(
+        state,
+        repository_identity=RepositoryIdentity("https://forgejo.local/acme/exomonad.git"),
+    )
 
     result = resolve_event_slice(event, state)
 
@@ -163,7 +220,7 @@ def test_repository_url_mismatch_is_rejected_even_with_slice_alias() -> None:
     assert result.reason == "repository_identity_conflict"
 
 
-def test_quarantine_round_trip_preserves_observation_for_replay(tmp_path) -> None:
+def test_quarantine_round_trip_preserves_observation_for_replay(tmp_path: Path) -> None:
     create("root", {}, root_dir=tmp_path)
     store = RunStore("root", tmp_path)
     event = _event("ci.status_changed", agent_id="unknown-owner", branch=None)
@@ -173,14 +230,14 @@ def test_quarantine_round_trip_preserves_observation_for_replay(tmp_path) -> Non
     entries = store.quarantined_events()
     assert len(entries) == 1
     assert entries[0]["run_seq"] == 7
-    assert entries[0]["data"]["pr_number"] == 42
+    assert _mapping(entries[0]["data"])["pr_number"] == 42
 
     store.release_quarantined_event(7)
 
     assert store.quarantined_events() == ()
 
 
-def test_corrupt_quarantine_storage_is_visible_to_controller(tmp_path) -> None:
+def test_corrupt_quarantine_storage_is_visible_to_controller(tmp_path: Path) -> None:
     create("root", {}, root_dir=tmp_path)
     store = RunStore("root", tmp_path)
     store.event_quarantine_path.write_text("{not-json", encoding="utf-8")
@@ -194,10 +251,10 @@ class _RecordingLedgerQueue:
         self.queue = queue
         self.acknowledged: list[int] = []
 
-    def get(self, timeout: float | None = None) -> object:
+    def get(self, timeout: float | None = None) -> EventEnvelope:
         return self.queue.get(timeout=timeout)
 
-    def acknowledge(self, event: object) -> int:
+    def acknowledge(self, event: EventEnvelope) -> int:
         sequence = self.queue.acknowledge(event)
         self.acknowledged.append(sequence)
         return sequence
@@ -210,7 +267,9 @@ class _RecordingLedgerQueue:
 
 
 class _NoopTransport:
-    def call_tool(self, role, name, tool_name, arguments):
+    def call_tool(
+        self, role: str, name: str, tool_name: str, arguments: JsonObject
+    ) -> JsonObject:
         del role, name, arguments
         if tool_name == "repository_identity":
             return {
@@ -227,7 +286,7 @@ def _routing_event(
     agent_id: str,
     data: dict[str, object],
     invocation_id: str | None = None,
-) -> object:
+) -> EventEnvelope:
     document: dict[str, object] = {
         "type": event_type,
         "run_seq": sequence,
@@ -242,7 +301,7 @@ def _routing_event(
     return project(document)
 
 
-def test_ci_before_pr_is_quarantined_then_replayed_by_persisted_pr(tmp_path) -> None:
+def test_ci_before_pr_is_quarantined_then_replayed_by_persisted_pr(tmp_path: Path) -> None:
     slice_state = SliceState(
         id="tunable-operator-body",
         status=SliceStatus.IN_REVIEW,
@@ -374,7 +433,7 @@ def test_ci_before_pr_is_quarantined_then_replayed_by_persisted_pr(tmp_path) -> 
             "routing-run",
             WorkPlan(leaves=(LeafTask("tunable-operator-body", "route review and CI"),)),
             source,
-            ReadOnlyEffectClient(_NoopTransport()),
+            ReadOnlyEffectClient(EffectClient(_NoopTransport())),
             config=TLLoopConfig(
                 active=False,
                 keep_alive_on_waiting=True,
@@ -393,5 +452,5 @@ def test_ci_before_pr_is_quarantined_then_replayed_by_persisted_pr(tmp_path) -> 
     assert final.pr_number == 42
     assert final.ci_state == {"head-42": "success"}
     assert source.acknowledged == [1, 2, 3, 4]
-    assert len(result.diagnostics["unresolved_events"]) == 1
+    assert len(_items(result.diagnostics["unresolved_events"])) == 1
     assert RunStore("routing-run", tmp_path).quarantined_events() == ()

@@ -13,7 +13,7 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -785,7 +785,9 @@ def _run_token(store: RunStore) -> str:
 
 
 @contextmanager
-def _escalation_locks(store: RunStore, run_id: str, slice_id: str, attempt: int, cause: ParkCause):
+def _escalation_locks(
+    store: RunStore, run_id: str, slice_id: str, attempt: int, cause: ParkCause
+) -> Iterator[tuple[Path, Path]]:
     """Serialize one escalation across both the pre-389 and digest lock files.
 
     A pre-389 invocation holds only the historical lock, so a new invocation

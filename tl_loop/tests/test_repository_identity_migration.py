@@ -7,12 +7,14 @@ from pathlib import Path
 
 import pytest
 
-import tl_loop.state.store as store_module
 from tl_loop.state.lock import RunLock
 from tl_loop.state.plan_manifest import build_plan_manifest
 from tl_loop.state.repository_identity_migration import RepositoryIdentityMigrationError
 from tl_loop.state.schema import RepositoryIdentity
+from tl_loop.state.schema import validate as validate_document
 from tl_loop.state.store import RunStore
+from tl_loop.state.write import Document, Mutator, Validator, WriteHooks
+from tl_loop.state.write import apply as store_apply
 from tl_loop.tests.checkpoint_fixtures import create_legacy_identity_checkpoint
 
 CANONICAL_URL = "https://forge.example.com/Org/Repo.git"
@@ -70,14 +72,28 @@ def _seed_root_and_child(
 
 
 def _read(path: Path) -> dict[str, object]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    value: object = json.loads(path.read_text(encoding="utf-8"))
+    return _mapping(value, "checkpoint")
+
+
+def _mapping(value: object, field: str) -> dict[str, object]:
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        raise AssertionError(f"{field} must be a JSON object with string keys")
+    return value
+
+
+def _revision(document: dict[str, object]) -> int:
+    revision = document["revision"]
+    if not isinstance(revision, int):
+        raise TypeError("checkpoint revision must be an integer")
+    return revision
 
 
 def test_missing_root_identity_migrates_only_with_matching_declared_child(tmp_path: Path) -> None:
     root, child = _seed_root_and_child(tmp_path)
     before = _read(root.path)
     child_before = _read(child.path)
-    stage_slice = before["slices"]["stage"]
+    stage_slice = _mapping(_mapping(before["slices"], "slices")["stage"], "stage slice")
     stage_slice["publication"] = {
         "pr_number": 46,
         "head_sha": "571c83a324de31b0c4dc5f60e37eb476e7c5af05",
@@ -103,14 +119,20 @@ def test_missing_root_identity_migrates_only_with_matching_declared_child(tmp_pa
     after = _read(root.path)
     assert migrated.repository_identity == RepositoryIdentity(CANONICAL_URL)
     assert after["repository_identity"] == {"remote_url": CANONICAL_URL}
-    assert after["slices"] == before["slices"]
-    assert after["slices"]["stage"]["publication"] == before["slices"]["stage"]["publication"]
-    assert after["revision"] == before["revision"] + 1
-    audit = after["repository_identity_migration"]
+    before_slices = _mapping(before["slices"], "before slices")
+    after_slices = _mapping(after["slices"], "after slices")
+    before_stage = _mapping(before_slices["stage"], "before stage slice")
+    after_stage = _mapping(after_slices["stage"], "after stage slice")
+    assert after_slices == before_slices
+    assert after_stage["publication"] == before_stage["publication"]
+    assert _revision(after) == _revision(before) + 1
+    audit = _mapping(after["repository_identity_migration"], "migration audit")
     assert audit["source_shape"] == "missing"
     assert audit["reason_code"] == "bootstrap_missing_identity"
     assert audit["source_checkpoint_sha256"]
-    assert audit["corroborating_children"][0]["run_id"] == "stage"
+    corroborating_children = audit["corroborating_children"]
+    assert isinstance(corroborating_children, list)
+    assert _mapping(corroborating_children[0], "corroborating child")["run_id"] == "stage"
     assert _read(child.path) == child_before
     assert receipt_path.read_bytes() == receipt_before
 
@@ -118,13 +140,15 @@ def test_missing_root_identity_migrates_only_with_matching_declared_child(tmp_pa
     assert journal["status"] == "complete"
     assert "forge.example.com" not in json.dumps(journal)
     root.set_repository_identity(RepositoryIdentity(CANONICAL_URL))
-    revision_after_followup_write = _read(root.path)["revision"]
+    revision_after_followup_write = _revision(_read(root.path))
 
     replayed = root.migrate_repository_identity(RepositoryIdentity(CANONICAL_URL))
 
     assert replayed.repository_identity == RepositoryIdentity(CANONICAL_URL)
-    assert _read(root.path)["revision"] == revision_after_followup_write
-    assert _read(root.run_dir / "repository-identity-migration.json")["audit"] == audit
+    assert _revision(_read(root.path)) == revision_after_followup_write
+    assert _mapping(
+        _read(root.run_dir / "repository-identity-migration.json")["audit"], "migration audit"
+    ) == audit
 
 
 def test_missing_root_identity_without_child_proof_fails_closed(tmp_path: Path) -> None:
@@ -160,7 +184,9 @@ def test_legacy_identity_is_canonicalized_after_authoritative_comparison(tmp_pat
     assert state.repository_identity == RepositoryIdentity(CANONICAL_URL)
     persisted = _read(root.path)
     assert persisted["repository_identity"] == {"remote_url": CANONICAL_URL}
-    assert persisted["repository_identity_migration"]["source_shape"] == "legacy"
+    assert _mapping(
+        persisted["repository_identity_migration"], "migration audit"
+    )["source_shape"] == "legacy"
     assert "secret" not in root.path.read_text(encoding="utf-8")
 
 
@@ -228,18 +254,39 @@ def test_identity_failures_are_classified_without_mutating_checkpoint(
     assert not (root.run_dir / "repository-identity-migration.json").exists()
 
 
-def test_stale_checkpoint_fingerprint_refuses_apply(tmp_path: Path, monkeypatch) -> None:
+def test_stale_checkpoint_fingerprint_refuses_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root, _child = _seed_root_and_child(tmp_path)
-    real_apply = store_module.apply
+    real_apply = store_apply
 
-    def race_before_apply(run_dir, mutator, **kwargs):
+    def race_before_apply(
+        run_dir: str | Path,
+        mutator: Mutator,
+        *,
+        lock_timeout: float = 5.0,
+        hooks: WriteHooks | None = None,
+        initial: Document | None = None,
+        target_name: str = "run.json",
+        lock_name: str = "run.lock",
+        validator: Validator = validate_document,
+    ) -> Document:
         if Path(run_dir) == root.run_dir:
             current = _read(root.path)
-            current["revision"] = current["revision"] + 1
+            current["revision"] = _revision(current) + 1
             root.path.write_text(json.dumps(current), encoding="utf-8")
-        return real_apply(run_dir, mutator, **kwargs)
+        return real_apply(
+            run_dir,
+            mutator,
+            lock_timeout=lock_timeout,
+            hooks=hooks,
+            initial=initial,
+            target_name=target_name,
+            lock_name=lock_name,
+            validator=validator,
+        )
 
-    monkeypatch.setattr(store_module, "apply", race_before_apply)
+    monkeypatch.setattr("tl_loop.state.store.apply", race_before_apply)
     with pytest.raises(RepositoryIdentityMigrationError) as rejected:
         root.migrate_repository_identity(
             RepositoryIdentity(CANONICAL_URL), corroborating_sub_tls=("stage",)
@@ -299,24 +346,43 @@ def test_malformed_transition_journal_fails_closed(tmp_path: Path) -> None:
 
 
 def test_interrupted_migration_rejects_changed_child_fingerprint(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root, child = _seed_root_and_child(tmp_path)
-    real_apply = store_module.apply
+    real_apply = store_apply
 
-    def interrupt_root(run_dir, mutator, **kwargs):
+    def interrupt_root(
+        run_dir: str | Path,
+        mutator: Mutator,
+        *,
+        lock_timeout: float = 5.0,
+        hooks: WriteHooks | None = None,
+        initial: Document | None = None,
+        target_name: str = "run.json",
+        lock_name: str = "run.lock",
+        validator: Validator = validate_document,
+    ) -> Document:
         if Path(run_dir) == root.run_dir:
             raise RuntimeError("simulated interruption before identity checkpoint write")
-        return real_apply(run_dir, mutator, **kwargs)
+        return real_apply(
+            run_dir,
+            mutator,
+            lock_timeout=lock_timeout,
+            hooks=hooks,
+            initial=initial,
+            target_name=target_name,
+            lock_name=lock_name,
+            validator=validator,
+        )
 
-    monkeypatch.setattr(store_module, "apply", interrupt_root)
+    monkeypatch.setattr("tl_loop.state.store.apply", interrupt_root)
     with pytest.raises(RuntimeError, match="simulated interruption"):
         root.migrate_repository_identity(
             RepositoryIdentity(CANONICAL_URL), corroborating_sub_tls=("stage",)
         )
-    monkeypatch.setattr(store_module, "apply", real_apply)
+    monkeypatch.setattr("tl_loop.state.store.apply", real_apply)
     child_document = _read(child.path)
-    child_document["revision"] = child_document["revision"] + 1
+    child_document["revision"] = _revision(child_document) + 1
     child.path.write_text(json.dumps(child_document), encoding="utf-8")
     before = root.path.read_bytes()
 
@@ -331,30 +397,58 @@ def test_interrupted_migration_rejects_changed_child_fingerprint(
 
 @pytest.mark.parametrize("crash_after_apply", [False, True])
 def test_interrupted_migration_replays_once(
-    tmp_path: Path, monkeypatch, crash_after_apply: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, crash_after_apply: bool
 ) -> None:
     root, _child = _seed_root_and_child(tmp_path)
-    real_apply = store_module.apply
+    real_apply = store_apply
 
-    def interrupt(run_dir, mutator, **kwargs):
+    def interrupt(
+        run_dir: str | Path,
+        mutator: Mutator,
+        *,
+        lock_timeout: float = 5.0,
+        hooks: WriteHooks | None = None,
+        initial: Document | None = None,
+        target_name: str = "run.json",
+        lock_name: str = "run.lock",
+        validator: Validator = validate_document,
+    ) -> Document:
         if Path(run_dir) != root.run_dir:
-            return real_apply(run_dir, mutator, **kwargs)
+            return real_apply(
+                run_dir,
+                mutator,
+                lock_timeout=lock_timeout,
+                hooks=hooks,
+                initial=initial,
+                target_name=target_name,
+                lock_name=lock_name,
+                validator=validator,
+            )
         if not crash_after_apply:
             raise RuntimeError("simulated interruption before identity checkpoint write")
-        real_apply(run_dir, mutator, **kwargs)
+        real_apply(
+            run_dir,
+            mutator,
+            lock_timeout=lock_timeout,
+            hooks=hooks,
+            initial=initial,
+            target_name=target_name,
+            lock_name=lock_name,
+            validator=validator,
+        )
         raise RuntimeError("simulated interruption after identity checkpoint write")
 
-    monkeypatch.setattr(store_module, "apply", interrupt)
+    monkeypatch.setattr("tl_loop.state.store.apply", interrupt)
     with pytest.raises(RuntimeError, match="simulated interruption"):
         root.migrate_repository_identity(
             RepositoryIdentity(CANONICAL_URL), corroborating_sub_tls=("stage",)
         )
-    revision_at_crash = _read(root.path)["revision"]
-    transition_before = _read(root.run_dir / "repository-identity-migration.json")["audit"][
-        "transition_id"
-    ]
+    revision_at_crash = _revision(_read(root.path))
+    transition_before = _mapping(
+        _read(root.run_dir / "repository-identity-migration.json")["audit"], "migration audit"
+    )["transition_id"]
 
-    monkeypatch.setattr(store_module, "apply", real_apply)
+    monkeypatch.setattr("tl_loop.state.store.apply", real_apply)
     resumed = root.migrate_repository_identity(
         RepositoryIdentity(CANONICAL_URL), corroborating_sub_tls=("stage",)
     )
@@ -363,5 +457,5 @@ def test_interrupted_migration_replays_once(
     journal = _read(root.run_dir / "repository-identity-migration.json")
     assert resumed.repository_identity == RepositoryIdentity(CANONICAL_URL)
     assert journal["status"] == "complete"
-    assert journal["audit"]["transition_id"] == transition_before
-    assert final["revision"] == revision_at_crash + (0 if crash_after_apply else 1)
+    assert _mapping(journal["audit"], "migration audit")["transition_id"] == transition_before
+    assert _revision(final) == revision_at_crash + (0 if crash_after_apply else 1)

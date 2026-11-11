@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import cast
+from typing import TypeGuard
 
 from tl_loop.client.effects import (
     TOOL_METHODS,
@@ -200,7 +200,7 @@ def test_missing_error_kind_remains_unknown_for_domain_failure() -> None:
 
 def test_merge_pr_emits_compare_and_swap_evidence() -> None:
     transport = RecordingTransport()
-    approval = {
+    approval: JsonObject = {
         "receipt_id": "approval-a",
         "parent_run_id": "root-run",
         "parent_scope_path": ["root-run"],
@@ -276,7 +276,10 @@ def test_role_route_is_carried_by_spawn_and_blocked_resume_arguments() -> None:
         **route,
     )
 
-    route_objects = [arguments["role_route"] for _, arguments in transport.calls]
+    route_objects = [
+        _json_object(arguments.get("role_route"), "role_route")
+        for _, arguments in transport.calls
+    ]
     assert [route["role"] for route in route_objects] == ["worker"] * 3
     assert [route["model"] for route in route_objects] == ["gpt-6-luna"] * 3
     assert [route["effort"] for route in route_objects] == ["xhigh"] * 3
@@ -310,7 +313,7 @@ def test_unbound_harness_overrides_do_not_claim_controller_route_provenance() ->
 
 
 def _load_schemas() -> dict[str, JsonObject]:
-    raw = cast(JsonObject, json.loads(FIXTURE.read_text(encoding="utf-8")))
+    raw = _json_object(json.loads(FIXTURE.read_text(encoding="utf-8")), "schema fixture")
     tools = raw.get("tools")
     assert isinstance(tools, list)
     schemas: dict[str, JsonObject] = {}
@@ -320,8 +323,26 @@ def _load_schemas() -> dict[str, JsonObject]:
         input_schema = tool.get("inputSchema")
         assert isinstance(name, str)
         assert isinstance(input_schema, dict)
-        schemas[name] = cast(JsonObject, input_schema)
+        schemas[name] = _json_object(input_schema, f"schema for {name}")
     return schemas
+
+
+def _is_json_value(value: object) -> TypeGuard[JsonValue]:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return True
+    if isinstance(value, list):
+        return all(_is_json_value(item) for item in value)
+    if isinstance(value, dict):
+        return all(
+            isinstance(key, str) and _is_json_value(item) for key, item in value.items()
+        )
+    return False
+
+
+def _json_object(value: object, field_name: str) -> JsonObject:
+    if not _is_json_value(value) or not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be a JSON object")
+    return value
 
 
 def _invoke_sample_effects(client: EffectClient) -> None:
@@ -543,15 +564,13 @@ def _assert_value_matches_schema(value: JsonValue, schema: JsonObject) -> None:
             assert isinstance(key, str)
             assert key in value
         for key, child in value.items():
-            child_schema = properties.get(key)
-            assert isinstance(child_schema, dict), key
-            _assert_value_matches_schema(child, cast(JsonObject, child_schema))
+            child_schema = _json_object(properties.get(key), f"schema for {key}")
+            _assert_value_matches_schema(child, child_schema)
     elif schema_type == "array":
         assert isinstance(value, list)
-        items = schema.get("items")
-        assert isinstance(items, dict)
+        items = _json_object(schema.get("items"), "array item schema")
         for item in value:
-            _assert_value_matches_schema(item, cast(JsonObject, items))
+            _assert_value_matches_schema(item, items)
     elif schema_type == "string":
         assert isinstance(value, str)
     elif schema_type == "integer":

@@ -821,7 +821,7 @@ def _json_mapping(value: Mapping[str, object], field_name: str) -> dict[str, obj
     return result
 
 
-def _freeze_mapping(value: Mapping[str, object]) -> MappingProxyType:
+def _freeze_mapping(value: Mapping[str, object]) -> MappingProxyType[str, object]:
     return MappingProxyType(
         {key: _freeze_json(item, "manifest mapping") for key, item in value.items()}
     )

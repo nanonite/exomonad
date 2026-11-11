@@ -10,18 +10,21 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from pathlib import Path
 
 from tl_loop.client.effects import EffectClient, ToolResult
+from tl_loop.client.transport import JsonObject, JsonValue
 from tl_loop.loop.driver import (
+    EffectIntent,
     TLLoopConfig,
     _action_journal_gate_name,
     _reconcile_action_journal,
     _record_controller_event,
 )
 from tl_loop.loop.journal import EffectJournal
-from tl_loop.state.schema import GateStatus, SliceStatus
+from tl_loop.state.schema import GateStatus, RunState, SliceStatus
 from tl_loop.state.store import RunStore
 from tl_loop.tests.checkpoint_fixtures import create
 from tl_loop.tests.test_reconcile import _slice
@@ -31,13 +34,13 @@ from tl_loop.tests.test_reconcile import _slice
 class _Intent:
     operation: str = "merge_pr"
     target: str = "slice-a"
-    arguments: dict[str, Any] = field(
+    arguments: dict[str, JsonValue] = field(
         default_factory=lambda: {"head_sha": "head-a", "pr_number": 42}
     )
     active: bool = True
 
 
-def _journal_with_unknown_entry(tmp_path) -> tuple[EffectJournal, _Intent, str]:
+def _journal_with_unknown_entry(tmp_path: Path) -> tuple[EffectJournal, _Intent, str]:
     path = tmp_path / "action-journal.json"
     journal = EffectJournal("reconcile-journal", path)
     intent = _Intent()
@@ -46,13 +49,26 @@ def _journal_with_unknown_entry(tmp_path) -> tuple[EffectJournal, _Intent, str]:
     return journal, intent, journal.key_for(intent)
 
 
-def _store_and_state(tmp_path):
+def _store_and_state(tmp_path: Path) -> tuple[RunStore, RunState]:
     create("reconcile-journal", {"slices": {}}, root_dir=tmp_path)
     store = RunStore("reconcile-journal", tmp_path)
     return store, store.load()
 
 
-def test_first_reconciliation_opens_a_named_gate_and_leaves_entry_blocked(tmp_path) -> None:
+def _journal_entry(journal: EffectJournal, intent: _Intent) -> Mapping[str, object]:
+    entry = journal.existing(intent)
+    if entry is None:
+        raise RuntimeError("expected journal entry is missing")
+    return entry
+
+
+def _json_object(value: object) -> JsonObject:
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        raise RuntimeError("expected JSON object in journal entry")
+    return value
+
+
+def test_first_reconciliation_opens_a_named_gate_and_leaves_entry_blocked(tmp_path: Path) -> None:
     journal, intent, key = _journal_with_unknown_entry(tmp_path)
     store, state = _store_and_state(tmp_path)
 
@@ -63,10 +79,10 @@ def test_first_reconciliation_opens_a_named_gate_and_leaves_entry_blocked(tmp_pa
     assert gate is not None
     assert gate.status is GateStatus.PENDING
     # The entry itself is untouched until the operator answers the gate.
-    assert journal.existing(intent)["status"] == "unknown"
+    assert _journal_entry(journal, intent)["status"] == "unknown"
 
 
-def test_intended_resume_entry_from_process_death_opens_gate_without_dispatch(tmp_path) -> None:
+def test_intended_resume_entry_from_process_death_opens_gate_without_dispatch(tmp_path: Path) -> None:
     path = tmp_path / "action-journal.json"
     child = """
 from pathlib import Path
@@ -104,7 +120,7 @@ os._exit(0)
     assert pending[0]["status"] == "intended"
 
 
-def test_approved_gate_compensates_the_entry_and_clears_the_block(tmp_path) -> None:
+def test_approved_gate_compensates_the_entry_and_clears_the_block(tmp_path: Path) -> None:
     journal, intent, key = _journal_with_unknown_entry(tmp_path)
     store, state = _store_and_state(tmp_path)
     gate_name = _action_journal_gate_name(key)
@@ -113,10 +129,10 @@ def test_approved_gate_compensates_the_entry_and_clears_the_block(tmp_path) -> N
     _reconcile_action_journal(state, store, journal)
 
     assert journal.pending_entries() == []
-    assert journal.existing(intent)["status"] == "compensated"
+    assert _journal_entry(journal, intent)["status"] == "compensated"
 
 
-def test_rejected_gate_records_a_durable_rejected_outcome(tmp_path) -> None:
+def test_rejected_gate_records_a_durable_rejected_outcome(tmp_path: Path) -> None:
     journal, intent, key = _journal_with_unknown_entry(tmp_path)
     store, state = _store_and_state(tmp_path)
     gate_name = _action_journal_gate_name(key)
@@ -125,14 +141,14 @@ def test_rejected_gate_records_a_durable_rejected_outcome(tmp_path) -> None:
     _reconcile_action_journal(state, store, journal)
 
     assert journal.pending_entries() == []
-    resolved = journal.existing(intent)
+    resolved = _journal_entry(journal, intent)
     assert resolved["status"] == "rejected"
-    assert resolved["result"]["success"] is False
+    assert _json_object(resolved["result"])["success"] is False
 
 
-def test_reconciliation_is_a_noop_without_an_action_journal(tmp_path) -> None:
+def test_reconciliation_is_a_noop_without_an_action_journal(tmp_path: Path) -> None:
     store, state = _store_and_state(tmp_path)
-    plain_effects_log: list[object] = []
+    plain_effects_log: list[EffectIntent] = []
 
     new_state = _reconcile_action_journal(state, store, plain_effects_log)
 
@@ -140,17 +156,17 @@ def test_reconciliation_is_a_noop_without_an_action_journal(tmp_path) -> None:
     assert plain_effects_log == []
 
 
-def test_controller_event_journal_records_confirmed_and_unknown_outcomes(tmp_path) -> None:
-    class Client:
+def test_controller_event_journal_records_confirmed_and_unknown_outcomes(tmp_path: Path) -> None:
+    class ClientTransport:
         def __init__(self, result: ToolResult | None = None) -> None:
             self.result = result
 
-        def emit_controller_event(
-            self, *, event_type: str, payload: dict[str, object]
-        ) -> ToolResult:
-            del event_type, payload
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
+            del role, name, tool_name, arguments
             if self.result is not None:
-                return self.result
+                return self.result.raw
             raise RuntimeError("connection lost")
 
     journal = EffectJournal("controller-events", tmp_path / "action-journal.json")
@@ -161,7 +177,7 @@ def test_controller_event_journal_records_confirmed_and_unknown_outcomes(tmp_pat
         "tl.slice_status_changed",
         payload,
         config,
-        Client(ToolResult.from_raw({"success": True, "result": {}})),
+        EffectClient(ClientTransport(ToolResult.from_raw({"success": True, "result": {}}))),
         journal,
     )
     confirmed = journal._read()[0]
@@ -172,17 +188,17 @@ def test_controller_event_journal_records_confirmed_and_unknown_outcomes(tmp_pat
         "tl.slice_status_changed",
         {"slice_id": "slice-a", "to_status": "merged"},
         config,
-        Client(),
+        EffectClient(ClientTransport()),
         journal,
     )
     unknown = journal._read()[-1]
     assert unknown["status"] == "unknown"
 
 
-def test_scope_handoff_unknown_replays_exact_snapshot_without_operator_gate(tmp_path) -> None:
+def test_scope_handoff_unknown_replays_exact_snapshot_without_operator_gate(tmp_path: Path) -> None:
     store, state = _store_and_state(tmp_path)
     journal = EffectJournal("reconcile-journal", store.run_dir / "action-journal.json")
-    arguments = {
+    arguments: JsonObject = {
         "apply": True,
         "handoff_id": "handoff-id",
         "controller_id": "root-controller",
@@ -203,9 +219,11 @@ def test_scope_handoff_unknown_replays_exact_snapshot_without_operator_gate(tmp_
 
     class Transport:
         def __init__(self) -> None:
-            self.calls = []
+            self.calls: list[tuple[str, str, str, JsonObject]] = []
 
-        def call_tool(self, role, name, tool_name, received):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, received: JsonObject
+        ) -> JsonObject:
             self.calls.append((role, name, tool_name, received))
             assert tool_name == "prepare_scope_handoff"
             assert received == arguments
@@ -243,16 +261,17 @@ def test_scope_handoff_unknown_replays_exact_snapshot_without_operator_gate(tmp_
 
     assert transport.calls == [("tl", "root", "prepare_scope_handoff", arguments)]
     assert journal.pending_entries() == []
-    assert journal.existing(intent)["status"] == "confirmed"
-    retained = journal.existing(intent)["result"]["result"]
-    assert retained["committed_paths"] == ["747261636b65642e747874"]
-    assert retained["remaining_dirty_paths"] == []
-    assert retained["changed_paths"] == retained["remaining_dirty_paths"]
+    assert _journal_entry(journal, intent)["status"] == "confirmed"
+    retained = _json_object(_journal_entry(journal, intent)["result"])["result"]
+    retained_result = _json_object(retained)
+    assert retained_result["committed_paths"] == ["747261636b65642e747874"]
+    assert retained_result["remaining_dirty_paths"] == []
+    assert retained_result["changed_paths"] == retained_result["remaining_dirty_paths"]
     assert reconciled.gates == state.gates
 
 
 def test_a_second_unknown_outcome_for_the_same_key_does_not_reuse_the_earlier_approval(
-    tmp_path,
+    tmp_path: Path,
 ) -> None:
     """chainlink #905 follow-up: one approval must not silently authorize a
     retried effect (spawn/merge/PR/cleanup) to run again with no further
@@ -268,8 +287,8 @@ def test_a_second_unknown_outcome_for_the_same_key_does_not_reuse_the_earlier_ap
 
     state = _reconcile_action_journal(state, store, journal)
 
-    assert journal.existing(intent)["status"] == "compensated"
-    assert journal.existing(intent)["compensation_attempt"] == 1
+    assert _journal_entry(journal, intent)["status"] == "compensated"
+    assert _journal_entry(journal, intent)["compensation_attempt"] == 1
 
     # The retried dispatch re-appends the same key (a fresh "intended"
     # attempt), then itself becomes ambiguous again.
@@ -287,11 +306,12 @@ def test_a_second_unknown_outcome_for_the_same_key_does_not_reuse_the_earlier_ap
     # The first, already-spent approval remains as a durable audit record
     # but must not have resolved the new occurrence.
     first_gate = next((g for g in state.gates if g.name == first_gate_name), None)
+    assert first_gate is not None
     assert first_gate.status is GateStatus.APPROVED
-    assert journal.existing(intent)["status"] == "unknown"
+    assert _journal_entry(journal, intent)["status"] == "unknown"
 
 
-def test_invoke_error_points_to_the_attempt_scoped_gate(tmp_path) -> None:
+def test_invoke_error_points_to_the_attempt_scoped_gate(tmp_path: Path) -> None:
     import pytest
 
     from tl_loop.loop.driver import TLLoopError, _invoke
@@ -299,7 +319,7 @@ def test_invoke_error_points_to_the_attempt_scoped_gate(tmp_path) -> None:
     journal, intent, key = _journal_with_unknown_entry(tmp_path)
     journal.resolve_by_key(key, compensation_attempt=1)
 
-    def call(_client: object) -> ToolResult:
+    def call(_client: EffectClient) -> ToolResult:
         raise AssertionError("must not dispatch while the entry is still blocked")
 
     with pytest.raises(TLLoopError, match=_action_journal_gate_name(key, attempt=1)):
@@ -309,12 +329,12 @@ def test_invoke_error_points_to_the_attempt_scoped_gate(tmp_path) -> None:
             intent.arguments,
             intent.active,
             None,
-            call,  # type: ignore[arg-type]
+            call,
             journal,
         )
 
 
-def test_restart_adopts_an_authoritative_merge_for_a_pending_intent(tmp_path) -> None:
+def test_restart_adopts_an_authoritative_merge_for_a_pending_intent(tmp_path: Path) -> None:
     journal, intent, _ = _journal_with_unknown_entry(tmp_path)
     store, state = _store_and_state(tmp_path)
     state = store.checkpoint(
@@ -325,20 +345,22 @@ def test_restart_adopts_an_authoritative_merge_for_a_pending_intent(tmp_path) ->
     )
 
     class Watcher:
-        def watcher_pr_state(self, *, pr_number: int) -> ToolResult:
-            assert pr_number == 42
-            return ToolResult.from_raw(
-                {"success": True, "result": {"merged": True, "pr_state": "closed"}}
-            )
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
+            del role, name
+            if tool_name != "watcher_pr_state" or arguments.get("pr_number") != 42:
+                raise RuntimeError("unexpected watcher request")
+            return {"success": True, "result": {"merged": True, "pr_state": "closed"}}
 
     reconciled = _reconcile_action_journal(
         state,
         store,
         journal,
-        effects=Watcher(),
+        effects=EffectClient(Watcher()),
     )
 
     assert journal.pending_entries() == []
-    assert journal.existing(intent)["status"] == "confirmed"
+    assert _journal_entry(journal, intent)["status"] == "confirmed"
     assert reconciled.slices["slice-a"].status is SliceStatus.IN_REVIEW
     assert reconciled.slices["slice-a"].action is None
