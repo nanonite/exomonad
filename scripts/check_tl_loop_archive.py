@@ -14,6 +14,18 @@ class ArchiveFingerprintError(RuntimeError):
     """The archive was not built from the supplied source tree."""
 
 
+def _fingerprint_object(value: object) -> dict[str, object]:
+    """Validate and copy a dynamically loaded source fingerprint object."""
+    if not isinstance(value, dict):
+        raise ArchiveFingerprintError("source fingerprint has an invalid shape")
+    fingerprint: dict[str, object] = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise ArchiveFingerprintError("source fingerprint has an invalid shape")
+        fingerprint[key] = item
+    return fingerprint
+
+
 def _source_fingerprint(source: Path) -> dict[str, object]:
     module_path = source / "fingerprint.py"
     spec = importlib.util.spec_from_file_location(
@@ -25,7 +37,8 @@ def _source_fingerprint(source: Path) -> dict[str, object]:
         )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.source_fingerprint(source)
+    value: object = module.source_fingerprint(source)
+    return _fingerprint_object(value)
 
 
 def check_archive_fingerprint(archive: Path, source: Path) -> None:

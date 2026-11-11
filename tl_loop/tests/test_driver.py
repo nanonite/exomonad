@@ -27141,3 +27141,22 @@ def test_confirmed_repair_without_a_recorded_attempt_fails_closed(tmp_path: Path
 
     with pytest.raises(TLLoopError, match="repair action is missing its attempt"):
         driver_module._reconcile_confirmed_repair_actions(state, store, journal)
+
+
+def test_exit_marker_matches_checkpoint_uses_child_store_load(tmp_path: Path) -> None:
+    create("exit-marker-load", {}, root_dir=tmp_path)
+    store = RunStore("exit-marker-load", tmp_path)
+    checkpoint = store.load()
+
+    assert driver_module._exit_marker_matches_checkpoint(
+        {"checkpoint_revision": checkpoint.revision}, store
+    )
+    assert not driver_module._exit_marker_matches_checkpoint(
+        {"checkpoint_revision": checkpoint.revision + 1}, store
+    )
+
+    store_without_load = cast(RunStore, SimpleNamespace())
+    with pytest.raises(AttributeError, match="load"):
+        driver_module._exit_marker_matches_checkpoint(
+            {"checkpoint_revision": checkpoint.revision}, store_without_load
+        )

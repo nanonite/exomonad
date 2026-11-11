@@ -1,8 +1,5 @@
 {
   "errors": {
-    "scripts/check_tl_loop_archive.py": {
-      "no-any-return": 1
-    },
     "tl_loop/loop/driver.py": {
       "type-arg": 1
     },

@@ -13,7 +13,11 @@ from pathlib import Path
 import pytest
 
 from scripts.build_tl_loop_archive import build_archive
-from scripts.check_tl_loop_archive import ArchiveFingerprintError, check_archive_fingerprint
+from scripts.check_tl_loop_archive import (
+    ArchiveFingerprintError,
+    _source_fingerprint,
+    check_archive_fingerprint,
+)
 
 REPOSITORY_ROOT = Path(__file__).parents[2]
 SOURCE_MODULE = REPOSITORY_ROOT / "tl_loop/preflight.py"
@@ -174,3 +178,31 @@ def test_archive_fingerprint_detects_source_edit(tmp_path: Path) -> None:
     )
     with pytest.raises(ArchiveFingerprintError, match="stale TL controller archive"):
         check_archive_fingerprint(archive, source)
+
+
+def test_source_fingerprint_accepts_a_string_keyed_object(tmp_path: Path) -> None:
+    source = tmp_path / "valid-fingerprint"
+    source.mkdir()
+    (source / "fingerprint.py").write_text(
+        "def source_fingerprint(source):\n"
+        "    return {'schema_version': 1, 'tree_sha256': 'a' * 64}\n",
+        encoding="utf-8",
+    )
+
+    assert _source_fingerprint(source) == {
+        "schema_version": 1,
+        "tree_sha256": "a" * 64,
+    }
+
+
+def test_source_fingerprint_rejects_a_malformed_loaded_value(tmp_path: Path) -> None:
+    source = tmp_path / "malformed-fingerprint"
+    source.mkdir()
+    (source / "fingerprint.py").write_text(
+        "def source_fingerprint(source):\n"
+        "    return ['not', 'an object']\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ArchiveFingerprintError, match="invalid shape"):
+        _source_fingerprint(source)

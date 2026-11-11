@@ -994,6 +994,11 @@ accepted dispatch intent, an exit diagnostic bound to the exact child
 checkpoint revision, and a retryable exit reason. When any proof fails the run
 keeps `tl_failed` and opens `tl-ordered-child-recovery-<child>`.
 
+The marker comparison reads the current child revision through
+`RunStore.load()`. A malformed marker or a load that raises `OSError` or
+`ValueError` does not match; a store without the required `load()` method is a
+programming error.
+
 During terminal-owner recovery, `_terminal_owner_ledger_proof` returns
 `(None, reason)` when the accepted launch lacks a dispatch invocation ID, agent
 ID, intent ID, or branch. Its caller keeps that proof unresolved. Ordered
