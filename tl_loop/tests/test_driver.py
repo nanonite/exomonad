@@ -15,7 +15,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ClassVar, cast
+from typing import Any, Callable, ClassVar, cast
 from typing import Protocol
 
 import pytest
@@ -32,6 +32,8 @@ from tl_loop.fsm.event import ChildCompleted, PRFiled, PRUpdated
 from tl_loop.fsm.lane import LanePhase, LaneReserved, LaneState
 from tl_loop.fsm.phase import ChildHandle, TLFailed, TLPhase, TLPlanning, TLWaiting
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
+from tl_loop.fsm.child import TLOrchestrationEvent
+from tl_loop.fsm.post_merge_events import PostMergeEvent, PostMergeNotApplicable
 from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState, begin_recovery
 from tl_loop.fsm.recovery import transition_recovery
 from tl_loop.fsm.scope import TLAllMerged as RecursiveTLAllMerged
@@ -43,7 +45,11 @@ from tl_loop.fsm.scope import TLRunning as RecursiveTLRunning
 from tl_loop.fsm.scope import TLDone as RecursiveTLDone
 from tl_loop.fsm.scope import TLParked as RecursiveTLParked
 from tl_loop.loop.abandon import abandon_slice
-from tl_loop.loop.blocked_leaf_resume import BlockedLeafOwner
+from tl_loop.loop.blocked_leaf_resume import (
+    BlockedLeafOwner,
+    blocked_resume_intent_id,
+    resolve_dormant_owner_for_slice,
+)
 from tl_loop.loop.convergence import ConvergenceInvariantError, ConvergenceTracker
 from tl_loop.loop.pr_number import require_pr_number
 from tl_loop.loop.review import verify_integration
@@ -83,6 +89,7 @@ from tl_loop.loop.driver import (
     _integrate_one_candidate,
     _is_aggregate_slice,
     _LeafIssueProvenance,
+    _TerminalOwnerRecoveryProof,
     _merge_result_is_authoritative,
     _migrate_audit_marked_quarantine,
     _new_dispatch_attempt,
@@ -17242,7 +17249,7 @@ def test_continue_reopens_failed_later_scope_without_replacing_completed_sub_tl_
         park_cause=None,
     )
     completed_state = root_store.checkpoint(
-        completed_state.recursive_fsm or completed_state.fsm,
+        _required_fsm_input(completed_state.recursive_fsm, completed_state.fsm),
         {**completed_state.slices, "architecture": completed_architecture},
         completed_state.budgets,
         completed_state.events.last_consumed_offset,
@@ -17300,12 +17307,13 @@ def test_continue_reopens_failed_later_scope_without_replacing_completed_sub_tl_
         ordered_stages=root_state.ordered_stages,
         integration=root_state.integration,
     )
-    assert root_store.load().plan_manifest.role == "root"
+    assert _required_plan_manifest(root_store.load()).role == "root"
     assert driver_module._continued_failed_root_reason(root_store.load(), config) is not None
 
     child_store = RunStore("kani", root_store.run_dir)
-    child_manifest = root_state.plan_manifest.child_manifests[
-        next(node.node_id for node in root_state.plan_manifest.nodes if node.name == "kani")
+    root_manifest = _required_plan_manifest(root_state)
+    child_manifest = root_manifest.child_manifests[
+        next(node.node_id for node in root_manifest.nodes if node.name == "kani")
     ]
     if not child_store.path.exists():
         child_config = driver_module._child_config(
@@ -17318,6 +17326,7 @@ def test_continue_reopens_failed_later_scope_without_replacing_completed_sub_tl_
             worktree,
             keep_alive_on_waiting=True,
         )
+        assert isinstance(kani_task.plan, WorkPlan)
         child_slices = _initial_slices(kani_task.plan, child_config, root_store.run_dir, "kani")
         create(
             "kani",
@@ -17343,7 +17352,9 @@ def test_continue_reopens_failed_later_scope_without_replacing_completed_sub_tl_
     child_store.record_exit_reason("server socket timed out during child startup")
 
     class KaniRecoveryTransport(RecordingTransport):
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
             if tool_name == "repository_identity":
                 self.calls.append((tool_name, arguments))
                 return {
@@ -17407,6 +17418,13 @@ def test_continue_reopens_failed_later_scope_without_replacing_completed_sub_tl_
     assert repeated.final_state.slices["kani"].attempts == 1
     assert tuple(journal.snapshot()) == reconciled_journal_entries
     assert not any(name in {"merge_pr", "file_pr"} for name, _ in transport.calls)
+
+
+def _required_project_root(config: TLLoopConfig) -> Path:
+    root = config.project_root
+    if root is None:
+        raise AssertionError("test config is missing its project root")
+    return Path(root)
 
 
 def test_require_manifest_digest_refuses_a_manifest_without_a_digest() -> None:
@@ -17507,7 +17525,7 @@ def test_ordered_recovery_holds_for_missing_or_conflicting_completed_receipts(
         publication=changed_publication,
     )
     root_store.checkpoint(
-        state.recursive_fsm or state.fsm,
+        _required_fsm_input(state.recursive_fsm, state.fsm),
         {**state.slices, "architecture": changed_architecture},
         state.budgets,
         state.events.last_consumed_offset,
@@ -17558,7 +17576,9 @@ def test_continue_records_scoped_hold_for_invalid_completed_sub_tl_receipt(
     )
 
     class SameRepositoryTransport(RecordingTransport):
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
             if tool_name == "repository_identity":
                 self.calls.append((tool_name, arguments))
                 return {
@@ -17587,7 +17607,7 @@ def test_continue_records_scoped_hold_for_invalid_completed_sub_tl_receipt(
     )
 
     held = root_store.load()
-    assert result.diagnostics["ordered_completion_recovery"].startswith(
+    assert _required_object_string(result.diagnostics, "ordered_completion_recovery").startswith(
         "ordered recovery child 'architecture': completion proof is unresolved: "
     )
     assert isinstance(held.recursive_fsm, RecursiveTLFailed)
@@ -17648,14 +17668,16 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
         "root",
         {
             "slices": root_slices,
-            "repository_identity": {"remote_url": root_config.repository_identity.remote_url},
+            "repository_identity": {
+                "remote_url": _required_repository_identity(root_config).remote_url
+            },
         },
         root_dir=tmp_path,
     )
     root_store = RunStore("root", tmp_path)
     root_store.set_plan_manifest(root_manifest, slices=root_slices)
     ordered_stages = tuple(
-        driver_module.OrderedStageState(stage.order, stage.sub_tls) for stage in plan.ordered_stages
+        OrderedStageState(stage.order, stage.sub_tls) for stage in plan.ordered_stages
     )
     root_state = root_store.set_ordered_state(1, ordered_stages, root_store.load().integration)
     task = plan.sub_tls[0]
@@ -17706,7 +17728,7 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
         "kani",
         {
             "slices": child_slices,
-            "repository_identity": {"remote_url": root_config.repository_identity.remote_url},
+            "repository_identity": {"remote_url": _required_repository_identity(root_config).remote_url},
             "owner_branch": child_branch,
             "owner_worktree": child_worktree,
             "parent_run_id": "root",
@@ -17773,7 +17795,7 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
         "Commit the scaffold (per scaffold-fork-converge) or run `discard_worker_output` if throwaway, then retry. "
         "Workers spawn in-place and would inherit this state; dev-leaves fork from your branch HEAD and would not see your uncommitted work."
     )
-    recovery = driver_module.transition_recovery(
+    recovery = transition_recovery(
         begin_recovery(
             cause="human_decision_required",
             owner_run_id="kani",
@@ -17863,7 +17885,7 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
         worktree=str(project / ".exo" / "worktrees" / "foreign-owner"),
     )
     child_store.checkpoint(
-        state.recursive_fsm or state.fsm,
+        _required_fsm_input(state.recursive_fsm, state.fsm),
         {**state.slices, issue_slice: conflicting},
         state.budgets,
         state.events.last_consumed_offset,
@@ -17878,7 +17900,7 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
     )
     current = child_store.load()
     child_store.checkpoint(
-        current.recursive_fsm or current.fsm,
+        _required_fsm_input(current.recursive_fsm, current.fsm),
         {**current.slices, issue_slice: blocked},
         current.budgets,
         current.events.last_consumed_offset,
@@ -17903,7 +17925,7 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
         provisioned: list[dict[str, object]] = field(default_factory=list)
         parent_terminalized_after_provision: bool = False
 
-        def provision_ordered_sub_tl(self, caller, **arguments):
+        def provision_ordered_sub_tl(self, caller: str, **arguments: object) -> str:
             self.provisioned.append({"caller": caller, **arguments})
             parent = root_store.load()
             assert isinstance(parent.recursive_fsm, RecursiveTLRunning)
@@ -17922,39 +17944,40 @@ def test_ordered_controller_accepts_approved_blocked_leaf_without_exit_diagnosti
 
     transport = ProvisionTransport()
 
-    def child_controller(root_spec, child_config, budgets):
-        assert cast(dict[str, object], root_spec)["run_id"] == "kani"
+    def child_controller(root_spec: Mapping[str, object], child_config: TLLoopConfig, budgets: BudgetLedger) -> SimpleNamespace:
+        assert isinstance(root_spec, Mapping)
+        assert root_spec["run_id"] == "kani"
         assert child_config.ordered_recovery is True
         del budgets
         return SimpleNamespace(final_state=child_store.load())
 
     class InlineProcess:
-        def __init__(self, target, args, name):
+        def __init__(self, target: Callable[..., object], args: tuple[object, ...], name: str) -> None:
             self.target = target
             self.args = args
             self.name = name
-            self.exitcode = None
+            self.exitcode: int | None = None
 
-        def start(self):
+        def start(self) -> None:
             parent = root_store.load()
             assert isinstance(parent.recursive_fsm, RecursiveTLRunning)
             assert parent.slices["kani"].status is SliceStatus.SPAWNED
             self.target(*self.args)
             self.exitcode = 0
 
-        def is_alive(self):
+        def is_alive(self) -> bool:
             return False
 
-        def join(self, timeout=None):
+        def join(self, timeout: float | None = None) -> None:
             del timeout
 
     class InlineContext:
-        def Process(self, *, target, args, name):
+        def Process(self, *, target: Callable[..., object], args: tuple[object, ...], name: str) -> InlineProcess:
             return InlineProcess(target, args, name)
 
     monkeypatch.setattr(driver_module, "tl_run", child_controller)
     monkeypatch.setattr(
-        driver_module.multiprocessing, "get_context", lambda _method: InlineContext()
+        multiprocessing, "get_context", lambda _method: InlineContext()
     )
     outcomes = driver_module._run_live_sub_tl_batch(
         (replace(task, source=SyntheticQueue([])),),
@@ -17997,7 +18020,7 @@ def test_ordered_recovery_keeps_declared_aggregate_not_required_outcome(
         post_merge=PostMergeState(PostMergePhase.NOT_REQUIRED, {}),
     )
     root_store.checkpoint(
-        state.recursive_fsm or state.fsm,
+        _required_fsm_input(state.recursive_fsm, state.fsm),
         {**state.slices, "architecture": architecture, "kani": kani},
         state.budgets,
         state.events.last_consumed_offset,
@@ -18035,14 +18058,14 @@ def test_completed_optional_sub_tl_records_parent_not_required_receipt(
             "slices": root_slices,
             "owner_branch": "main",
             "owner_worktree": str(tmp_path),
-            "repository_identity": config.repository_identity.to_document(),
+            "repository_identity": _required_repository_identity(config).to_document(),
             "plan_manifest": manifest.to_document(),
         },
         root_dir=tmp_path,
     )
     root_store = RunStore("root", tmp_path)
     root_store.set_plan_manifest(manifest, slices=root_slices)
-    stages = (driver_module.OrderedStageState(1, ("kani",)),)
+    stages = (OrderedStageState(1, ("kani",)),)
     state = root_store.set_ordered_state(1, stages, root_store.load().integration)
     parent_slice = replace(
         state.slices["kani"],
@@ -18055,7 +18078,7 @@ def test_completed_optional_sub_tl_records_parent_not_required_receipt(
         dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
     )
     state = root_store.checkpoint(
-        state.recursive_fsm or state.fsm,
+        _required_fsm_input(state.recursive_fsm, state.fsm),
         {**state.slices, "kani": parent_slice},
         state.budgets,
         state.events.last_consumed_offset,
@@ -18078,6 +18101,7 @@ def test_completed_optional_sub_tl_records_parent_not_required_receipt(
         depth=1,
         declared_manifest=child_manifest,
     )
+    assert isinstance(task.plan, WorkPlan)
     child_slices = _initial_slices(task.plan, child_config, root_store.run_dir, "kani")
     create(
         "kani",
@@ -18089,7 +18113,7 @@ def test_completed_optional_sub_tl_records_parent_not_required_receipt(
             "parent_run_id": "root",
             "parent_agent_id": "root",
             "depth": 1,
-            "repository_identity": config.repository_identity.to_document(),
+            "repository_identity": _required_repository_identity(config).to_document(),
             "plan_manifest": child_manifest.to_document(),
         },
         root_dir=root_store.run_dir,
@@ -18098,7 +18122,7 @@ def test_completed_optional_sub_tl_records_parent_not_required_receipt(
     child_state = child_store.checkpoint(
         RecursiveTLAllMerged(
             scope_path=(child_manifest.scope_id,),
-            plan_digest=child_manifest.digest,
+            plan_digest=_required_manifest_digest(child_store.load()),
         ),
         child_slices,
         child_store.load().budgets,
@@ -18267,14 +18291,14 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
             "slices": root_slices,
             "owner_branch": "main",
             "owner_worktree": str(tmp_path),
-            "repository_identity": config.repository_identity.to_document(),
+            "repository_identity": _required_repository_identity(config).to_document(),
             "plan_manifest": manifest.to_document(),
         },
         root_dir=state_root,
     )
     root_store = RunStore("root", state_root)
     root_store.set_plan_manifest(manifest, slices=root_slices)
-    stages = (driver_module.OrderedStageState(1, ("kani",)),)
+    stages = (OrderedStageState(1, ("kani",)),)
     state = root_store.set_ordered_state(1, stages, root_store.load().integration)
     parent_slice = replace(
         state.slices["kani"],
@@ -18301,7 +18325,7 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
         sub_tl_recovery={"kani": stale_recovery},
     )
     root_state = root_store.checkpoint(
-        state.recursive_fsm or state.fsm,
+        _required_fsm_input(state.recursive_fsm, state.fsm),
         {**state.slices, "kani": parent_slice},
         state.budgets,
         state.events.last_consumed_offset,
@@ -18340,14 +18364,14 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
             "parent_run_id": child_parent_run_id,
             "parent_agent_id": "root",
             "depth": 1,
-            "repository_identity": config.repository_identity.to_document(),
+            "repository_identity": _required_repository_identity(config).to_document(),
             "plan_manifest": child_manifest.to_document(),
         },
         root_dir=root_store.run_dir,
     )
     child_store.set_plan_manifest(child_manifest, slices=child_slices)
     child_state = child_store.load()
-    child_slices = dict(child_state.slices)
+    child_test_slices: dict[str, SliceState] = dict(child_state.slices)
     leaf_receipt = PostMergeState(
         PostMergePhase.NOT_REQUIRED,
         {"leaf_result": "completed"},
@@ -18356,7 +18380,7 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
         PostMergePhase.REMOTE_MERGE_ADOPTED,
         {
             "child_id": "issue-814",
-            "repository": config.repository_identity.remote_url,
+            "repository": _required_repository_identity(config).remote_url,
             "parent_branch": "main.kani",
             "pr_number": "3",
             "head_sha": "a" * 40,
@@ -18386,15 +18410,15 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
         },
     )
     if child_complete:
-        child_slices["issue-814"] = replace(
-            child_slices["issue-814"],
+        child_test_slices["issue-814"] = replace(
+            child_test_slices["issue-814"],
             status=SliceStatus.MERGED,
             attempts=1,
             post_merge=leaf_receipt,
         )
     if child_post_merge_finishes_during_controller_poll:
-        child_slices["issue-814"] = replace(
-            child_slices["issue-814"],
+        child_test_slices["issue-814"] = replace(
+            child_test_slices["issue-814"],
             status=SliceStatus.MERGED,
             attempts=1,
             pr_number=3,
@@ -18407,7 +18431,7 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
     child_phase = (
         RecursiveTLAllMerged(
             scope_path=(child_manifest.scope_id,),
-            plan_digest=child_manifest.digest,
+            plan_digest=_required_manifest_digest(child_store.load()),
             completed_children=(
                 {"issue-814": completed_leaf_merge}
                 if child_post_merge_finishes_during_controller_poll and child_complete
@@ -18432,12 +18456,12 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
                 )
             },
             scope_path=(child_manifest.scope_id,),
-            plan_digest=child_manifest.digest,
+            plan_digest=_required_manifest_digest(child_store.load()),
         )
     )
     child_state = child_store.checkpoint(
         child_phase,
-        child_slices,
+        child_test_slices,
         child_store.load().budgets,
         child_store.load().events.last_consumed_offset,
     )
@@ -18476,7 +18500,7 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
                     park_cause=None,
                 )
                 root_store.checkpoint(
-                    latest.recursive_fsm or latest.fsm,
+                    _required_fsm_input(latest.recursive_fsm, latest.fsm),
                     {**latest.slices, "kani": active_parent},
                     latest.budgets,
                     latest.events.last_consumed_offset,
@@ -18486,7 +18510,7 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
                     expected_revision=latest.revision,
                 )
                 abandoned = abandon_slice(
-                    config.project_root,
+                    _required_project_root(config),
                     "root",
                     "kani",
                     effects=EffectClient(RecordingTransport()),
@@ -18518,7 +18542,7 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
             concurrent_integration = changed_integration
             original_checkpoint(
                 root_store,
-                latest.recursive_fsm or latest.fsm,
+                _required_fsm_input(latest.recursive_fsm, latest.fsm),
                 {**latest.slices, "kani": changed_parent},
                 changed_budget,
                 latest.events.last_consumed_offset,
@@ -18530,12 +18554,20 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
 
         def checkpoint_with_concurrent_parent_write(
             checkpoint_store: RunStore,
-            fsm,
-            slices,
-            budgets,
-            offset,
-            **kwargs,
-        ):
+            fsm: FSMInput,
+            slices: Mapping[str, SliceInput],
+            budgets: BudgetInput,
+            offset: int,
+            *,
+            current_order: int | None = None,
+            ordered_stages: OrderedStagesInput | None = None,
+            integration: IntegrationInput | None = None,
+            state_version: int | None = None,
+            plan_manifest: PlanManifest | None = None,
+            expected_revision: int | None = None,
+            clear_gates: Sequence[str] = (),
+            ensure_gates: Sequence[tuple[str, GateStatus]] = (),
+        ) -> RunState:
             should_interleave = (
                 checkpoint_store.run_id == "root"
                 and isinstance(fsm, RecursiveTLFailed)
@@ -18549,7 +18581,21 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
             )
             if should_interleave:
                 interleave_parent_update()
-            return original_checkpoint(checkpoint_store, fsm, slices, budgets, offset, **kwargs)
+            return original_checkpoint(
+                checkpoint_store,
+                fsm,
+                slices,
+                budgets,
+                offset,
+                current_order=current_order,
+                ordered_stages=ordered_stages,
+                integration=integration,
+                state_version=state_version,
+                plan_manifest=plan_manifest,
+                expected_revision=expected_revision,
+                clear_gates=clear_gates,
+                ensure_gates=ensure_gates,
+            )
 
         monkeypatch.setattr(RunStore, "checkpoint", checkpoint_with_concurrent_parent_write)
 
@@ -18587,7 +18633,7 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
                     child_store.checkpoint(
                         RecursiveTLAllMerged(
                             scope_path=(child_manifest.scope_id,),
-                            plan_digest=child_manifest.digest,
+                            plan_digest=_required_manifest_digest(child_store.load()),
                             completed_children={
                                 "issue-814": (
                                     completed_leaf_merge
@@ -18603,7 +18649,7 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
                 raise queue.Empty
 
         source = CompleteChildOnPollQueue([])
-        result = run_tl_loop(
+        loop_result = run_tl_loop(
             "root",
             plan,
             source,
@@ -18612,7 +18658,7 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
             root_dir=state_root,
         )
     else:
-        result = driver_module._run_sub_tls(
+        state_result = driver_module._run_sub_tls(
             plan,
             root_state,
             config,
@@ -18623,7 +18669,12 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
         )
 
     parent_after = root_store.load()
-    result_state = result.final_state if poll_completes_child else result
+    if poll_completes_child:
+        assert isinstance(loop_result, TLRunResult)
+        result_state = loop_result.final_state
+    else:
+        assert isinstance(state_result, RunState)
+        result_state = state_result
     if poll_completes_child:
         assert child_store.path.read_bytes() != child_bytes_before
         assert driver_module._aggregate_scope_phase_complete(child_store.load())
@@ -18693,17 +18744,17 @@ def test_startup_reconciles_only_proven_completed_optional_sub_tl_projection(
             for name, _ in transport.calls
         )
     else:
-        assert isinstance(result.recursive_fsm, RecursiveTLFailed)
+        assert isinstance(result_state.recursive_fsm, RecursiveTLFailed)
         expected_reason = (
             "explicitly rejected"
             if concurrent_race == "operator_rejects_gate_during_hold"
             else expected_proof_error
         )
-        assert expected_reason in result.recursive_fsm.reason
-        assert result.slices["kani"].post_merge is None
-        assert result.integration.sub_tl_recovery["kani"] == stale_recovery
+        assert expected_reason in result_state.recursive_fsm.reason
+        assert result_state.slices["kani"].post_merge is None
+        assert result_state.integration.sub_tl_recovery["kani"] == stale_recovery
         matching_gate = next(
-            gate for gate in result.gates if gate.name == "tl-ordered-completion-evidence-kani"
+            gate for gate in result_state.gates if gate.name == "tl-ordered-completion-evidence-kani"
         )
         assert matching_gate.status is expected_gate_status
         if concurrent_race in {
@@ -18744,7 +18795,7 @@ def test_ordered_recovery_retains_valid_entry_added_completion_evidence(
         },
     )
     root_store.checkpoint(
-        state.recursive_fsm or state.fsm,
+        _required_fsm_input(state.recursive_fsm, state.fsm),
         {
             **state.slices,
             "architecture": replace(
@@ -18763,7 +18814,7 @@ def test_ordered_recovery_retains_valid_entry_added_completion_evidence(
 
     reopened = driver_module._reopen_ordered_scope(root_store.load(), plan, root_store, None)
 
-    assert reopened.recursive_fsm is not None
+    assert isinstance(reopened.recursive_fsm, RecursiveTLRunning)
     assert reopened.recursive_fsm.completed_children["architecture"].child_id == "architecture"
     assert reopened.recursive_fsm.post_merge["architecture"] == complete_receipt
 
@@ -18888,7 +18939,7 @@ def test_captured_aggregate_completion_preserves_conflicting_or_unresolved_lane(
     assert not any(
         name == "emit_controller_event"
         and arguments.get("event_type") == "tl.dispatch_confirmed"
-        and arguments.get("payload", {}).get("slice_id") == "kani"
+        and _required_json_object(arguments, "payload").get("slice_id") == "kani"
         for name, arguments in transport.calls
     )
 
@@ -18915,7 +18966,7 @@ def test_captured_aggregate_requires_sync_projection_to_match_its_receipt(
     current = state.slices["architecture"]
     reconciliation = {**dict(current.reconciliation or {}), field: value}
     root_store.checkpoint(
-        state.recursive_fsm or state.fsm,
+        _required_fsm_input(state.recursive_fsm, state.fsm),
         {**state.slices, current.id: replace(current, reconciliation=reconciliation)},
         state.budgets,
         state.events.last_consumed_offset,
@@ -18996,7 +19047,7 @@ def test_captured_aggregate_rejects_conflicting_merge_coordinates(
         evidence={**current.post_merge.evidence, field: value},
     )
     root_store.checkpoint(
-        state.recursive_fsm or state.fsm,
+        _required_fsm_input(state.recursive_fsm, state.fsm),
         {**state.slices, current.id: replace(current, post_merge=changed_post)},
         state.budgets,
         state.events.last_consumed_offset,
@@ -19072,10 +19123,17 @@ def test_completion_checkpoint_crash_replays_without_rejudging_or_duplicate_even
     )
     original_record = driver_module._record_controller_event
 
-    def crash_after_checkpoint(slice_id, event_type, *args, **kwargs):
+    def crash_after_checkpoint(
+        target: str,
+        event_type: str,
+        payload: Mapping[str, object],
+        config: TLLoopConfig,
+        effects: EffectClient | ReadOnlyEffectClient,
+        effects_log: list[EffectIntent],
+    ) -> ToolResult | None:
         if event_type == "tl.unlinked_changelog_resolved":
             raise _SimulatedPostMergeCrash("after completion checkpoint")
-        return original_record(slice_id, event_type, *args, **kwargs)
+        return original_record(target, event_type, payload, config, effects, effects_log)
 
     monkeypatch.setattr(driver_module, "_record_controller_event", crash_after_checkpoint)
     with pytest.raises(_SimulatedPostMergeCrash, match="after completion checkpoint"):
@@ -19101,19 +19159,39 @@ def test_completion_crash_before_checkpoint_reuses_captured_judgment(
     )
     original_checkpoint = driver_module._checkpoint_post_merge_event
 
-    def crash_before_checkpoint(*args, **kwargs):
-        event = args[3] if len(args) > 3 else kwargs.get("event")
-        if isinstance(event, driver_module.PostMergeNotApplicable):
+    def crash_before_checkpoint(
+        store: RunStore,
+        state: RunState,
+        slice_id: str,
+        event: PostMergeEvent,
+        reconciliation_additions: Mapping[str, object] | None = None,
+        lane_event: TLOrchestrationEvent | tuple[TLOrchestrationEvent, ...] | None = None,
+        *,
+        expected_revision: int | None = None,
+        clear_gates: tuple[str, ...] = (),
+        clear_dispatch_error: bool = False,
+    ) -> RunState:
+        if isinstance(event, PostMergeNotApplicable):
             raise _SimulatedPostMergeCrash("before completion checkpoint")
-        return original_checkpoint(*args, **kwargs)
+        return original_checkpoint(
+            store,
+            state,
+            slice_id,
+            event,
+            reconciliation_additions,
+            lane_event,
+            expected_revision=expected_revision,
+            clear_gates=clear_gates,
+            clear_dispatch_error=clear_dispatch_error,
+        )
 
     monkeypatch.setattr(driver_module, "_checkpoint_post_merge_event", crash_before_checkpoint)
     with pytest.raises(_SimulatedPostMergeCrash, match="before completion checkpoint"):
         _complete_captured_aggregate_boundary(root_store, tmp_path)
     monkeypatch.setattr(driver_module, "_checkpoint_post_merge_event", original_checkpoint)
-    assert root_store.load().slices["architecture"].post_merge.phase is (
-        PostMergePhase.PARENT_BRANCH_SYNCED
-    )
+    saved_architecture = root_store.load().slices["architecture"]
+    assert saved_architecture.post_merge is not None
+    assert saved_architecture.post_merge.phase is PostMergePhase.PARENT_BRANCH_SYNCED
 
     resumed, transport = _complete_captured_aggregate_boundary(root_store, tmp_path)
 
@@ -19139,17 +19217,37 @@ def test_concurrent_lane_reservation_survives_completion_checkpoint_race(
     original_checkpoint = driver_module._checkpoint_post_merge_event
     injected = False
 
-    def reserve_before_completion(*args, **kwargs):
+    def reserve_before_completion(
+        store: RunStore,
+        state: RunState,
+        slice_id: str,
+        event: PostMergeEvent,
+        reconciliation_additions: Mapping[str, object] | None = None,
+        lane_event: TLOrchestrationEvent | tuple[TLOrchestrationEvent, ...] | None = None,
+        *,
+        expected_revision: int | None = None,
+        clear_gates: tuple[str, ...] = (),
+        clear_dispatch_error: bool = False,
+    ) -> RunState:
         nonlocal injected
-        event = args[3] if len(args) > 3 else kwargs.get("event")
-        if not injected and isinstance(event, driver_module.PostMergeNotApplicable):
+        if not injected and isinstance(event, PostMergeNotApplicable):
             injected = True
             root_store.transition_lane(
                 "https://forge.example.test/test/repository.git",
                 "main",
                 LaneReserved("kani", 3, base_sha),
             )
-        return original_checkpoint(*args, **kwargs)
+        return original_checkpoint(
+            store,
+            state,
+            slice_id,
+            event,
+            reconciliation_additions,
+            lane_event,
+            expected_revision=expected_revision,
+            clear_gates=clear_gates,
+            clear_dispatch_error=clear_dispatch_error,
+        )
 
     monkeypatch.setattr(driver_module, "_checkpoint_post_merge_event", reserve_before_completion)
 
@@ -19167,7 +19265,7 @@ def test_concurrent_lane_reservation_survives_completion_checkpoint_race(
     assert not any(
         name == "emit_controller_event"
         and arguments.get("event_type") == "tl.dispatch_confirmed"
-        and arguments.get("payload", {}).get("slice_id") == "kani"
+        and _required_json_object(arguments, "payload").get("slice_id") == "kani"
         for name, arguments in transport.calls
     )
 
@@ -19181,7 +19279,9 @@ def _assert_aggregate_recovery_stays_parked(
     """Run the production driver and require a scoped proof hold."""
 
     class AggregateProofTransport(RecordingTransport):
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
             if tool_name == "repository_identity":
                 self.calls.append((tool_name, arguments))
                 return {
@@ -19224,7 +19324,7 @@ def _assert_aggregate_recovery_stays_parked(
     assert not any(
         name == "emit_controller_event"
         and arguments.get("event_type") == "tl.dispatch_confirmed"
-        and arguments.get("payload", {}).get("slice_id") == "kani"
+        and _required_json_object(arguments, "payload").get("slice_id") == "kani"
         for name, arguments in transport.calls
     )
 
@@ -19544,7 +19644,7 @@ def test_merged_aggregate_with_conflicting_merge_coordinates_stays_parked(
         evidence={**current.post_merge.evidence, "head_sha": "unrelated-head"},
     )
     root_store.checkpoint(
-        state.recursive_fsm or state.fsm,
+        _required_fsm_input(state.recursive_fsm, state.fsm),
         {**state.slices, "architecture": replace(current, post_merge=bad_receipt)},
         state.budgets,
         state.events.last_consumed_offset,
@@ -19554,7 +19654,7 @@ def test_merged_aggregate_with_conflicting_merge_coordinates_stays_parked(
     )
 
     class IdentityTransport(RecordingTransport):
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(self, role: str, name: str, tool_name: str, arguments: JsonObject) -> JsonObject:
             if tool_name == "repository_identity":
                 self.calls.append((tool_name, arguments))
                 return {
@@ -19615,7 +19715,7 @@ def test_verified_aggregate_merge_preserves_rejected_manual_gate(
     root_store.set_gate("unrelated-human-gate", GateStatus.PENDING)
 
     class IdentityTransport(RecordingTransport):
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(self, role: str, name: str, tool_name: str, arguments: JsonObject) -> JsonObject:
             if tool_name == "repository_identity":
                 self.calls.append((tool_name, arguments))
                 return {
@@ -19703,6 +19803,7 @@ def test_unconfirmed_aggregate_merge_observation_stays_parked(
     state = root_store.load()
     current = state.slices["architecture"]
     candidate = state.integration.candidates["architecture"]
+    assert current.publication is not None
     if watcher_result is not None:
         watcher_result = {
             **watcher_result,
@@ -19713,7 +19814,7 @@ def test_unconfirmed_aggregate_merge_observation_stays_parked(
         }
 
     class UnconfirmedMergeTransport(RecordingTransport):
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(self, role: str, name: str, tool_name: str, arguments: JsonObject) -> JsonObject:
             if tool_name == "repository_identity":
                 self.calls.append((tool_name, arguments))
                 return {
@@ -19752,9 +19853,11 @@ def test_unconfirmed_aggregate_merge_observation_stays_parked(
     assert architecture.status is SliceStatus.PARKED
     assert architecture.park_cause is ParkCause.PUBLICATION_BLOCKED
     assert architecture.reconciliation is not None
-    assert architecture.reconciliation["aggregate_post_merge_hold"]["reason_code"] == (
-        expected_reason
+    hold = _required_mapping(
+        architecture.reconciliation.get("aggregate_post_merge_hold"),
+        "aggregate post-merge hold",
     )
+    assert hold["reason_code"] == expected_reason
     assert result.final_state.current_order == 1
     assert any(name == "watcher_pr_state" for name, _ in transport.calls)
     assert any(
@@ -19829,7 +19932,8 @@ def test_driver_does_not_merge_unrelated_head_that_matches_candidate_and_watcher
         ),
     )
     assert unrelated_publication is not None
-    watcher = {
+    empty_successors: list[JsonValue] = []
+    watcher: JsonObject = {
         "found": True,
         "pr_number": unrelated_slice.pr_number,
         "merged": False,
@@ -19848,7 +19952,7 @@ def test_driver_does_not_merge_unrelated_head_that_matches_candidate_and_watcher
             "invocation_id": unrelated_publication.invocation_id,
             "slice_id": "architecture",
             "author_agent": "architecture",
-            "succession_invocation_ids": [],
+            "succession_invocation_ids": empty_successors,
         },
     }
     transport = IntegrationTransport(snapshots=[watcher])
@@ -19919,10 +20023,14 @@ def test_recovery_boundary_is_recorded_while_quarantine_is_pending(tmp_path: Pat
         entry
         for entry in result.journal_entries
         if entry.get("operation") == "emit_controller_event"
-        and cast("dict[str, Any]", entry["arguments"]).get("event_type") == "tl.recovery_boundary"
+        and _required_object_string(
+            _required_mapping(entry.get("arguments"), "journal arguments"), "event_type"
+        )
+        == "tl.recovery_boundary"
     ]
     assert boundary, "the recovery boundary was not recorded"
-    payload = cast("dict[str, Any]", cast("dict[str, Any]", boundary[0]["arguments"])["payload"])
+    boundary_arguments = _required_mapping(boundary[0].get("arguments"), "journal arguments")
+    payload = _required_mapping(boundary_arguments.get("payload"), "recovery payload")
     assert payload["reason"] == "historical_catch_up_pending"
     assert payload["pending_quarantine"] == 1
     assert payload["cursor"] == 8
@@ -19982,7 +20090,7 @@ def test_recovery_consistency_hold_blocks_live_dispatch(tmp_path: Path) -> None:
         and gate.status is GateStatus.PENDING
         for gate in result.final_state.gates
     )
-    assert "ghost" in result.diagnostics["recovery_consistency"]
+    assert "ghost" in _required_object_string(result.diagnostics, "recovery_consistency")
     assert not any(
         name in {"spawn_leaf", "spawn_worker", "spawn_reviewer", "merge_pr"}
         for name, _ in transport.calls
@@ -20418,14 +20526,10 @@ def test_finite_startup_prefix_drains_before_dispatch_and_live_events(
     class FiniteSnapshotQueue(SyntheticQueue):
         snapshot_count = 0
 
-        def capture_snapshot(self, cursor: int) -> SimpleNamespace:
+        def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
             self.snapshot_count += 1
-            return SimpleNamespace(
-                events=(historical,) if cursor < 1 else (),
-                boundary_run_seq=1,
-                sequence_status=SequenceStatus.COMPLETE,
-                findings=(),
-                active_tail=None,
+            return LedgerSnapshot(
+                (historical,) if cursor < 1 else (), 1, SequenceStatus.COMPLETE, (), None
             )
 
         def acknowledge(self, observed: EventEnvelope) -> int:
@@ -20455,7 +20559,9 @@ def test_finite_startup_prefix_drains_before_dispatch_and_live_events(
         for index, (name, arguments) in enumerate(transport.calls)
         if name == "emit_controller_event"
         and arguments.get("event_type") == "tl.recovery_boundary"
-        and cast(dict[str, Any], arguments["payload"]).get("reason")
+        and _required_object_string(
+            _required_mapping(arguments.get("payload"), "recovery payload"), "reason"
+        )
         == "historical_catch_up_complete"
     )
     dispatch_index = next(
@@ -20505,7 +20611,7 @@ def test_production_driver_accepts_contiguous_interior_supersession_history(
     reader = LedgerReader(segments, ledger_run_id=run_id)
 
     class ReaderBackedSource:
-        def capture_snapshot(self, cursor: int):
+        def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
             return reader.capture_snapshot(cursor)
 
         def get(self, timeout: float | None = None) -> EventEnvelope:
@@ -20536,7 +20642,9 @@ def test_production_driver_accepts_contiguous_interior_supersession_history(
     assert any(
         name == "emit_controller_event"
         and arguments.get("event_type") == "tl.recovery_boundary"
-        and cast(dict[str, Any], arguments["payload"]).get("reason")
+        and _required_object_string(
+            _required_mapping(arguments.get("payload"), "recovery payload"), "reason"
+        )
         == "historical_catch_up_complete"
         for name, arguments in transport.calls
     )
@@ -20549,14 +20657,8 @@ def test_incomplete_startup_ledger_holds_before_live_dispatch(tmp_path: Path) ->
     plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
 
     class IncompleteSnapshotQueue(SyntheticQueue):
-        def capture_snapshot(self, cursor: int) -> SimpleNamespace:
-            return SimpleNamespace(
-                events=(),
-                boundary_run_seq=cursor + 2,
-                sequence_status=SequenceStatus.PARTIAL,
-                findings=(),
-                active_tail=None,
-            )
+        def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+            return LedgerSnapshot((), cursor + 2, SequenceStatus.PARTIAL, (), None)
 
     transport = RecordingTransport()
     result = run_tl_loop(
@@ -20594,6 +20696,15 @@ def test_missing_startup_snapshot_capability_holds_before_dispatch(tmp_path: Pat
             del event
             raise AssertionError("an empty source cannot acknowledge an event")
 
+        def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+            raise AssertionError(f"snapshot capability should be hidden: {cursor}")
+
+        def __getattribute__(self, name: str) -> object:
+            if name == "capture_snapshot":
+                raise AttributeError(name)
+            value: object = object.__getattribute__(self, name)
+            return value
+
     transport = RecordingTransport()
     result = run_tl_loop(
         run_id,
@@ -20617,7 +20728,7 @@ def test_unavailable_startup_snapshot_preserves_reader_error_before_dispatch(
     plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
 
     class UnavailableSnapshotQueue(SyntheticQueue):
-        def capture_snapshot(self, cursor: int) -> SimpleNamespace:
+        def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
             raise QueueError(
                 cursor=cursor,
                 sequence_status=SequenceStatus.UNKNOWN,
@@ -20644,14 +20755,8 @@ def test_startup_snapshot_queue_mismatch_holds_without_acknowledging(tmp_path: P
     observed = _canonical_event(2, "agent.spawned", "worker-a", run_id)
 
     class MismatchedQueue(SyntheticQueue):
-        def capture_snapshot(self, cursor: int) -> SimpleNamespace:
-            return SimpleNamespace(
-                events=(expected,),
-                boundary_run_seq=1,
-                sequence_status=SequenceStatus.COMPLETE,
-                findings=(),
-                active_tail=None,
-            )
+        def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+            return LedgerSnapshot((expected,), 1, SequenceStatus.COMPLETE, (), None)
 
     transport = RecordingTransport()
     source = MismatchedQueue([observed])
@@ -20669,20 +20774,16 @@ def test_startup_snapshot_queue_mismatch_holds_without_acknowledging(tmp_path: P
     assert not any(name == "spawn_worker" for name, _ in transport.calls)
 
 
-def test_startup_snapshot_drain_timeout_parks_before_dispatch(tmp_path: Path, monkeypatch) -> None:
+def test_startup_snapshot_drain_timeout_parks_before_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     run_id = "startup-snapshot-drain-timeout"
     plan = WorkPlan.from_mapping({"workers": [{"name": "worker-a", "task": "task"}]})
     historical = _canonical_event(1, "inbox.message", "worker-a", run_id)
 
     class MissingRowQueue(SyntheticQueue):
-        def capture_snapshot(self, cursor: int) -> SimpleNamespace:
-            return SimpleNamespace(
-                events=(historical,),
-                boundary_run_seq=1,
-                sequence_status=SequenceStatus.COMPLETE,
-                findings=(),
-                active_tail=None,
-            )
+        def capture_snapshot(self, cursor: int) -> LedgerSnapshot:
+            return LedgerSnapshot((historical,), 1, SequenceStatus.COMPLETE, (), None)
 
     monkeypatch.setattr(driver_module, "STARTUP_DRAIN_EMPTY_POLL_LIMIT", 1)
     transport = RecordingTransport()
@@ -20702,21 +20803,23 @@ def test_startup_snapshot_drain_timeout_parks_before_dispatch(tmp_path: Path, mo
 class _PollWorkersTransport(RecordingTransport):
     """RecordingTransport that answers heartbeat liveness polling."""
 
-    cancel_event: object | None = None
+    cancel_event: threading.Event | None = None
 
     def call_tool(
-        self, role: str, name: str, tool_name: str, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
+        self, role: str, name: str, tool_name: str, arguments: JsonObject
+    ) -> JsonObject:
         if tool_name == "poll_workers":
             self.calls.append((tool_name, arguments))
-            agents = arguments.get("agents", [])
-            rows = [
-                {"name": str(agent), "pane_alive": True}
-                for agent in agents
+            raw_agents = arguments.get("agents", [])
+            if not isinstance(raw_agents, list):
+                raise AssertionError("poll_workers agents must be a list")
+            rows: list[JsonValue] = [
+                {"name": agent, "pane_alive": True}
+                for agent in raw_agents
                 if isinstance(agent, str)
             ]
             if self.cancel_event is not None:
-                self.cancel_event.set()  # type: ignore[attr-defined]
+                self.cancel_event.set()
             return {"success": True, "result": {"workers": rows, "missing_agents": []}}
         return super().call_tool(role, name, tool_name, arguments)
 
@@ -20875,7 +20978,7 @@ def test_replay_does_not_read_work_clock_before_live_heartbeat(
             run_tl_loop(
                 run_id,
                 WorkPlan.from_mapping(plan_document),
-                cast(Any, source),
+                source,
                 EffectClient(transport),
                 config=replace(
                     _config(),
@@ -20979,10 +21082,19 @@ def test_recovery_consistency_gate_clears_when_projection_is_restored(tmp_path: 
         for gate in restored.final_state.gates
     )
     reasons = [
-        cast("dict[str, Any]", entry["arguments"])["payload"]["reason"]
+        _required_object_string(
+            _required_mapping(
+                _required_mapping(entry.get("arguments"), "journal arguments").get("payload"),
+                "recovery payload",
+            ),
+            "reason",
+        )
         for entry in restored.journal_entries
         if entry.get("operation") == "emit_controller_event"
-        and cast("dict[str, Any]", entry["arguments"]).get("event_type") == "tl.recovery_boundary"
+        and _required_object_string(
+            _required_mapping(entry.get("arguments"), "journal arguments"), "event_type"
+        )
+        == "tl.recovery_boundary"
     ]
     assert "consistency_restored" in reasons
 
@@ -21092,7 +21204,7 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
     current = state.slices[slice_id]
     assert current.branch == planned_branch
     assert current.worktree == str(planned_worktree)
-    recovery = driver_module.transition_recovery(
+    recovery = transition_recovery(
         begin_recovery(
             cause="human_decision_required",
             owner_run_id=run_id,
@@ -21172,13 +21284,13 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
         ),
     )
 
-    owner = driver_module.resolve_dormant_owner_for_slice(
+    owner = resolve_dormant_owner_for_slice(
         project,
         slice_id=slice_id,
         expected_issue_id=814,
         expected_parent_branch="main.kani",
     )
-    expected_intent = driver_module.blocked_resume_intent_id(owner)
+    expected_intent = blocked_resume_intent_id(owner)
     observed_resume_intents: list[str] = []
 
     class ResumeTransport(RecordingTransport):
@@ -21192,7 +21304,7 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
             if tool_name == "resume_blocked_leaf":
                 self.calls.append((tool_name, arguments))
                 observed_resume_intents.append(expected_intent)
-                persisted_route = dict(arguments["role_route"])
+                persisted_route = dict(_required_json_object(arguments, "role_route"))
                 # The host serializer retains optional provenance fields as
                 # explicit nulls when the accepted route has no policy.
                 persisted_route.setdefault("policy_fingerprint", None)
@@ -21313,7 +21425,7 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
         index for index, (name, _) in enumerate(transport.calls) if name == "resume_blocked_leaf"
     )
     resume_arguments = transport.calls[resume_index][1]
-    route_arguments = resume_arguments["role_route"]
+    route_arguments = _required_json_object(resume_arguments, "role_route")
     assert route_arguments["role"] == "worker"
     assert route_arguments["harness"] == "opencode/opencode-go/deepseek-v4.1-flash"
     assert route_arguments["agent_type"] == "opencode"
@@ -21321,9 +21433,9 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
     assert route_arguments["effort"] == "high"
     assert route_arguments["configuration_fingerprint"] == "sha256:v1:" + "4" * 64
     assert route_arguments["manifest_digest"] == manifest.digest
-    assert route_arguments["route_fingerprint"].startswith("sha256:v1:")
+    assert _required_json_string(route_arguments, "route_fingerprint").startswith("sha256:v1:")
     resume_entry = journal.entries_for("resume_blocked_leaf", slice_id)[0]
-    journal_arguments = resume_entry["arguments"]
+    journal_arguments = _required_mapping(resume_entry["arguments"], "resume journal arguments")
     for journal_key, response_key in (
         ("role", "role"),
         ("harness", "harness"),
@@ -21606,7 +21718,7 @@ def _seed_terminal_provider_failure_leaf(
                 ),
             ),
             scope_path=(manifest.scope_id,),
-            plan_digest=manifest.digest,
+            plan_digest=_required_manifest_digest(planned_state),
         ),
         planned_state.slices,
         planned_state.budgets,
@@ -21615,7 +21727,7 @@ def _seed_terminal_provider_failure_leaf(
     )
     pre_recovery_state = store.load()
     current = pre_recovery_state.slices[slice_id]
-    recovery = driver_module.transition_recovery(
+    recovery = transition_recovery(
         begin_recovery(
             cause="human_decision_required",
             owner_run_id=run_id,
@@ -21665,7 +21777,7 @@ def _seed_terminal_provider_failure_leaf(
         current_order=0,
         pending_by_order={},
         scope_path=(manifest.scope_id,),
-        plan_digest=manifest.digest,
+        plan_digest=_required_manifest_digest(pre_recovery_state),
         parallel_pending=(
             ChildRecord(
                 slice_id,
@@ -21704,7 +21816,7 @@ def _seed_terminal_provider_failure_leaf(
     launch_journal = EffectJournal(run_id, store.run_dir / "action-journal.json")
     launch_journal.append(accepted_launch)
     if legacy_spawn_result:
-        spawn_result: dict[str, object] = {
+        spawn_result: JsonObject = {
             "agent_type": prior_runtime,
             "branch_name": branch,
             "worktree_path": str(owner_worktree),
@@ -21906,8 +22018,9 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
             reference_requirements=(reference_requirement,),
         )
     )
+    assert config.worktree is not None
     reference_commit = subprocess.run(
-        ["git", "-C", str(config.worktree / reference_requirement.path), "rev-parse", "HEAD"],
+        ["git", "-C", str(Path(config.worktree) / reference_requirement.path), "rev-parse", "HEAD"],
         check=True,
         capture_output=True,
         text=True,
@@ -21921,8 +22034,8 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
     legacy_proof_gate_name = f"tl-blocked-leaf-resume-proof-{plan.leaves[0].name}"
     store.set_gate(legacy_proof_gate_name, GateStatus.PENDING)
     store.answer_gate(legacy_proof_gate_name, GateStatus.REJECTED)
-    owner = driver_module.resolve_dormant_owner_for_slice(
-        config.project_root,
+    owner = resolve_dormant_owner_for_slice(
+        _required_project_root(config),
         slice_id=plan.leaves[0].name,
         expected_issue_id=814,
         expected_parent_branch=config.branch,
@@ -21937,20 +22050,25 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
         plan, store.load(), config, store
     )
     assert terminal_proof is not None and proof_reason is None
-    resume_identity = driver_module.blocked_resume_intent_id(owner)
+    accepted_terminal_proof = terminal_proof
+    resume_identity = blocked_resume_intent_id(owner)
     original_invocation = json.loads((owner_dir / "invocation.json").read_text(encoding="utf-8"))
     original_ledger = (
-        Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
+        _required_project_root(config) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
     ).read_bytes()
 
     class TerminalResumeTransport(RecordingTransport):
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(self, role: str, name: str, tool_name: str, arguments: JsonObject) -> JsonObject:
             if tool_name != "resume_blocked_leaf":
                 return super().call_tool(role, name, tool_name, arguments)
             self.calls.append((tool_name, arguments))
             identity_path = owner_dir / "identity.json"
             identity = json.loads(identity_path.read_text(encoding="utf-8"))
-            route_receipt = driver_module._blocked_resume_role_route_response(terminal_proof.resume)
+            route_receipt_value = driver_module._blocked_resume_role_route_response(
+                accepted_terminal_proof.resume
+            )
+            assert route_receipt_value is not None
+            route_receipt = _required_json_value_object(route_receipt_value, "role route receipt")
             identity.update(
                 {
                     "agent_type": "codex",
@@ -22056,23 +22174,26 @@ def test_startup_recovery_replaces_confirmed_terminal_provider_failure(
     journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
     retained_launch = journal.entries_for("spawn_leaf", plan.leaves[0].name)
     assert len(retained_launch) == 1 and retained_launch[0]["status"] == "confirmed"
-    assert retained_launch[0]["result"]["result"]["invocation_id"] == prior_invocation_id
+    launch_response = _required_mapping(retained_launch[0]["result"], "launch response")
+    launch_payload = _required_mapping(launch_response.get("result"), "launch payload")
+    assert launch_payload["invocation_id"] == prior_invocation_id
     migration = journal.entries_for("resume_blocked_leaf", plan.leaves[0].name)
     assert len(migration) == 1 and migration[0]["status"] == "confirmed"
-    assert migration[0]["arguments"]["prior_dispatch_invocation_id"] == prior_invocation_id
+    migration_arguments = _required_mapping(migration[0]["arguments"], "resume arguments")
+    assert migration_arguments["prior_dispatch_invocation_id"] == prior_invocation_id
     assert (
-        migration[0]["arguments"]["route_reconciliation_source"]
+        migration_arguments["route_reconciliation_source"]
         == "proven_terminal_provider_failure"
     )
     assert (
-        migration[0]["arguments"]["route_authorization_source"]
+        migration_arguments["route_authorization_source"]
         == "accepted_operator_role_configuration"
     )
-    assert migration[0]["arguments"]["terminal_invocation_digest"] == (
+    assert migration_arguments["terminal_invocation_digest"] == (
         driver_module._terminal_invocation_digest(original_invocation)
     )
     assert (
-        Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
+        _required_project_root(config) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
     ).read_bytes() == original_ledger
 
     repeated_transport = RecordingTransport()
@@ -22108,7 +22229,7 @@ def test_terminal_recovery_accepts_supported_producer_runtime_spelling(
         prior_model=prior_model,
     )
     ledger_path = (
-        Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
+        _required_project_root(config) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
     )
     events = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()]
     spawn_event = next(event for event in events if event.get("type") == "agent.spawned")
@@ -22133,7 +22254,7 @@ def test_terminal_recovery_rejects_unknown_or_conflicting_producer_runtime(
 ) -> None:
     plan, config, store, _, _, _ = _seed_terminal_provider_failure_leaf(tmp_path)
     ledger_path = (
-        Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
+        _required_project_root(config) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
     )
     events = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()]
     spawn_event = next(event for event in events if event.get("type") == "agent.spawned")
@@ -22160,6 +22281,7 @@ def test_terminal_recovery_reconciles_confirmed_wrong_route_successor_before_cur
     state = driver_module._persist_terminal_route_authorization(initial, store.load(), store)
     initial, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
     assert initial is not None, reason
+    accepted_initial = initial
 
     # This is the retained legacy action: the controller requested Luna xhigh,
     # while the host selected Sol xhigh and confirmed that actual invocation.
@@ -22254,11 +22376,13 @@ def test_terminal_recovery_reconciles_confirmed_wrong_route_successor_before_cur
     cancel_event = threading.Event()
 
     class CurrentRouteTransport(RecordingTransport):
-        def call_tool(self, role, name, tool_name, call_arguments):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, call_arguments: JsonObject
+        ) -> JsonObject:
             if tool_name != "resume_blocked_leaf":
                 return super().call_tool(role, name, tool_name, call_arguments)
             self.calls.append((tool_name, call_arguments))
-            route = call_arguments["role_route"]
+            route = _required_json_object(call_arguments, "role_route")
             assert route["harness"] == "codex/gpt-6-luna"
             assert route["model"] == "gpt-6-luna"
             assert route["effort"] == "xhigh"
@@ -22282,8 +22406,8 @@ def test_terminal_recovery_reconciles_confirmed_wrong_route_successor_before_cur
                         "model": "gpt-6-luna",
                         "effort": "xhigh",
                         "trigger": "resume_blocked",
-                        "branch": initial.resume.owner.branch,
-                        "worktree": str(initial.resume.owner.worktree),
+                        "branch": accepted_initial.resume.owner.branch,
+                        "worktree": str(accepted_initial.resume.owner.worktree),
                         "slice_id": plan.leaves[0].name,
                         "prior_invocation_id": successor_id,
                         "pr_number": None,
@@ -22316,8 +22440,8 @@ def test_terminal_recovery_reconciles_confirmed_wrong_route_successor_before_cur
                         "issue": plan.leaves[0].name,
                         "intent_id": route["dispatch_intent_id"],
                         "agent_type": "codex",
-                        "branch_name": initial.resume.owner.branch,
-                        "worktree_path": str(initial.resume.owner.worktree),
+                        "branch_name": accepted_initial.resume.owner.branch,
+                        "worktree_path": str(accepted_initial.resume.owner.worktree),
                         "role_route": route,
                     },
                     "invocation": {
@@ -22357,12 +22481,15 @@ def test_terminal_recovery_reconciles_confirmed_wrong_route_successor_before_cur
     journal_entries = journal.entries_for("resume_blocked_leaf", plan.leaves[0].name)
     assert len(journal_entries) == 2
     assert journal_entries[0] == original_entry
-    assert journal_entries[0]["result"] == original_result
+    assert _required_json_value(journal_entries[0]["result"]) == original_result
     assert journal_entries[1]["status"] == "confirmed"
-    assert journal_entries[1]["arguments"]["expected_invocation_id"] == successor_id
-    assert journal_entries[1]["arguments"]["prior_generation"] == 2
-    assert journal_entries[1]["arguments"]["desired_model"] == "gpt-6-luna"
-    assert journal_entries[1]["arguments"]["desired_effort"] == "xhigh"
+    successor_arguments = _required_mapping(
+        journal_entries[1]["arguments"], "successor resume arguments"
+    )
+    assert successor_arguments["expected_invocation_id"] == successor_id
+    assert successor_arguments["prior_generation"] == 2
+    assert successor_arguments["desired_model"] == "gpt-6-luna"
+    assert successor_arguments["desired_effort"] == "xhigh"
 
     repeat_transport = RecordingTransport()
     repeat = driver_module._resume_terminal_owner_failure(
@@ -22385,7 +22512,7 @@ def test_terminal_resume_history_accepts_multiple_stopped_successors_and_route_r
         tmp_path
     )
     ledger_path = (
-        Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
+        _required_project_root(config) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
     )
     ledger_rows = [
         json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()
@@ -22444,7 +22571,7 @@ def test_terminal_resume_history_accepts_multiple_stopped_successors_and_route_r
         )
 
     def record_terminal_resume(
-        current_proof,
+        current_proof: _TerminalOwnerRecoveryProof,
         invocation_id: str,
         generation: int,
         predecessor_id: str,
@@ -22468,7 +22595,7 @@ def test_terminal_resume_history_accepts_multiple_stopped_successors_and_route_r
         intent = EffectIntent("resume_blocked_leaf", plan.leaves[0].name, arguments, True)
         journal.append(intent)
         response_route = None if legacy else route
-        result_document: dict[str, object] = {
+        result_document: JsonObject = {
             "success": True,
             "result": {
                 "chainlink_issue_id": 814,
@@ -22494,8 +22621,13 @@ def test_terminal_resume_history_accepts_multiple_stopped_successors_and_route_r
             },
         }
         if response_route is not None:
-            result_document["result"]["agent"]["role_route"] = response_route
-            result_document["result"]["invocation"]["role_route"] = response_route
+            result_payload = _required_json_object(result_document, "result")
+            _required_json_object(result_payload, "agent")["role_route"] = (
+                _required_json_value_object(response_route, "agent route receipt")
+            )
+            _required_json_object(result_payload, "invocation")["role_route"] = (
+                _required_json_value_object(response_route, "invocation route receipt")
+            )
         journal.mark_result(intent, ToolResult.from_raw(result_document))
         identity.update(
             {
@@ -22633,57 +22765,64 @@ def test_terminal_resume_history_accepts_multiple_stopped_successors_and_route_r
     assert entries[2]["arguments"] == third_args
     assert entries[3]["arguments"] == fourth_args
     assert all(entry["status"] == "confirmed" for entry in entries)
-    assert [entries[index]["arguments"]["expected_invocation_id"] for index in range(4)] == [
+    recorded_arguments = [
+        _required_mapping(entry["arguments"], "resume journal arguments") for entry in entries
+    ]
+    assert [recorded_arguments[index]["expected_invocation_id"] for index in range(4)] == [
         original_id,
         "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d",
         "e861f870-65f7-47cb-b75b-0a26dbbde0b7",
         "terminal-route-b-successor",
     ]
-    assert [entries[index]["arguments"]["prior_generation"] for index in range(4)] == [
+    assert [recorded_arguments[index]["prior_generation"] for index in range(4)] == [
         1,
         2,
         3,
         4,
     ]
-    assert [entries[index]["arguments"]["desired_model"] for index in range(4)] == [
+    assert [recorded_arguments[index]["desired_model"] for index in range(4)] == [
         "gpt-6-luna",
         "gpt-6-luna",
         "opencode-go/deepseek-v4.1-flash",
         "gpt-6-luna",
     ]
-    assert [entries[index]["arguments"]["desired_effort"] for index in range(4)] == [
+    assert [recorded_arguments[index]["desired_effort"] for index in range(4)] == [
         "xhigh",
         "xhigh",
         "high",
         "xhigh",
     ]
-    assert entries[0]["arguments"].get("route_fingerprint") is None
+    assert recorded_arguments[0].get("route_fingerprint") is None
     assert (
-        entries[1]["arguments"]["route_configuration_fingerprint"]
+        recorded_arguments[1]["route_configuration_fingerprint"]
         == route_a.role_route_configuration_fingerprint
     )
     assert (
-        entries[2]["arguments"]["route_configuration_fingerprint"]
+        recorded_arguments[2]["route_configuration_fingerprint"]
         == config_b.role_route_configuration_fingerprint
     )
     assert (
-        entries[3]["arguments"]["route_configuration_fingerprint"]
+        recorded_arguments[3]["route_configuration_fingerprint"]
         == route_a.role_route_configuration_fingerprint
     )
-    authorization_history = (
-        store.load()
-        .slices[plan.leaves[0].name]
-        .recovery.evidence["configured_route_authorization_history"]
-    )
+    history_recovery = store.load().slices[plan.leaves[0].name].recovery
+    assert history_recovery is not None
+    history_value = history_recovery.evidence.get("configured_route_authorization_history")
+    if not isinstance(history_value, list):
+        raise AssertionError("route authorization history is not a list")
+    authorization_history = [
+        _required_mapping(item, "route authorization history entry") for item in history_value
+    ]
     assert len(authorization_history) >= 2
     assert authorization_history[-1]["agent_type"] == "opencode"
     assert authorization_history[-1]["model"] == "opencode-go/deepseek-v4.1-flash"
-    assert (
-        store.load()
-        .slices[plan.leaves[0].name]
-        .recovery.evidence["configured_route_authorization"]["model"]
-        == "gpt-6-luna"
+    current_recovery = store.load().slices[plan.leaves[0].name].recovery
+    assert current_recovery is not None
+    current_authorization = _required_mapping(
+        current_recovery.evidence.get("configured_route_authorization"),
+        "configured route authorization",
     )
+    assert current_authorization["model"] == "gpt-6-luna"
 
 
 def _seed_modern_confirmed_terminal_resume(
@@ -22705,8 +22844,9 @@ def _seed_modern_confirmed_terminal_resume(
     initial, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
     assert initial is not None, reason
     arguments = dict(driver_module._blocked_leaf_resume_action_arguments(initial.resume, state))
-    route = driver_module._blocked_resume_role_route_response(initial.resume)
-    assert route is not None and arguments.get("route_fingerprint")
+    route_value = driver_module._blocked_resume_role_route_response(initial.resume)
+    assert route_value is not None and arguments.get("route_fingerprint")
+    route = _required_json_value_object(route_value, "route response")
     invocation_id = "modern-terminal-resume-generation-two"
     if conflict == "action_route":
         arguments["effort"] = "medium"
@@ -22714,8 +22854,8 @@ def _seed_modern_confirmed_terminal_resume(
     intent = EffectIntent("resume_blocked_leaf", plan.leaves[0].name, arguments, True)
     journal.append(intent)
 
-    def receipt(name: str) -> dict[str, object]:
-        value = json.loads(json.dumps(route))
+    def receipt(name: str) -> JsonObject:
+        value = _required_json_value_object(json.loads(json.dumps(route)), "route receipt")
         if conflict == name:
             value["effort"] = "medium"
         return value
@@ -22731,7 +22871,7 @@ def _seed_modern_confirmed_terminal_resume(
     if missing == "both_response":
         agent_receipt = None
         invocation_receipt = None
-    result_agent: dict[str, object] = {
+    result_agent: JsonObject = {
         "id": owner_name,
         "issue": plan.leaves[0].name,
         "intent_id": initial.resume.intent_id,
@@ -22739,7 +22879,7 @@ def _seed_modern_confirmed_terminal_resume(
         "branch_name": initial.resume.owner.branch,
         "worktree_path": str(initial.resume.owner.worktree),
     }
-    result_invocation: dict[str, object] = {
+    result_invocation: JsonObject = {
         "invocation_id": invocation_id,
         "generation": 2,
         "trigger": "resume_blocked",
@@ -22875,7 +23015,8 @@ def test_legacy_terminal_resume_corroborates_omitted_initial_spawn_effort(
     spawn = EffectJournal(store.run_id, store.run_dir / "action-journal.json").entries_for(
         "spawn_leaf", plan.leaves[0].name
     )[0]
-    assert "effort" not in spawn["arguments"]
+    spawn_arguments = _required_mapping(spawn["arguments"], "spawn arguments")
+    assert "effort" not in spawn_arguments
 
 
 @pytest.mark.parametrize(
@@ -22900,7 +23041,9 @@ def test_legacy_terminal_resume_rejects_explicit_conflicting_spawn_effort(
     saved_spawn = EffectJournal(store.run_id, journal_path).entries_for(
         "spawn_leaf", plan.leaves[0].name
     )[0]
-    assert saved_spawn["arguments"]["effort"] == spawn["arguments"]["effort"]
+    spawn_arguments = _required_mapping(spawn["arguments"], "spawn arguments")
+    saved_spawn_arguments = _required_mapping(saved_spawn["arguments"], "saved spawn arguments")
+    assert saved_spawn_arguments["effort"] == spawn_arguments["effort"]
 
     proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
 
@@ -22920,7 +23063,8 @@ def test_terminal_owner_resume_requires_current_reference_evidence(
             reference_requirements=(requirement,),
         )
     )
-    reference = config.worktree / requirement.path
+    assert config.worktree is not None
+    reference = Path(config.worktree) / requirement.path
     commit = subprocess.run(
         ["git", "-C", str(reference), "rev-parse", "HEAD"],
         check=True,
@@ -23037,18 +23181,29 @@ def test_terminal_owner_rejection_after_route_authorization_blocks_resume(
     assert (
         next(gate for gate in result.gates if gate.name == gate_name).status is GateStatus.REJECTED
     )
-    assert result.slices[plan.leaves[0].name].recovery.evidence.get("terminal_owner_recovery_hold")
-    prior_authorization = result.slices[plan.leaves[0].name].recovery.evidence[
-        "configured_route_authorization"
-    ]
+    rejected_recovery = result.slices[plan.leaves[0].name].recovery
+    assert rejected_recovery is not None
+    assert rejected_recovery.evidence.get("terminal_owner_recovery_hold")
+    prior_authorization = _required_mapping(
+        rejected_recovery.evidence.get("configured_route_authorization"),
+        "configured route authorization",
+    )
     approved = store.answer_gate(gate_name, GateStatus.APPROVED)
     fresh_proof, reason = driver_module._terminal_owner_recovery_proof(
         plan, approved, config, store
     )
     assert fresh_proof is not None and reason is None
-    assert fresh_proof.route_authorization["recovery_gate_authorization"]["status"] == "approved"
+    gate_authorization = _required_mapping(
+        fresh_proof.route_authorization.get("recovery_gate_authorization"),
+        "recovery gate authorization",
+    )
+    assert _required_object_string(gate_authorization, "status") == "approved"
     authorized = driver_module._persist_terminal_route_authorization(fresh_proof, approved, store)
-    recovery_evidence = authorized.slices[plan.leaves[0].name].recovery.evidence
+    authorized_recovery = authorized.slices[plan.leaves[0].name].recovery
+    assert authorized_recovery is not None
+    recovery_evidence = _required_mapping(
+        authorized_recovery.evidence, "authorized recovery evidence"
+    )
     assert recovery_evidence["configured_route_authorization_history"] == [prior_authorization]
     assert recovery_evidence["configured_route_authorization"] == fresh_proof.route_authorization
 
@@ -23063,9 +23218,12 @@ def test_terminal_owner_configuration_change_invalidates_saved_route_authorizati
     proof, reason = driver_module._terminal_owner_recovery_proof(plan, store.load(), config, store)
     assert proof is not None and reason is None
     authorized = driver_module._persist_terminal_route_authorization(proof, store.load(), store)
-    saved_authorization = authorized.slices[leaf.name].recovery.evidence[
-        "configured_route_authorization"
-    ]
+    saved_recovery = authorized.slices[leaf.name].recovery
+    assert saved_recovery is not None
+    saved_authorization = _required_mapping(
+        saved_recovery.evidence.get("configured_route_authorization"),
+        "configured route authorization",
+    )
     changed_config = replace(
         config,
         role_route_configuration_fingerprint="sha256:v1:" + "9" * 64,
@@ -23085,9 +23243,11 @@ def test_terminal_owner_configuration_change_invalidates_saved_route_authorizati
     assert not EffectJournal(store.run_id, store.run_dir / "action-journal.json").entries_for(
         "resume_blocked_leaf", leaf.name
     )
-    persisted = held.slices[leaf.name].recovery.evidence
+    held_recovery = held.slices[leaf.name].recovery
+    assert held_recovery is not None
+    persisted = held_recovery.evidence
     assert persisted["configured_route_authorization"] == saved_authorization
-    assert persisted["terminal_owner_recovery_hold"].startswith(
+    assert _required_object_string(persisted, "terminal_owner_recovery_hold").startswith(
         "persisted terminal-owner route authorization conflicts with current configuration"
     )
 
@@ -23119,8 +23279,14 @@ def test_terminal_owner_resume_holds_without_accepted_configuration_fingerprint(
     assert not EffectJournal(store.run_id, store.run_dir / "action-journal.json").entries_for(
         "resume_blocked_leaf", plan.leaves[0].name
     )
+    held_recovery = held.slices[plan.leaves[0].name].recovery
+    assert held_recovery is not None
     assert (
-        held.slices[plan.leaves[0].name].recovery.evidence["terminal_owner_recovery_hold"] == reason
+        _required_object_string(
+            held_recovery.evidence,
+            "terminal_owner_recovery_hold",
+        )
+        == reason
     )
 
 

@@ -1,21 +1,15 @@
 {
   "errors": {
     "tl_loop/tests/test_driver.py": {
-      "arg-type": 116,
-      "assignment": 1,
-      "attr-defined": 49,
-      "call-overload": 17,
-      "dict-item": 5,
-      "index": 91,
-      "list-item": 1,
-      "no-any-return": 1,
-      "no-untyped-call": 1,
-      "no-untyped-def": 44,
-      "operator": 15,
-      "override": 5,
-      "type-var": 3,
-      "union-attr": 76,
-      "var-annotated": 1
+      "arg-type": 78,
+      "attr-defined": 27,
+      "call-overload": 6,
+      "dict-item": 2,
+      "index": 47,
+      "no-untyped-def": 21,
+      "operator": 9,
+      "type-var": 1,
+      "union-attr": 21
     }
   },
   "mypy_version": "2.3.0",
