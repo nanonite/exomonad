@@ -1,6 +1,13 @@
 {
   "version": 1,
-  "locks": {},
+  "locks": {
+    "1339": {
+      "agent_id": "codex",
+      "branch": "chainlink/1339",
+      "claimed_at": "2026-11-12T02:36:06.807879173Z",
+      "signed_by": "codex"
+    }
+  },
   "settings": {
     "stale_lock_timeout_minutes": 60
   }
