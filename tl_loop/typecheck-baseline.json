@@ -1,17 +1,5 @@
 {
-  "errors": {
-    "tl_loop/tests/test_driver.py": {
-      "arg-type": 78,
-      "attr-defined": 27,
-      "call-overload": 6,
-      "dict-item": 2,
-      "index": 47,
-      "no-untyped-def": 21,
-      "operator": 9,
-      "type-var": 1,
-      "union-attr": 21
-    }
-  },
+  "errors": {},
   "mypy_version": "2.3.0",
   "schema_version": 2
 }

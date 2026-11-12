@@ -47,9 +47,13 @@ from tl_loop.fsm.scope import TLParked as RecursiveTLParked
 from tl_loop.loop.abandon import abandon_slice
 from tl_loop.loop.blocked_leaf_resume import (
     BlockedLeafOwner,
+    BlockedLeafRouteProvenanceError,
     blocked_resume_intent_id,
     resolve_dormant_owner_for_slice,
 )
+from tl_loop.loop.heartbeat import HeartbeatConfig, heartbeat_once
+from tl_loop.loop.nested_recovery import verified_nested_recovery_wait
+from tl_loop.loop.work_clock import ActiveWorkClock
 from tl_loop.loop.convergence import ConvergenceInvariantError, ConvergenceTracker
 from tl_loop.loop.pr_number import require_pr_number
 from tl_loop.loop.review import verify_integration
@@ -134,6 +138,7 @@ from tl_loop.loop.reconcile import (
     watcher_presents_publication,
 )
 from tl_loop.loop.shadow import TLEventDecoder, _update_slices
+from tl_loop.loop.shadow import _phase_from_state
 from tl_loop.ordered import (
     ChildRecoverySummary,
     IntegrationContract,
@@ -146,6 +151,8 @@ from tl_loop.select.classify import Difficulty
 from tl_loop.select.model import ModelCatalog
 from tl_loop.select.policy import validate_policy
 from tl_loop.state.plan_manifest import ManifestNode, PlanManifest, build_plan_manifest
+from tl_loop.state.schema import OrderedStageState
+from tl_loop.state.store import CheckpointConflict
 from tl_loop.state.plan_reconciliation import analyze_plan_reconciliation
 from tl_loop.state.plan_reconciliation_apply import apply_plan_reconciliation
 from tl_loop.state.plan_revision_apply import apply_plan_revision
@@ -23304,6 +23311,9 @@ def test_terminal_owner_retries_exact_legacy_route_refusal_after_fresh_gate_appr
     assert terminal is not None and reason is None
 
     legacy_config = replace(config, role_route_configuration_fingerprint=None)
+    assert terminal.resume.desired_harness is not None
+    assert terminal.resume.desired_agent_type is not None
+    assert terminal.resume.desired_effort is not None
     legacy_route = driver_module._dispatch_route_fields(
         legacy_config,
         state,
@@ -23312,17 +23322,18 @@ def test_terminal_owner_retries_exact_legacy_route_refusal_after_fresh_gate_appr
         model=terminal.resume.desired_model,
         choice=None,
     )
+    manifest_digest = _required_manifest_digest(state)
     legacy_digest = driver_module._terminal_route_authorization_digest(
         legacy_config,
-        cast(str, terminal.resume.desired_harness),
-        cast(str, terminal.resume.desired_agent_type),
+        terminal.resume.desired_harness,
+        terminal.resume.desired_agent_type,
         terminal.resume.desired_model,
-        cast(str, terminal.resume.desired_effort),
-        cast(str, terminal.route_authorization["prior_runtime"]),
+        terminal.resume.desired_effort,
+        _required_object_string(terminal.route_authorization, "prior_runtime"),
         terminal.route_authorization["prior_model"],
         terminal.route_authorization["prior_effort"],
         None,
-        cast(str, state.plan_manifest.digest),
+        manifest_digest,
     )
     legacy_authorization = dict(terminal.route_authorization)
     legacy_authorization.pop("configuration_fingerprint")
@@ -23377,7 +23388,9 @@ def test_terminal_owner_retries_exact_legacy_route_refusal_after_fresh_gate_appr
         journal,
     )
     assert not any(tool == "resume_blocked_leaf" for tool, _ in refused_transport.calls)
-    assert held.slices[leaf.name].recovery.evidence["terminal_owner_recovery_gate_rejection"]
+    held_recovery = held.slices[leaf.name].recovery
+    assert held_recovery is not None
+    assert held_recovery.evidence["terminal_owner_recovery_gate_rejection"]
     assert journal.entries_for("resume_blocked_leaf", leaf.name) == (original_refusal,)
 
     approved = store.answer_gate(gate_name, GateStatus.APPROVED)
@@ -23396,11 +23409,13 @@ def test_terminal_owner_retries_exact_legacy_route_refusal_after_fresh_gate_appr
     successor_id = "terminal-route-refusal-successor"
 
     class AcceptedRouteResumeTransport(RecordingTransport):
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
             if tool_name != "resume_blocked_leaf":
                 return super().call_tool(role, name, tool_name, arguments)
             self.calls.append((tool_name, arguments))
-            route_receipt = cast(dict[str, object], arguments["role_route"])
+            route_receipt = _required_json_value_object(arguments["role_route"], "role_route")
             identity_path = owner_dir / "identity.json"
             identity = json.loads(identity_path.read_text(encoding="utf-8"))
             identity.update(
@@ -23408,7 +23423,7 @@ def test_terminal_owner_retries_exact_legacy_route_refusal_after_fresh_gate_appr
                     "agent_type": "codex",
                     "model": "gpt-6-luna",
                     "effort": "xhigh",
-                    "role_route": route_receipt,
+                    "role_route": _required_json_value_object(route_receipt, "role_route"),
                 }
             )
             identity_path.write_text(json.dumps(identity), encoding="utf-8")
@@ -23481,13 +23496,30 @@ def test_terminal_owner_retries_exact_legacy_route_refusal_after_fresh_gate_appr
     assert len(entries) == 2 and entries[0] == original_refusal
     assert entries[0]["status"] == "rejected"
     assert entries[1]["status"] == "confirmed"
-    assert entries[1]["arguments"]["route_configuration_fingerprint"] == (
+    successor_arguments = _required_mapping(entries[1]["arguments"], "arguments")
+    successor_result = _required_mapping(entries[1]["result"], "result")
+    successor_result_data = _required_mapping(successor_result["result"], "result.result")
+    successor_agent = _required_mapping(successor_result_data["agent"], "result.result.agent")
+    assert successor_arguments["route_configuration_fingerprint"] == (
         config.role_route_configuration_fingerprint
     )
     assert (
         json.loads((owner_dir / "identity.json").read_text())["role_route"]
-        == (entries[1]["result"]["result"]["agent"]["role_route"])
+        == successor_agent["role_route"]
     )
+
+
+def _required_manifest_digest_value(manifest: PlanManifest) -> str:
+    digest = manifest.digest
+    if digest is None:
+        raise ValueError("plan manifest is missing its digest")
+    return digest
+
+
+def _required_work_plan(value: WorkPlan | Mapping[str, object]) -> WorkPlan:
+    if not isinstance(value, WorkPlan):
+        raise TypeError("nested recovery fixture requires a WorkPlan")
+    return value
 
 
 def test_terminal_owner_rejection_at_dispatch_boundary_prevents_resume_call(
@@ -23500,7 +23532,9 @@ def test_terminal_owner_rejection_at_dispatch_boundary_prevents_resume_call(
     store.set_gate(gate_name, GateStatus.PENDING)
 
     class RejectBeforeResume(RecordingTransport):
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
             if (
                 tool_name == "emit_controller_event"
                 and arguments.get("event_type") == "tl.spawn_requested"
@@ -23518,7 +23552,9 @@ def test_terminal_owner_rejection_at_dispatch_boundary_prevents_resume_call(
     assert (
         next(gate for gate in result.gates if gate.name == gate_name).status is GateStatus.REJECTED
     )
-    assert result.slices[plan.leaves[0].name].recovery.evidence.get(
+    result_recovery = result.slices[plan.leaves[0].name].recovery
+    assert result_recovery is not None
+    assert result_recovery.evidence.get(
         "terminal_owner_recovery_gate_rejection"
     )
     approval = store.answer_gate(gate_name, GateStatus.APPROVED)
@@ -23527,6 +23563,7 @@ def test_terminal_owner_rejection_at_dispatch_boundary_prevents_resume_call(
     )
     assert fresh_proof is not None and reason is None
     assert fresh_proof.resume.action_arguments is None
+    assert fresh_proof.resume.recovery_gate_authorization is not None
     assert fresh_proof.resume.recovery_gate_authorization["status"] == "approved"
 
 
@@ -23644,7 +23681,7 @@ def test_terminal_provider_recovery_authorizes_effort_only_route_change(
                     "agent_type": "codex",
                     "branch_name": proof.resume.owner.branch,
                     "worktree_path": str(proof.resume.owner.worktree),
-                    "role_route": route_receipt,
+                    "role_route": _required_json_value_object(route_receipt, "role_route"),
                 },
                 "invocation": {
                     "invocation_id": "effort-only-successor",
@@ -23653,7 +23690,7 @@ def test_terminal_provider_recovery_authorizes_effort_only_route_change(
                     "ready": True,
                     "fresh": True,
                     "outcome": "started",
-                    "role_route": route_receipt,
+                    "role_route": _required_json_value_object(route_receipt, "role_route"),
                 },
             },
         }
@@ -23677,7 +23714,7 @@ def test_terminal_provider_recovery_authorizes_effort_only_route_change(
             "different-dispatch-intent"
         )
         with pytest.raises(
-            driver_module.BlockedLeafRouteProvenanceError,
+            BlockedLeafRouteProvenanceError,
             match="response role-route provenance",
         ):
             driver_module._validated_blocked_resume_result(
@@ -23713,7 +23750,7 @@ def test_parent_schedules_terminal_provider_failure_before_human_gate_projection
         )
     )
     parent_root = Path(child_config.root_dir).parent
-    project = Path(child_config.project_root)
+    project = _required_project_root(child_config)
     parent_config = replace(
         child_config,
         run_id="root",
@@ -23764,7 +23801,7 @@ def test_parent_schedules_terminal_provider_failure_before_human_gate_projection
         current_order=2,
         pending_by_order={2: (ChildRecord("substitution-model-kani-stage", ChildKind.SUB_TL),)},
         scope_path=(manifest.scope_id,),
-        plan_digest=manifest.digest,
+        plan_digest=_required_manifest_digest(initial),
     )
     parent_store.checkpoint(
         running,
@@ -23787,7 +23824,9 @@ def test_parent_schedules_terminal_provider_failure_before_human_gate_projection
     )
     calls: list[tuple[str, str | None, str | None]] = []
 
-    def run_child(spec: Mapping[str, object], config: TLLoopConfig, budgets: BudgetLedger):
+    def run_child(
+        spec: Mapping[str, object], config: TLLoopConfig, budgets: BudgetLedger
+    ) -> object:
         del budgets
         calls.append(
             (
@@ -23839,7 +23878,7 @@ def test_continue_reconciles_historical_parent_stall_before_nested_recovery(
             controller_invocation_id="37defeed-df70-42d3-b51d-0b63d4a4ef1e",
         )
     )
-    project = Path(child_config.project_root)
+    project = _required_project_root(child_config)
     root_dir = Path(child_config.root_dir).parent
     architecture_name = "substitution-model-architecture-stage"
     kani_name = child_store.run_id
@@ -23884,7 +23923,7 @@ def test_continue_reconciles_historical_parent_stall_before_nested_recovery(
         {
             "owner_branch": "main",
             "owner_worktree": str(project),
-            "repository_identity": root_config.repository_identity.to_document(),
+            "repository_identity": _required_repository_identity(root_config).to_document(),
             "plan_manifest": manifest.to_document(),
             "slices": root_slices,
         },
@@ -23892,7 +23931,7 @@ def test_continue_reconciles_historical_parent_stall_before_nested_recovery(
     )
     root_store.set_plan_manifest(manifest)
     stages = tuple(
-        driver_module.OrderedStageState(stage.order, stage.sub_tls) for stage in plan.ordered_stages
+        OrderedStageState(stage.order, stage.sub_tls) for stage in plan.ordered_stages
     )
     initial = root_store.set_ordered_state(2, stages, root_store.load().integration)
     kani_node = next(node for node in manifest.nodes if node.name == kani_name)
@@ -23956,7 +23995,7 @@ def test_continue_reconciles_historical_parent_stall_before_nested_recovery(
             )
         },
         scope_path=(manifest.scope_id,),
-        plan_digest=manifest.digest,
+        plan_digest=_required_manifest_digest(initial),
     )
     saved_phase = (
         phase
@@ -23993,11 +24032,13 @@ def test_continue_reconciles_historical_parent_stall_before_nested_recovery(
         assert driver_module._continued_failed_root_reason(root_store.load(), root_config)
     assert (
         manifest.child_manifests[kani_node.node_id].digest
-        == child_store.load().plan_manifest.digest
+        == _required_manifest_digest(child_store.load())
     )
     calls: list[str] = []
 
-    def resume_child(spec: Mapping[str, object], config: TLLoopConfig, budgets: BudgetLedger):
+    def resume_child(
+        spec: Mapping[str, object], config: TLLoopConfig, budgets: BudgetLedger
+    ) -> object:
         del config, budgets
         assert spec["run_id"] == kani_name
         calls.append(kani_name)
@@ -24019,12 +24060,16 @@ def test_continue_reconciles_historical_parent_stall_before_nested_recovery(
     monkeypatch.setattr(driver_module, "tl_run", resume_child)
 
     class FixtureRepositoryTransport(RecordingTransport):
-        def call_tool(self, role: str, name: str, tool_name: str, arguments: JsonObject):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
             if tool_name == "repository_identity":
                 self.calls.append((tool_name, arguments))
                 return {
                     "success": True,
-                    "result": {"remote_url": root_config.repository_identity.remote_url},
+                    "result": {
+                        "remote_url": _required_repository_identity(root_config).remote_url
+                    },
                 }
             return super().call_tool(role, name, tool_name, arguments)
 
@@ -24080,8 +24125,10 @@ def test_continue_reconciles_historical_parent_stall_before_nested_recovery(
         result.final_state.slices[kani_name].dispatch_invocation_id == kani.dispatch_invocation_id
     )
     assert parent.slices[kani_name].park_audit is not None
-    assert parent.slices[kani_name].park_audit["reason"] == "pane_alive=false"
-    assert parent.slices[kani_name].park_audit["superseded_by_epoch"] == parent.controller_epoch
+    audit = parent.slices[kani_name].park_audit
+    assert audit is not None
+    assert audit["reason"] == "pane_alive=false"
+    assert audit["superseded_by_epoch"] == parent.controller_epoch
     assert (
         next(
             gate
@@ -24122,7 +24169,9 @@ def test_continue_reconciles_historical_parent_stall_before_nested_recovery(
     )
 
     class DeadNestedPaneTransport(FixtureRepositoryTransport):
-        def call_tool(self, role: str, name: str, tool_name: str, arguments: JsonObject):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
             if tool_name == "poll_workers":
                 self.calls.append((tool_name, arguments))
                 return {
@@ -24152,14 +24201,14 @@ def test_continue_reconciles_historical_parent_stall_before_nested_recovery(
         clock_reads.append(1)
         return float(len(clock_reads))
 
-    nested_heartbeat = driver_module.heartbeat_once(
+    nested_heartbeat = heartbeat_once(
         parent,
         root_store,
         EffectClient(DeadNestedPaneTransport()),
-        driver_module.HeartbeatConfig(interval_seconds=0.001, stall_threshold_seconds=1.0),
+        HeartbeatConfig(interval_seconds=0.001, stall_threshold_seconds=1.0),
         now=time.time() + 10,
         project_root=project,
-        active_work=driver_module.ActiveWorkClock(work_clock),
+        active_work=ActiveWorkClock(work_clock),
     )
     assert nested_heartbeat.state.slices[kani_name].status is SliceStatus.SPAWNED
     assert nested_heartbeat.parked_slice_ids == ()
@@ -24224,7 +24273,7 @@ def test_terminal_provider_recovery_holds_unproven_or_conflicting_evidence(
         )
 
     class HoldTransport(RecordingTransport):
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(self, role: str, name: str, tool_name: str, arguments: JsonObject) -> JsonObject:
             if tool_name == "resolve_live_pr_for_slice":
                 self.calls.append((tool_name, arguments))
                 if scenario == "live_publication":
@@ -24333,11 +24382,12 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
             reference_requirements=(reference_requirement,),
         )
     )
+    assert config.worktree is not None
     reference_commit = subprocess.run(
         [
             "git",
             "-C",
-            str(config.worktree / reference_requirement.path),
+            str(Path(config.worktree) / reference_requirement.path),
             "rev-parse",
             "HEAD",
         ],
@@ -24349,6 +24399,7 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
     state = store.load()
     terminal, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
     assert terminal is not None and reason is None
+    resume = terminal.resume
     state = driver_module._persist_terminal_route_authorization(terminal, state, store)
     terminal, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
     assert terminal is not None and reason is None
@@ -24358,11 +24409,13 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
     journal.append(intent)
     journal.mark_unknown(intent, TimeoutError("simulated lost response after accepted launch"))
 
-    owner = terminal.resume.owner
+    owner = resume.owner
     successor_id = "codex-terminal-response-loss-successor"
     identity_path = owner_dir / "identity.json"
     identity = json.loads(identity_path.read_text(encoding="utf-8"))
-    route_receipt = driver_module._blocked_resume_role_route_response(terminal.resume)
+    route_receipt_value = driver_module._blocked_resume_role_route_response(resume)
+    assert route_receipt_value is not None
+    route_receipt = _required_json_value_object(route_receipt_value, "role_route")
     identity.update(
         {
             "agent_type": "codex",
@@ -24392,7 +24445,7 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
         ),
         encoding="utf-8",
     )
-    (owner_dir / "dispatch_intent").write_text(terminal.resume.intent_id + "\n", encoding="utf-8")
+    (owner_dir / "dispatch_intent").write_text(resume.intent_id + "\n", encoding="utf-8")
     (owner_dir / "routing.json").write_text(
         json.dumps(
             {
@@ -24407,7 +24460,9 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
     class AdoptionTransport(RecordingTransport):
         resume_calls = 0
 
-        def call_tool(self, role, name, tool_name, call_arguments):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, call_arguments: JsonObject
+        ) -> JsonObject:
             if tool_name == "resume_blocked_leaf":
                 self.calls.append((tool_name, call_arguments))
                 self.resume_calls += 1
@@ -24418,7 +24473,7 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
                         "agent": {
                             "id": owner_name,
                             "issue": plan.leaves[0].name,
-                            "intent_id": terminal.resume.intent_id,
+                "intent_id": resume.intent_id,
                             "agent_type": "codex",
                             "branch_name": owner.branch,
                             "worktree_path": str(owner.worktree),
@@ -24455,8 +24510,10 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
     assert leaf.dispatch_role == "worker"
     assert leaf.dispatch_effort == "xhigh"
     assert leaf.dispatch_route_configuration_fingerprint == "sha256:v1:" + "2" * 64
-    assert leaf.dispatch_route_manifest_digest == store.load().plan_manifest.digest
+    assert leaf.dispatch_route_manifest_digest == _required_manifest_digest(store.load())
+    assert leaf.dispatch_route_fingerprint is not None
     assert leaf.dispatch_route_fingerprint.startswith("sha256:v1:")
+    assert leaf.dispatch_route_policy_fingerprint is not None
     assert leaf.dispatch_route_policy_fingerprint.startswith("sha256:v1:")
     assert leaf.recovery is None
     resume_arguments = journal.entries_for("resume_blocked_leaf", plan.leaves[0].name)[0][
@@ -24465,7 +24522,8 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
     transport_arguments = next(
         arguments for name, arguments in transport.calls if name == "resume_blocked_leaf"
     )
-    transport_route = transport_arguments["role_route"]
+    transport_route = _required_mapping(transport_arguments["role_route"], "role_route")
+    journal_arguments = _required_mapping(resume_arguments, "resume_arguments")
     assert transport_route["harness"] == "codex/gpt-6-luna"
     assert transport_route["model"] == "gpt-6-luna"
     assert transport_route["effort"] == "xhigh"
@@ -24482,7 +24540,7 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
         ("route_fingerprint", "route_fingerprint"),
         ("dispatch_intent_id", "dispatch_intent_id"),
     ):
-        assert transport_route[route_key] == resume_arguments[journal_key]
+        assert transport_route[route_key] == journal_arguments[journal_key]
     assert transport_route["scope_id"] == plan.leaves[0].name
     assert (
         journal.entries_for("resume_blocked_leaf", plan.leaves[0].name)[0]["status"] == "confirmed"
@@ -24543,11 +24601,12 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
             reference_requirements=(reference_requirement,),
         )
     )
+    assert config.worktree is not None
     reference_commit = subprocess.run(
         [
             "git",
             "-C",
-            str(config.worktree / reference_requirement.path),
+            str(Path(config.worktree) / reference_requirement.path),
             "rev-parse",
             "HEAD",
         ],
@@ -24562,19 +24621,24 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
     state = driver_module._persist_terminal_route_authorization(terminal, state, store)
     terminal, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
     assert terminal is not None and reason is None
-    leaf = terminal.resume.leaf
-    owner = terminal.resume.owner
+    resume = terminal.resume
+    leaf = resume.leaf
+    owner = resume.owner
     successor_id = "codex-terminal-checkpoint-crash-successor"
     resume_calls = 0
 
     class ConfirmedResumeTransport(RecordingTransport):
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
             nonlocal resume_calls
             if tool_name != "resume_blocked_leaf":
                 return super().call_tool(role, name, tool_name, arguments)
             self.calls.append((tool_name, arguments))
             resume_calls += 1
-            route_receipt = driver_module._blocked_resume_role_route_response(terminal.resume)
+            route_receipt_value = driver_module._blocked_resume_role_route_response(resume)
+            assert route_receipt_value is not None
+            route_receipt = _required_json_value_object(route_receipt_value, "role_route")
             identity_path = owner_dir / "identity.json"
             identity = json.loads(identity_path.read_text(encoding="utf-8"))
             identity.update(
@@ -24607,7 +24671,7 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
                 encoding="utf-8",
             )
             (owner_dir / "dispatch_intent").write_text(
-                terminal.resume.intent_id + "\n", encoding="utf-8"
+                resume.intent_id + "\n", encoding="utf-8"
             )
             (owner_dir / "routing.json").write_text(
                 json.dumps(
@@ -24626,7 +24690,7 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
                     "agent": {
                         "id": owner_name,
                         "issue": leaf.name,
-                        "intent_id": terminal.resume.intent_id,
+                        "intent_id": resume.intent_id,
                         "agent_type": "codex",
                         "branch_name": owner.branch,
                         "worktree_path": str(owner.worktree),
@@ -24650,16 +24714,46 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
 
     def crash_before_successor_checkpoint(
         checkpoint_store: RunStore,
-        fsm,
-        slices,
-        budgets,
-        offset,
-        **kwargs,
-    ):
+        fsm: FSMInput,
+        slices: Mapping[str, SliceInput],
+        budgets: BudgetInput,
+        offset: int,
+        *,
+        current_order: int | None = None,
+        ordered_stages: OrderedStagesInput | None = None,
+        integration: IntegrationInput | None = None,
+        state_version: int | None = None,
+        plan_manifest: PlanManifest | None = None,
+        expected_revision: int | None = None,
+        clear_gates: Sequence[str] = (),
+        ensure_gates: Sequence[tuple[str, GateStatus]] = (),
+    ) -> RunState:
         updated = slices.get(leaf.name)
-        if updated is not None and updated.dispatch_invocation_id == successor_id:
+        if updated is not None:
+            updated_invocation = (
+                updated.dispatch_invocation_id
+                if isinstance(updated, SliceState)
+                else _required_mapping(updated, "updated slice").get("dispatch_invocation_id")
+            )
+        else:
+            updated_invocation = None
+        if updated_invocation == successor_id:
             raise SystemExit("simulated crash after confirmed owner result")
-        return original_checkpoint(checkpoint_store, fsm, slices, budgets, offset, **kwargs)
+        return original_checkpoint(
+            checkpoint_store,
+            fsm,
+            slices,
+            budgets,
+            offset,
+            current_order=current_order,
+            ordered_stages=ordered_stages,
+            integration=integration,
+            state_version=state_version,
+            plan_manifest=plan_manifest,
+            expected_revision=expected_revision,
+            clear_gates=clear_gates,
+            ensure_gates=ensure_gates,
+        )
 
     monkeypatch.setattr(RunStore, "checkpoint", crash_before_successor_checkpoint)
     with pytest.raises(SystemExit, match="simulated crash after confirmed owner result"):
@@ -24682,7 +24776,7 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
         [
             "git",
             "-C",
-            str(config.worktree / reference_requirement.path),
+            str(Path(config.worktree) / reference_requirement.path),
             "remote",
             "set-url",
             "origin",
@@ -24816,17 +24910,24 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
             plan, store.load(), config, store
         )
         assert legacy_proof is not None and legacy_reason is None, legacy_reason
-        legacy_authorization = dict(legacy_proof.successor_adoption_authorization)
+        legacy_authorization = dict(
+            _required_mapping(
+                legacy_proof.successor_adoption_authorization,
+                "successor_adoption_authorization",
+            )
+        )
         legacy_authorization.pop("authorization_version")
         legacy_authorization.pop("predecessor_generation")
         legacy_authorization["successor_generation"] = owner.generation
         latest = store.load()
         current = latest.slices[leaf.name]
-        evidence = dict(current.recovery.evidence)
+        current_recovery = current.recovery
+        assert current_recovery is not None
+        evidence = dict(current_recovery.evidence)
         evidence["confirmed_successor_adoption_authorization"] = legacy_authorization
-        legacy_recovery = replace(current.recovery, evidence=evidence)
+        legacy_recovery = replace(current_recovery, evidence=evidence)
         store.checkpoint(
-            driver_module._phase_from_state(latest),
+            _phase_from_state(latest),
             {**latest.slices, leaf.name: replace(current, recovery=legacy_recovery)},
             latest.budgets,
             latest.events.last_consumed_offset,
@@ -24852,6 +24953,7 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
             ),
         )
         legacy_adoption_entry = journal.existing(legacy_intent)
+        assert legacy_adoption_entry is not None
 
     adoption_proof, adoption_reason = driver_module._terminal_owner_recovery_proof(
         plan, store.load(), config, store
@@ -24860,9 +24962,12 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
     persisted_adoption_state = driver_module._persist_terminal_route_authorization(
         adoption_proof, store.load(), store
     )
-    adoption_checkpoint = persisted_adoption_state.slices[leaf.name].recovery.evidence[
-        "confirmed_successor_adoption_authorization"
-    ]
+    persisted_recovery = persisted_adoption_state.slices[leaf.name].recovery
+    assert persisted_recovery is not None
+    adoption_checkpoint = _required_mapping(
+        persisted_recovery.evidence["confirmed_successor_adoption_authorization"],
+        "confirmed_successor_adoption_authorization",
+    )
     persisted_successor = json.loads((owner_dir / "invocation.json").read_text(encoding="utf-8"))
     assert adoption_checkpoint["authorization_version"] == 2
     assert adoption_checkpoint["prior_invocation_id"] == prior_invocation_id
@@ -24872,6 +24977,7 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
     assert adoption_checkpoint["successor_generation"] == owner.generation + 1
     assert adoption_checkpoint["dispatch_generation"] == interrupted.dispatch_generation
     if legacy_adoption_audit:
+        assert legacy_adoption_entry is not None
         assert adoption_checkpoint["correction_reason"] == (
             "legacy_successor_generation_recorded_as_predecessor"
         )
@@ -24879,13 +24985,15 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
             adoption_checkpoint["supersedes_legacy_authorization_sha256"]
             == hashlib.sha256(
                 json.dumps(
-                    legacy_adoption_entry["arguments"], sort_keys=True, separators=(",", ":")
+                    _required_mapping(legacy_adoption_entry["arguments"], "arguments"),
+                    sort_keys=True,
+                    separators=(",", ":"),
                 ).encode("utf-8")
             ).hexdigest()
         )
-        adoption_evidence = persisted_adoption_state.slices[leaf.name].recovery.evidence
+        adoption_evidence = persisted_recovery.evidence
         assert adoption_evidence["confirmed_successor_adoption_authorization_history"] == [
-            legacy_adoption_entry["arguments"]
+            _required_mapping(legacy_adoption_entry["arguments"], "arguments")
         ]
     authorization_digest = hashlib.sha256(
         json.dumps(adoption_checkpoint, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -24898,7 +25006,7 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
     staged_adoption_entry = next(
         entry
         for entry in staged_adoption_entries
-        if entry["arguments"].get("authorization_version") == 2
+        if _required_mapping(entry["arguments"], "arguments").get("authorization_version") == 2
     )
     assert staged_adoption_entry["arguments"] == adoption_checkpoint
     assert journal.replay(staged_adoption_entry).result == {
@@ -24942,19 +25050,23 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
     adoption_entries = journal.entries_for("authorize_terminal_owner_successor_adoption", leaf.name)
     assert len(adoption_entries) == expected_adoption_entry_count
     adoption_entry = next(
-        entry for entry in adoption_entries if entry["arguments"].get("authorization_version") == 2
+        entry
+        for entry in adoption_entries
+        if _required_mapping(entry["arguments"], "arguments").get("authorization_version") == 2
     )
     assert adoption_entry["status"] == "confirmed"
-    adoption = adoption_entry["arguments"]
-    assert isinstance(adoption, Mapping)
+    adoption = _required_mapping(adoption_entry["arguments"], "arguments")
     assert adoption["resume_action_key"] == journal_entry[0]["key"]
     assert (
-        adoption["resume_dispatch_intent_id"] == journal_entry[0]["arguments"]["dispatch_intent_id"]
+        adoption["resume_dispatch_intent_id"]
+        == _required_mapping(journal_entry[0]["arguments"], "arguments")["dispatch_intent_id"]
     )
     assert adoption["accepted_dispatch_intent_id"] == interrupted.dispatch_intent_id
     assert (
         adoption["route_authorization_digest"]
-        == journal_entry[0]["arguments"]["route_authorization_digest"]
+        == _required_mapping(journal_entry[0]["arguments"], "arguments")[
+            "route_authorization_digest"
+        ]
     )
     assert adoption["prior_invocation_id"] == prior_invocation_id
     assert adoption["successor_invocation_id"] == successor_id
@@ -24973,7 +25085,10 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
     assert adoption["worktree_fingerprint"] == owner.worktree_fingerprint
     assert adoption["runtime"] == "codex"
     assert adoption["model"] == "gpt-6-luna" and adoption["effort"] == "xhigh"
-    assert adoption["recovery_gate_authorization"]["status"] == GateStatus.APPROVED.value
+    recovery_gate_authorization = _required_mapping(
+        adoption["recovery_gate_authorization"], "recovery_gate_authorization"
+    )
+    assert recovery_gate_authorization["status"] == GateStatus.APPROVED.value
     assert (
         adoption["confirmed_result_sha256"]
         == hashlib.sha256(
@@ -24988,7 +25103,10 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
             next(
                 entry
                 for entry in adoption_entries
-                if entry["arguments"].get("authorization_version") is None
+                if _required_mapping(entry["arguments"], "arguments").get(
+                    "authorization_version"
+                )
+                is None
             )
             == legacy_adoption_entry
         )
@@ -24996,7 +25114,9 @@ def test_terminal_provider_recovery_replays_confirmed_owner_result_after_checkpo
             adoption["supersedes_legacy_authorization_sha256"]
             == hashlib.sha256(
                 json.dumps(
-                    legacy_adoption_entry["arguments"], sort_keys=True, separators=(",", ":")
+                    _required_mapping(legacy_adoption_entry["arguments"], "arguments"),
+                    sort_keys=True,
+                    separators=(",", ":"),
                 ).encode("utf-8")
             ).hexdigest()
         )
@@ -25044,7 +25164,7 @@ def test_continue_reconciles_nested_parallel_leaf_stall_with_canonical_zero_orde
     original_invocation = parked.dispatch_invocation_id
     original_attempts = parked.attempts
     store.checkpoint(
-        before.recursive_fsm,
+        _required_fsm_input(before.recursive_fsm, before.fsm),
         {**before.slices, leaf_id: parked},
         before.budgets,
         before.events.last_consumed_offset,
@@ -25055,7 +25175,7 @@ def test_continue_reconciles_nested_parallel_leaf_stall_with_canonical_zero_orde
         config.run_id,
         plan,
         SyntheticQueue([]),
-        ReadOnlyEffectClient(RecordingTransport()),
+        ReadOnlyEffectClient(EffectClient(RecordingTransport())),
         config=config,
         root_dir=config.root_dir,
     )
@@ -25081,7 +25201,7 @@ def test_continue_reconciles_nested_parallel_leaf_stall_with_canonical_zero_orde
         config.run_id,
         plan,
         SyntheticQueue([]),
-        ReadOnlyEffectClient(RecordingTransport()),
+        ReadOnlyEffectClient(EffectClient(RecordingTransport())),
         config=config,
         root_dir=config.root_dir,
     )
@@ -25094,7 +25214,7 @@ def test_continue_reconciles_root_parallel_leaf_stall_without_inventing_order(
     """Root-owned parallel recovery keeps order zero and accepted evidence."""
     base_plan, base_config, *_ = _seed_terminal_provider_failure_leaf(tmp_path)
     plan = WorkPlan(leaves=base_plan.leaves)
-    root_dir = base_config.project_root / ".exo" / "tl-loop"
+    root_dir = _required_project_root(base_config) / ".exo" / "tl-loop"
     config = replace(
         base_config,
         run_id="direct-root",
@@ -25158,7 +25278,7 @@ def test_continue_reconciles_root_parallel_leaf_stall_without_inventing_order(
                 ),
             ),
             scope_path=(manifest.scope_id,),
-            plan_digest=manifest.digest,
+            plan_digest=_required_manifest_digest_value(manifest),
         ),
         {**before.slices, leaf_id: parked},
         before.budgets,
@@ -25171,7 +25291,7 @@ def test_continue_reconciles_root_parallel_leaf_stall_without_inventing_order(
         config.run_id,
         plan,
         SyntheticQueue([]),
-        ReadOnlyEffectClient(transport),
+        ReadOnlyEffectClient(EffectClient(transport)),
         config=config,
         root_dir=root_dir,
     )
@@ -25198,7 +25318,7 @@ def test_continue_reconciles_root_parallel_leaf_stall_without_inventing_order(
         config.run_id,
         plan,
         SyntheticQueue([]),
-        ReadOnlyEffectClient(RecordingTransport()),
+        ReadOnlyEffectClient(EffectClient(RecordingTransport())),
         config=config,
         root_dir=root_dir,
     )
@@ -25234,12 +25354,12 @@ def test_depth_three_recovery_checkpoint_path_is_verified_during_continue_and_he
         root_state = root_store.load()
     root_slice = root_state.slices["outer"]
     if conflict is not None:
-        proof, reason = driver_module.verified_nested_recovery_wait(
+        proof, reason = verified_nested_recovery_wait(
             root_state,
             root_slice,
             root_store,
             parent_controller_agent_id=config.agent_id or config.run_id,
-            project_root=config.project_root,
+            project_root=_required_project_root(config),
         )
         assert not proof
         if conflict == "inner_parent":
@@ -25265,12 +25385,12 @@ def test_depth_three_recovery_checkpoint_path_is_verified_during_continue_and_he
             assert isinstance(held.recursive_fsm, RecursiveTLRunning)
         return
 
-    proof, reason = driver_module.verified_nested_recovery_wait(
+    proof, reason = verified_nested_recovery_wait(
         root_state,
         root_slice,
         root_store,
         parent_controller_agent_id=config.agent_id or config.run_id,
-        project_root=config.project_root,
+        project_root=_required_project_root(config),
     )
     assert proof, reason
 
@@ -25297,7 +25417,7 @@ def test_depth_three_recovery_checkpoint_path_is_verified_during_continue_and_he
     assert continued.slices["outer"].dispatch_invocation_id == "root-outer-invocation"
 
     class DeadControllerTransport(RecordingTransport):
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(self, role: str, name: str, tool_name: str, arguments: JsonObject) -> JsonObject:
             if tool_name == "poll_workers":
                 self.calls.append((tool_name, arguments))
                 return {
@@ -25311,13 +25431,13 @@ def test_depth_three_recovery_checkpoint_path_is_verified_during_continue_and_he
                 }
             return super().call_tool(role, name, tool_name, arguments)
 
-    heartbeat = driver_module.heartbeat_once(
+    heartbeat = heartbeat_once(
         reconciled,
         root_store,
         EffectClient(DeadControllerTransport()),
-        driver_module.HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
+        HeartbeatConfig(interval_seconds=1.0, stall_threshold_seconds=1.0),
         now=100.0,
-        project_root=config.project_root,
+        project_root=_required_project_root(config),
         controller_agent_id=config.agent_id or config.run_id,
     )
     assert heartbeat.state.slices["outer"].status is SliceStatus.SPAWNED
@@ -25342,12 +25462,12 @@ def test_nested_recovery_binds_parent_and_child_controller_identities_separately
     root_state = root_store.load()
     root_slice = root_state.slices["outer"]
 
-    verified, reason = driver_module.verified_nested_recovery_wait(
+    verified, reason = verified_nested_recovery_wait(
         root_state,
         root_slice,
         root_store,
         parent_controller_agent_id=config.agent_id or config.run_id,
-        project_root=config.project_root,
+        project_root=_required_project_root(config),
     )
 
     outer_state = outer_store.load()
@@ -25366,12 +25486,12 @@ def test_nested_recovery_rejects_conflicting_parent_manifest_binding(tmp_path: P
     state = root_store.load()
     conflicted = replace(state.slices["outer"], manifest_node_id="root/sub_tl/other")
 
-    verified, reason = driver_module.verified_nested_recovery_wait(
+    verified, reason = verified_nested_recovery_wait(
         state,
         conflicted,
         root_store,
         parent_controller_agent_id=config.agent_id or config.run_id,
-        project_root=config.project_root,
+        project_root=_required_project_root(config),
     )
 
     assert not verified
@@ -25399,14 +25519,24 @@ def test_fresh_continue_stall_reset_reassesses_concurrent_checkpoint_changes(
 
     def interleaved_checkpoint(
         checkpoint_store: RunStore,
-        fsm,
-        slices,
-        budgets,
-        offset,
-        **kwargs,
-    ):
+        fsm: FSMInput,
+        slices: Mapping[str, SliceInput],
+        budgets: BudgetInput,
+        offset: int,
+        *,
+        current_order: int | None = None,
+        ordered_stages: OrderedStagesInput | None = None,
+        integration: IntegrationInput | None = None,
+        state_version: int | None = None,
+        plan_manifest: PlanManifest | None = None,
+        expected_revision: int | None = None,
+        clear_gates: Sequence[str] = (),
+        ensure_gates: Sequence[tuple[str, GateStatus]] = (),
+    ) -> RunState:
         nonlocal raced, root_journal_after_concurrent
         candidate = slices.get("outer")
+        if candidate is not None and not isinstance(candidate, SliceState):
+            raise TypeError("concurrent checkpoint slice must be a SliceState")
         reset_candidate = (
             checkpoint_store.run_id == store.run_id
             and candidate is not None
@@ -25433,14 +25563,28 @@ def test_fresh_continue_stall_reset_reassesses_concurrent_checkpoint_changes(
                 )
                 assert reset.slices["outer"].status is SliceStatus.SPAWNED
                 abandoned = abandon_slice(
-                    config.project_root.parent,
+                    _required_project_root(config).parent,
                     "root",
                     "outer",
                     effects=EffectClient(RecordingTransport()),
                 )
                 assert abandoned["status"] == "abandoned"
                 root_journal_after_concurrent = root_journal_path.read_bytes()
-        return original_checkpoint(checkpoint_store, fsm, slices, budgets, offset, **kwargs)
+        return original_checkpoint(
+            checkpoint_store,
+            fsm,
+            slices,
+            budgets,
+            offset,
+            current_order=current_order,
+            ordered_stages=ordered_stages,
+            integration=integration,
+            state_version=state_version,
+            plan_manifest=plan_manifest,
+            expected_revision=expected_revision,
+            clear_gates=clear_gates,
+            ensure_gates=ensure_gates,
+        )
 
     monkeypatch.setattr(RunStore, "checkpoint", interleaved_checkpoint)
     result = driver_module._reconcile_fresh_continue_stalls(
@@ -25469,9 +25613,11 @@ def test_fresh_continue_stall_reset_reassesses_concurrent_checkpoint_changes(
         assert outer.dispatch_invocation_id == "concurrent-confirmed-invocation"
         assert outer.dispatch_agent_id == original_outer.dispatch_agent_id
         assert outer.dispatch_generation == original_outer.dispatch_generation
+        recursive_state = latest.recursive_fsm
+        assert isinstance(recursive_state, RecursiveTLRunning)
         record = next(
             record
-            for records in latest.recursive_fsm.pending_by_order.values()
+            for records in recursive_state.pending_by_order.values()
             for record in records
             if record.child_id == "outer"
         )
@@ -25480,6 +25626,7 @@ def test_fresh_continue_stall_reset_reassesses_concurrent_checkpoint_changes(
         outer = latest.slices["outer"]
         assert outer.status is SliceStatus.PARKED
         assert outer.park_cause is ParkCause.ATTEMPT_ABANDONED
+        assert outer.park_audit is not None
         assert outer.park_audit["reason"] == "operator_requested"
         assert outer.dispatch_intent_id == original_outer.dispatch_intent_id
         assert outer.dispatch_agent_id == original_outer.dispatch_agent_id
@@ -25521,7 +25668,7 @@ def test_depth_three_nested_recovery_replays_through_full_tl_startup(
         "root",
         plan,
         SyntheticQueue([]),
-        ReadOnlyEffectClient(transport),
+        ReadOnlyEffectClient(EffectClient(transport)),
         config=config,
         root_dir=config.root_dir,
     )
@@ -25546,7 +25693,7 @@ def test_depth_three_nested_recovery_replays_through_full_tl_startup(
         "root",
         plan,
         SyntheticQueue([]),
-        ReadOnlyEffectClient(RecordingTransport()),
+        ReadOnlyEffectClient(EffectClient(RecordingTransport())),
         config=config,
         root_dir=config.root_dir,
     )
@@ -25614,11 +25761,12 @@ def _seed_deep_nested_recovery_run(
     )
     root_store.set_plan_manifest(root_manifest, slices=root_slices)
     stages = tuple(
-        driver_module.OrderedStageState(stage.order, stage.sub_tls) for stage in plan.ordered_stages
+        OrderedStageState(stage.order, stage.sub_tls) for stage in plan.ordered_stages
     )
     root_state = root_store.set_ordered_state(1, stages, root_store.load().integration)
 
     outer_task = plan.sub_tls[0]
+    outer_work_plan = _required_work_plan(outer_task.plan)
     outer_node = next(node for node in root_manifest.nodes if node.name == "outer")
     outer_manifest = root_manifest.child_manifests[outer_node.node_id]
     outer_worktree = Path(root_state.slices["outer"].worktree or project / "outer")
@@ -25631,7 +25779,7 @@ def _seed_deep_nested_recovery_run(
         outer_node.owned_branch,
         str(outer_worktree),
     )
-    outer_slices = _initial_slices(outer_task.plan, outer_config, root_store.run_dir, "outer")
+    outer_slices = _initial_slices(_required_work_plan(outer_task.plan), outer_config, root_store.run_dir, "outer")
     outer_store = RunStore("outer", root_store.run_dir)
     create(
         "outer",
@@ -25654,8 +25802,8 @@ def _seed_deep_nested_recovery_run(
     )
     outer_store.set_plan_manifest(outer_manifest, slices=outer_slices)
     outer_stages = tuple(
-        driver_module.OrderedStageState(stage.order, stage.sub_tls)
-        for stage in outer_task.plan.ordered_stages
+        OrderedStageState(stage.order, stage.sub_tls)
+        for stage in _required_work_plan(outer_task.plan).ordered_stages
     )
     outer_state = outer_store.set_ordered_state(1, outer_stages, outer_store.load().integration)
 
@@ -25671,7 +25819,7 @@ def _seed_deep_nested_recovery_run(
         inner_node.owned_branch,
         str(inner_worktree),
     )
-    inner_slices = _initial_slices(inner_task.plan, inner_config, outer_store.run_dir, "inner")
+    inner_slices = _initial_slices(_required_work_plan(inner_task.plan), inner_config, outer_store.run_dir, "inner")
     inner_store = RunStore("inner", outer_store.run_dir)
     create(
         "inner",
@@ -25699,7 +25847,7 @@ def _seed_deep_nested_recovery_run(
     current_leaf = inner_state.slices["leaf-a"]
     leaf_invocation = "deep-leaf-invocation"
     leaf_owner = "deep-leaf-owner"
-    recovery = driver_module.transition_recovery(
+    recovery = transition_recovery(
         begin_recovery(
             cause="human_decision_required",
             owner_run_id="inner",
@@ -25744,7 +25892,7 @@ def _seed_deep_nested_recovery_run(
                 ),
             ),
             scope_path=(inner_manifest.scope_id,),
-            plan_digest=inner_manifest.digest,
+            plan_digest=_required_manifest_digest_value(inner_manifest),
         ),
         {**inner_state.slices, "leaf-a": leaf},
         inner_state.budgets,
@@ -25789,7 +25937,7 @@ def _seed_deep_nested_recovery_run(
         sub_tl_recovery={"inner": inner_summary},
     )
     outer_state = outer_store.checkpoint(
-        outer_state.recursive_fsm or outer_state.fsm,
+        _required_fsm_input(outer_state.recursive_fsm, outer_state.fsm),
         {**outer_state.slices, "inner": outer_slice},
         outer_state.budgets,
         outer_state.events.last_consumed_offset,
@@ -25848,7 +25996,7 @@ def _seed_deep_nested_recovery_run(
             ),
         },
         scope_path=(root_manifest.scope_id,),
-        plan_digest=root_manifest.digest,
+        plan_digest=_required_manifest_digest_value(root_manifest),
     )
     root_store.checkpoint(
         root_phase,
@@ -26079,7 +26227,7 @@ def _stop_terminal_successor_with_human_gate(
     current = state.slices[slice_id]
     assert current.dispatch_invocation_id is not None
     assert current.dispatch_intent_id is not None
-    project_path = Path(config.project_root)
+    project_path = _required_project_root(config)
     sequence = _next_ledger_sequence(project_path) + 1
     invocation = json.loads((owner_dir / "invocation.json").read_text(encoding="utf-8"))
     runtime = str(invocation["runtime"])
@@ -26158,7 +26306,7 @@ def _stop_terminal_successor_with_human_gate(
         state.controller_epoch,
     )
     state = store.checkpoint(
-        driver_module._phase_from_state(state),
+        _phase_from_state(state),
         slices,
         state.budgets,
         max(sequence, state.events.last_consumed_offset),
@@ -26191,7 +26339,7 @@ def _stop_terminal_successor_with_human_gate(
             blocked_event,
             state,
             store,
-            driver_module._phase_from_state(state),
+            _phase_from_state(state),
             blocked_sequence,
             EffectClient(transport),
         ),
@@ -26218,7 +26366,7 @@ class RepeatedTransitionTransport(RecordingTransport):
         if tool_name != "resume_blocked_leaf":
             return super().call_tool(role, name, tool_name, arguments)
         self.calls.append((tool_name, arguments))
-        route = dict(arguments["role_route"])
+        route = _required_json_value_object(arguments["role_route"], "role_route")
         current_invocation = json.loads(
             (self.owner_dir / "invocation.json").read_text(encoding="utf-8")
         )
@@ -26389,23 +26537,24 @@ def test_terminal_recovery_executes_repeated_model_and_effort_route_changes(
     assert len({item["intent_id"] for item in transport.successors}) == 4
     assert first["intent_id"] != fourth["intent_id"]
     entries = journal.entries_for("resume_blocked_leaf", plan.leaves[0].name)
+    entry_arguments = [_required_mapping(entry["arguments"], "arguments") for entry in entries]
     assert entries[0] == original_entries[0]
-    assert [entry["arguments"]["expected_invocation_id"] for entry in entries] == [
+    assert [arguments["expected_invocation_id"] for arguments in entry_arguments] == [
         original_id,
         successor_id,
         first["invocation_id"],
         second["invocation_id"],
         third["invocation_id"],
     ]
-    assert [entry["arguments"]["prior_generation"] for entry in entries] == [1, 2, 3, 4, 5]
-    assert [entry["arguments"]["desired_model"] for entry in entries] == [
+    assert [arguments["prior_generation"] for arguments in entry_arguments] == [1, 2, 3, 4, 5]
+    assert [arguments["desired_model"] for arguments in entry_arguments] == [
         "gpt-6-luna",
         "gpt-6-luna",
         "gpt-6.1-sol",
         "gpt-6-luna",
         "gpt-6-luna",
     ]
-    assert [entry["arguments"]["desired_effort"] for entry in entries] == [
+    assert [arguments["desired_effort"] for arguments in entry_arguments] == [
         "xhigh",
         "xhigh",
         "xhigh",
@@ -26590,7 +26739,7 @@ def test_terminal_recovery_loads_current_worker_route_across_runtime_adapters(
         plan, config, store, owner_dir, owner_name, original_id
     )
     selected = _write_loaded_role_files(
-        Path(config.project_root),
+        _required_project_root(config),
         worker_allow=(route,),
         worker_effort={route: effort},
     )
@@ -26637,7 +26786,7 @@ def test_terminal_recovery_loads_current_worker_route_across_runtime_adapters(
     assert launched["model"] == model
     assert launched["effort"] == effort
     entry = journal.entries_for("resume_blocked_leaf", plan.leaves[0].name)[-1]
-    route_arguments = entry["arguments"]
+    route_arguments = _required_mapping(entry["arguments"], "arguments")
     assert route_arguments["harness"] == route
     assert route_arguments["agent_type"] == harness
     assert route_arguments["model"] == model
@@ -26707,7 +26856,7 @@ def test_terminal_continuation_preserves_live_work_and_unresolved_effects(
         receipt = PostMergeState(
             PostMergePhase.COMPLETE,
             {
-                "repository": config.repository_identity.remote_url,
+                "repository": _required_repository_identity(config).remote_url,
                 "parent_branch": config.branch,
                 "pr_number": "46",
                 "head_sha": "4f0b5b761331c6a4e9f186ce6542af6d2f417c9d",
@@ -26726,7 +26875,7 @@ def test_terminal_continuation_preserves_live_work_and_unresolved_effects(
             post_merge=receipt,
         )
         store.checkpoint(
-            driver_module._phase_from_state(state),
+            _phase_from_state(state),
             {**state.slices, slice_id: completed},
             state.budgets,
             state.events.last_consumed_offset,
@@ -26763,7 +26912,9 @@ def test_terminal_continuation_preserves_live_work_and_unresolved_effects(
                 next(gate for gate in result.gates if gate.name == gate_name).status
                 is GateStatus.REJECTED
             )
-            assert result.slices[slice_id].recovery.evidence.get("terminal_owner_recovery_hold")
+            result_recovery = result.slices[slice_id].recovery
+            assert result_recovery is not None
+            assert result_recovery.evidence.get("terminal_owner_recovery_hold")
     else:
         assert len(resume_calls) == 1 and len(transport.successors) == 1
         assert (Path(invocation["worktree"]) / "preserved-terminal-edit.txt").read_text(
@@ -26780,7 +26931,8 @@ def test_terminal_continuation_preserves_live_work_and_unresolved_effects(
                 ).stdout
             ).hexdigest()
         )
-        assert entry["arguments"]["expected_worktree_fingerprint"] == fingerprint
+        entry_arguments = _required_mapping(entry["arguments"], "arguments")
+        assert entry_arguments["expected_worktree_fingerprint"] == fingerprint
 
 
 def test_stale_concurrent_continuation_adopts_without_duplicate_launch(
@@ -26831,7 +26983,12 @@ def test_stale_concurrent_continuation_adopts_without_duplicate_launch(
     assert len(entries) == 2
     assert entries[-1]["status"] == "confirmed"
     assert (
-        entries[-1]["result"]["result"]["invocation"]["invocation_id"]
+        _required_mapping(
+            _required_mapping(
+                _required_mapping(entries[-1]["result"], "result")["result"], "result.result"
+            )["invocation"],
+            "result.result.invocation",
+        )["invocation_id"]
         == (launched["invocation_id"])
     )
 
@@ -26861,7 +27018,7 @@ def test_workspace_shutdown_reopens_exact_child_dispatch_for_reprovision(
         worktree=worktree,
     )
     store.checkpoint(
-        driver_module._phase_from_state(state),
+        _phase_from_state(state),
         {**state.slices, "child-controller": spawned},
         state.budgets,
         state.events.last_consumed_offset,
@@ -26902,7 +27059,7 @@ def test_workspace_shutdown_reopens_exact_child_dispatch_for_reprovision(
         dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
     )
     store.checkpoint(
-        driver_module._phase_from_state(failed_state),
+        _phase_from_state(failed_state),
         {**failed_state.slices, "child-controller": respawned},
         failed_state.budgets,
         failed_state.events.last_consumed_offset,
@@ -26921,6 +27078,47 @@ def test_workspace_shutdown_reopens_exact_child_dispatch_for_reprovision(
     assert unchanged.slices["child-controller"].status is SliceStatus.SPAWNED
 
 
+def _updated_slice_for_test(
+    child: SliceState, updates: Mapping[str, object]
+) -> SliceState:
+    string_fields = {
+        "branch",
+        "dispatch_agent_id",
+        "dispatch_intent_id",
+        "dispatch_invocation_id",
+        "worktree",
+    }
+    unsupported = set(updates) - {"attempts", *string_fields}
+    if unsupported:
+        raise ValueError(f"unsupported slice updates: {sorted(unsupported)}")
+    result = child
+    if "attempts" in updates:
+        attempts = updates["attempts"]
+        if not isinstance(attempts, int):
+            raise TypeError("attempts update must be an integer")
+        result = replace(result, attempts=attempts)
+    if "dispatch_invocation_id" in updates:
+        invocation_id = updates["dispatch_invocation_id"]
+        if invocation_id is not None and not isinstance(invocation_id, str):
+            raise TypeError("dispatch invocation update must be a string or None")
+        result = replace(result, dispatch_invocation_id=invocation_id)
+    string_updates: dict[str, str] = {}
+    for field_name in string_fields.intersection(updates):
+        field_value = updates[field_name]
+        if not isinstance(field_value, str):
+            raise TypeError(f"{field_name} update must be a string")
+        string_updates[field_name] = field_value
+    if "branch" in string_updates:
+        result = replace(result, branch=string_updates.pop("branch"))
+    if "dispatch_agent_id" in string_updates:
+        result = replace(result, dispatch_agent_id=string_updates.pop("dispatch_agent_id"))
+    if "dispatch_intent_id" in string_updates:
+        result = replace(result, dispatch_intent_id=string_updates.pop("dispatch_intent_id"))
+    if "worktree" in string_updates:
+        result = replace(result, worktree=string_updates.pop("worktree"))
+    return result
+
+
 def _shutdown_child_fixture(
     tmp_path: Path,
     *,
@@ -26936,21 +27134,22 @@ def _shutdown_child_fixture(
     child = state.slices["child-controller"]
     assert child.branch is not None
     worktree = str(project / ".exo" / "worktrees" / "child-controller")
-    spawned_fields: dict[str, object] = {
-        "status": SliceStatus.SPAWNED,
-        "attempts": 1,
-        "dispatch_agent_id": "child-controller",
-        "dispatch_invocation_id": "workspace-shutdown-child-invocation",
-        "dispatch_intent_id": "workspace-shutdown-child-intent",
-        "dispatch_authoritative_event_seq": 1,
-        "dispatch_generation": 1,
-        "dispatch_last_boundary": driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
-        "worktree": worktree,
-    }
-    spawned_fields.update(current_updates or {})
-    spawned = replace(child, **spawned_fields)
+    spawned = replace(
+        child,
+        status=SliceStatus.SPAWNED,
+        attempts=1,
+        dispatch_agent_id="child-controller",
+        dispatch_invocation_id="workspace-shutdown-child-invocation",
+        dispatch_intent_id="workspace-shutdown-child-intent",
+        dispatch_authoritative_event_seq=1,
+        dispatch_generation=1,
+        dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
+        worktree=worktree,
+    )
+    if current_updates:
+        spawned = _updated_slice_for_test(spawned, current_updates)
     store.checkpoint(
-        driver_module._phase_from_state(state),
+        _phase_from_state(state),
         {**state.slices, "child-controller": spawned},
         state.budgets,
         state.events.last_consumed_offset,
@@ -27102,15 +27301,30 @@ def _inject_concurrent_checkpoint(
     original = RunStore.checkpoint
     injected = False
 
-    def wrapped(self, fsm, slices, budgets, offset, **kwargs):
+    def wrapped(
+        self: RunStore,
+        fsm: FSMInput,
+        slices: Mapping[str, SliceInput],
+        budgets: BudgetInput,
+        offset: int,
+        *,
+        current_order: int | None = None,
+        ordered_stages: OrderedStagesInput | None = None,
+        integration: IntegrationInput | None = None,
+        state_version: int | None = None,
+        plan_manifest: PlanManifest | None = None,
+        expected_revision: int | None = None,
+        clear_gates: Sequence[str] = (),
+        ensure_gates: Sequence[tuple[str, GateStatus]] = (),
+    ) -> RunState:
         nonlocal injected
         if self.run_id == store.run_id and not injected:
             injected = True
             latest = store.load()
             concurrent = dict(latest.slices)
             if child_updates:
-                concurrent["child-controller"] = replace(
-                    concurrent["child-controller"], **child_updates
+                concurrent["child-controller"] = _updated_slice_for_test(
+                    concurrent["child-controller"], child_updates
                 )
             concurrent_budgets = (
                 replace(latest.budgets, tokens=budget_tokens)
@@ -27125,7 +27339,21 @@ def _inject_concurrent_checkpoint(
                 offset,
                 expected_revision=latest.revision,
             )
-        return original(self, fsm, slices, budgets, offset, **kwargs)
+        return original(
+            self,
+            fsm,
+            slices,
+            budgets,
+            offset,
+            current_order=current_order,
+            ordered_stages=ordered_stages,
+            integration=integration,
+            state_version=state_version,
+            plan_manifest=plan_manifest,
+            expected_revision=expected_revision,
+            clear_gates=clear_gates,
+            ensure_gates=ensure_gates,
+        )
 
     monkeypatch.setattr(RunStore, "checkpoint", wrapped)
 
@@ -27180,10 +27408,17 @@ def test_shutdown_reopen_conflict_exhaustion_never_writes_stale_state(
     baseline = store.load()
     calls = 0
 
-    def always_conflict(self, fsm, slices, budgets, offset, **kwargs):
+    def always_conflict(
+        self: RunStore,
+        fsm: object,
+        slices: object,
+        budgets: object,
+        offset: object,
+        **kwargs: object,
+    ) -> None:
         nonlocal calls
         calls += 1
-        raise driver_module.CheckpointConflict("simulated concurrent writer")
+        raise CheckpointConflict("simulated concurrent writer")
 
     monkeypatch.setattr(RunStore, "checkpoint", always_conflict)
 
@@ -27221,6 +27456,7 @@ def _live_child_controller_fixture(
     )
     manifest = state.plan_manifest
     assert manifest is not None
+    assert manifest.digest is not None
     node = next(node for node in manifest.nodes if node.name == "child-controller")
     store.checkpoint(
         RecursiveTLRunning(
@@ -27236,7 +27472,7 @@ def _live_child_controller_fixture(
                 )
             },
             scope_path=(manifest.scope_id,),
-            plan_digest=manifest.digest,
+            plan_digest=_required_manifest_digest_value(manifest),
         ),
         {**state.slices, "child-controller": spawned},
         state.budgets,
@@ -27292,7 +27528,16 @@ def test_live_adoption_rejects_stale_proof_after_concurrent_binding(
     original_helper = driver_module._checkpoint_ordered_sub_tl_invocation
     injected = False
 
-    def interleaved_helper(store_arg, child_id, invocation_id, **kwargs):
+    def interleaved_helper(
+        store_arg: RunStore,
+        child_id: str,
+        invocation_id: str,
+        *,
+        generation: int | None = None,
+        expected_predecessor_invocation: str | None = None,
+        expected_predecessor_generation: int | None = None,
+        expected_revision: int | None = None,
+    ) -> bool:
         nonlocal injected
         if not injected:
             injected = True
@@ -27309,7 +27554,15 @@ def test_live_adoption_rejects_stale_proof_after_concurrent_binding(
                 latest.events.last_consumed_offset,
                 expected_revision=latest.revision,
             )
-        return original_helper(store_arg, child_id, invocation_id, **kwargs)
+        return original_helper(
+            store_arg,
+            child_id,
+            invocation_id,
+            generation=generation,
+            expected_predecessor_invocation=expected_predecessor_invocation,
+            expected_predecessor_generation=expected_predecessor_generation,
+            expected_revision=expected_revision,
+        )
 
     monkeypatch.setattr(driver_module, "_checkpoint_ordered_sub_tl_invocation", interleaved_helper)
 
@@ -27330,7 +27583,16 @@ def test_live_adoption_preserves_unrelated_concurrent_update(
     injected = False
     expected_tokens = store.load().budgets.tokens + 41
 
-    def interleaved_helper(store_arg, child_id, invocation_id, **kwargs):
+    def interleaved_helper(
+        store_arg: RunStore,
+        child_id: str,
+        invocation_id: str,
+        *,
+        generation: int | None = None,
+        expected_predecessor_invocation: str | None = None,
+        expected_predecessor_generation: int | None = None,
+        expected_revision: int | None = None,
+    ) -> bool:
         nonlocal injected
         if not injected:
             injected = True
@@ -27342,7 +27604,15 @@ def test_live_adoption_preserves_unrelated_concurrent_update(
                 latest.events.last_consumed_offset,
                 expected_revision=latest.revision,
             )
-        return original_helper(store_arg, child_id, invocation_id, **kwargs)
+        return original_helper(
+            store_arg,
+            child_id,
+            invocation_id,
+            generation=generation,
+            expected_predecessor_invocation=expected_predecessor_invocation,
+            expected_predecessor_generation=expected_predecessor_generation,
+            expected_revision=expected_revision,
+        )
 
     monkeypatch.setattr(driver_module, "_checkpoint_ordered_sub_tl_invocation", interleaved_helper)
 
@@ -27366,7 +27636,16 @@ def test_live_adoption_preserves_concurrent_abandonment_and_rejection(
     original_helper = driver_module._checkpoint_ordered_sub_tl_invocation
     injected = False
 
-    def interleaved_helper(store_arg, child_id, invocation_id, **kwargs):
+    def interleaved_helper(
+        store_arg: RunStore,
+        child_id: str,
+        invocation_id: str,
+        *,
+        generation: int | None = None,
+        expected_predecessor_invocation: str | None = None,
+        expected_predecessor_generation: int | None = None,
+        expected_revision: int | None = None,
+    ) -> bool:
         nonlocal injected
         if not injected:
             injected = True
@@ -27383,7 +27662,15 @@ def test_live_adoption_preserves_concurrent_abandonment_and_rejection(
                 latest.events.last_consumed_offset,
                 expected_revision=latest.revision,
             )
-        return original_helper(store_arg, child_id, invocation_id, **kwargs)
+        return original_helper(
+            store_arg,
+            child_id,
+            invocation_id,
+            generation=generation,
+            expected_predecessor_invocation=expected_predecessor_invocation,
+            expected_predecessor_generation=expected_predecessor_generation,
+            expected_revision=expected_revision,
+        )
 
     monkeypatch.setattr(driver_module, "_checkpoint_ordered_sub_tl_invocation", interleaved_helper)
 
@@ -27407,10 +27694,12 @@ def test_live_adoption_conflict_exhaustion_leaves_binding_unchanged(
     plan, config, store, _owner_dir = _live_child_controller_fixture(tmp_path)
     calls = 0
 
-    def always_conflict(self, fsm, slices, budgets, offset, **kwargs):
+    def always_conflict(
+        self: RunStore, fsm: object, slices: object, budgets: object, offset: object, **kwargs: object
+    ) -> None:
         nonlocal calls
         calls += 1
-        raise driver_module.CheckpointConflict("simulated concurrent writer")
+        raise CheckpointConflict("simulated concurrent writer")
 
     monkeypatch.setattr(RunStore, "checkpoint", always_conflict)
 
@@ -27455,12 +27744,21 @@ def test_live_adoption_rejects_changed_parent_binding(
     original_helper = driver_module._checkpoint_ordered_sub_tl_invocation
     injected = False
 
-    def interleaved_helper(store_arg, child_id, invocation_id, **kwargs):
+    def interleaved_helper(
+        store_arg: RunStore,
+        child_id: str,
+        invocation_id: str,
+        *,
+        generation: int | None = None,
+        expected_predecessor_invocation: str | None = None,
+        expected_predecessor_generation: int | None = None,
+        expected_revision: int | None = None,
+    ) -> bool:
         nonlocal injected
         if not injected:
             injected = True
             latest = store_arg.load()
-            changed = replace(latest.slices["child-controller"], **updates)
+            changed = _updated_slice_for_test(latest.slices["child-controller"], updates)
             store_arg.checkpoint(
                 latest.fsm,
                 {**latest.slices, "child-controller": changed},
@@ -27468,7 +27766,15 @@ def test_live_adoption_rejects_changed_parent_binding(
                 latest.events.last_consumed_offset,
                 expected_revision=latest.revision,
             )
-        return original_helper(store_arg, child_id, invocation_id, **kwargs)
+        return original_helper(
+            store_arg,
+            child_id,
+            invocation_id,
+            generation=generation,
+            expected_predecessor_invocation=expected_predecessor_invocation,
+            expected_predecessor_generation=expected_predecessor_generation,
+            expected_revision=expected_revision,
+        )
 
     monkeypatch.setattr(driver_module, "_checkpoint_ordered_sub_tl_invocation", interleaved_helper)
 
@@ -27490,7 +27796,7 @@ def test_terminal_recovery_resolves_legacy_initial_spawn_identity(
         legacy_spawn_result=True,
     )
     ledger_path = (
-        Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
+        _required_project_root(config) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
     )
     rows = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()]
     spawn_event = next(row for row in rows if row.get("type") == "agent.spawned")
@@ -27502,9 +27808,12 @@ def test_terminal_recovery_resolves_legacy_initial_spawn_identity(
     spawn_entry = EffectJournal(store.run_id, journal_path).entries_for(
         "spawn_leaf", plan.leaves[0].name
     )[0]
-    assert "agent_id" not in spawn_entry["result"]["result"]
-    assert spawn_entry["result"]["result"]["invocation_id"] is None
-    assert "effort" not in spawn_entry["arguments"]
+    spawn_result = _required_mapping(spawn_entry["result"], "result")
+    spawn_result_data = _required_mapping(spawn_result["result"], "result.result")
+    spawn_arguments = _required_mapping(spawn_entry["arguments"], "arguments")
+    assert "agent_id" not in spawn_result_data
+    assert spawn_result_data["invocation_id"] is None
+    assert "effort" not in spawn_arguments
 
     successor_id = _stage_wrong_route_history(
         plan, config, store, owner_dir, owner_name, original_id
@@ -27571,7 +27880,7 @@ def test_legacy_initial_spawn_identity_requires_exact_corroboration(
             legacy_spawn_result=True,
         )
     )
-    project = Path(config.project_root)
+    project = _required_project_root(config)
     ledger_path = project / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
     rows = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()]
     spawn_event = next(row for row in rows if row.get("type") == "agent.spawned")
@@ -27625,7 +27934,9 @@ def test_modern_initial_spawn_result_carries_agent_type(tmp_path: Path) -> None:
     spawn = EffectJournal(store.run_id, store.run_dir / "action-journal.json").entries_for(
         "spawn_leaf", plan.leaves[0].name
     )[0]
-    assert spawn["result"]["result"]["agent_type"] == "opencode"
+    spawn_result = _required_mapping(spawn["result"], "result")
+    spawn_data = _required_mapping(spawn_result["result"], "result.result")
+    assert spawn_data["agent_type"] == "opencode"
 
 
 @pytest.mark.parametrize(
@@ -27690,7 +28001,7 @@ def test_spawn_result_worktree_path_must_be_absolute(
     plan, config, store, _owner_dir, owner_name, _original_id = (
         _seed_terminal_provider_failure_leaf(tmp_path)
     )
-    owner_worktree = Path(config.project_root) / ".exo" / "worktrees" / owner_name
+    owner_worktree = _required_project_root(config) / ".exo" / "worktrees" / owner_name
     monkeypatch.chdir(owner_worktree)
     journal_path = store.run_dir / "action-journal.json"
     rows = json.loads(journal_path.read_text(encoding="utf-8"))
@@ -27857,7 +28168,7 @@ def test_legacy_original_spawn_event_scope_validated_after_adoption(
         legacy_spawn_result=legacy_spawn_result,
     )
     ledger_path = (
-        Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
+        _required_project_root(config) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
     )
     rows = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()]
     original_event = next(row for row in rows if row.get("type") == "agent.spawned")
@@ -27914,7 +28225,7 @@ def test_initial_spawn_event_requires_envelope_and_data_invocation_agreement(
         _seed_terminal_provider_failure_leaf(tmp_path, legacy_spawn_result=True)
     )
     ledger_path = (
-        Path(config.project_root) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
+        _required_project_root(config) / ".exo" / "ledger" / "segments" / "segment-000000108015.jsonl"
     )
     rows = [json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()]
     spawn = next(row for row in rows if row.get("type") == "agent.spawned")
