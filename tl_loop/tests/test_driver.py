@@ -9,20 +9,21 @@ import queue
 import subprocess
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, cast
+from typing import Protocol
 
 import pytest
 
 import tl_loop.loop.driver as driver_module
 from tl_loop.client.effects import EffectClient, ToolResult, ToolUnavailableError
 from tl_loop.client.readonly import ReadOnlyEffectClient
-from tl_loop.client.transport import JsonObject, TransportClient
+from tl_loop.client.transport import JsonObject, JsonValue, TransportClient
 from tl_loop.events.envelope import EventEnvelope, EventKind, project
 from tl_loop.events.queue import LedgerQueue, QueueError
 from tl_loop.events.reader import LedgerReader, LedgerSnapshot, SequenceStatus
@@ -32,11 +33,13 @@ from tl_loop.fsm.lane import LanePhase, LaneReserved, LaneState
 from tl_loop.fsm.phase import ChildHandle, TLFailed, TLPhase, TLPlanning, TLWaiting
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState, begin_recovery
+from tl_loop.fsm.recovery import transition_recovery
 from tl_loop.fsm.scope import TLAllMerged as RecursiveTLAllMerged
 from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
 from tl_loop.fsm.scope import TLPRFiled as RecursiveTLPRFiled
 from tl_loop.fsm.scope import TLRunning as RecursiveTLRunning
 from tl_loop.loop.abandon import abandon_slice
+from tl_loop.loop.blocked_leaf_resume import BlockedLeafOwner
 from tl_loop.loop.convergence import ConvergenceInvariantError, ConvergenceTracker
 from tl_loop.loop.pr_number import require_pr_number
 from tl_loop.loop.driver import (
@@ -46,7 +49,6 @@ from tl_loop.loop.driver import (
     DISPATCH_HISTORICAL_AUDIT,
     DISPATCH_INTEGRITY_CONFLICT,
     INTEGRATION_FAILURE_GATE_NAME,
-    REPEATED_ACTION_GATE_PREFIX,
     DepthLimitExceeded,
     DispatchAttempt,
     EffectIntent,
@@ -106,6 +108,7 @@ from tl_loop.loop.observation import WatcherObservation
 from tl_loop.loop.reconcile import (
     ExternalIntent,
     Quiescent,
+    REPEATED_ACTION_GATE_PREFIX,
     ReconciliationResult,
     action_key,
     derive_next_action,
@@ -165,8 +168,17 @@ from tl_loop.state.schema import (
     Verdict,
 )
 from tl_loop.state.serialization import DurableWriteError
-from tl_loop.state.store import QuarantineStorageError, RunStore
+from tl_loop.state.store import (
+    BudgetInput,
+    FSMInput,
+    IntegrationInput,
+    OrderedStagesInput,
+    QuarantineStorageError,
+    RunStore,
+    SliceInput,
+)
 from tl_loop.state.store import load as load_state
+from tl_loop.state.slice_transition import SliceStatusChanged, slice_transition
 from tl_loop.tests.checkpoint_fixtures import create
 
 
@@ -286,9 +298,15 @@ def test_dispatch_attempt_payload_and_invocation_identity_are_explicit() -> None
     attempt = DispatchAttempt("intent-2", 1.0, "codex/gpt-luna", attempt=2)
 
     assert _dispatch_payload("slice-a", attempt, "dispatch_intended")["attempt"] == 2
-    assert _spawn_invocation_id(SimpleNamespace(result={"invocation_id": "inv-2"})) == "inv-2"
+    assert _spawn_invocation_id(
+        ToolResult.from_raw({"result": {"invocation_id": "inv-2"}})
+    ) == "inv-2"
     assert (
-        _spawn_invocation_id(SimpleNamespace(result={"invocation": {"invocation_id": "inv-3"}}))
+        _spawn_invocation_id(
+            ToolResult.from_raw(
+                {"result": {"invocation": {"invocation_id": "inv-3"}}}
+            )
+        )
         == "inv-3"
     )
 
@@ -394,7 +412,7 @@ def _spawn_row(
     run_id: str,
     *,
     run_seq: int,
-    data: dict[str, object],
+    data: Mapping[str, object],
     agent_id: str = "root",
 ) -> EventEnvelope:
     """One ``agent.spawned`` ledger row projected the way the server writes it."""
@@ -1034,7 +1052,9 @@ class RecordingTransport:
                 result["invocation_id"] = self.spawned_invocation_id
             return {"success": True, "result": result}
         if tool_name == "list_agents":
-            return {"success": True, "result": {"agents": self.listed_agents}}
+            agents: list[JsonValue] = []
+            agents.extend(self.listed_agents)
+            return {"success": True, "result": {"agents": agents}}
         if tool_name == "repository_identity":
             return {
                 "success": True,
@@ -1100,9 +1120,10 @@ class RecordingTransport:
                     head_branch=head_branch,
                     base_branch=base_branch,
                 )
-                reconciliation["watcher"]["head_sha"] = head_sha
+                watcher = _required_json_object(reconciliation, "watcher")
+                watcher["head_sha"] = head_sha
                 if head_tree:
-                    reconciliation["watcher"]["pr_head_tree_sha"] = head_tree
+                    watcher["pr_head_tree_sha"] = head_tree
                 self.aggregate_reconciliations[slice_id] = reconciliation
                 return {
                     "success": True,
@@ -1199,6 +1220,14 @@ class RecordingTransport:
         return {"success": True, "result": None}
 
 
+class _InvocationQueue(Protocol):
+    def get(self, timeout: float | None = None) -> EventEnvelope: ...
+
+    def acknowledge(self, event: EventEnvelope) -> int: ...
+
+    def capture_snapshot(self, cursor: int) -> LedgerSnapshot: ...
+
+
 def _install_ordered_invocation(
     monkeypatch: pytest.MonkeyPatch,
     invocation_id: str,
@@ -1206,7 +1235,16 @@ def _install_ordered_invocation(
     """Record a server-confirmed subTL invocation in synthetic controller tests."""
     original = driver_module._prepare_sub_tl_stage
 
-    def prepare(tasks, state, config, source, effects, store, effects_log, order):
+    def prepare(
+        tasks: Sequence[SubTLTask],
+        state: RunState,
+        config: TLLoopConfig,
+        source: _InvocationQueue,
+        effects: EffectClient | ReadOnlyEffectClient,
+        store: RunStore,
+        effects_log: list[EffectIntent],
+        order: int,
+    ) -> tuple[RunState, tuple[SubTLTask, ...]]:
         state, prepared = original(tasks, state, config, source, effects, store, effects_log, order)
         _checkpoint_ordered_sub_tl_invocation(store, tasks[0].name, invocation_id)
         return store.load(), prepared
@@ -1223,7 +1261,7 @@ def _aggregate_watcher_fixture(
     base_branch: str = "main",
     succession_invocation_ids: tuple[str, ...] = (),
 ) -> JsonObject:
-    publication = {
+    publication: JsonObject = {
         "invocation_id": invocation_id,
         "slice_id": slice_id,
         "author_agent": author_agent,
@@ -1278,7 +1316,13 @@ class ScopeHandoffTransport(RecordingTransport):
     commit_count: int = 0
     owners: list[str] = field(default_factory=list)
 
-    def call_tool(self, role, name, tool_name, arguments):
+    def call_tool(
+        self,
+        role: str,
+        name: str,
+        tool_name: str,
+        arguments: JsonObject,
+    ) -> JsonObject:
         if tool_name != "prepare_scope_handoff":
             return super().call_tool(role, name, tool_name, arguments)
         self.calls.append((tool_name, arguments))
@@ -1392,7 +1436,11 @@ def _scope_handoff_tool_response(
     remaining_dirty_paths: list[str] | None = None,
 ) -> JsonObject:
     """Shape a typed host response behind the MCP success envelope."""
-    remaining = remaining_dirty_paths if remaining_dirty_paths is not None else changed_paths or []
+    paths = remaining_dirty_paths if remaining_dirty_paths is not None else changed_paths or []
+    remaining: list[JsonValue] = []
+    remaining.extend(paths)
+    committed: list[JsonValue] = []
+    committed.extend(committed_paths or [])
     return {
         "success": True,
         "result": {
@@ -1416,7 +1464,7 @@ def _scope_handoff_tool_response(
             "commit_sha": commit_sha,
             "source_fingerprint": fingerprint,
             "changed_paths": remaining,
-            "committed_paths": committed_paths or [],
+            "committed_paths": committed,
             "remaining_dirty_paths": remaining,
             "ready": ready,
         },
@@ -2024,6 +2072,74 @@ def _live_child_state(phase: TLPhase = TLPhase.TLWaiting) -> RunState:
     )
 
 
+class _MemoryRunStore(RunStore):
+    """Small typed store double for supervisor tests without checkpoint writes."""
+
+    def __init__(self, state: RunState, *, fail_on_exit_reason: bool = False) -> None:
+        super().__init__(state.run_id)
+        self.state = state
+        self.fail_on_exit_reason = fail_on_exit_reason
+        self.recorded_exit_reasons: list[str] = []
+
+    def load(self) -> RunState:
+        return self.state
+
+    def checkpoint(
+        self,
+        fsm: FSMInput,
+        slices: Mapping[str, SliceInput],
+        budgets: BudgetInput,
+        offset: int,
+        *,
+        current_order: int | None = None,
+        ordered_stages: OrderedStagesInput | None = None,
+        integration: IntegrationInput | None = None,
+        state_version: int | None = None,
+        plan_manifest: PlanManifest | None = None,
+        expected_revision: int | None = None,
+        clear_gates: Sequence[str] = (),
+        ensure_gates: Sequence[tuple[str, GateStatus]] = (),
+    ) -> RunState:
+        del (
+            fsm,
+            slices,
+            budgets,
+            offset,
+            current_order,
+            ordered_stages,
+            integration,
+            state_version,
+            plan_manifest,
+            expected_revision,
+            clear_gates,
+            ensure_gates,
+        )
+        raise OSError("memory run store does not persist child startup failures")
+
+    def record_exit_reason(
+        self,
+        reason: str,
+        *,
+        error: BaseException | None = None,
+        outcome: str = "controller_exit",
+        expected_revision: int | None = None,
+    ) -> bool:
+        del error, outcome, expected_revision
+        if self.fail_on_exit_reason:
+            pytest.fail(reason)
+        self.recorded_exit_reasons.append(reason)
+        return True
+
+
+def _checkpoint_phase(state: RunState) -> FSMInput:
+    phase = state.recursive_fsm
+    if phase is None:
+        return state.fsm
+    if not isinstance(phase, FSMInput):
+        raise AssertionError("recursive checkpoint phase is not a valid FSM input")
+    return phase
+
+
 def test_live_waiting_child_is_not_terminated_by_elapsed_supervision() -> None:
     class FakeProcess:
         def __init__(self) -> None:
@@ -2044,10 +2160,7 @@ def test_live_waiting_child_is_not_terminated_by_elapsed_supervision() -> None:
             self.alive = False
 
     process = FakeProcess()
-    child_store = SimpleNamespace(
-        load=lambda: _live_child_state(),
-        record_exit_reason=lambda reason: pytest.fail(reason),
-    )
+    child_store = _MemoryRunStore(_live_child_state(), fail_on_exit_reason=True)
 
     state = _supervise_live_sub_tl(
         process,
@@ -2082,6 +2195,9 @@ def test_live_supervisor_waits_for_approved_blocked_leaf_successor_checkpoint(
     project = tmp_path / "repo"
     project.mkdir()
     worktree = project / ".exo/worktrees/kani"
+    repository_identity = RepositoryIdentity(
+        "https://forge.example.test/test/repository.git"
+    )
     config = TLLoopConfig(
         active=True,
         run_id="kani",
@@ -2093,9 +2209,11 @@ def test_live_supervisor_waits_for_approved_blocked_leaf_successor_checkpoint(
         parent_branch="main",
         parent_agent_id="kani",
         session_mode="continue",
-        repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
+        repository_identity=repository_identity,
     )
     manifest = driver_module._candidate_manifest(plan, "kani", config)
+    manifest_digest = manifest.digest
+    assert manifest_digest is not None
     slices = _initial_slices(plan, config, tmp_path, "kani")
     state = create(
         "kani",
@@ -2106,7 +2224,7 @@ def test_live_supervisor_waits_for_approved_blocked_leaf_successor_checkpoint(
             "parent_branch": "main",
             "parent_agent_id": "kani",
             "depth": 1,
-            "repository_identity": config.repository_identity.to_document(),
+            "repository_identity": repository_identity.to_document(),
             "plan_manifest": manifest.to_document(),
             "slices": slices,
         },
@@ -2115,7 +2233,7 @@ def test_live_supervisor_waits_for_approved_blocked_leaf_successor_checkpoint(
     store = RunStore("kani", tmp_path)
     blocked_intent = "approved-blocked-resume-intent"
     leaf = plan.leaves[0]
-    recovery = driver_module.transition_recovery(
+    recovery = transition_recovery(
         begin_recovery(
             cause="human_decision_required",
             owner_run_id="kani",
@@ -2153,7 +2271,23 @@ def test_live_supervisor_waits_for_approved_blocked_leaf_successor_checkpoint(
     proof = driver_module._BlockedLeafResumeProof(
         leaf,
         blocked,
-        object(),
+        BlockedLeafOwner(
+            directory=project / "owner",
+            agent_name="kani",
+            slice_id=issue_slice,
+            issue_id=814,
+            prior_invocation_id="prior-invocation",
+            generation=1,
+            runtime="codex",
+            model="gpt-luna",
+            effort=None,
+            branch="main.kani",
+            parent_branch="main",
+            worktree=worktree,
+            worktree_recorded=str(worktree),
+            worktree_fingerprint="fingerprint",
+            invocation_record={},
+        ),
         recovery_gate,
         {},
         blocked_intent,
@@ -2179,10 +2313,12 @@ def test_live_supervisor_waits_for_approved_blocked_leaf_successor_checkpoint(
             self.join_calls.append(timeout)
             current_state = store.load()
             current = current_state.slices[issue_slice]
+            if manifest_digest is None:
+                raise AssertionError("candidate manifest must include a digest")
             resumed = replace(
-                driver_module.slice_transition(
+                slice_transition(
                     current,
-                    driver_module.SliceStatusChanged(SliceStatus.DISPATCH_UNCONFIRMED),
+                    SliceStatusChanged(SliceStatus.DISPATCH_UNCONFIRMED),
                 ),
                 dispatch_agent_id=f"{issue_slice}-opencode",
                 dispatch_invocation_id="codex-successor-invocation",
@@ -2197,7 +2333,7 @@ def test_live_supervisor_waits_for_approved_blocked_leaf_successor_checkpoint(
                     pending_by_order={},
                     parallel_pending=(ChildRecord(issue_slice, ChildKind.LEAF),),
                     scope_path=(manifest.scope_id,),
-                    plan_digest=manifest.digest,
+                    plan_digest=manifest_digest,
                     dispatch_intents={issue_slice: blocked_intent},
                 ),
                 {**current_state.slices, issue_slice: resumed},
@@ -2324,16 +2460,37 @@ def test_nested_recovery_projection_preserves_complete_owner_path() -> None:
         recovery_round=2,
         next_probe_at=12.0,
     )
-    outer = SimpleNamespace(
+    outer = replace(
+        _live_child_state(),
         run_id="outer",
-        slices={"inner": SimpleNamespace(recovery=None)},
-        integration=SimpleNamespace(
+        slices={
+            "inner": SliceState(
+                id="inner",
+                status=SliceStatus.PENDING,
+                paths=(),
+                depends_on=(),
+                base_ref=None,
+                test_plan=(),
+                agent_type=None,
+                model=None,
+                branch=None,
+                worktree=None,
+                pr_number=None,
+                reviewed_head=None,
+                attempts=0,
+                verdict=None,
+                recovery=None,
+            ),
+        },
+        integration=IntegrationRuntimeState(
             sub_tl_states={"inner": SubTLLifecycle.HUMAN_GATE},
             sub_tl_recovery={"inner": summary},
         ),
     )
 
-    lifecycle, projected = _child_recovery_projection(outer, "root")
+    projection = _child_recovery_projection(outer, "root")
+    assert projection is not None
+    lifecycle, projected = projection
     assert lifecycle is SubTLLifecycle.HUMAN_GATE
     assert projected.child_path == ("root", "outer", "inner", "leaf")
 
@@ -2358,10 +2515,7 @@ def test_live_waiting_child_is_terminated_on_explicit_cancellation() -> None:
     reasons: list[str] = []
     cancel_event = threading.Event()
     cancel_event.set()
-    child_store = SimpleNamespace(
-        load=lambda: _live_child_state(),
-        record_exit_reason=reasons.append,
-    )
+    child_store = _MemoryRunStore(_live_child_state())
 
     state = _supervise_live_sub_tl(
         process,
@@ -2376,7 +2530,7 @@ def test_live_waiting_child_is_terminated_on_explicit_cancellation() -> None:
     assert process.terminated
     # The lightweight fixture cannot persist a failure checkpoint. A diagnostic
     # must not be written unless it can bind to that durable failure revision.
-    assert reasons == []
+    assert child_store.recorded_exit_reasons == reasons
 
 
 def test_exited_waiting_child_is_failed_as_process_loss() -> None:
@@ -2396,10 +2550,7 @@ def test_exited_waiting_child_is_failed_as_process_loss() -> None:
             self.alive = False
 
     reasons: list[str] = []
-    child_store = SimpleNamespace(
-        load=lambda: _live_child_state(),
-        record_exit_reason=reasons.append,
-    )
+    child_store = _MemoryRunStore(_live_child_state())
 
     state = _supervise_live_sub_tl(
         FakeProcess(),
@@ -2410,7 +2561,7 @@ def test_exited_waiting_child_is_failed_as_process_loss() -> None:
     assert state is None
     # Without a durable checkpoint there is no revision for an exit diagnostic
     # to bind to, so the observer leaves recovery to the real RunStore path.
-    assert reasons == []
+    assert child_store.recorded_exit_reasons == reasons
 
 
 @dataclass
@@ -2481,7 +2632,7 @@ class OrderedIntegrationTransport(IntegrationTransport):
             patch_digest = f"patch-{sub_tl_id}"
             base_sha = "base-alpha" if sub_tl_id == "alpha" else "base-after-alpha"
             head_branch = f"{base_branch}.{sub_tl_id}"
-            publication = {
+            publication: JsonObject = {
                 "invocation_id": f"{sub_tl_id}-invocation",
                 "slice_id": sub_tl_id,
                 "author_agent": sub_tl_id,
@@ -2802,7 +2953,7 @@ def _seed_nested_aggregate_in_review(root_store: RunStore) -> RunState:
         candidates={**state.integration.candidates, "architecture": candidate},
     )
     return root_store.checkpoint(
-        state.recursive_fsm or state.fsm,
+        _checkpoint_phase(state),
         {**state.slices, "architecture": waiting},
         state.budgets,
         state.events.last_consumed_offset,
@@ -2817,7 +2968,7 @@ def _seed_nested_aggregate_with_original_dispatch_owner(root_store: RunStore) ->
     state = _seed_nested_aggregate_in_review(root_store)
     current = state.slices["architecture"]
     return root_store.checkpoint(
-        state.recursive_fsm or state.fsm,
+        _checkpoint_phase(state),
         {**state.slices, "architecture": replace(current, dispatch_agent_id="architecture")},
         state.budgets,
         state.events.last_consumed_offset,
@@ -2908,7 +3059,7 @@ def test_legacy_aggregate_coordinator_binding_reconciles_from_exact_publication(
         for gate in reconciled.gates
     )
     identity_audits = [
-        arguments["payload"]
+        _required_json_object(arguments, "payload")
         for name, arguments in transport.calls
         if name == "emit_controller_event"
         and arguments.get("event_type") == "tl.aggregate_dispatch_identity_reconciled"
@@ -3055,6 +3206,7 @@ def test_completed_nested_blocker_is_audited_without_reopening_or_bypassing_aggr
         run_id,
     )
     assert child_store is not None
+    completed_child_store = child_store
     completed_state = _complete_legacy_shape_nested_leaf(child_store, event_seq=77)
     completed_leaf = completed_state.slices["leaf-a"]
     assert completed_leaf.chainlink_issue_id is None
@@ -3072,6 +3224,8 @@ def test_completed_nested_blocker_is_audited_without_reopening_or_bypassing_aggr
     _seed_nested_aggregate_in_review(root_store)
     active_root = root_store.load()
     assert active_root.plan_manifest is not None
+    active_manifest_digest = active_root.plan_manifest.digest
+    assert active_manifest_digest is not None
     recursive_root = RecursiveTLRunning(
         current_order=1,
         pending_by_order={
@@ -3079,7 +3233,7 @@ def test_completed_nested_blocker_is_audited_without_reopening_or_bypassing_aggr
             2: (ChildRecord("kani", ChildKind.SUB_TL),),
         },
         scope_path=(run_id,),
-        plan_digest=active_root.plan_manifest.digest,
+        plan_digest=active_manifest_digest,
         dispatch_intents={"architecture": "architecture-intent"},
     )
     active_root = root_store.checkpoint(
@@ -3135,21 +3289,23 @@ def test_completed_nested_blocker_is_audited_without_reopening_or_bypassing_aggr
     )
     owner_lookup = driver_module._resolve_task_blocked_owner(event, recovered_root, root_store)
     assert owner_lookup.owner is not None, owner_lookup
+    owner_store = owner_lookup.owner.store
+    assert owner_store is not None
     completion = driver_module._classify_task_blocked_disposition(
         event,
         owner_lookup.owner,
-        owner_lookup.owner.store.load(),
+        owner_store.load(),
         owner_lookup,
     )
     assert completion.decision == "superseded_by_durable_completion", completion
 
     class ObservingQueue(SyntheticQueue):
         def acknowledge(self, observed: EventEnvelope) -> int:
-            child = child_store.load().slices["leaf-a"]
+            child = completed_child_store.load().slices["leaf-a"]
             assert child.status is SliceStatus.MERGED
             assert child.recovery is None
             assert child.post_merge == completed_leaf.post_merge
-            assert child_store.load().budgets == child_budgets
+            assert completed_child_store.load().budgets == child_budgets
             assert root_store.load().events.last_consumed_offset == observed.run_seq
             assert not any(gate.name == owner_gate for gate in root_store.load().gates)
             result = super().acknowledge(observed)
@@ -3186,9 +3342,10 @@ def test_completed_nested_blocker_is_audited_without_reopening_or_bypassing_aggr
     assert dispositions[0]["decision"] == "superseded_by_durable_completion"
     assert dispositions[0]["subject_slice_id"] == "leaf-a"
     assert dispositions[0]["reporter_scope_path"] == [run_id, "architecture"]
-    assert "blocker_attempt=6" in dispositions[0]["proof"]
-    assert "completion_attempt=1" in dispositions[0]["proof"]
-    assert "subject_consumed_offset=78" in dispositions[0]["proof"]
+    proof_values = _required_string_list(dispositions[0], "proof")
+    assert "blocker_attempt=6" in proof_values
+    assert "completion_attempt=1" in proof_values
+    assert "subject_consumed_offset=78" in proof_values
     assert root_after.current_order == 1
     assert root_after.slices["architecture"].pr_number == 273
     assert root_after.slices["architecture"].status is SliceStatus.IN_REVIEW
@@ -3234,7 +3391,7 @@ def test_legacy_completion_shape_requires_attempt_repository_and_closure_corrobo
     if mutation == "cursor":
         child_state = child_store.load()
         child_store.checkpoint(
-            child_state.recursive_fsm or child_state.fsm,
+            _checkpoint_phase(child_state),
             child_state.slices,
             child_state.budgets,
             89,
@@ -3285,7 +3442,7 @@ def test_completed_nested_blocker_with_incomplete_receipts_stays_unresolved(
     leaf = completed.slices["leaf-a"]
     assert leaf.handoff is not None
     child_store.checkpoint(
-        completed.recursive_fsm or completed.fsm,
+        _checkpoint_phase(completed),
         {
             **completed.slices,
             "leaf-a": replace(leaf, handoff=replace(leaf.handoff, attempt=5)),
@@ -3325,7 +3482,7 @@ def test_completed_nested_blocker_with_incomplete_receipts_stays_unresolved(
     assert child_after.handoff is not None
     assert child_after.handoff.attempt == 5
     assert any(gate.name == "task-blocked-owner:88" for gate in result.final_state.gates)
-    diagnostic = " ".join(result.diagnostics["unresolved_events"])
+    diagnostic = " ".join(_required_string_list(result.diagnostics, "unresolved_events"))
     assert "completed_child_evidence_incomplete" in diagnostic
     assert "handoff_attempt" in diagnostic
 
@@ -3362,7 +3519,7 @@ def test_foreign_reporter_conflict_is_diagnosed_with_scope_and_alias_evidence(
     assert source.acknowledged == []
     assert child_store.load().slices["leaf-a"].recovery is None
     assert root_store.load().events.last_consumed_offset == 0
-    diagnostic = " ".join(result.diagnostics["unresolved_events"])
+    diagnostic = " ".join(_required_string_list(result.diagnostics, "unresolved_events"))
     assert "reporter='kani'" in diagnostic
     assert "subject='leaf-a'" in diagnostic
     assert "candidate_scopes" in diagnostic
@@ -3380,7 +3537,7 @@ def test_nested_blocker_reporter_uses_durable_controller_alias(tmp_path: Path) -
         dispatch_agent_id="architecture-controller",
     )
     state = root_store.checkpoint(
-        state.recursive_fsm or state.fsm,
+        _checkpoint_phase(state),
         root_slices,
         state.budgets,
         state.events.last_consumed_offset,
@@ -3443,7 +3600,7 @@ def test_blocker_alias_conflicts_do_not_route_to_a_nested_owner(tmp_path: Path) 
     )
     assert source.acknowledged == []
     assert child_store.load().slices["leaf-a"].recovery is None
-    diagnostic = " ".join(result.diagnostics["unresolved_events"])
+    diagnostic = " ".join(_required_string_list(result.diagnostics, "unresolved_events"))
     assert "intent_id->architecture" in diagnostic
     assert "consistent_event_aliases" in diagnostic
 
@@ -3472,7 +3629,16 @@ def test_unbound_reporter_invocation_evidence_is_rejected(
         generation=None,
         role="controller",
     )
-    conflicting = replace(event, **{field: value})
+    if field == "invocation_id":
+        if not isinstance(value, str):
+            raise AssertionError("invocation_id fixture must be a string")
+        conflicting = replace(event, invocation_id=value)
+    elif field == "generation":
+        if not isinstance(value, int):
+            raise AssertionError("generation fixture must be an integer")
+        conflicting = replace(event, generation=value)
+    else:
+        raise AssertionError(f"unsupported event field fixture: {field}")
     lookup = driver_module._resolve_task_blocked_owner(
         conflicting,
         root_store.load(),
@@ -3665,7 +3831,7 @@ def test_reconciled_blocker_integrates_without_root_review_before_next_stage(
     )
     assert root_slice.publication is not None
     aggregate_head = root_slice.publication.head_sha
-    publication_record = {
+    publication_record: JsonObject = {
         "invocation_id": root_slice.publication.invocation_id,
         "slice_id": "architecture",
         "author_agent": "architecture",
@@ -3690,7 +3856,13 @@ def test_reconciled_blocker_integrates_without_root_review_before_next_stage(
     }
 
     class GateIntegrationTransport(IntegrationTransport):
-        def call_tool(self, role, name, tool_name, arguments):
+        def call_tool(
+            self,
+            role: str,
+            name: str,
+            tool_name: str,
+            arguments: JsonObject,
+        ) -> JsonObject:
             if tool_name == "repository_identity":
                 self.calls.append((tool_name, arguments))
                 return {
@@ -3804,17 +3976,15 @@ def test_reconciled_blocker_integrates_without_root_review_before_next_stage(
     ]
     assert not any(name == "spawn_reviewer" for name, _ in transport.calls)
     assert any(
-        arguments.get("event_type") == "tl.ordered_recovery_superseded"
+        name == "emit_controller_event"
+        and _event_has_type(arguments, "tl.ordered_recovery_superseded")
         for name, arguments in transport.calls
-        if name == "emit_controller_event"
     )
     kani_dispatches = [
         arguments
         for name, arguments in transport.calls
         if name == "emit_controller_event"
-        and arguments.get("event_type") == "tl.dispatch_confirmed"
-        and isinstance(arguments.get("payload"), Mapping)
-        and arguments["payload"].get("slice_id") == "kani"
+        and _event_payload_has(arguments, "tl.dispatch_confirmed", "slice_id", "kani")
     ]
     assert len(kani_dispatches) == 1
 
@@ -3835,9 +4005,9 @@ def test_reconciled_blocker_integrates_without_root_review_before_next_stage(
                 arguments
                 for name, arguments in transport.calls
                 if name == "emit_controller_event"
-                and arguments.get("event_type") == "tl.dispatch_confirmed"
-                and isinstance(arguments.get("payload"), Mapping)
-                and arguments["payload"].get("slice_id") == "kani"
+                and _event_payload_has(
+                    arguments, "tl.dispatch_confirmed", "slice_id", "kani"
+                )
             ]
         )
         == 1
@@ -3934,10 +4104,11 @@ def test_nested_controller_reporter_routes_legacy_blocker_to_child_before_ack(
     cancel_event = threading.Event()
     plan, root_store, child_store = _nested_blocked_owner_stores(tmp_path, run_id)
     assert child_store is not None
+    required_child_store = child_store
 
     class ObservingQueue(SyntheticQueue):
         def acknowledge(self, event: EventEnvelope) -> int:
-            child = child_store.load().slices["leaf-a"]
+            child = required_child_store.load().slices["leaf-a"]
             assert child.recovery is not None
             assert child.recovery.cause == ParkCause.HUMAN_DECISION_REQUIRED.value
             assert root_store.load().events.last_consumed_offset == event.run_seq
@@ -4039,14 +4210,14 @@ def _nested_blocked_owner_stores(
     root_state = root_store.set_ordered_state(
         1,
         (
-            driver_module.OrderedStageState(1, ("architecture",)),
-            driver_module.OrderedStageState(2, ("kani",)),
+            OrderedStageState(1, ("architecture",)),
+            OrderedStageState(2, ("kani",)),
         ),
         root_store.load().integration,
     )
-    root_slices = dict(root_state.slices)
-    root_slices["architecture"] = replace(
-        root_slices["architecture"],
+    root_slice_states: dict[str, SliceState] = dict(root_state.slices)
+    root_slice_states["architecture"] = replace(
+        root_slice_states["architecture"],
         status=SliceStatus.SPAWNED,
         dispatch_intent_id="architecture-intent",
         dispatch_agent_id="architecture",
@@ -4055,7 +4226,7 @@ def _nested_blocked_owner_stores(
     )
     root_store.checkpoint(
         root_state.fsm.phase,
-        root_slices,
+        root_slice_states,
         root_state.budgets,
         root_state.events.last_consumed_offset,
         current_order=1,
@@ -4173,7 +4344,7 @@ def _sibling_blocked_owner_stores(
     initial = root_store.set_ordered_state(
         1,
         tuple(
-            driver_module.OrderedStageState(stage.order, stage.sub_tls)
+            OrderedStageState(stage.order, stage.sub_tls)
             for stage in root_plan.ordered_stages
         ),
         root_store.load().integration,
@@ -4294,7 +4465,7 @@ def _three_level_blocked_owner_stores(
     root_store.set_plan_manifest(root_manifest, slices=root_slices)
     root_state = root_store.set_ordered_state(
         1,
-        (driver_module.OrderedStageState(1, ("outer",)),),
+        (OrderedStageState(1, ("outer",)),),
         root_store.load().integration,
     )
 
@@ -4318,7 +4489,7 @@ def _three_level_blocked_owner_stores(
     outer_store.set_plan_manifest(outer_manifest, slices=outer_slices)
     outer_state = outer_store.set_ordered_state(
         1,
-        (driver_module.OrderedStageState(1, ("inner",)),),
+        (OrderedStageState(1, ("inner",)),),
         outer_store.load().integration,
     )
 
@@ -4357,7 +4528,7 @@ def _three_level_blocked_owner_stores(
             dispatch_last_boundary="sub_tl_started",
         )
         parent_store.checkpoint(
-            parent_state.recursive_fsm or parent_state.fsm,
+            _checkpoint_phase(parent_state),
             {**parent_state.slices, child_name: started},
             parent_state.budgets,
             parent_state.events.last_consumed_offset,
@@ -4603,7 +4774,7 @@ def _rewrite_legacy_completion_evidence(
     evidence = {**current.post_merge.evidence, **updates}
     updated = replace(current, post_merge=PostMergeState(current.post_merge.phase, evidence))
     return store.checkpoint(
-        state.recursive_fsm or state.fsm,
+        _checkpoint_phase(state),
         {**state.slices, current.id: updated},
         state.budgets,
         state.events.last_consumed_offset,
@@ -4617,10 +4788,11 @@ def test_nested_task_blocked_recovers_child_before_ack_and_keeps_ordered_stage_g
     cancel_event = threading.Event()
     plan, root_store, child_store = _nested_blocked_owner_stores(tmp_path, run_id)
     assert child_store is not None
+    required_child_store = child_store
 
     class ObservingQueue(SyntheticQueue):
         def acknowledge(self, event: EventEnvelope) -> int:
-            assert child_store.load().slices["leaf-a"].recovery is not None
+            assert required_child_store.load().slices["leaf-a"].recovery is not None
             assert root_store.load().events.last_consumed_offset == event.run_seq
             result = super().acknowledge(event)
             cancel_event.set()
@@ -4910,10 +5082,14 @@ def test_nested_task_blocked_persistence_failure_does_not_ack_unrecorded_event(
     assert source.acknowledged == []
     assert root_store.load().events.last_consumed_offset == 0
     assert any(gate.name == "task-blocked-owner:1" for gate in result.final_state.gates)
-    assert expected_reason in " ".join(result.diagnostics["unresolved_events"])
+    assert expected_reason in " ".join(
+        _required_string_list(result.diagnostics, "unresolved_events")
+    )
 
 
-def test_durable_journal_failure_parks_the_affected_slice(tmp_path: Path, monkeypatch) -> None:
+def test_durable_journal_failure_parks_the_affected_slice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     class ParkingTransport(RecordingTransport):
         def call_tool(
             self,
@@ -4952,7 +5128,9 @@ def test_durable_journal_failure_parks_the_affected_slice(tmp_path: Path, monkey
         if slice_state.park_cause is not None
     ]
     assert len(parked) == 1
-    assert parked[0].park_cause.value == "durable_write_failed"
+    park_cause = parked[0].park_cause
+    assert park_cause is not None
+    assert park_cause.value == "durable_write_failed"
 
 
 def test_observability_failure_does_not_change_terminal_state(
@@ -5064,6 +5242,7 @@ def test_rejected_spawn_is_persisted_as_dispatch_failure(tmp_path: Path) -> None
     slice_state = result.final_state.slices["leaf-a"]
     assert result.final_state.fsm.phase is TLPhase.TLFailed
     assert slice_state.status is SliceStatus.DISPATCH_FAILED
+    assert slice_state.park_cause is not None
     assert slice_state.park_cause.value == "dispatch_failed"
     assert slice_state.dispatch_last_boundary == "spawn_request_failed"
     assert "tmux launch rejected" in (slice_state.dispatch_error or "")
@@ -5074,7 +5253,7 @@ def test_rejected_spawn_is_persisted_as_dispatch_failure(tmp_path: Path) -> None
     )
     assert not any(
         arguments["event_type"] == "tl.gate_opened"
-        and arguments["payload"].get("gate_name") == "tl-timeout"
+        and _required_json_object(arguments, "payload").get("gate_name") == "tl-timeout"
         for name, arguments in transport.calls
         if name == "emit_controller_event"
     )
@@ -5252,6 +5431,7 @@ def test_stale_spawn_intent_cannot_confirm_new_attempt(tmp_path: Path) -> None:
     assert stale.status is SliceStatus.DISPATCH_UNCONFIRMED
     assert stale.dispatch_intent_id == "intent-new-2"
     assert stale.dispatch_authoritative_event_seq is None
+    assert stale.park_cause is not None
     assert stale.park_cause.value == "dispatch_unconfirmed"
     assert source.acknowledged == [1]
     assert isinstance(outcome.get("error"), LoopCancelled)
@@ -5560,7 +5740,7 @@ def test_opt_in_reviewer_spawn_claims_attempt_and_injects_criteria(tmp_path: Pat
     }
     source = SyntheticQueue(
         [
-            project(cast(dict[str, object], raw_pr_filed)),
+            project(raw_pr_filed),
             project(
                 {
                     **raw_pr_filed,
@@ -5704,7 +5884,7 @@ def test_binding_review_findings_adjudicate_and_resume_same_pr(
         review_model_choice=_review_choice(backend),
         review_policy_path=Path(".exo/review-policy.toml"),
     )
-    effects_log: list[object] = []
+    effects_log: list[EffectIntent] = []
 
     _route_review_event(
         WorkPlan.from_mapping(
@@ -6729,6 +6909,7 @@ def test_repeated_action_parks_with_gate_instead_of_crashing(tmp_path: Path) -> 
     assert parked_slice.status is SliceStatus.PARKED
     assert parked_slice.park_cause is ParkCause.REPEATED_ACTION_NO_PROGRESS
     audit = parked_slice.park_audit
+    assert audit is not None
     assert audit["invariant"] == "repeated_state_version_action"
     assert audit["action"] == "merge effect"
     assert audit["target_id"] == "leaf-a"
@@ -7272,10 +7453,12 @@ def test_parent_sync_attempt_identity_survives_optional_evidence_and_retries_ref
     }
 
     class SyncTransport:
-        calls: ClassVar[list[dict[str, object]]] = []
+        calls: ClassVar[list[JsonObject]] = []
         tool_names: ClassVar[list[str]] = []
 
-        def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
             del role, name
             self.calls.append(arguments)
             is_reconcile = arguments.get("reconcile_only") is True
@@ -7283,11 +7466,11 @@ def test_parent_sync_attempt_identity_survives_optional_evidence_and_retries_ref
                 "post_merge_parent_sync_reconcile" if is_reconcile else tool_name
             )
             if is_reconcile:
-                reconcile_result: dict[str, object] = {
+                reconcile_result: JsonObject = {
                     **arguments,
                     "sync_outcome": "safe_to_retry",
                     "sync_phase": "reconcile_complete",
-                    "completed_steps": ["fetch", "fast_forward_available"],
+                    "completed_steps": _json_strings("fetch", "fast_forward_available"),
                     "retry_safe": True,
                     "diagnostic": "the refusal preconditions changed",
                     "refusal_preconditions": {
@@ -7302,11 +7485,11 @@ def test_parent_sync_attempt_identity_survives_optional_evidence_and_retries_ref
                 return {"success": True, "result": reconcile_result}
             assert tool_name == "post_merge_parent_sync"
             outcome = "known_partial_progress" if len(self.calls) == 1 else "confirmed"
-            result: dict[str, object] = {
+            result: JsonObject = {
                 **arguments,
                 "sync_outcome": outcome,
                 "sync_phase": "fast_forward" if outcome != "confirmed" else "complete",
-                "completed_steps": ["fetch"],
+                "completed_steps": _json_strings("fetch"),
                 "retry_safe": outcome != "confirmed",
                 "diagnostic": "fast-forward refused" if outcome != "confirmed" else "",
             }
@@ -7380,7 +7563,10 @@ def test_parent_sync_attempt_identity_survives_optional_evidence_and_retries_ref
         "post_merge_parent_sync",
     ]
     attempts = journal.entries_for("post_merge_parent_sync", "leaf-a")
-    assert [entry["arguments"]["sync_attempt"] for entry in attempts] == [1, 3]
+    assert [
+        _required_integer(_required_mapping(entry["arguments"], "journal arguments"), "sync_attempt")
+        for entry in attempts
+    ] == [1, 3]
 
 
 @pytest.mark.parametrize("include_initial_preconditions", [True, False])
@@ -7397,7 +7583,7 @@ def test_parent_sync_holds_unchanged_known_fast_forward_refusal(
         "merge_journal_id": "merge-journal-a",
         "lane_epoch": "1",
     }
-    refusal_preconditions: dict[str, object] = {
+    refusal_preconditions: JsonObject = {
         "parent_branch": "main",
         "remote_name": "origin",
         "local_head_sha": "local-a",
@@ -7407,19 +7593,21 @@ def test_parent_sync_holds_unchanged_known_fast_forward_refusal(
     }
 
     class RefusalTransport:
-        calls: ClassVar[list[tuple[str, dict[str, object]]]] = []
+        calls: ClassVar[list[tuple[str, JsonObject]]] = []
 
-        def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
             del role, name
             assert tool_name == "post_merge_parent_sync"
             self.calls.append((tool_name, arguments))
             is_reconcile = arguments.get("reconcile_only") is True
             outcome = "safe_to_retry" if is_reconcile else "known_partial_progress"
-            result: dict[str, object] = {
+            result: JsonObject = {
                 **arguments,
                 "sync_outcome": outcome,
                 "sync_phase": "reconcile_complete" if is_reconcile else "fast_forward",
-                "completed_steps": ["fetch"],
+                "completed_steps": _json_strings("fetch"),
                 "retry_safe": True,
                 "diagnostic": "local changes would be overwritten",
             }
@@ -7471,7 +7659,7 @@ def test_parent_sync_holds_unchanged_known_fast_forward_refusal(
     ]
     assert transport.calls[1][1]["reconcile_only"] is True
     assert [
-        entry["arguments"]["sync_attempt"]
+        _required_integer(_required_mapping(entry["arguments"], "journal arguments"), "sync_attempt")
         for entry in journal.entries_for("post_merge_parent_sync", "leaf-a")
     ] == [1]
     assert journal.entries_for("post_merge_parent_sync", "leaf-a")[0] == original_attempt
@@ -7492,7 +7680,7 @@ def test_parent_sync_holds_unchanged_known_fast_forward_refusal(
     assert len(transport.calls) == 3
     assert all(call[1]["reconcile_only"] is True for call in transport.calls[1:])
     assert [
-        entry["arguments"]["sync_attempt"]
+        _required_integer(_required_mapping(entry["arguments"], "journal arguments"), "sync_attempt")
         for entry in journal.entries_for("post_merge_parent_sync", "leaf-a")
     ] == [1]
 
@@ -7508,7 +7696,7 @@ def test_parent_sync_holds_unchanged_divergent_history_after_replay(tmp_path: Pa
         "merge_journal_id": "merge-journal-a",
         "lane_epoch": "1",
     }
-    refusal_preconditions: dict[str, object] = {
+    refusal_preconditions: JsonObject = {
         "parent_branch": "main",
         "remote_name": "origin",
         "local_head_sha": "local-a",
@@ -7518,19 +7706,21 @@ def test_parent_sync_holds_unchanged_divergent_history_after_replay(tmp_path: Pa
     }
 
     class DivergenceTransport:
-        calls: ClassVar[list[dict[str, object]]] = []
+        calls: ClassVar[list[JsonObject]] = []
 
-        def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
             del role, name
             assert tool_name == "post_merge_parent_sync"
             self.calls.append(arguments)
             is_reconcile = arguments.get("reconcile_only") is True
-            result: dict[str, object] = {
+            result: JsonObject = {
                 **arguments,
                 "sync_outcome": "unresolved" if is_reconcile else "known_partial_progress",
                 "sync_phase": "reconcile_observation" if is_reconcile else "fast_forward",
                 "sync_blocker": "diverged_history",
-                "completed_steps": ["fetch"],
+                "completed_steps": _json_strings("fetch"),
                 "retry_safe": False,
                 "diagnostic": "local and remote history is divergent",
                 "refusal_preconditions": refusal_preconditions,
@@ -7572,7 +7762,7 @@ def test_parent_sync_holds_unchanged_divergent_history_after_replay(tmp_path: Pa
     assert len(transport.calls) == 2
     assert transport.calls[1]["reconcile_only"] is True
     assert [
-        entry["arguments"]["sync_attempt"]
+        _required_integer(_required_mapping(entry["arguments"], "journal arguments"), "sync_attempt")
         for entry in journal.entries_for("post_merge_parent_sync", "leaf-a")
     ] == [1]
     assert journal.entries_for("post_merge_parent_sync", "leaf-a")[0] == original_attempt
@@ -7593,7 +7783,9 @@ def test_parent_sync_rejects_mismatched_result_correlation_as_a_recoverable_hold
     }
 
     class MismatchedTransport:
-        def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
             del role, name
             assert tool_name == "post_merge_parent_sync"
             return {
@@ -7623,7 +7815,9 @@ def test_parent_sync_rejects_mismatched_result_correlation_as_a_recoverable_hold
     )
 
     assert result["sync_outcome"] == "unresolved"
-    assert "different logical operation identity" in result["diagnostic"]
+    diagnostic = result["diagnostic"]
+    assert isinstance(diagnostic, str)
+    assert "different logical operation identity" in diagnostic
     assert journal.entries_for("post_merge_parent_sync", "leaf-a")[0]["status"] == "confirmed"
 
 
@@ -7652,20 +7846,22 @@ def test_parent_sync_timeout_is_reconciled_before_a_new_mutation_attempt(tmp_pat
     }
 
     class SyncTransport:
-        calls: ClassVar[list[dict[str, object]]] = []
+        calls: ClassVar[list[JsonObject]] = []
 
-        def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
             del role, name
             assert tool_name == "post_merge_parent_sync"
             self.calls.append(arguments)
             if len(self.calls) == 1:
                 raise TimeoutError("response lost after Git may have run")
             outcome = "safe_to_retry" if arguments["reconcile_only"] else "confirmed"
-            result: dict[str, object] = {
+            result: JsonObject = {
                 **arguments,
                 "sync_outcome": outcome,
                 "sync_phase": "reconcile_complete" if arguments["reconcile_only"] else "complete",
-                "completed_steps": ["fetch"],
+                "completed_steps": _json_strings("fetch"),
                 "retry_safe": outcome == "safe_to_retry",
                 "diagnostic": "verified fast-forward is available"
                 if outcome == "safe_to_retry"
@@ -7758,18 +7954,20 @@ def test_parent_sync_reconciles_legacy_unknown_rows_without_rewriting_them(tmp_p
     historical = journal.snapshot()
 
     class SyncTransport:
-        calls: ClassVar[list[dict[str, object]]] = []
+        calls: ClassVar[list[JsonObject]] = []
 
-        def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
             del role, name
             assert tool_name == "post_merge_parent_sync"
             self.calls.append(arguments)
             outcome = "safe_to_retry" if arguments["reconcile_only"] else "confirmed"
-            result: dict[str, object] = {
+            result: JsonObject = {
                 **arguments,
                 "sync_outcome": outcome,
                 "sync_phase": "reconcile_complete" if arguments["reconcile_only"] else "complete",
-                "completed_steps": ["fetch"],
+                "completed_steps": _json_strings("fetch"),
                 "retry_safe": outcome == "safe_to_retry",
                 "diagnostic": "remote integration verified" if outcome == "safe_to_retry" else "",
             }
@@ -7849,7 +8047,7 @@ def test_parent_sync_revalidates_legacy_confirmed_receipt_against_current_git(
         )
 
     journal = EffectJournal(state.run_id, store.run_dir / "action-journal.json")
-    legacy_arguments = {
+    legacy_arguments: JsonObject = {
         "child_id": "leaf-a",
         "pr_number": 42,
         "repository": remote_url,
@@ -7859,7 +8057,7 @@ def test_parent_sync_revalidates_legacy_confirmed_receipt_against_current_git(
         "lane_epoch": 1,
         "working_dir": ".",
     }
-    receipt = {
+    receipt: JsonObject = {
         **legacy_arguments,
         "remote_name": "forgejo",
         "parent_commit_sha": merged_head,
@@ -7872,9 +8070,11 @@ def test_parent_sync_revalidates_legacy_confirmed_receipt_against_current_git(
     historical = journal.snapshot()
 
     class CurrentGitTransport:
-        calls: ClassVar[list[tuple[str, dict[str, object]]]] = []
+        calls: ClassVar[list[tuple[str, JsonObject]]] = []
 
-        def call_tool(self, role: str, name: str, tool_name: str, arguments: dict[str, object]):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
             del role, name
             self.calls.append((tool_name, dict(arguments)))
             if tool_name == "repository_identity":
@@ -7945,11 +8145,11 @@ def test_parent_sync_revalidates_legacy_confirmed_receipt_against_current_git(
                     "reconcile_observation",
                     "current Git coordinates differ from the historical receipt",
                 )
-            result: dict[str, object] = {
+            result: JsonObject = {
                 **arguments,
                 "sync_outcome": outcome,
                 "sync_phase": phase,
-                "completed_steps": ["fetch"],
+                "completed_steps": _json_strings("fetch"),
                 "retry_safe": outcome == "safe_to_retry",
                 "diagnostic": diagnostic,
             }
@@ -8927,6 +9127,7 @@ def test_conflicting_publication_refused_before_reduction_preserves_owner(
     assert final.handoff == baseline_slice.handoff
     assert final.handoff is not None and final.handoff.head_sha == "head-45"
     assert final.recovery is not None
+    assert baseline_slice.recovery is not None
     assert final.recovery.cause == baseline_slice.recovery.cause
     assert final.recovery.phase == baseline_slice.recovery.phase
     assert final.status == baseline_slice.status
@@ -9732,6 +9933,66 @@ def test_parent_branch_ci_failure_ceiling_opens_gate_without_another_judgment(
     assert restored.integration.candidates["leaf-a"].tl_intervention_attempts == 1
 
 
+def _required_json_object(payload: Mapping[str, JsonValue], key: str) -> JsonObject:
+    value = payload.get(key)
+    if not isinstance(value, dict):
+        raise AssertionError(f"expected {key!r} to contain a JSON object")
+    return value
+
+
+def _required_json_string(payload: Mapping[str, JsonValue], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str):
+        raise AssertionError(f"expected {key!r} to contain a string")
+    return value
+
+
+def _required_string_list(payload: Mapping[str, object], key: str) -> list[str]:
+    value = payload.get(key)
+    if not isinstance(value, list):
+        raise AssertionError(f"expected {key!r} to contain a list")
+    strings: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise AssertionError(f"expected every {key!r} item to be a string")
+        strings.append(item)
+    return strings
+
+
+def _required_mapping(value: object, label: str) -> Mapping[str, object]:
+    if not isinstance(value, Mapping):
+        raise AssertionError(f"expected {label} to contain a mapping")
+    return value
+
+
+def _required_integer(payload: Mapping[str, object], key: str) -> int:
+    value = payload.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise AssertionError(f"expected {key!r} to contain an integer")
+    return value
+
+
+def _event_payload_has(
+    arguments: JsonObject,
+    event_type: str,
+    key: str,
+    expected: str,
+) -> bool:
+    if arguments.get("event_type") != event_type:
+        return False
+    return _required_json_object(arguments, "payload").get(key) == expected
+
+
+def _event_has_type(arguments: JsonObject, event_type: str) -> bool:
+    return arguments.get("event_type") == event_type
+
+
+def _json_strings(*values: str) -> list[JsonValue]:
+    result: list[JsonValue] = []
+    result.extend(values)
+    return result
+
+
 def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> None:
     transport = RecordingTransport()
     run_id = "selector-run"
@@ -9764,18 +10025,22 @@ def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> 
         "spawn_leaf",
         "root_branch_finalize",
     ]
+    manifest = result.final_state.plan_manifest
+    assert manifest is not None
+    manifest_digest = manifest.digest
+    assert manifest_digest is not None
     spawn_worker_call = next(
         arguments for name, arguments in transport.calls if name == "spawn_worker"
     )
-    worker_route = spawn_worker_call["role_route"]
+    worker_route = _required_json_object(spawn_worker_call, "role_route")
     assert spawn_worker_call["agent_type"] == "codex"
     assert spawn_worker_call["model"] == "gpt-5.5"
     assert worker_route["role"] == "worker"
     assert worker_route["effort"] == "xhigh"
     assert worker_route["configuration_fingerprint"] == "sha256:v1:" + "1" * 64
-    assert worker_route["manifest_digest"] == result.final_state.plan_manifest.digest
-    assert worker_route["policy_fingerprint"].startswith("sha256:v1:")
-    assert worker_route["route_fingerprint"].startswith("sha256:v1:")
+    assert worker_route["manifest_digest"] == manifest_digest
+    assert _required_json_string(worker_route, "policy_fingerprint").startswith("sha256:v1:")
+    assert _required_json_string(worker_route, "route_fingerprint").startswith("sha256:v1:")
     assert result.final_state.budgets.role_reserved == {"worker": 500}
     assert result.final_state.budgets.harness_reserved == {"codex/gpt-luna": 500}
     assert result.final_state.slices["worker-a"].model == "gpt-5.5"
@@ -9783,7 +10048,7 @@ def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> 
     assert worker_state.dispatch_role == "worker"
     assert worker_state.dispatch_effort == "xhigh"
     assert worker_state.dispatch_route_configuration_fingerprint == "sha256:v1:" + "1" * 64
-    assert worker_state.dispatch_route_manifest_digest == result.final_state.plan_manifest.digest
+    assert worker_state.dispatch_route_manifest_digest == manifest_digest
     assert worker_state.dispatch_route_policy_fingerprint == worker_route["policy_fingerprint"]
     assert worker_state.dispatch_route_fingerprint == worker_route["route_fingerprint"]
     worker_intent = next(intent for intent in result.effects if intent.operation == "spawn_worker")
@@ -9797,7 +10062,7 @@ def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> 
         == worker_route["route_fingerprint"]
     )
     leaf_call = next(arguments for name, arguments in transport.calls if name == "spawn_leaf")
-    leaf_route = leaf_call["role_route"]
+    leaf_route = _required_json_object(leaf_call, "role_route")
     assert leaf_route["harness"] == worker_route["harness"]
     assert leaf_route["agent_type"] == worker_route["agent_type"]
     assert leaf_route["model"] == worker_route["model"]
