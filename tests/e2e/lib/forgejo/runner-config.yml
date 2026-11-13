@@ -1,0 +1,27 @@
+# Base runner config for the disposable Actions template.
+#
+# The entrypoint copies this file to /data/runner-config.yml, adds the
+# job-container host mapping for Forgejo, and registers on first start.
+#
+# force_pull is false on purpose: with a pre-loaded nested image store there is
+# no reason to contact a registry.  force_pull=true does not fail a job when the
+# local image exists (the runner logs a warning and continues), but it still
+# makes a registry request, which an offline stack cannot serve.
+log:
+  level: info
+  job_level: info
+
+runner:
+  file: /data/.runner
+  capacity: 1
+  timeout: 30m
+
+cache:
+  enabled: false
+
+container:
+  network: ""
+  privileged: false
+  options: ""
+  valid_volumes: []
+  force_pull: false

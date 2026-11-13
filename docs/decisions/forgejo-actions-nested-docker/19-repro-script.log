@@ -1,0 +1,153 @@
+project=spike1337-repro-20261113052442-3964612
+workdir=/home/goya/tmp-1331/spike1337.M39YgP
+template=/home/goya/agent-workspace/exomonad/tests/e2e/lib/forgejo/docker-compose.actions.yml
+template file: 1db7af3f87826cca719d8c9301cfe621e00248d725021d1650312e1ef7b6b1c8  /home/goya/agent-workspace/exomonad/tests/e2e/lib/forgejo/docker-compose.actions.yml
+template file: 8a7256e4062a20086f37a2e294e8f993e502dbcd5071b4e8d0071e50e598ee12  /home/goya/agent-workspace/exomonad/tests/e2e/lib/forgejo/runner-config.yml
+template file: 959249283516c705dceb50f4d2028d1e2a594077510107cb4939e7496bcfd528  /home/goya/agent-workspace/exomonad/tests/e2e/lib/forgejo/runner-entrypoint.sh
+template check: no container_name
+starting forgejo and dind from the checked-in template
+$ compose up -d --wait forgejo dind
+ Volume spike1337-repro-20261113052442-3964612_forgejo-data Creating 
+ Volume spike1337-repro-20261113052442-3964612_forgejo-data Creating 
+ Network spike1337-repro-20261113052442-3964612_default Creating 
+ Network spike1337-repro-20261113052442-3964612_default Creating 
+ Network spike1337-repro-20261113052442-3964612_ci Creating 
+ Network spike1337-repro-20261113052442-3964612_ci Creating 
+ Volume spike1337-repro-20261113052442-3964612_forgejo-data Created 
+ Volume spike1337-repro-20261113052442-3964612_forgejo-data Created 
+ Network spike1337-repro-20261113052442-3964612_ci Created 
+ Network spike1337-repro-20261113052442-3964612_ci Created 
+ Container spike1337-repro-20261113052442-3964612-dind-1 Creating 
+ Network spike1337-repro-20261113052442-3964612_default Created 
+ Network spike1337-repro-20261113052442-3964612_default Created 
+ Container spike1337-repro-20261113052442-3964612-forgejo-1 Creating 
+ Container spike1337-repro-20261113052442-3964612-dind-1 Created 
+ Container spike1337-repro-20261113052442-3964612-forgejo-1 Created 
+ Container spike1337-repro-20261113052442-3964612-forgejo-1 Starting 
+ Container spike1337-repro-20261113052442-3964612-dind-1 Starting 
+ Container spike1337-repro-20261113052442-3964612-forgejo-1 Started 
+ Container spike1337-repro-20261113052442-3964612-dind-1 Started 
+ Container spike1337-repro-20261113052442-3964612-dind-1 Waiting 
+ Container spike1337-repro-20261113052442-3964612-forgejo-1 Waiting 
+ Container spike1337-repro-20261113052442-3964612-forgejo-1 Healthy 
+ Container spike1337-repro-20261113052442-3964612-dind-1 Healthy 
+$ docker compose -p spike1337-repro-20261113052442-3964612 port forgejo 3000
+127.0.0.1:32780
+base=http://127.0.0.1:32780 dind=ef2ea1e5f8b0d2ff846e9de564ecf2571cfb703107af00306e4acc81401e1476
+creating admin user and runner registration token via the Forgejo container CLI
+runner token: 43 characters from forgejo actions generate-runner-token
+starting the runner through the template entrypoint
+$ compose up -d runner
+ Container spike1337-repro-20261113052442-3964612-forgejo-1 Running 
+ Container spike1337-repro-20261113052442-3964612-dind-1 Running 
+ Volume spike1337-repro-20261113052442-3964612_runner-data Creating 
+ Volume spike1337-repro-20261113052442-3964612_runner-data Creating 
+ Volume spike1337-repro-20261113052442-3964612_runner-data Created 
+ Volume spike1337-repro-20261113052442-3964612_runner-data Created 
+ Container spike1337-repro-20261113052442-3964612-runner-1 Creating 
+ Container spike1337-repro-20261113052442-3964612-runner-1 Created 
+ Container spike1337-repro-20261113052442-3964612-dind-1 Waiting 
+ Container spike1337-repro-20261113052442-3964612-forgejo-1 Waiting 
+ Container spike1337-repro-20261113052442-3964612-forgejo-1 Healthy 
+ Container spike1337-repro-20261113052442-3964612-dind-1 Healthy 
+ Container spike1337-repro-20261113052442-3964612-runner-1 Starting 
+ Container spike1337-repro-20261113052442-3964612-runner-1 Started 
+runner registered through the template entrypoint:
+runner-1  | level=info msg="Runner registered successfully."
+runner-1  | time="2026-11-13T05:24:49Z" level=info msg="runner: spike1337-repro-20261113052442-3964612-runner, with version: v12.10.1, with labels: [ubuntu-latest], ephemeral: false, declared successfully"
+files inside the runner container (mount + entrypoint copy):
+$ compose exec -T runner sha256sum /etc/runner-config.yml /runner-entrypoint.sh /data/runner-config.yml
+8a7256e4062a20086f37a2e294e8f993e502dbcd5071b4e8d0071e50e598ee12  /etc/runner-config.yml
+959249283516c705dceb50f4d2028d1e2a594077510107cb4939e7496bcfd528  /runner-entrypoint.sh
+e8cdfb08ceb934cda44fddcdcfa07b56d6c2115364ae0f8259d64507d80bbe2e  /data/runner-config.yml
+runner config after the entrypoint patch:
+# Base runner config for the disposable Actions template.
+#
+# The entrypoint copies this file to /data/runner-config.yml, adds the
+# job-container host mapping for Forgejo, and registers on first start.
+#
+# force_pull is false on purpose: with a pre-loaded nested image store there is
+# no reason to contact a registry.  force_pull=true does not fail a job when the
+# local image exists (the runner logs a warning and continues), but it still
+# makes a registry request, which an offline stack cannot serve.
+log:
+  level: info
+  job_level: info
+
+runner:
+  file: /data/.runner
+  capacity: 1
+  timeout: 30m
+
+cache:
+  enabled: false
+
+container:
+  network: ""
+  privileged: false
+  options: "--add-host forgejo:172.31.0.2"
+  valid_volumes: []
+  force_pull: false
+resolved compose model (docker compose config --no-interpolate)
+5:    internal: true
+26:    image: docker:28-dind
+29:    privileged: true
+43:      - FORGEJO__actions__ENABLED=true
+56:    image: codeberg.org/forgejo/forgejo:15
+64:        target: 3000
+87:    image: data.forgejo.org/forgejo/runner:12
+creating scratch repository
+run 1: image absent from the nested store
+2026-11-13T05:24:53.9071511Z spike1337-repro-20261113052442-3964612-runner(version:v12.10.1) received task 1 of job probe, be triggered by event: push
+2026-11-13T05:24:53.9086832Z workflow prepared
+2026-11-13T05:24:53.9087991Z 🚀  Start image=ubuntu:24.04
+2026-11-13T05:24:53.9200069Z   🐳  docker pull image=ubuntu:24.04 platform=linux/amd64 username= forcePull=false
+2026-11-13T05:24:53.9435828Z Error response from daemon: Get "https://registry-1.docker.io/v2/": dial tcp: lookup registry-1.docker.io on 127.0.0.11:53: server misbehaving
+run 1 failed as expected (missing image, attempted pull)
+loading ubuntu:24.04 into the nested store
+$ docker save ubuntu:24.04 | docker exec -i ef2ea1e5f8b0d2ff846e9de564ecf2571cfb703107af00306e4acc81401e1476 docker -H tcp://localhost:2375 load
+Loaded image: ubuntu:24.04
+run 2: same workflow after the image is loaded
+2026-11-13T05:24:55.8851923Z spike1337-repro-20261113052442-3964612-runner(version:v12.10.1) received task 2 of job probe, be triggered by event: push
+2026-11-13T05:24:55.8866736Z workflow prepared
+2026-11-13T05:24:55.8867384Z 🚀  Start image=ubuntu:24.04
+2026-11-13T05:24:55.8963963Z Cleaning up network for job probe, and network name is: WORKFLOW-496349f3b1dfda09419d585e7e35cab9
+2026-11-13T05:24:55.9427712Z   🐳  docker create image=ubuntu:24.04 platform=linux/amd64 entrypoint=["tail" "-f" "/dev/null"] cmd=[] network="WORKFLOW-496349f3b1dfda09419d585e7e35cab9"
+2026-11-13T05:24:56.0708855Z   🐳  docker run image=ubuntu:24.04 platform=linux/amd64 entrypoint=["tail" "-f" "/dev/null"] cmd=[] network="WORKFLOW-496349f3b1dfda09419d585e7e35cab9"
+2026-11-13T05:24:56.3407176Z ⭐ Run Main Show job identity
+2026-11-13T05:24:56.3466586Z   🐳  docker exec cmd=[sh /var/run/act/0e63fde172d99779.sh] user= workdir=
+2026-11-13T05:24:56.3961024Z   🐳  docker exec cmd=[bash --noprofile --norc -e -o pipefail /var/run/act/workflow/0.sh] user= workdir=
+2026-11-13T05:24:56.4283310Z job-image-probe-ok
+2026-11-13T05:24:56.4283861Z Linux 3f13b962384c 6.8.0-147-generic #147-Ubuntu SMP PREEMPT_DYNAMIC Thu Sep 24 11:33:16 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+2026-11-13T05:24:56.4283932Z uid=0(root) gid=0(root) groups=0(root)
+2026-11-13T05:24:56.4284011Z PRETTY_NAME="Ubuntu 24.04.5 LTS"
+2026-11-13T05:24:56.4284079Z NAME="Ubuntu"
+2026-11-13T05:24:56.4284161Z VERSION_ID="24.04"
+2026-11-13T05:24:56.5412211Z 172.31.0.2      forgejo
+2026-11-13T05:24:56.5503315Z 🏁  Job succeeded
+PASS: missing image failed; after docker save | docker load the job succeeded
+PASS: the job container resolved forgejo through the template's host mapping
+teardown: docker compose -p spike1337-repro-20261113052442-3964612 -f /home/goya/agent-workspace/exomonad/tests/e2e/lib/forgejo/docker-compose.actions.yml down -v --remove-orphans
+ Container spike1337-repro-20261113052442-3964612-runner-1 Stopping 
+ Container spike1337-repro-20261113052442-3964612-runner-1 Stopped 
+ Container spike1337-repro-20261113052442-3964612-runner-1 Removing 
+ Container spike1337-repro-20261113052442-3964612-runner-1 Removed 
+ Container spike1337-repro-20261113052442-3964612-dind-1 Stopping 
+ Container spike1337-repro-20261113052442-3964612-forgejo-1 Stopping 
+ Container spike1337-repro-20261113052442-3964612-dind-1 Stopped 
+ Container spike1337-repro-20261113052442-3964612-dind-1 Removing 
+ Container spike1337-repro-20261113052442-3964612-dind-1 Removed 
+ Container spike1337-repro-20261113052442-3964612-forgejo-1 Stopped 
+ Container spike1337-repro-20261113052442-3964612-forgejo-1 Removing 
+ Container spike1337-repro-20261113052442-3964612-forgejo-1 Removed 
+ Volume spike1337-repro-20261113052442-3964612_forgejo-data Removing 
+ Volume spike1337-repro-20261113052442-3964612_runner-data Removing 
+ Network spike1337-repro-20261113052442-3964612_ci Removing 
+ Network spike1337-repro-20261113052442-3964612_default Removing 
+ Volume spike1337-repro-20261113052442-3964612_forgejo-data Removed 
+ Volume spike1337-repro-20261113052442-3964612_runner-data Removed 
+ Network spike1337-repro-20261113052442-3964612_default Removed 
+ Network spike1337-repro-20261113052442-3964612_ci Removed 
+teardown verified: no container, volume or network for project spike1337-repro-20261113052442-3964612
+teardown verified: no volume created by this run remains
+EXIT=0

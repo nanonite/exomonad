@@ -1,0 +1,46 @@
+$ docker run --rm --entrypoint sh <image> -c "<tool probe>"
+=== ubuntu:24.04
+git=MISSING
+node=MISSING
+npm=MISSING
+python3=MISSING
+pip3=MISSING
+just=MISSING
+curl=MISSING
+venv=no
+=== node:lts
+git=/usr/bin/git
+node=/usr/local/bin/node
+npm=/usr/local/bin/npm
+python3=/usr/bin/python3
+pip3=MISSING
+just=MISSING
+curl=/usr/bin/curl
+venv=yes
+=== docker:dind
+git=/usr/bin/git
+node=MISSING
+npm=MISSING
+python3=MISSING
+pip3=MISSING
+just=MISSING
+curl=MISSING
+venv=no
+=== ghcr.io/catthehacker/ubuntu:rust-24.04
+git=/usr/bin/git
+node=/opt/acttoolcache/node/24.15.0/x64/bin/node
+npm=/opt/acttoolcache/node/24.15.0/x64/bin/npm
+python3=/usr/bin/python3
+pip3=/usr/bin/pip3
+just=MISSING
+curl=/usr/bin/curl
+venv=yes
+=== nixos/nix:latest
+git=/root/.nix-profile/bin/git
+node=MISSING
+npm=MISSING
+python3=MISSING
+pip3=MISSING
+just=MISSING
+curl=/root/.nix-profile/bin/curl
+venv=no

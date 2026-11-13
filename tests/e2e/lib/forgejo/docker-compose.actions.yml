@@ -1,0 +1,121 @@
+# Disposable Forgejo with Actions for nested-docker (dind) jobs.
+#
+# This is a TEMPLATE, not a running instance.  Each harness brings it up under
+# its own unique compose project name and tears it down with
+# `docker compose -p <project> down -v --remove-orphans`.
+#
+# The two load-bearing properties of the non-Actions template are preserved:
+#
+#   * No `container_name`.  Containers are named by the compose project, so a
+#     run's teardown can find them and concurrent runs cannot collide.
+#   * No fixed host port.  `127.0.0.1::3000` asks Docker for an ephemeral port,
+#     which the harness reads back with `docker compose -p <project> port`.
+#
+# What this variant adds:
+#
+#   * `FORGEJO__actions__ENABLED=true` and DEFAULT_ACTIONS_URL pointing at the
+#     instance itself.  Offline `uses:` steps therefore require the action
+#     source to be mirrored into this instance (for example an `actions/checkout`
+#     repository).  Without the mirror the runner logs
+#     `unable to clone 'http://forgejo:3000/actions/checkout' ... Not found`.
+#   * A privileged dind service.  The job containers live in this daemon, not
+#     on the host, so its image store starts empty on every run.
+#   * A runner service that registers itself on first start.  The harness must
+#     generate the token with the Forgejo container CLI:
+#
+#       docker compose -p <project> exec -T -u git forgejo \
+#         forgejo actions generate-runner-token
+#
+#     and pass it as FORGEJO_RUNNER_TOKEN when the runner starts.
+#
+# The nested image store is the important part: the host's image cache is not
+# visible to the runner.  Before a job can use an image, the harness must copy
+# it into the dind daemon:
+#
+#   docker save <image> | \
+#     docker exec -i "$(docker compose -p <project> ps -q dind)" \
+#     docker -H tcp://localhost:2375 load
+#
+# Use Docker 28 for dind.  On Docker 29 the runner's `copyContent` to
+# /var/run/act fails with `mkdirat var/run/act: path escapes from parent`
+# because Ubuntu's /var/run is a symlink to /run; Docker 28 handles the same
+# path correctly.  See docs/decisions/forgejo-actions-nested-docker.md.
+#
+# Cache is disabled below.  If it is enabled, the runner needs a network with a
+# default route to determine its outbound IP, and cache.host must be an address
+# the job containers can reach (the runner's internal-network IP, not its
+# compose DNS name, unless the name is added to the job container's hosts).
+
+services:
+  forgejo:
+    image: codeberg.org/forgejo/forgejo:15
+    restart: "no"
+    ports:
+      - "127.0.0.1::3000"
+    volumes:
+      - forgejo-data:/data
+    environment:
+      - USER_UID=1000
+      - USER_GID=1000
+      - FORGEJO__DEFAULT__APP_NAME=Forgejo E2E (disposable)
+      - FORGEJO__database__DB_TYPE=sqlite3
+      - FORGEJO__security__INSTALL_LOCK=true
+      - FORGEJO__server__DOMAIN=forgejo
+      - FORGEJO__server__HTTP_PORT=3000
+      - FORGEJO__server__ROOT_URL=http://forgejo:3000/
+      - FORGEJO__server__LOCAL_ROOT_URL=http://forgejo:3000/
+      - FORGEJO__service__DISABLE_REGISTRATION=true
+      - FORGEJO__actions__ENABLED=true
+      - FORGEJO__actions__DEFAULT_ACTIONS_URL=http://forgejo:3000
+      - FORGEJO__log__LEVEL=Info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    networks: [default, ci]
+
+  dind:
+    image: docker:28-dind
+    restart: "no"
+    privileged: true
+    environment:
+      - DOCKER_TLS_CERTDIR=
+    command: ["dockerd", "-H", "tcp://0.0.0.0:2375", "--tls=false"]
+    healthcheck:
+      test: ["CMD-SHELL", "docker --host tcp://localhost:2375 info >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+    networks: [ci]
+
+  runner:
+    image: data.forgejo.org/forgejo/runner:12
+    restart: "no"
+    user: "0:0"
+    depends_on:
+      forgejo:
+        condition: service_healthy
+      dind:
+        condition: service_healthy
+    volumes:
+      - runner-data:/data
+      - ./runner-config.yml:/etc/runner-config.yml:ro
+      - ./runner-entrypoint.sh:/runner-entrypoint.sh:ro
+    environment:
+      - DOCKER_HOST=tcp://dind:2375
+      - FORGEJO_RUNNER_TOKEN=${FORGEJO_RUNNER_TOKEN:-}
+      - FORGEJO_RUNNER_NAME=${FORGEJO_RUNNER_NAME:-e2e-runner}
+      - FORGEJO_RUNNER_LABELS=${FORGEJO_RUNNER_LABELS:-ubuntu-latest:docker://ubuntu:24.04}
+    command: ["/bin/sh", "/runner-entrypoint.sh"]
+    networks: [ci]
+
+volumes:
+  forgejo-data:
+  runner-data:
+
+networks:
+  ci:
+    internal: true

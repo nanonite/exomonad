@@ -880,6 +880,22 @@ The instance is installed-locked with registration disabled, so the only way in
 is the container CLI, and the run's accounts and repository are created from
 code. Nothing is copied from a live forge and no account pre-exists.
 
+**A run that needs Forgejo Actions uses the Actions variant.**
+`tests/e2e/lib/forgejo/docker-compose.actions.yml` keeps both load-bearing
+properties and adds a privileged `docker:28-dind` service, a runner, and
+`runner-config.yml` / `runner-entrypoint.sh`. The runner creates job containers
+in the nested daemon, whose image store starts empty, so the host's image cache
+is invisible to a job: copy each job image in with
+`docker save <image> | docker exec -i <dind> docker -H tcp://localhost:2375 load`
+and keep `force_pull: false`. Docker 29 dind cannot copy the runner's
+`/var/run/act` payload into images whose `/var/run` is a symlink, so the dind
+stays on 28. The job container resolves `forgejo` only through the entrypoint's
+`--add-host`, and `uses: actions/checkout` needs the action mirrored into the
+instance. The diagnosis and its captured evidence are in
+`docs/decisions/forgejo-actions-nested-docker.md`;
+`just check-forgejo-actions-template` runs the template's contract and
+`just spike-forgejo-nested-docker` reproduces the failure and the fix.
+
 **A run that walks many cases owns a Forgejo per batch, not one for the whole
 run.** A matrix case pushes, reviews, and merges; one container asked to carry
 all of them is a single point of failure whose death turns every case after it

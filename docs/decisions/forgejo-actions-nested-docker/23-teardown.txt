@@ -1,0 +1,258 @@
+===== BEFORE TEARDOWN =====
+$ docker ps -a --format "{{.Names}}\t{{.Image}}\t{{.Status}}"
+spike1337-attempt1-runner-1	data.forgejo.org/forgejo/runner:12	Up 11 minutes
+spike1337-attempt1-forgejo-1	codeberg.org/forgejo/forgejo:15	Up 25 minutes (healthy)
+spike1337-attempt1-dind-1	docker:dind	Up 25 minutes (healthy)
+issue38-vlm-probe	cactus-arm64-convert:qwen35-rotary-fix	Exited (0) 2 days ago
+issue38-vlm-run	cactus-arm64-convert:qwen35-rotary-fix	Exited (0) 2 days ago
+issue38-vlm-convert	cactus-arm64-convert:qwen35-rotary-fix	Exited (0) 2 days ago
+cactus-qwen35-combined	cactus-arm64-convert:qwen35-rotary-fix	Exited (0) 4 weeks ago
+cactus-qwen35-legacy	cactus-arm64-convert:qwen35-rotary-fix	Exited (0) 5 weeks ago
+cactus-qwen35-update2	cactus-arm64-convert:qwen35-rotary-fix	Exited (0) 5 weeks ago
+cactus250-smoke3	cactus-arm64-convert:v221	Exited (0) 5 weeks ago
+cactus250-smoke2	cactus-arm64-convert:v221	Exited (137) 5 weeks ago
+cactus250-smoke	cactus-arm64-convert:v221	Exited (137) 5 weeks ago
+cactus250-cmd-b	cactus-arm64-convert:v221	Exited (0) 5 weeks ago
+cactus257-cmd-b	cactus-arm64-convert:v221	Exited (0) 5 weeks ago
+cactus256-cmd-b	cactus-arm64-convert:v221	Exited (1) 5 weeks ago
+cactus255-cmd-b	cactus-arm64-convert:v221	Exited (1) 6 weeks ago
+cactus254-cmd-b	cactus-arm64-convert:v221	Exited (1) 6 weeks ago
+cactus253b-cmd-b	cactus-arm64-convert:v221	Exited (1) 6 weeks ago
+cactus253-cmd-b	cactus-arm64-convert:v221	Exited (1) 6 weeks ago
+cactus252-cmd-b	cactus-arm64-convert:v221	Exited (1) 6 weeks ago
+cactus243-check	cactus-arm64-convert:v221	Exited (0) 6 weeks ago
+cactus243-cmd-d	cactus-arm64-convert:v221	Exited (0) 6 weeks ago
+cactus243-cmd-b	cactus-arm64-convert:v221	Exited (1) 6 weeks ago
+exomonad-1059-forgejo	codeberg.org/forgejo/forgejo:15	Exited (255) 6 weeks ago
+p5probe	cactus-arm64-convert:built	Exited (0) 6 weeks ago
+p5transpile	cactus-arm64-convert:built	Exited (0) 6 weeks ago
+apart-incident-hackathon-workspace-ollama-1	ollama/ollama:0.34.0	Exited (0) 8 weeks ago
+ollama	ollama/ollama	Exited (0) 2 months ago
+forgejo	codeberg.org/forgejo/forgejo:15	Up 43 hours (healthy)
+forgejo-runner	data.forgejo.org/forgejo/runner:12	Up 43 hours
+localnf-apple-vm-4core	localnf/docker-osx:sonoma-recovery-cache	Exited (0) 3 months ago
+localnf-apple-vm-64g	localnf/docker-osx:sonoma-recovery-cache	Exited (0) 3 months ago
+localnf-apple-vm-nopicker	localnf/docker-osx:sonoma-recovery-cache	Exited (0) 3 months ago
+localnf-apple-vm-penryn	localnf/docker-osx:sonoma-recovery-cache	Exited (0) 3 months ago
+localnf-apple-vm-sonoma	sickcodes/docker-osx:latest	Exited (0) 3 months ago
+localnf-apple-vm-console	localnf/docker-osx:sequoia-installer-cache	Exited (0) 3 months ago
+localnf-apple-vm-vnc	localnf/docker-osx:sequoia-installer-cache	Exited (137) 3 months ago
+localnf-apple-vm	sickcodes/docker-osx:latest	Exited (137) 3 months ago
+forgejo-runner-221	data.forgejo.org/forgejo/runner:12	Exited (127) 5 months ago
+forgejo-dind	docker:28-dind	Up 43 hours (healthy)
+registry	registry:2	Exited (2) 6 months ago
+
+$ docker volume ls
+DRIVER    VOLUME NAME
+local     0b95ee4a4e76133b9ad8a9bd7a440269516eb10086a7b41ae1f1d06060efdaba
+local     1da813bcd5aa1acab7740ddd9b901bdff4f8890a901ac679ccadcd7af76abfb2
+local     1e40d634c4698cf6089e7d552114095055e2f3a4e49041ebd27546e0fe6fdbae
+local     5d153ec8535b20d8bfc2bbb78115f8c16a4de684e38b63333bdacd91414adb97
+local     5f953dd0060b3fd1cc0f66ba2c0b6c4a3e74edd54ca824b94a2901c0a23ad37f
+local     6fb662cab06b12ee48330ed951d8cfb50793d25e9da59de3c4c2abe8d2de385a
+local     017a4337607f0220a75cd6459b64816c29c84dd744edcd99f7b96e207b3f4ec6
+local     491fe6816cb6a773d4f131d1533ec39ff987b60cdcbe2cb5b9d5eb2d68906998
+local     518b520b48b68e8164befd90c51ea21011ea83f8c0e6e90940fe03f567a074ba
+local     700bf193fae621dcc3a592f218c1780e6928021654669203f290807d2ddb1af0
+local     808ca8bf0e801925c234999e25b19389e74c7c8e72994dd8e11d8d3057ef9154
+local     1057d79892b3dff6aa9a2a100a1cae9b20adfde6bb1d3598bc0eb048ee3b87d0
+local     3409d474047a0b099826fbef00ae2149667d4a9b0068e219109cb6cedfd4b3bb
+local     7754fdcbd1e63966496710b93ba3acef4aaf8f2b379bcfd6fdcc7f0eaf75cf5e
+local     20779aa8c4078c1fcd39bd4a059ef056f7dab8dd072b2940a46d1e5565b1545a
+local     024963c82237e4b833de3484e65586bd72465f9d8a8bba0f3c692bbc16d71ca7
+local     38583d4f5d1366835f1f9b802e547f324f62e3ba4d3064a19ec51ec579abaf62
+local     42753b6bbe5b6bd7767495550e17853a235dcdf1374b73f005af0a5b707544ea
+local     84567de7020f280f3d71cd39285edef7d8468a76a6b870982f7a05183bd92a01
+local     831430a26a9eefa1bf1589088ca7d6d3dd43bb00089e4b222d20f730e0dd46fc
+local     b1d0db8f5457337c94369b36518f032e03c3bb516fc21dd7434051a55c6aa137
+local     c8313de56a386e1ba49d242557315bce6c22fc8516ca51e9a869a043347f071c
+local     ce9423ac2b0ae66f4870d0775a6d629b7e28c195b755a4fe9f6ec259cda53824
+local     d8a1777ec1cf6b36c3be67bbd031a55bc51c6577536d7ff6ee42f77907d0479a
+local     d59c08af688a7d7f547387c79075f02b42ddc8d7365b46cf9ad68ead8b602ff1
+local     exomonad-1059-forgejo-data
+local     fc31a001a23a88f1e02237c4a182c7b9aaa714f6f430554e70c636e7b16314bc
+local     ff17587334a3d86b58a982cd9d86e7c0d770cdce1632e286ebf023988fdd06f4
+local     forgejo_forgejo-data
+local     ollama-data
+local     ollama-secondary
+local     ollama_models
+local     spike1337-attempt1_forgejo-data
+local     spike1337-attempt1_runner-data
+local     supabase_config_secondbrain
+local     supabase_db_secondbrain
+local     supabase_edge_runtime_secondbrain
+local     supabase_inbucket_secondbrain
+local     supabase_storage_secondbrain
+local     vscode
+
+$ docker network ls
+NETWORK ID     NAME                                            DRIVER    SCOPE
+dab7a7e57e25   apart-incident-hackathon-workspace_default      bridge    local
+eb37efb2b587   bridge                                          bridge    local
+ef419f3e6440   escuela-brahmavidya-workspace_default           bridge    local
+fca03666f2c6   exo-e2e-1111-contract-both_default              bridge    local
+030240171a89   exo-e2e-1111-e2e1111-069c3443-forgejo_default   bridge    local
+d017d18a6c72   exo-e2e-1111-e2e1111-70b51699-forgejo_default   bridge    local
+4323c3d037c3   exo-e2e-1111-e2e1111-93a87613-forgejo_default   bridge    local
+744a17ecbd38   exo-e2e-1111-e2e1111-760a6417-forgejo_default   bridge    local
+6a627a749e27   exo-e2e-1111-e2e1111-d8755cb3-forgejo_default   bridge    local
+8eb106dc9aba   forgejo_default                                 bridge    local
+910a1bd2b83e   host                                            host      local
+d2f3827a5c37   letta-network                                   bridge    local
+250cb2dcc4bb   none                                            null      local
+fa946664f345   spike1337-attempt1_ci                           bridge    local
+22c325159857   spike1337-attempt1_edge                         bridge    local
+9e030f66f1f9   tangled-knot_default                            bridge    local
+f2bda9d757fc   thoth-dev-network                               bridge    local
+
+===== BASELINE EXCLUDING spike1337-* =====
+containers: 38, volumes: 38, networks: 15
+
+===== TEARDOWN =====
+$ docker compose -p spike1337-attempt1 -f /home/goya/tmp-1331/opencode/spike1337/docker-compose.yml down -v --remove-orphans
+ Container spike1337-attempt1-runner-1 Stopping 
+ Container spike1337-attempt1-runner-1 Stopped 
+ Container spike1337-attempt1-runner-1 Removing 
+ Container spike1337-attempt1-runner-1 Removed 
+ Container spike1337-attempt1-dind-1 Stopping 
+ Container spike1337-attempt1-forgejo-1 Stopping 
+ Container spike1337-attempt1-forgejo-1 Stopped 
+ Container spike1337-attempt1-forgejo-1 Removing 
+ Container spike1337-attempt1-forgejo-1 Removed 
+ Container spike1337-attempt1-dind-1 Stopped 
+ Container spike1337-attempt1-dind-1 Removing 
+ Container spike1337-attempt1-dind-1 Removed 
+ Volume spike1337-attempt1_forgejo-data Removing 
+ Volume spike1337-attempt1_runner-data Removing 
+ Network spike1337-attempt1_edge Removing 
+ Network spike1337-attempt1_ci Removing 
+ Volume spike1337-attempt1_forgejo-data Removed 
+ Volume spike1337-attempt1_runner-data Removed 
+ Network spike1337-attempt1_edge Removed 
+ Network spike1337-attempt1_ci Removed 
+
+$ docker rm -f spike1337-dind28
+
+===== AFTER TEARDOWN =====
+$ docker ps -a --format "{{.Names}}\t{{.Image}}\t{{.Status}}"
+issue38-vlm-probe	cactus-arm64-convert:qwen35-rotary-fix	Exited (0) 2 days ago
+issue38-vlm-run	cactus-arm64-convert:qwen35-rotary-fix	Exited (0) 2 days ago
+issue38-vlm-convert	cactus-arm64-convert:qwen35-rotary-fix	Exited (0) 2 days ago
+cactus-qwen35-combined	cactus-arm64-convert:qwen35-rotary-fix	Exited (0) 4 weeks ago
+cactus-qwen35-legacy	cactus-arm64-convert:qwen35-rotary-fix	Exited (0) 5 weeks ago
+cactus-qwen35-update2	cactus-arm64-convert:qwen35-rotary-fix	Exited (0) 5 weeks ago
+cactus250-smoke3	cactus-arm64-convert:v221	Exited (0) 5 weeks ago
+cactus250-smoke2	cactus-arm64-convert:v221	Exited (137) 5 weeks ago
+cactus250-smoke	cactus-arm64-convert:v221	Exited (137) 5 weeks ago
+cactus250-cmd-b	cactus-arm64-convert:v221	Exited (0) 5 weeks ago
+cactus257-cmd-b	cactus-arm64-convert:v221	Exited (0) 5 weeks ago
+cactus256-cmd-b	cactus-arm64-convert:v221	Exited (1) 5 weeks ago
+cactus255-cmd-b	cactus-arm64-convert:v221	Exited (1) 6 weeks ago
+cactus254-cmd-b	cactus-arm64-convert:v221	Exited (1) 6 weeks ago
+cactus253b-cmd-b	cactus-arm64-convert:v221	Exited (1) 6 weeks ago
+cactus253-cmd-b	cactus-arm64-convert:v221	Exited (1) 6 weeks ago
+cactus252-cmd-b	cactus-arm64-convert:v221	Exited (1) 6 weeks ago
+cactus243-check	cactus-arm64-convert:v221	Exited (0) 6 weeks ago
+cactus243-cmd-d	cactus-arm64-convert:v221	Exited (0) 6 weeks ago
+cactus243-cmd-b	cactus-arm64-convert:v221	Exited (1) 6 weeks ago
+exomonad-1059-forgejo	codeberg.org/forgejo/forgejo:15	Exited (255) 6 weeks ago
+p5probe	cactus-arm64-convert:built	Exited (0) 6 weeks ago
+p5transpile	cactus-arm64-convert:built	Exited (0) 6 weeks ago
+apart-incident-hackathon-workspace-ollama-1	ollama/ollama:0.34.0	Exited (0) 8 weeks ago
+ollama	ollama/ollama	Exited (0) 2 months ago
+forgejo	codeberg.org/forgejo/forgejo:15	Up 43 hours (healthy)
+forgejo-runner	data.forgejo.org/forgejo/runner:12	Up 43 hours
+localnf-apple-vm-4core	localnf/docker-osx:sonoma-recovery-cache	Exited (0) 3 months ago
+localnf-apple-vm-64g	localnf/docker-osx:sonoma-recovery-cache	Exited (0) 3 months ago
+localnf-apple-vm-nopicker	localnf/docker-osx:sonoma-recovery-cache	Exited (0) 3 months ago
+localnf-apple-vm-penryn	localnf/docker-osx:sonoma-recovery-cache	Exited (0) 3 months ago
+localnf-apple-vm-sonoma	sickcodes/docker-osx:latest	Exited (0) 3 months ago
+localnf-apple-vm-console	localnf/docker-osx:sequoia-installer-cache	Exited (0) 3 months ago
+localnf-apple-vm-vnc	localnf/docker-osx:sequoia-installer-cache	Exited (137) 3 months ago
+localnf-apple-vm	sickcodes/docker-osx:latest	Exited (137) 3 months ago
+forgejo-runner-221	data.forgejo.org/forgejo/runner:12	Exited (127) 5 months ago
+forgejo-dind	docker:28-dind	Up 43 hours (healthy)
+registry	registry:2	Exited (2) 6 months ago
+
+$ docker volume ls
+DRIVER    VOLUME NAME
+local     0b95ee4a4e76133b9ad8a9bd7a440269516eb10086a7b41ae1f1d06060efdaba
+local     1da813bcd5aa1acab7740ddd9b901bdff4f8890a901ac679ccadcd7af76abfb2
+local     1e40d634c4698cf6089e7d552114095055e2f3a4e49041ebd27546e0fe6fdbae
+local     5d153ec8535b20d8bfc2bbb78115f8c16a4de684e38b63333bdacd91414adb97
+local     5f953dd0060b3fd1cc0f66ba2c0b6c4a3e74edd54ca824b94a2901c0a23ad37f
+local     6fb662cab06b12ee48330ed951d8cfb50793d25e9da59de3c4c2abe8d2de385a
+local     017a4337607f0220a75cd6459b64816c29c84dd744edcd99f7b96e207b3f4ec6
+local     491fe6816cb6a773d4f131d1533ec39ff987b60cdcbe2cb5b9d5eb2d68906998
+local     518b520b48b68e8164befd90c51ea21011ea83f8c0e6e90940fe03f567a074ba
+local     700bf193fae621dcc3a592f218c1780e6928021654669203f290807d2ddb1af0
+local     808ca8bf0e801925c234999e25b19389e74c7c8e72994dd8e11d8d3057ef9154
+local     3409d474047a0b099826fbef00ae2149667d4a9b0068e219109cb6cedfd4b3bb
+local     7754fdcbd1e63966496710b93ba3acef4aaf8f2b379bcfd6fdcc7f0eaf75cf5e
+local     20779aa8c4078c1fcd39bd4a059ef056f7dab8dd072b2940a46d1e5565b1545a
+local     024963c82237e4b833de3484e65586bd72465f9d8a8bba0f3c692bbc16d71ca7
+local     38583d4f5d1366835f1f9b802e547f324f62e3ba4d3064a19ec51ec579abaf62
+local     42753b6bbe5b6bd7767495550e17853a235dcdf1374b73f005af0a5b707544ea
+local     84567de7020f280f3d71cd39285edef7d8468a76a6b870982f7a05183bd92a01
+local     831430a26a9eefa1bf1589088ca7d6d3dd43bb00089e4b222d20f730e0dd46fc
+local     b1d0db8f5457337c94369b36518f032e03c3bb516fc21dd7434051a55c6aa137
+local     c8313de56a386e1ba49d242557315bce6c22fc8516ca51e9a869a043347f071c
+local     ce9423ac2b0ae66f4870d0775a6d629b7e28c195b755a4fe9f6ec259cda53824
+local     d8a1777ec1cf6b36c3be67bbd031a55bc51c6577536d7ff6ee42f77907d0479a
+local     d59c08af688a7d7f547387c79075f02b42ddc8d7365b46cf9ad68ead8b602ff1
+local     exomonad-1059-forgejo-data
+local     fc31a001a23a88f1e02237c4a182c7b9aaa714f6f430554e70c636e7b16314bc
+local     ff17587334a3d86b58a982cd9d86e7c0d770cdce1632e286ebf023988fdd06f4
+local     forgejo_forgejo-data
+local     ollama-data
+local     ollama-secondary
+local     ollama_models
+local     supabase_config_secondbrain
+local     supabase_db_secondbrain
+local     supabase_edge_runtime_secondbrain
+local     supabase_inbucket_secondbrain
+local     supabase_storage_secondbrain
+local     vscode
+
+$ docker network ls
+NETWORK ID     NAME                                            DRIVER    SCOPE
+dab7a7e57e25   apart-incident-hackathon-workspace_default      bridge    local
+eb37efb2b587   bridge                                          bridge    local
+ef419f3e6440   escuela-brahmavidya-workspace_default           bridge    local
+fca03666f2c6   exo-e2e-1111-contract-both_default              bridge    local
+030240171a89   exo-e2e-1111-e2e1111-069c3443-forgejo_default   bridge    local
+d017d18a6c72   exo-e2e-1111-e2e1111-70b51699-forgejo_default   bridge    local
+4323c3d037c3   exo-e2e-1111-e2e1111-93a87613-forgejo_default   bridge    local
+744a17ecbd38   exo-e2e-1111-e2e1111-760a6417-forgejo_default   bridge    local
+6a627a749e27   exo-e2e-1111-e2e1111-d8755cb3-forgejo_default   bridge    local
+8eb106dc9aba   forgejo_default                                 bridge    local
+910a1bd2b83e   host                                            host      local
+d2f3827a5c37   letta-network                                   bridge    local
+250cb2dcc4bb   none                                            null      local
+9e030f66f1f9   tangled-knot_default                            bridge    local
+f2bda9d757fc   thoth-dev-network                               bridge    local
+
+===== REMAINING spike1337-* RESOURCES =====
+$ docker ps -a | grep spike1337
+none
+$ docker volume ls | grep spike1337
+none
+$ docker network ls | grep spike1337
+none
+
+===== BASELINE DIFF (non-spike resources) =====
+containers:
+  unchanged
+volumes:
+--- /home/goya/tmp-1331/opencode/spike1337/before-vol.txt	2026-11-12 22:41:19.327651026 -0500
++++ /home/goya/tmp-1331/opencode/spike1337/after-vol.txt	2026-11-12 22:41:30.337715495 -0500
+@@ -1,7 +1,6 @@
+ 017a4337607f0220a75cd6459b64816c29c84dd744edcd99f7b96e207b3f4ec6
+ 024963c82237e4b833de3484e65586bd72465f9d8a8bba0f3c692bbc16d71ca7
+ 0b95ee4a4e76133b9ad8a9bd7a440269516eb10086a7b41ae1f1d06060efdaba
+-1057d79892b3dff6aa9a2a100a1cae9b20adfde6bb1d3598bc0eb048ee3b87d0
+ 1da813bcd5aa1acab7740ddd9b901bdff4f8890a901ac679ccadcd7af76abfb2
+ 1e40d634c4698cf6089e7d552114095055e2f3a4e49041ebd27546e0fe6fdbae
+ 20779aa8c4078c1fcd39bd4a059ef056f7dab8dd072b2940a46d1e5565b1545a
+networks:
+  unchanged

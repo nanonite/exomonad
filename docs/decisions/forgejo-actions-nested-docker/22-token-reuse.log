@@ -1,0 +1,16 @@
+$ TOKEN=$(docker compose -p spike1337-attempt1 -f docker-compose.yml exec -T -u git forgejo forgejo actions generate-runner-token)
+<redacted-runner-token length=43>
+
+$ docker run --rm --user 0:0 --network spike1337-attempt1_ci --tmpfs /data -w /data --entrypoint forgejo-runner data.forgejo.org/forgejo/runner:12 register --no-interactive --instance http://forgejo:3000 --token $TOKEN --name spike1337-reuse-a --labels ubuntu-latest:docker://ubuntu:24.04
+level=warning msg="`register` has been deprecated; declare connections in the runner configuration instead"
+level=info msg="Registering runner, arch=amd64, os=linux, version=v12.10.1."
+level=info msg="No configuration file specified; using default settings."
+level=debug msg="Successfully pinged the Forgejo instance server"
+level=info msg="Runner registered successfully."
+
+$ docker run --rm --user 0:0 --network spike1337-attempt1_ci --tmpfs /data -w /data --entrypoint forgejo-runner data.forgejo.org/forgejo/runner:12 register --no-interactive --instance http://forgejo:3000 --token $TOKEN --name spike1337-reuse-b --labels ubuntu-latest:docker://ubuntu:24.04
+level=warning msg="`register` has been deprecated; declare connections in the runner configuration instead"
+level=info msg="Registering runner, arch=amd64, os=linux, version=v12.10.1."
+level=info msg="No configuration file specified; using default settings."
+level=debug msg="Successfully pinged the Forgejo instance server"
+level=info msg="Runner registered successfully."

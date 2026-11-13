@@ -1,0 +1,16 @@
+PROJ=spike1337-cache-1794541387
+$ docker compose -p $PROJ -f <tmp>/docker-compose.actions.yml up -d --wait forgejo dind
+ Container spike1337-cache-1794541387-forgejo-1 Healthy 
+ Container spike1337-cache-1794541387-dind-1 Healthy 
+
+$ FORGEJO_RUNNER_TOKEN=<token> docker compose ... up -d runner
+ Container spike1337-cache-1794541387-runner-1 Starting 
+ Container spike1337-cache-1794541387-runner-1 Started 
+
+$ docker logs $PROJ-runner-1 | grep -i cache
+time="2026-11-13T03:43:14Z" level=error msg="Could not start the cache server, cache will be disabled: unable to determine outbound IP address"
+
+$ docker compose ... down -v --remove-orphans
+ Volume spike1337-cache-1794541387_forgejo-data Removed 
+ Network spike1337-cache-1794541387_default Removed 
+ Network spike1337-cache-1794541387_ci Removed 

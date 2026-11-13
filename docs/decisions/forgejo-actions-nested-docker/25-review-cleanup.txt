@@ -1,0 +1,89 @@
+===== REVIEW FINDING: leftover docker resources =====
+3409d474047a0b099826fbef00ae2149667d4a9b0068e219109cb6cedfd4b3bb
+fc31a001a23a88f1e02237c4a182c7b9aaa714f6f430554e70c636e7b16314bc
+
+===== BEFORE CLEANUP =====
+$ docker volume inspect 3409d474047a0b099826fbef00ae2149667d4a9b0068e219109cb6cedfd4b3bb
+[
+    {
+        "CreatedAt": "2026-11-12T22:23:55-05:00",
+        "Driver": "local",
+        "Labels": {
+            "com.docker.volume.anonymous": ""
+        },
+        "Mountpoint": "/home/goya/docker/volumes/3409d474047a0b099826fbef00ae2149667d4a9b0068e219109cb6cedfd4b3bb/_data",
+        "Name": "3409d474047a0b099826fbef00ae2149667d4a9b0068e219109cb6cedfd4b3bb",
+        "Options": null,
+        "Scope": "local"
+    }
+]
+
+$ docker volume inspect fc31a001a23a88f1e02237c4a182c7b9aaa714f6f430554e70c636e7b16314bc
+[
+    {
+        "CreatedAt": "2026-11-12T22:31:44-05:00",
+        "Driver": "local",
+        "Labels": {
+            "com.docker.volume.anonymous": ""
+        },
+        "Mountpoint": "/home/goya/docker/volumes/fc31a001a23a88f1e02237c4a182c7b9aaa714f6f430554e70c636e7b16314bc/_data",
+        "Name": "fc31a001a23a88f1e02237c4a182c7b9aaa714f6f430554e70c636e7b16314bc",
+        "Options": null,
+        "Scope": "local"
+    }
+]
+
+$ docker ps -a --filter volume=3409d474047a0b099826fbef00ae2149667d4a9b0068e219109cb6cedfd4b3bb --format '{{.Names}}'
+$ docker ps -a --filter volume=fc31a001a23a88f1e02237c4a182c7b9aaa714f6f430554e70c636e7b16314bc --format '{{.Names}}'
+
+Both volumes are anonymous (com.docker.volume.anonymous) and not attached to any container.
+
+===== CLEANUP =====
+$ docker volume rm 3409d474047a0b099826fbef00ae2149667d4a9b0068e219109cb6cedfd4b3bb fc31a001a23a88f1e02237c4a182c7b9aaa714f6f430554e70c636e7b16314bc
+3409d474047a0b099826fbef00ae2149667d4a9b0068e219109cb6cedfd4b3bb
+fc31a001a23a88f1e02237c4a182c7b9aaa714f6f430554e70c636e7b16314bc
+
+===== AFTER CLEANUP =====
+$ docker volume inspect 3409d474047a0b099826fbef00ae2149667d4a9b0068e219109cb6cedfd4b3bb
+[]
+Error response from daemon: get 3409d474047a0b099826fbef00ae2149667d4a9b0068e219109cb6cedfd4b3bb: no such volume
+$ docker volume inspect fc31a001a23a88f1e02237c4a182c7b9aaa714f6f430554e70c636e7b16314bc
+[]
+Error response from daemon: get fc31a001a23a88f1e02237c4a182c7b9aaa714f6f430554e70c636e7b16314bc: no such volume
+
+$ docker volume ls -f dangling=true
+DRIVER    VOLUME NAME
+local     0b95ee4a4e76133b9ad8a9bd7a440269516eb10086a7b41ae1f1d06060efdaba
+local     1e40d634c4698cf6089e7d552114095055e2f3a4e49041ebd27546e0fe6fdbae
+local     5d153ec8535b20d8bfc2bbb78115f8c16a4de684e38b63333bdacd91414adb97
+local     5f953dd0060b3fd1cc0f66ba2c0b6c4a3e74edd54ca824b94a2901c0a23ad37f
+local     6fb662cab06b12ee48330ed951d8cfb50793d25e9da59de3c4c2abe8d2de385a
+local     017a4337607f0220a75cd6459b64816c29c84dd744edcd99f7b96e207b3f4ec6
+local     808ca8bf0e801925c234999e25b19389e74c7c8e72994dd8e11d8d3057ef9154
+local     20779aa8c4078c1fcd39bd4a059ef056f7dab8dd072b2940a46d1e5565b1545a
+local     38583d4f5d1366835f1f9b802e547f324f62e3ba4d3064a19ec51ec579abaf62
+local     831430a26a9eefa1bf1589088ca7d6d3dd43bb00089e4b222d20f730e0dd46fc
+local     b1d0db8f5457337c94369b36518f032e03c3bb516fc21dd7434051a55c6aa137
+local     d8a1777ec1cf6b36c3be67bbd031a55bc51c6577536d7ff6ee42f77907d0479a
+local     ff17587334a3d86b58a982cd9d86e7c0d770cdce1632e286ebf023988fdd06f4
+local     ollama-secondary
+local     ollama_models
+local     supabase_config_secondbrain
+local     supabase_db_secondbrain
+local     supabase_edge_runtime_secondbrain
+local     supabase_inbucket_secondbrain
+local     supabase_storage_secondbrain
+local     vscode
+
+===== FINAL RESOURCE CHECK =====
+$ docker ps -a | grep spike1337
+none
+$ docker volume ls | grep spike1337
+none
+$ docker network ls | grep spike1337
+none
+
+$ docker ps -a --filter name=^forgejo$ --filter name=^forgejo-dind$ --filter name=^forgejo-runner$
+forgejo	codeberg.org/forgejo/forgejo:15	Up 43 hours (healthy)
+forgejo-runner	data.forgejo.org/forgejo/runner:12	Up 43 hours
+forgejo-dind	docker:28-dind	Up 43 hours (healthy)

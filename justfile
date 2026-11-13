@@ -196,6 +196,20 @@ check-e2e-recreated-leaf-recovery:
     test -s tests/e2e/recursive-crash-convergence/e2e-test.md
     test -s tests/e2e/recursive-crash-convergence/testrunner.md
 
+# Check the disposable Actions Forgejo template (chainlink #1337) without Docker:
+# no fixed name or port, a privileged docker:28-dind on an internal network, an
+# offline pull policy with the cache disabled, and the runner entrypoint's
+# host-mapping patch and refusal paths.
+check-forgejo-actions-template:
+    bash -n tests/e2e/lib/forgejo/runner-entrypoint.sh
+    bash -n scripts/spike-forgejo-nested-docker.sh
+    {{py}} -m pytest -q tests/e2e/lib/forgejo/test_contract.py
+
+# Run the nested-docker reproduction (chainlink #1337) on its own compose project
+# from the cached images; it pulls nothing and verifies its own teardown.
+spike-forgejo-nested-docker:
+    ./scripts/spike-forgejo-nested-docker.sh
+
 # Lint the programmatic TL controller
 tl-loop-lint:
     {{py}} -m ruff check tl_loop --exclude tl_loop/tests scripts/compile_failure_atlas.py scripts/failure_atlas_measure.py

@@ -1,0 +1,11 @@
+$ docker compose -p spike1337-attempt1 -f docker-compose.yml ps
+NAME                           IMAGE                                COMMAND                  SERVICE   CREATED          STATUS                    PORTS
+spike1337-attempt1-dind-1      docker:dind                          "dockerd-entrypoint.…"   dind      20 minutes ago   Up 20 minutes (healthy)   2375-2376/tcp
+spike1337-attempt1-forgejo-1   codeberg.org/forgejo/forgejo:15      "/usr/bin/entrypoint…"   forgejo   20 minutes ago   Up 20 minutes (healthy)   22/tcp, 127.0.0.1:32768->3000/tcp
+spike1337-attempt1-runner-1    data.forgejo.org/forgejo/runner:12   "forgejo-runner daem…"   runner    5 minutes ago    Up 5 minutes              
+
+$ docker compose -p spike1337-attempt1 -f docker-compose.yml port forgejo 3000
+127.0.0.1:32768
+
+$ docker version --format "{{.Server.Version}}"
+29.9.2

@@ -1,0 +1,25 @@
+===== DANGLING VOLUME CREATION CHECK =====
+$ docker volume ls -q -f dangling=true | docker volume inspect --format "{{.CreatedAt}} {{.Name}} {{.Labels}}"
+2026-05-24T15:30:30-05:00 0b95ee4a4e76133b9ad8a9bd7a440269516eb10086a7b41ae1f1d06060efdaba {'com.docker.volume.anonymous': ''}
+2026-05-27T12:47:11-05:00 1e40d634c4698cf6089e7d552114095055e2f3a4e49041ebd27546e0fe6fdbae {'com.docker.volume.anonymous': ''}
+2026-07-01T14:08:50-05:00 5d153ec8535b20d8bfc2bbb78115f8c16a4de684e38b63333bdacd91414adb97 {'com.docker.volume.anonymous': ''}
+2026-06-30T21:42:19-05:00 5f953dd0060b3fd1cc0f66ba2c0b6c4a3e74edd54ca824b94a2901c0a23ad37f {'com.docker.volume.anonymous': ''}
+2026-06-30T21:42:17-05:00 6fb662cab06b12ee48330ed951d8cfb50793d25e9da59de3c4c2abe8d2de385a {'com.docker.volume.anonymous': ''}
+2026-05-27T11:58:07-05:00 017a4337607f0220a75cd6459b64816c29c84dd744edcd99f7b96e207b3f4ec6 {'com.docker.volume.anonymous': ''}
+2026-05-27T11:57:50-05:00 808ca8bf0e801925c234999e25b19389e74c7c8e72994dd8e11d8d3057ef9154 {'com.docker.volume.anonymous': ''}
+2026-05-27T11:57:33-05:00 20779aa8c4078c1fcd39bd4a059ef056f7dab8dd072b2940a46d1e5565b1545a {'com.docker.volume.anonymous': ''}
+2026-07-01T14:19:02-05:00 38583d4f5d1366835f1f9b802e547f324f62e3ba4d3064a19ec51ec579abaf62 {'com.docker.volume.anonymous': ''}
+2026-05-24T15:28:43-05:00 831430a26a9eefa1bf1589088ca7d6d3dd43bb00089e4b222d20f730e0dd46fc {'com.docker.volume.anonymous': ''}
+2026-05-21T00:55:48-05:00 b1d0db8f5457337c94369b36518f032e03c3bb516fc21dd7434051a55c6aa137 {'com.docker.volume.anonymous': ''}
+2026-04-07T21:03:27-05:00 d8a1777ec1cf6b36c3be67bbd031a55bc51c6577536d7ff6ee42f77907d0479a {'com.docker.volume.anonymous': ''}
+2026-04-07T21:03:27-05:00 ff17587334a3d86b58a982cd9d86e7c0d770cdce1632e286ebf023988fdd06f4 {'com.docker.volume.anonymous': ''}
+2026-02-05T18:58:05-05:00 ollama-secondary None
+2026-02-03T09:55:57-05:00 ollama_models None
+2024-10-22T20:11:29-05:00 supabase_config_secondbrain None
+2024-10-22T20:11:29-05:00 supabase_db_secondbrain None
+2024-10-22T20:11:29-05:00 supabase_edge_runtime_secondbrain None
+2024-10-22T20:11:29-05:00 supabase_inbucket_secondbrain None
+2024-10-22T20:11:29-05:00 supabase_storage_secondbrain None
+2026-04-07T12:49:34-05:00 vscode None
+
+anonymous volumes created during the spike window: none

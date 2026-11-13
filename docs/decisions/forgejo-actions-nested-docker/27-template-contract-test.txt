@@ -1,0 +1,22 @@
+===== template contract test (no Docker) =====
+
+$ tl_loop/.venv/bin/python -V
+Python 3.13.14
+
+$ tl_loop/.venv/bin/python -m ruff check tests/e2e/lib/forgejo/test_contract.py
+All checks passed!
+
+$ tl_loop/.venv/bin/python -m pytest -q tests/e2e/lib/forgejo/test_contract.py
+.......                                                                  [100%]
+7 passed in 0.02s
+
+$ tl_loop/.venv/bin/python -m pytest --collect-only -q tests/e2e/lib/forgejo/test_contract.py
+tests/e2e/lib/forgejo/test_contract.py::test_the_template_has_no_fixed_container_name_or_host_port
+tests/e2e/lib/forgejo/test_contract.py::test_the_template_pins_a_privileged_dind_28_on_an_internal_network
+tests/e2e/lib/forgejo/test_contract.py::test_the_template_runner_registers_through_the_entrypoint
+tests/e2e/lib/forgejo/test_contract.py::test_the_runner_config_keeps_offline_images_and_disables_the_cache
+tests/e2e/lib/forgejo/test_contract.py::test_the_entrypoint_patches_container_options
+tests/e2e/lib/forgejo/test_contract.py::test_the_entrypoint_refuses_a_config_it_cannot_patch
+tests/e2e/lib/forgejo/test_contract.py::test_the_entrypoint_fails_when_forgejo_cannot_be_resolved
+
+7 tests collected in 0.01s

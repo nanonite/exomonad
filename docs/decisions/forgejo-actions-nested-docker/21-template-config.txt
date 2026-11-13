@@ -1,0 +1,9 @@
+$ docker compose -p spike1337-configcheck -f tests/e2e/lib/forgejo/docker-compose.actions.yml config | grep ...
+12:    image: docker:28-dind
+15:    privileged: true
+29:      FORGEJO__actions__ENABLED: "true"
+40:    image: codeberg.org/forgejo/forgejo:15
+62:        target: 3000
+70:      DOCKER_HOST: tcp://dind:2375
+74:    image: data.forgejo.org/forgejo/runner:12
+103:    internal: true

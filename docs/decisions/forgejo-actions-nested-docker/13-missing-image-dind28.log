@@ -1,0 +1,11 @@
+2026-11-13T03:27:06.0017128Z spike1337-runner(version:v12.10.1) received task 11 of job absent, be triggered by event: push
+2026-11-13T03:27:06.0026529Z workflow prepared
+2026-11-13T03:27:06.0029442Z evaluating expression 'success()'
+2026-11-13T03:27:06.0029749Z expression 'success()' evaluated to 'true'
+2026-11-13T03:27:06.0031042Z 🚀  Start image=spike1337/absent:1
+2026-11-13T03:27:06.0075401Z RunContext absent is assigned random name 26cfb9c5ee732d000544c7b0489b83bd
+2026-11-13T03:27:06.0076305Z platform not specified, defaulting to detected linux/amd64
+2026-11-13T03:27:06.0108829Z Image exists? false
+2026-11-13T03:27:06.0109008Z pulling image 'docker.io/spike1337/absent:1' (linux/amd64)
+2026-11-13T03:27:06.0112359Z   🐳  docker pull image=spike1337/absent:1 platform=linux/amd64 username= forcePull=false
+2026-11-13T03:27:06.0282986Z Error response from daemon: Get "https://registry-1.docker.io/v2/": dial tcp: lookup registry-1.docker.io on 127.0.0.11:53: server misbehaving

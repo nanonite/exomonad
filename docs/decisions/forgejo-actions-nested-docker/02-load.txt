@@ -1,0 +1,13 @@
+$ docker save ubuntu:24.04 | docker exec -i spike1337-attempt1-dind-1 docker -H tcp://localhost:2375 load
+Loaded image: ubuntu:24.04
+
+$ docker exec spike1337-attempt1-dind-1 docker -H tcp://localhost:2375 images
+IMAGE          ID             DISK USAGE   CONTENT SIZE   EXTRA
+ubuntu:24.04   d401e511e11e        168MB         80.7MB   U
+
+$ docker image inspect ubuntu:24.04 --format "{{.Id}} {{.Architecture}}/{{.Os}}"
+sha256:69f919497cada9a8611f3de61df902d9f94bf20f84552ef5bd93125c38608ef9 amd64/linux
+
+The dind store lists a different image ID (d401e511e11e) than the host
+(69f919497cad). The loaded image ran the amd64 job successfully; see
+08-dind28-load-then-run-success.log and 19-repro-script.log.

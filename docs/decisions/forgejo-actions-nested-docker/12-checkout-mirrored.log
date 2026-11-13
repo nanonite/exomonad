@@ -1,0 +1,207 @@
+2026-11-13T03:31:09.7631424Z spike1337-runner(version:v12.10.1) received task 30 of job checkout, be triggered by event: push
+2026-11-13T03:31:09.7646005Z workflow prepared
+2026-11-13T03:31:09.7648440Z evaluating expression 'success()'
+2026-11-13T03:31:09.7648876Z expression 'success()' evaluated to 'true'
+2026-11-13T03:31:09.7649045Z 🚀  Start image=node:lts
+2026-11-13T03:31:09.7694774Z RunContext checkout is assigned random name 22354348655fda5cc2da1ed337ac77e7
+2026-11-13T03:31:09.7695819Z platform not specified, defaulting to detected linux/amd64
+2026-11-13T03:31:09.7734250Z Image exists? true
+2026-11-13T03:31:09.7742521Z Cleaning up network for job checkout, and network name is: WORKFLOW-22354348655fda5cc2da1ed337ac77e7
+2026-11-13T03:31:09.7747021Z [{none bacbffcb9794144b48d263e428cfeb7cd1d0dd4fe818138728d2ca555ae4b135 2026-11-13 03:23:56.710576362 +0000 UTC local null true false {default map[] []} false false false {} false map[] map[] map[] [] map[]} {host 85d765f1e6e5784b0fa99f556c64e135038340e462554b70dbf637a26442efcd 2026-11-13 03:23:56.728321618 +0000 UTC local host true false {default map[] []} false false false {} false map[] map[] map[] [] map[]} {bridge 13db722d02e28c99599626d59dae318b53f3888d4f06ecd4b48cea22bdc12637 2026-11-13 03:23:56.739973924 +0000 UTC local bridge true false {default map[] [{172.17.0.0/16  172.17.0.1 map[]}]} false false false {} false map[] map[com.docker.network.bridge.default_bridge:true com.docker.network.bridge.enable_icc:true com.docker.network.bridge.enable_ip_masquerade:true com.docker.network.bridge.host_binding_ipv4:0.0.0.0 com.docker.network.bridge.name:docker0 com.docker.network.driver.mtu:1500] map[] [] map[]}]
+2026-11-13T03:31:09.8037711Z   🐳  docker create image=node:lts platform=linux/amd64 entrypoint=["tail" "-f" "/dev/null"] cmd=[] network="WORKFLOW-22354348655fda5cc2da1ed337ac77e7"
+2026-11-13T03:31:09.8039748Z Common container.Config ==> &{Hostname: Domainname: User: AttachStdin:false AttachStdout:false AttachStderr:false ExposedPorts:map[] Tty:false OpenStdin:false StdinOnce:false Env:[RUNNER_TOOL_CACHE=/opt/hostedtoolcache RUNNER_OS=Linux RUNNER_ARCH=X64 RUNNER_TEMP=/tmp LANG=C.UTF-8] Cmd:[] Healthcheck:<nil> ArgsEscaped:false Image:node:lts Volumes:map[] WorkingDir:/workspace/spike-admin/spike-repo Entrypoint:[] NetworkDisabled:false MacAddress: OnBuild:[] Labels:map[] StopSignal: StopTimeout:<nil> Shell:[]}
+2026-11-13T03:31:09.8075263Z Common container.HostConfig ==> &{Binds:[] ContainerIDFile: LogConfig:{Type: Config:map[]} NetworkMode:WORKFLOW-22354348655fda5cc2da1ed337ac77e7 PortBindings:map[] RestartPolicy:{Name: MaximumRetryCount:0} AutoRemove:false VolumeDriver: VolumesFrom:[] ConsoleSize:[0 0] Annotations:map[] CapAdd:[] CapDrop:[] CgroupnsMode: DNS:[] DNSOptions:[] DNSSearch:[] ExtraHosts:[] GroupAdd:[] IpcMode: Cgroup: Links:[] OomScoreAdj:0 PidMode: Privileged:false PublishAllPorts:false ReadonlyRootfs:false SecurityOpt:[] StorageOpt:map[] Tmpfs:map[] UTSMode: UsernsMode: ShmSize:0 Sysctls:map[] Runtime: Isolation: Resources:{CPUShares:0 Memory:0 NanoCPUs:0 CgroupParent: BlkioWeight:0 BlkioWeightDevice:[] BlkioDeviceReadBps:[] BlkioDeviceWriteBps:[] BlkioDeviceReadIOps:[] BlkioDeviceWriteIOps:[] CPUPeriod:0 CPUQuota:0 CPURealtimePeriod:0 CPURealtimeRuntime:0 CpusetCpus: CpusetMems: Devices:[] DeviceCgroupRules:[] DeviceRequests:[] KernelMemory:0 KernelMemoryTCP:0 MemoryReservation:0 MemorySwap:0 MemorySwappiness:<nil> OomKillDisable:<nil> PidsLimit:<nil> Ulimits:[] CPUCount:0 CPUPercent:0 IOMaximumIOps:0 IOMaximumBandwidth:0} Mounts:[{Type:volume Source:22354348655fda5cc2da1ed337ac77e7-env Target:/var/run/act ReadOnly:false Consistency: BindOptions:<nil> VolumeOptions:<nil> ImageOptions:<nil> TmpfsOptions:<nil> ClusterOptions:<nil>} {Type:volume Source:22354348655fda5cc2da1ed337ac77e7 Target:/workspace/spike-admin/spike-repo ReadOnly:false Consistency: BindOptions:<nil> VolumeOptions:<nil> ImageOptions:<nil> TmpfsOptions:<nil> ClusterOptions:<nil>}] MaskedPaths:[] ReadonlyPaths:[] Init:0xc000488200}
+2026-11-13T03:31:09.8075900Z Custom container.Config from options ==> &{Hostname: Domainname: User: AttachStdin:false AttachStdout:true AttachStderr:true ExposedPorts:map[] Tty:false OpenStdin:false StdinOnce:false Env:[] Cmd:[] Healthcheck:<nil> ArgsEscaped:false Image: Volumes:map[] WorkingDir: Entrypoint:[] NetworkDisabled:false MacAddress: OnBuild:[] Labels:map[] StopSignal: StopTimeout:<nil> Shell:[]}
+2026-11-13T03:31:09.8076066Z Merged container.Config ==> &{Hostname: Domainname: User: AttachStdin:false AttachStdout:true AttachStderr:true ExposedPorts:map[] Tty:false OpenStdin:false StdinOnce:false Env:[RUNNER_TOOL_CACHE=/opt/hostedtoolcache RUNNER_OS=Linux RUNNER_ARCH=X64 RUNNER_TEMP=/tmp LANG=C.UTF-8] Cmd:[] Healthcheck:<nil> ArgsEscaped:false Image:node:lts Volumes:map[] WorkingDir:/workspace/spike-admin/spike-repo Entrypoint:[tail -f /dev/null] NetworkDisabled:false MacAddress: OnBuild:[] Labels:map[] StopSignal: StopTimeout:<nil> Shell:[]}
+2026-11-13T03:31:09.8076248Z Custom container.HostConfig from options ==> &{Binds:[] ContainerIDFile: LogConfig:{Type: Config:map[]} NetworkMode:default PortBindings:map[] RestartPolicy:{Name:no MaximumRetryCount:0} AutoRemove:false VolumeDriver: VolumesFrom:[] ConsoleSize:[0 0] Annotations:map[] CapAdd:[] CapDrop:[] CgroupnsMode: DNS:[] DNSOptions:[] DNSSearch:[] ExtraHosts:[forgejo:172.30.0.3] GroupAdd:[] IpcMode: Cgroup: Links:[] OomScoreAdj:0 PidMode: Privileged:false PublishAllPorts:false ReadonlyRootfs:false SecurityOpt:[] StorageOpt:map[] Tmpfs:map[] UTSMode: UsernsMode: ShmSize:0 Sysctls:map[] Runtime: Isolation: Resources:{CPUShares:0 Memory:0 NanoCPUs:0 CgroupParent: BlkioWeight:0 BlkioWeightDevice:[] BlkioDeviceReadBps:[] BlkioDeviceWriteBps:[] BlkioDeviceReadIOps:[] BlkioDeviceWriteIOps:[] CPUPeriod:0 CPUQuota:0 CPURealtimePeriod:0 CPURealtimeRuntime:0 CpusetCpus: CpusetMems: Devices:[] DeviceCgroupRules:[] DeviceRequests:[] KernelMemory:0 KernelMemoryTCP:0 MemoryReservation:0 MemorySwap:0 MemorySwappiness:0xc00030d548 OomKillDisable:0xc00030d443 PidsLimit:0xc00030d5a8 Ulimits:[] CPUCount:0 CPUPercent:0 IOMaximumIOps:0 IOMaximumBandwidth:0} Mounts:[] MaskedPaths:[] ReadonlyPaths:[] Init:<nil>}
+2026-11-13T03:31:09.8076525Z Merged container.HostConfig ==> &{Binds:[] ContainerIDFile: LogConfig:{Type: Config:map[]} NetworkMode:WORKFLOW-22354348655fda5cc2da1ed337ac77e7 PortBindings:map[] RestartPolicy:{Name:no MaximumRetryCount:0} AutoRemove:false VolumeDriver: VolumesFrom:[] ConsoleSize:[0 0] Annotations:map[] CapAdd:[] CapDrop:[] CgroupnsMode: DNS:[] DNSOptions:[] DNSSearch:[] ExtraHosts:[forgejo:172.30.0.3] GroupAdd:[] IpcMode: Cgroup: Links:[] OomScoreAdj:0 PidMode: Privileged:false PublishAllPorts:false ReadonlyRootfs:false SecurityOpt:[] StorageOpt:map[] Tmpfs:map[] UTSMode: UsernsMode: ShmSize:0 Sysctls:map[] Runtime: Isolation: Resources:{CPUShares:0 Memory:0 NanoCPUs:0 CgroupParent: BlkioWeight:0 BlkioWeightDevice:[] BlkioDeviceReadBps:[] BlkioDeviceWriteBps:[] BlkioDeviceReadIOps:[] BlkioDeviceWriteIOps:[] CPUPeriod:0 CPUQuota:0 CPURealtimePeriod:0 CPURealtimeRuntime:0 CpusetCpus: CpusetMems: Devices:[] DeviceCgroupRules:[] DeviceRequests:[] KernelMemory:0 KernelMemoryTCP:0 MemoryReservation:0 MemorySwap:0 MemorySwappiness:0xc00030d548 OomKillDisable:0xc00030d443 PidsLimit:0xc00030d5a8 Ulimits:[] CPUCount:0 CPUPercent:0 IOMaximumIOps:0 IOMaximumBandwidth:0} Mounts:[{Type:volume Source:22354348655fda5cc2da1ed337ac77e7-env Target:/var/run/act ReadOnly:false Consistency: BindOptions:<nil> VolumeOptions:<nil> ImageOptions:<nil> TmpfsOptions:<nil> ClusterOptions:<nil>} {Type:volume Source:22354348655fda5cc2da1ed337ac77e7 Target:/workspace/spike-admin/spike-repo ReadOnly:false Consistency: BindOptions:<nil> VolumeOptions:<nil> ImageOptions:<nil> TmpfsOptions:<nil> ClusterOptions:<nil>}] MaskedPaths:[] ReadonlyPaths:[] Init:0xc000488200}
+2026-11-13T03:31:09.8076892Z input.NetworkAliases ==> [checkout]
+2026-11-13T03:31:09.8928446Z Created container name=FORGEJO-ACTIONS-TASK-30_WORKFLOW-0506509e26e84897f782de4a458ddde1803896d58edbe3a8c85a078a0337e455_JOB-checkout id=2ac67b81ffb63f79c16d4dd0649a26a0cbc525a8133865de02629faa478793f7 from image node:lts (platform: linux/amd64)
+2026-11-13T03:31:09.8928761Z ENV ==> [RUNNER_TOOL_CACHE=/opt/hostedtoolcache RUNNER_OS=Linux RUNNER_ARCH=X64 RUNNER_TEMP=/tmp LANG=C.UTF-8]
+2026-11-13T03:31:09.8928872Z   🐳  docker run image=node:lts platform=linux/amd64 entrypoint=["tail" "-f" "/dev/null"] cmd=[] network="WORKFLOW-22354348655fda5cc2da1ed337ac77e7"
+2026-11-13T03:31:09.8928957Z Starting container: 2ac67b81ffb63f79c16d4dd0649a26a0cbc525a8133865de02629faa478793f7
+2026-11-13T03:31:10.0547602Z Started container: 2ac67b81ffb63f79c16d4dd0649a26a0cbc525a8133865de02629faa478793f7
+2026-11-13T03:31:10.1377027Z Writing entry to tarball workflow/event.json len:4806
+2026-11-13T03:31:10.1377349Z Writing entry to tarball workflow/envs.txt len:0
+2026-11-13T03:31:10.1377417Z Extracting content to '/var/run/act/'
+2026-11-13T03:31:10.1500988Z Authentication with token supported: true
+2026-11-13T03:31:10.1501311Z   git -C /data/.cache/act/17/6839ea59a9165c78bf96507968c2914de1c5ac6e6d5d082d4e26ff41118069 remote get-url origin
+2026-11-13T03:31:10.1508867Z   ☁️  git clone 'http://forgejo:3000/actions/checkout' # ref=v4
+2026-11-13T03:31:10.1508960Z   cloning http://forgejo:3000/actions/checkout to /data/.cache/act/17/6839ea59a9165c78bf96507968c2914de1c5ac6e6d5d082d4e26ff41118069
+2026-11-13T03:31:10.1509048Z   git --config-env http.http://forgejo:3000/.extraHeader=GIT_AUTH_HEADER clone --bare http://forgejo:3000/actions/checkout /data/.cache/act/17/6839ea59a9165c78bf96507968c2914de1c5ac6e6d5d082d4e26ff41118069
+2026-11-13T03:31:10.3945398Z Cloned http://forgejo:3000/actions/checkout to /data/.cache/act/17/6839ea59a9165c78bf96507968c2914de1c5ac6e6d5d082d4e26ff41118069
+2026-11-13T03:31:10.3945817Z   git -C /data/.cache/act/17/6839ea59a9165c78bf96507968c2914de1c5ac6e6d5d082d4e26ff41118069 rev-parse v4^{commit}
+2026-11-13T03:31:10.3957765Z Found revision: 11d5960a326750d5838078e36cf38b85af677262
+2026-11-13T03:31:10.3958061Z   ☁️  git fetch 'http://forgejo:3000/actions/checkout' # ref=v4
+2026-11-13T03:31:10.3958177Z   git --config-env http.http://forgejo:3000/.extraHeader=GIT_AUTH_HEADER -C /data/.cache/act/17/6839ea59a9165c78bf96507968c2914de1c5ac6e6d5d082d4e26ff41118069 fetch origin +refs/*:refs/*
+2026-11-13T03:31:10.4125379Z   git -C /data/.cache/act/17/6839ea59a9165c78bf96507968c2914de1c5ac6e6d5d082d4e26ff41118069 rev-parse v4^{commit}
+2026-11-13T03:31:10.4134307Z Found revision: 11d5960a326750d5838078e36cf38b85af677262
+2026-11-13T03:31:10.4134456Z   git worktree create for ref=v4 (sha=11d5960a326750d5838078e36cf38b85af677262) to /data/.cache/act/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72
+2026-11-13T03:31:10.4134522Z   git -C /data/.cache/act/17/6839ea59a9165c78bf96507968c2914de1c5ac6e6d5d082d4e26ff41118069 worktree add -f --end-of-options /data/.cache/act/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72 11d5960a326750d5838078e36cf38b85af677262
+2026-11-13T03:31:10.4304499Z   git -C /data/.cache/act/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72 rev-parse HEAD
+2026-11-13T03:31:10.4314314Z Found revision: 11d5960a326750d5838078e36cf38b85af677262
+2026-11-13T03:31:10.4320674Z Read action &{Checkout  Checkout a Git repository at a particular version map[allow-unsafe-pr-checkout:{Required to check out fork pull request code from a workflow triggered by `pull_request_target` or `workflow_run`. These workflows run with the base repository's GITHUB_TOKEN, secrets, default-branch cache scope, and runner access; fetching and executing a fork's code in that trusted context commonly leads to "pwn request" vulnerabilities. Set to `true` only after reviewing the risks at https://gh.io/securely-using-pull_request_target.\n false false} clean:{Whether to execute `git clean -ffdx && git reset --hard HEAD` before fetching false true} fetch-depth:{Number of commits to fetch. 0 indicates all history for all branches and tags. false 1} fetch-tags:{Whether to fetch tags, even if fetch-depth > 0. false false} filter:{Partially clone against a given filter. Overrides sparse-checkout if set.\n false } github-server-url:{The base URL for the GitHub instance that you are trying to clone from, will use environment defaults to fetch from the same instance that the workflow is running from unless specified. Example URLs are https://github.com or https://my-ghes-server.example.com false } lfs:{Whether to download Git-LFS files false false} path:{Relative path under $GITHUB_WORKSPACE to place the repository false } persist-credentials:{Whether to configure the token or SSH key with the local git config false true} ref:{The branch, tag or SHA to checkout. When checking out the repository that triggered a workflow, this defaults to the reference or SHA for that event.  Otherwise, uses the default branch.\n false } repository:{Repository name with owner. For example, actions/checkout false ${{ github.repository }}} set-safe-directory:{Add repository path as safe.directory for Git global config by running `git config --global --add safe.directory <path>` false true} show-progress:{Whether to show progress status output when fetching. false true} sparse-checkout:{Do a sparse checkout on given patterns. Each pattern should be separated with new lines.\n false } sparse-checkout-cone-mode:{Specifies whether to use cone-mode when doing a sparse checkout.\n false true} ssh-key:{SSH key used to fetch the repository. The SSH key is configured with the local git config, which enables your scripts to run authenticated git commands. The post-job step removes the SSH key.\n\nWe recommend using a service account with the least permissions necessary.\n\n[Learn more about creating and using encrypted secrets](https://help.github.com/en/actions/automating-your-workflow-with-github-actions/creating-and-using-encrypted-secrets)\n false } ssh-known-hosts:{Known hosts in addition to the user and global host key database. The public SSH keys for a host may be obtained using the utility `ssh-keyscan`. For example, `ssh-keyscan github.com`. The public key for github.com is always implicitly added.\n false } ssh-strict:{Whether to perform strict host key checking. When true, adds the options `StrictHostKeyChecking=yes` and `CheckHostIP=no` to the SSH command line. Use the input `ssh-known-hosts` to configure additional hosts.\n false true} ssh-user:{The user to use when connecting to the remote SSH host. By default 'git' is used.\n false git} submodules:{Whether to checkout submodules: `true` to checkout submodules or `recursive` to recursively checkout submodules.\n\nWhen the `ssh-key` input is not provided, SSH URLs beginning with `git@github.com:` are converted to HTTPS.\n false false} token:{Personal access token (PAT) used to fetch the repository. The PAT is configured with the local git config, which enables your scripts to run authenticated git commands. The post-job step removes the PAT.\n\nWe recommend using a service account with the least permissions necessary. Also when generating a new PAT, select the least scopes necessary.\n\n[Learn more about creating and using encrypted secrets](https://help.github.com/en/actions/automating-your-workflow-with-github-actions/creating-and-using-encrypted-secrets)\n false ${{ github.token }}}] map[commit:{The commit SHA that was checked out } ref:{The branch, tag or SHA that was checked out }] {node20 map[] dist/index.js  always() dist/index.js always()     [] []} { }} from 'Unknown'
+2026-11-13T03:31:10.4409533Z setupEnv => map[ACT:true ACTIONS_CACHE_URL:http://172.30.0.4:46715/599540896d01c0d3f3b671611f9b911a/ ACTIONS_ID_TOKEN_REQUEST_TOKEN: ACTIONS_ID_TOKEN_REQUEST_URL: ACTIONS_RESULTS_URL:http://forgejo:3000 ACTIONS_RUNTIME_TOKEN:*** ACTIONS_RUNTIME_URL:http://forgejo:3000/api/actions_pipeline/ CI:true FORGEJO_ACTION:0 FORGEJO_ACTIONS:true FORGEJO_ACTIONS_RUNNER_VERSION:v12.10.1 FORGEJO_ACTION_PATH: FORGEJO_ACTION_REF:v4 FORGEJO_ACTION_REPOSITORY:actions/checkout FORGEJO_ACTOR:spike-admin FORGEJO_API_URL:http://forgejo:3000/api/v1 FORGEJO_BASE_REF: FORGEJO_EVENT_NAME:push FORGEJO_EVENT_PATH:/var/run/act/workflow/event.json FORGEJO_HEAD_REF: FORGEJO_JOB:checkout FORGEJO_REF:refs/heads/main FORGEJO_REF_NAME:main FORGEJO_REF_TYPE:branch FORGEJO_REPOSITORY:spike-admin/spike-repo FORGEJO_REPOSITORY_OWNER:spike-admin FORGEJO_RETENTION_DAYS: FORGEJO_RUN_ATTEMPT:1 FORGEJO_RUN_ID:21 FORGEJO_RUN_NUMBER:21 FORGEJO_SERVER_URL:http://forgejo:3000 FORGEJO_SHA:64d083b87ee347f39b25af25dbedac0d67886e03 FORGEJO_TOKEN:*** FORGEJO_WORKFLOW:probe2 FORGEJO_WORKFLOW_REF:spike-admin/spike-repo/.forgejo/workflows/probe2.yml@refs/heads/main FORGEJO_WORKSPACE:/workspace/spike-admin/spike-repo GITEA_ACTIONS:true GITEA_ACTIONS_RUNNER_VERSION:v12.10.1 GITHUB_ACTION:0 GITHUB_ACTIONS:true GITHUB_ACTION_PATH: GITHUB_ACTION_REF:v4 GITHUB_ACTION_REPOSITORY:actions/checkout GITHUB_ACTOR:spike-admin GITHUB_API_URL:http://forgejo:3000/api/v1 GITHUB_BASE_REF: GITHUB_EVENT_NAME:push GITHUB_EVENT_PATH:/var/run/act/workflow/event.json GITHUB_HEAD_REF: GITHUB_JOB:checkout GITHUB_REF:refs/heads/main GITHUB_REF_NAME:main GITHUB_REF_TYPE:branch GITHUB_REPOSITORY:spike-admin/spike-repo GITHUB_REPOSITORY_OWNER:spike-admin GITHUB_RETENTION_DAYS: GITHUB_RUN_ATTEMPT:1 GITHUB_RUN_ID:21 GITHUB_RUN_NUMBER:21 GITHUB_SERVER_URL:http://forgejo:3000 GITHUB_SHA:64d083b87ee347f39b25af25dbedac0d67886e03 GITHUB_TOKEN:*** GITHUB_WORKFLOW:probe2 GITHUB_WORKFLOW_REF:spike-admin/spike-repo/.forgejo/workflows/probe2.yml@refs/heads/main GITHUB_WORKSPACE:/workspace/spike-admin/spike-repo ImageOS:tools JOB_CONTAINER_NAME:FORGEJO-ACTIONS-TASK-30_WORKFLOW-0506509e26e84897f782de4a458ddde1803896d58edbe3a8c85a078a0337e455_JOB-checkout RUNNER_PERFLOG:/dev/null RUNNER_TRACKING_ID:]
+2026-11-13T03:31:10.4447057Z evaluating expression ''
+2026-11-13T03:31:10.4447326Z expression '' evaluated to 'true'
+2026-11-13T03:31:10.4447386Z ⭐ Run Main actions/checkout@v4
+2026-11-13T03:31:10.4447497Z Writing entry to tarball workflow/outputcmd.txt len:0
+2026-11-13T03:31:10.4447605Z Writing entry to tarball workflow/statecmd.txt len:0
+2026-11-13T03:31:10.4447659Z Writing entry to tarball workflow/pathcmd.txt len:0
+2026-11-13T03:31:10.4447709Z Writing entry to tarball workflow/envs.txt len:0
+2026-11-13T03:31:10.4447757Z Writing entry to tarball workflow/SUMMARY.md len:0
+2026-11-13T03:31:10.4447804Z Extracting content to '/var/run/act'
+2026-11-13T03:31:10.4462479Z About to run action &{Checkout  Checkout a Git repository at a particular version map[allow-unsafe-pr-checkout:{Required to check out fork pull request code from a workflow triggered by `pull_request_target` or `workflow_run`. These workflows run with the base repository's GITHUB_TOKEN, secrets, default-branch cache scope, and runner access; fetching and executing a fork's code in that trusted context commonly leads to "pwn request" vulnerabilities. Set to `true` only after reviewing the risks at https://gh.io/securely-using-pull_request_target.\n false false} clean:{Whether to execute `git clean -ffdx && git reset --hard HEAD` before fetching false true} fetch-depth:{Number of commits to fetch. 0 indicates all history for all branches and tags. false 1} fetch-tags:{Whether to fetch tags, even if fetch-depth > 0. false false} filter:{Partially clone against a given filter. Overrides sparse-checkout if set.\n false } github-server-url:{The base URL for the GitHub instance that you are trying to clone from, will use environment defaults to fetch from the same instance that the workflow is running from unless specified. Example URLs are https://github.com or https://my-ghes-server.example.com false } lfs:{Whether to download Git-LFS files false false} path:{Relative path under $GITHUB_WORKSPACE to place the repository false } persist-credentials:{Whether to configure the token or SSH key with the local git config false true} ref:{The branch, tag or SHA to checkout. When checking out the repository that triggered a workflow, this defaults to the reference or SHA for that event.  Otherwise, uses the default branch.\n false } repository:{Repository name with owner. For example, actions/checkout false ${{ github.repository }}} set-safe-directory:{Add repository path as safe.directory for Git global config by running `git config --global --add safe.directory <path>` false true} show-progress:{Whether to show progress status output when fetching. false true} sparse-checkout:{Do a sparse checkout on given patterns. Each pattern should be separated with new lines.\n false } sparse-checkout-cone-mode:{Specifies whether to use cone-mode when doing a sparse checkout.\n false true} ssh-key:{SSH key used to fetch the repository. The SSH key is configured with the local git config, which enables your scripts to run authenticated git commands. The post-job step removes the SSH key.\n\nWe recommend using a service account with the least permissions necessary.\n\n[Learn more about creating and using encrypted secrets](https://help.github.com/en/actions/automating-your-workflow-with-github-actions/creating-and-using-encrypted-secrets)\n false } ssh-known-hosts:{Known hosts in addition to the user and global host key database. The public SSH keys for a host may be obtained using the utility `ssh-keyscan`. For example, `ssh-keyscan github.com`. The public key for github.com is always implicitly added.\n false } ssh-strict:{Whether to perform strict host key checking. When true, adds the options `StrictHostKeyChecking=yes` and `CheckHostIP=no` to the SSH command line. Use the input `ssh-known-hosts` to configure additional hosts.\n false true} ssh-user:{The user to use when connecting to the remote SSH host. By default 'git' is used.\n false git} submodules:{Whether to checkout submodules: `true` to checkout submodules or `recursive` to recursively checkout submodules.\n\nWhen the `ssh-key` input is not provided, SSH URLs beginning with `git@github.com:` are converted to HTTPS.\n false false} token:{Personal access token (PAT) used to fetch the repository. The PAT is configured with the local git config, which enables your scripts to run authenticated git commands. The post-job step removes the PAT.\n\nWe recommend using a service account with the least permissions necessary. Also when generating a new PAT, select the least scopes necessary.\n\n[Learn more about creating and using encrypted secrets](https://help.github.com/en/actions/automating-your-workflow-with-github-actions/creating-and-using-encrypted-secrets)\n false ${{ github.token }}}] map[commit:{The commit SHA that was checked out } ref:{The branch, tag or SHA that was checked out }] {node20 map[] dist/index.js  always() dist/index.js always()     [] []} { }}
+2026-11-13T03:31:10.4497849Z expression '${{ github.repository }}' rewritten to 'format('{0}', github.repository)'
+2026-11-13T03:31:10.4497967Z evaluating expression 'format('{0}', github.repository)'
+2026-11-13T03:31:10.4498167Z expression 'format('{0}', github.repository)' evaluated to '%!t(string=spike-admin/spike-repo)'
+2026-11-13T03:31:10.4498273Z expression '${{ github.token }}' rewritten to 'format('{0}', github.token)'
+2026-11-13T03:31:10.4498332Z evaluating expression 'format('{0}', github.token)'
+2026-11-13T03:31:10.4498451Z expression 'format('{0}', github.token)' evaluated to '%!t(string=***)'
+2026-11-13T03:31:10.4498808Z type=remote-action actionDir=/data/.cache/act/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72 actionPath= workdir=/workspace/spike-admin/spike-repo actionCacheDir=/data/.cache/act actionName=e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72 containerActionDir=/var/run/act/actions/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72
+2026-11-13T03:31:10.4498878Z /var/run/act/actions/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72
+2026-11-13T03:31:10.4499032Z Removing /data/.cache/act/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72/.gitignore before docker cp
+2026-11-13T03:31:10.4499447Z   🐳  docker cp src=/data/.cache/act/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72/ dst=/var/run/act/actions/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72/
+2026-11-13T03:31:10.4500494Z Writing tarball /tmp/act129046943 from /data/.cache/act/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72/
+2026-11-13T03:31:10.4500566Z Stripping prefix:/data/.cache/act/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72/ src:/data/.cache/act/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72/
+2026-11-13T03:31:10.4561765Z Extracting content from '/tmp/act129046943' to '/var/run/act/actions/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72/'
+2026-11-13T03:31:10.4636860Z executing remote job container: [node /var/run/act/actions/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72/dist/index.js]
+2026-11-13T03:31:10.4637020Z   🐳  docker exec cmd=[node /var/run/act/actions/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72/dist/index.js] user= workdir=
+2026-11-13T03:31:10.4637077Z Exec command '[node /var/run/act/actions/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72/dist/index.js]'
+2026-11-13T03:31:10.4637296Z Working directory '/workspace/spike-admin/spike-repo'
+2026-11-13T03:31:10.5476112Z   💬  ::debug::GITHUB_WORKSPACE = '/workspace/spike-admin/spike-repo'
+2026-11-13T03:31:10.5476681Z   💬  ::debug::qualified repository = 'spike-admin/spike-repo'
+2026-11-13T03:31:10.5477216Z   💬  ::debug::ref = 'refs/heads/main'
+2026-11-13T03:31:10.5477441Z   💬  ::debug::commit = '64d083b87ee347f39b25af25dbedac0d67886e03'
+2026-11-13T03:31:10.5477673Z   💬  ::debug::clean = true
+2026-11-13T03:31:10.5478024Z   💬  ::debug::filter = undefined
+2026-11-13T03:31:10.5478257Z   💬  ::debug::fetch depth = 1
+2026-11-13T03:31:10.5478420Z   💬  ::debug::fetch tags = false
+2026-11-13T03:31:10.5478557Z   💬  ::debug::show progress = true
+2026-11-13T03:31:10.5478790Z   💬  ::debug::lfs = false
+2026-11-13T03:31:10.5478931Z   💬  ::debug::submodules = false
+2026-11-13T03:31:10.5479082Z   💬  ::debug::recursive submodules = false
+2026-11-13T03:31:10.5486373Z   💬  ::debug::GitHub Host URL = 
+2026-11-13T03:31:10.5486495Z   💬  ::debug::allow unsafe PR checkout = false
+2026-11-13T03:31:10.5486778Z   ❓ add-matcher /run/act/actions/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72/dist/problem-matcher.json
+2026-11-13T03:31:10.5486964Z ::add-matcher::/run/act/actions/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72/dist/problem-matcher.json
+2026-11-13T03:31:10.5489293Z Syncing repository: spike-admin/spike-repo
+2026-11-13T03:31:10.5491058Z ##[group]Getting Git version info
+2026-11-13T03:31:10.5491175Z Working directory is '/workspace/spike-admin/spike-repo'
+2026-11-13T03:31:10.5503519Z [command]/usr/bin/git version
+2026-11-13T03:31:10.5531314Z git version 2.39.5
+2026-11-13T03:31:10.5541884Z ##[endgroup]
+2026-11-13T03:31:10.5549140Z Temporarily overriding HOME='/tmp/98f50497-03fe-41ab-a2b6-1b62e7641d98' before making global git config changes
+2026-11-13T03:31:10.5549245Z Adding repository directory to the temporary git global config as a safe directory
+2026-11-13T03:31:10.5551636Z [command]/usr/bin/git config --global --add safe.directory /workspace/spike-admin/spike-repo
+2026-11-13T03:31:10.5571669Z Deleting the contents of '/workspace/spike-admin/spike-repo'
+2026-11-13T03:31:10.5573366Z ##[group]Initializing the repository
+2026-11-13T03:31:10.5575307Z [command]/usr/bin/git init /workspace/spike-admin/spike-repo
+2026-11-13T03:31:10.5595055Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-11-13T03:31:10.5595172Z hint: is subject to change. To configure the initial branch name to use in all
+2026-11-13T03:31:10.5595249Z hint: of your new repositories, which will suppress this warning, call:
+2026-11-13T03:31:10.5595322Z hint: 
+2026-11-13T03:31:10.5595380Z hint: 	git config --global init.defaultBranch <name>
+2026-11-13T03:31:10.5595440Z hint: 
+2026-11-13T03:31:10.5595487Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-11-13T03:31:10.5595545Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-11-13T03:31:10.5595695Z hint: 
+2026-11-13T03:31:10.5595777Z hint: 	git branch -m <name>
+2026-11-13T03:31:10.5598854Z Initialized empty Git repository in /workspace/spike-admin/spike-repo/.git/
+2026-11-13T03:31:10.5603332Z [command]/usr/bin/git remote add origin http://forgejo:3000/spike-admin/spike-repo
+2026-11-13T03:31:10.5652050Z ##[endgroup]
+2026-11-13T03:31:10.5652144Z ##[group]Disabling automatic garbage collection
+2026-11-13T03:31:10.5654553Z [command]/usr/bin/git config --local gc.auto 0
+2026-11-13T03:31:10.5672239Z ##[endgroup]
+2026-11-13T03:31:10.5672327Z ##[group]Setting up auth
+2026-11-13T03:31:10.5675304Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-11-13T03:31:10.5691462Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-11-13T03:31:10.5865964Z [command]/usr/bin/git config --local --name-only --get-regexp http\.http\:\/\/forgejo\:3000\/\.extraheader
+2026-11-13T03:31:10.5882701Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.http\:\/\/forgejo\:3000\/\.extraheader' && git config --local --unset-all 'http.http://forgejo:3000/.extraheader' || :"
+2026-11-13T03:31:10.6050697Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-11-13T03:31:10.6071234Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-11-13T03:31:10.6249399Z [command]/usr/bin/git config --local http.http://forgejo:3000/.extraheader AUTHORIZATION: basic ***
+2026-11-13T03:31:10.6273523Z ##[endgroup]
+2026-11-13T03:31:10.6273634Z ##[group]Fetching the repository
+2026-11-13T03:31:10.6277779Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +64d083b87ee347f39b25af25dbedac0d67886e03:refs/remotes/origin/main
+2026-11-13T03:31:10.6510527Z From http://forgejo:3000/spike-admin/spike-repo
+2026-11-13T03:31:10.6510677Z  * [new ref]         64d083b87ee347f39b25af25dbedac0d67886e03 -> origin/main
+2026-11-13T03:31:10.6524285Z ##[endgroup]
+2026-11-13T03:31:10.6524381Z ##[group]Determining the checkout info
+2026-11-13T03:31:10.6525717Z ##[endgroup]
+2026-11-13T03:31:10.6528285Z [command]/usr/bin/git sparse-checkout disable
+2026-11-13T03:31:10.6553557Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-11-13T03:31:10.6572643Z ##[group]Checking out the ref
+2026-11-13T03:31:10.6574558Z [command]/usr/bin/git checkout --progress --force -B main refs/remotes/origin/main
+2026-11-13T03:31:10.6603584Z Switched to a new branch 'main'
+2026-11-13T03:31:10.6603888Z branch 'main' set up to track 'origin/main'.
+2026-11-13T03:31:10.6606322Z ##[endgroup]
+2026-11-13T03:31:10.6628427Z [command]/usr/bin/git log -1 --format=%H
+2026-11-13T03:31:10.6641896Z 64d083b87ee347f39b25af25dbedac0d67886e03
+2026-11-13T03:31:10.6649449Z ::remove-matcher owner=checkout-git::
+2026-11-13T03:31:10.7836310Z total 20
+2026-11-13T03:31:10.7836408Z drwxr-xr-x 4 root root 4096 Nov 13 03:31 .
+2026-11-13T03:31:10.7836456Z drwxr-xr-x 3 root root 4096 Nov 13 03:31 ..
+2026-11-13T03:31:10.7836504Z drwxr-xr-x 3 root root 4096 Nov 13 03:31 .forgejo
+2026-11-13T03:31:10.7836551Z drwxr-xr-x 8 root root 4096 Nov 13 03:31 .git
+2026-11-13T03:31:10.7836601Z -rw-r--r-- 1 root root   51 Nov 13 03:31 README.md
+2026-11-13T03:31:10.7969157Z setupEnv => map[ACT:true ACTIONS_CACHE_URL:http://172.30.0.4:46715/599540896d01c0d3f3b671611f9b911a/ ACTIONS_ID_TOKEN_REQUEST_TOKEN: ACTIONS_ID_TOKEN_REQUEST_URL: ACTIONS_RESULTS_URL:http://forgejo:3000 ACTIONS_RUNTIME_TOKEN:*** ACTIONS_RUNTIME_URL:http://forgejo:3000/api/actions_pipeline/ CI:true FORGEJO_ACTION:0 FORGEJO_ACTIONS:true FORGEJO_ACTIONS_RUNNER_VERSION:v12.10.1 FORGEJO_ACTION_PATH: FORGEJO_ACTION_REF:v4 FORGEJO_ACTION_REPOSITORY:actions/checkout FORGEJO_ACTOR:spike-admin FORGEJO_API_URL:http://forgejo:3000/api/v1 FORGEJO_BASE_REF: FORGEJO_ENV:/var/run/act/workflow/envs.txt FORGEJO_EVENT_NAME:push FORGEJO_EVENT_PATH:/var/run/act/workflow/event.json FORGEJO_HEAD_REF: FORGEJO_JOB:checkout FORGEJO_OUTPUT:/var/run/act/workflow/outputcmd.txt FORGEJO_PATH:/var/run/act/workflow/pathcmd.txt FORGEJO_REF:refs/heads/main FORGEJO_REF_NAME:main FORGEJO_REF_TYPE:branch FORGEJO_REPOSITORY:spike-admin/spike-repo FORGEJO_REPOSITORY_OWNER:spike-admin FORGEJO_RETENTION_DAYS: FORGEJO_RUN_ATTEMPT:1 FORGEJO_RUN_ID:21 FORGEJO_RUN_NUMBER:21 FORGEJO_SERVER_URL:http://forgejo:3000 FORGEJO_SHA:64d083b87ee347f39b25af25dbedac0d67886e03 FORGEJO_STATE:/var/run/act/workflow/statecmd.txt FORGEJO_STEP_SUMMARY:/var/run/act/workflow/SUMMARY.md FORGEJO_TOKEN:*** FORGEJO_WORKFLOW:probe2 FORGEJO_WORKFLOW_REF:spike-admin/spike-repo/.forgejo/workflows/probe2.yml@refs/heads/main FORGEJO_WORKSPACE:/workspace/spike-admin/spike-repo GITEA_ACTIONS:true GITEA_ACTIONS_RUNNER_VERSION:v12.10.1 GITHUB_ACTION:0 GITHUB_ACTIONS:true GITHUB_ACTION_PATH: GITHUB_ACTION_REF:v4 GITHUB_ACTION_REPOSITORY:actions/checkout GITHUB_ACTOR:spike-admin GITHUB_API_URL:http://forgejo:3000/api/v1 GITHUB_BASE_REF: GITHUB_ENV:/var/run/act/workflow/envs.txt GITHUB_EVENT_NAME:push GITHUB_EVENT_PATH:/var/run/act/workflow/event.json GITHUB_HEAD_REF: GITHUB_JOB:checkout GITHUB_OUTPUT:/var/run/act/workflow/outputcmd.txt GITHUB_PATH:/var/run/act/workflow/pathcmd.txt GITHUB_REF:refs/heads/main GITHUB_REF_NAME:main GITHUB_REF_TYPE:branch GITHUB_REPOSITORY:spike-admin/spike-repo GITHUB_REPOSITORY_OWNER:spike-admin GITHUB_RETENTION_DAYS: GITHUB_RUN_ATTEMPT:1 GITHUB_RUN_ID:21 GITHUB_RUN_NUMBER:21 GITHUB_SERVER_URL:http://forgejo:3000 GITHUB_SHA:64d083b87ee347f39b25af25dbedac0d67886e03 GITHUB_STATE:/var/run/act/workflow/statecmd.txt GITHUB_STEP_SUMMARY:/var/run/act/workflow/SUMMARY.md GITHUB_TOKEN:*** GITHUB_WORKFLOW:probe2 GITHUB_WORKFLOW_REF:spike-admin/spike-repo/.forgejo/workflows/probe2.yml@refs/heads/main GITHUB_WORKSPACE:/workspace/spike-admin/spike-repo ImageOS:tools JOB_CONTAINER_NAME:FORGEJO-ACTIONS-TASK-30_WORKFLOW-0506509e26e84897f782de4a458ddde1803896d58edbe3a8c85a078a0337e455_JOB-checkout RUNNER_PERFLOG:/dev/null RUNNER_TRACKING_ID:]
+2026-11-13T03:31:10.8002373Z evaluating expression 'always()'
+2026-11-13T03:31:10.8002555Z expression 'always()' evaluated to 'true'
+2026-11-13T03:31:10.8002619Z ⭐ Run Post actions/checkout@v4
+2026-11-13T03:31:10.8002709Z Writing entry to tarball workflow/outputcmd.txt len:0
+2026-11-13T03:31:10.8002777Z Writing entry to tarball workflow/statecmd.txt len:0
+2026-11-13T03:31:10.8002823Z Writing entry to tarball workflow/pathcmd.txt len:0
+2026-11-13T03:31:10.8002869Z Writing entry to tarball workflow/envs.txt len:0
+2026-11-13T03:31:10.8002908Z Writing entry to tarball workflow/SUMMARY.md len:0
+2026-11-13T03:31:10.8002953Z Extracting content to '/var/run/act'
+2026-11-13T03:31:10.8011154Z run post step for 'actions/checkout@v4'
+2026-11-13T03:31:10.8044851Z expression '${{ github.repository }}' rewritten to 'format('{0}', github.repository)'
+2026-11-13T03:31:10.8044917Z evaluating expression 'format('{0}', github.repository)'
+2026-11-13T03:31:10.8045072Z expression 'format('{0}', github.repository)' evaluated to '%!t(string=spike-admin/spike-repo)'
+2026-11-13T03:31:10.8045153Z expression '${{ github.token }}' rewritten to 'format('{0}', github.token)'
+2026-11-13T03:31:10.8045185Z evaluating expression 'format('{0}', github.token)'
+2026-11-13T03:31:10.8045269Z expression 'format('{0}', github.token)' evaluated to '%!t(string=***)'
+2026-11-13T03:31:10.8045528Z executing remote job container: [node /var/run/act/actions/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72/dist/index.js]
+2026-11-13T03:31:10.8045590Z   🐳  docker exec cmd=[node /var/run/act/actions/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72/dist/index.js] user= workdir=
+2026-11-13T03:31:10.8045650Z Exec command '[node /var/run/act/actions/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72/dist/index.js]'
+2026-11-13T03:31:10.8045874Z Working directory '/workspace/spike-admin/spike-repo'
+2026-11-13T03:31:10.8912732Z   💬  ::debug::Getting git version
+2026-11-13T03:31:10.8918456Z [command]/usr/bin/git version
+2026-11-13T03:31:10.8943694Z git version 2.39.5
+2026-11-13T03:31:10.8954066Z   💬  ::debug::0
+2026-11-13T03:31:10.8954217Z   💬  ::debug::git version 2.39.5%0A
+2026-11-13T03:31:10.8954915Z   💬  ::debug::Set git useragent to: git/2.39.5 (github-actions-checkout)
+2026-11-13T03:31:10.8956396Z   ⚙  ***
+2026-11-13T03:31:10.8965028Z Temporarily overriding HOME='/tmp/8adeefe7-701f-48f3-a8d4-8147d1631f31' before making global git config changes
+2026-11-13T03:31:10.8965148Z Adding repository directory to the temporary git global config as a safe directory
+2026-11-13T03:31:10.8967333Z [command]/usr/bin/git config --global --add safe.directory /workspace/spike-admin/spike-repo
+2026-11-13T03:31:10.8987961Z   💬  ::debug::0
+2026-11-13T03:31:10.8988131Z   💬  ::debug::
+2026-11-13T03:31:10.8991217Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-11-13T03:31:10.9010725Z   💬  ::debug::1
+2026-11-13T03:31:10.9010859Z   💬  ::debug::
+2026-11-13T03:31:10.9012699Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-11-13T03:31:10.9220439Z   💬  ::debug::0
+2026-11-13T03:31:10.9220578Z   💬  ::debug::
+2026-11-13T03:31:10.9224109Z [command]/usr/bin/git config --local --name-only --get-regexp http\.http\:\/\/forgejo\:3000\/\.extraheader
+2026-11-13T03:31:10.9241882Z http.http://forgejo:3000/.extraheader
+2026-11-13T03:31:10.9244272Z   💬  ::debug::0
+2026-11-13T03:31:10.9244452Z   💬  ::debug::http.http://forgejo:3000/.extraheader%0A
+2026-11-13T03:31:10.9246811Z [command]/usr/bin/git config --local --unset-all http.http://forgejo:3000/.extraheader
+2026-11-13T03:31:10.9262730Z   💬  ::debug::0
+2026-11-13T03:31:10.9262831Z   💬  ::debug::
+2026-11-13T03:31:10.9264408Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.http\:\/\/forgejo\:3000\/\.extraheader' && git config --local --unset-all 'http.http://forgejo:3000/.extraheader' || :"
+2026-11-13T03:31:10.9431911Z   💬  ::debug::0
+2026-11-13T03:31:10.9432066Z   💬  ::debug::
+2026-11-13T03:31:10.9434628Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-11-13T03:31:10.9448226Z   💬  ::debug::1
+2026-11-13T03:31:10.9448329Z   💬  ::debug::
+2026-11-13T03:31:10.9450290Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-11-13T03:31:10.9626311Z   💬  ::debug::0
+2026-11-13T03:31:10.9626636Z   💬  ::debug::
+2026-11-13T03:31:10.9627958Z   💬  ::debug::Unsetting HOME override
+2026-11-13T03:31:10.9695300Z   ✅  Success - Post actions/checkout@v4
+2026-11-13T03:31:10.9738219Z   git -C /data/.cache/act/17/6839ea59a9165c78bf96507968c2914de1c5ac6e6d5d082d4e26ff41118069 worktree remove --force --end-of-options /data/.cache/act/e5/d686770a70c2aa9c9f4574a11acca680137fe44d0cc31eedd32bfc45948a72
+2026-11-13T03:31:10.9770344Z   git -C /data/.cache/act/17/6839ea59a9165c78bf96507968c2914de1c5ac6e6d5d082d4e26ff41118069 worktree prune
+2026-11-13T03:31:10.9818608Z 🏁  Job succeeded
