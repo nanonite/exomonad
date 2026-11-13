@@ -27078,45 +27078,107 @@ def test_workspace_shutdown_reopens_exact_child_dispatch_for_reprovision(
     assert unchanged.slices["child-controller"].status is SliceStatus.SPAWNED
 
 
+_NULLABLE_STRING_SLICE_UPDATES = (
+    "branch",
+    "dispatch_agent_id",
+    "dispatch_intent_id",
+    "dispatch_invocation_id",
+    "worktree",
+)
+
+
+def _required_int_update(field_name: str, value: object) -> int:
+    """Return one integer update, refusing every other type."""
+    if not isinstance(value, int):
+        raise TypeError(f"{field_name} update must be an integer")
+    return value
+
+
+def _optional_string_update(field_name: str, value: object) -> str | None:
+    """Return one nullable string update, refusing every other type."""
+    if value is not None and not isinstance(value, str):
+        raise TypeError(f"{field_name} update must be a string or None")
+    return value
+
+
 def _updated_slice_for_test(
     child: SliceState, updates: Mapping[str, object]
 ) -> SliceState:
-    string_fields = {
-        "branch",
-        "dispatch_agent_id",
-        "dispatch_intent_id",
-        "dispatch_invocation_id",
-        "worktree",
-    }
-    unsupported = set(updates) - {"attempts", *string_fields}
+    """Apply one validated update to a slice, refusing unsupported keys.
+
+    Each supported field is validated exactly once, and nullable string fields
+    accept ``None`` so a test can clear a binding as well as change it.
+    """
+    unsupported = set(updates) - {"attempts", *_NULLABLE_STRING_SLICE_UPDATES}
     if unsupported:
         raise ValueError(f"unsupported slice updates: {sorted(unsupported)}")
     result = child
     if "attempts" in updates:
-        attempts = updates["attempts"]
-        if not isinstance(attempts, int):
-            raise TypeError("attempts update must be an integer")
-        result = replace(result, attempts=attempts)
+        result = replace(
+            result, attempts=_required_int_update("attempts", updates["attempts"])
+        )
+    if "branch" in updates:
+        result = replace(
+            result, branch=_optional_string_update("branch", updates["branch"])
+        )
+    if "dispatch_agent_id" in updates:
+        result = replace(
+            result,
+            dispatch_agent_id=_optional_string_update(
+                "dispatch_agent_id", updates["dispatch_agent_id"]
+            ),
+        )
+    if "dispatch_intent_id" in updates:
+        result = replace(
+            result,
+            dispatch_intent_id=_optional_string_update(
+                "dispatch_intent_id", updates["dispatch_intent_id"]
+            ),
+        )
     if "dispatch_invocation_id" in updates:
-        invocation_id = updates["dispatch_invocation_id"]
-        if invocation_id is not None and not isinstance(invocation_id, str):
-            raise TypeError("dispatch invocation update must be a string or None")
-        result = replace(result, dispatch_invocation_id=invocation_id)
-    string_updates: dict[str, str] = {}
-    for field_name in string_fields.intersection(updates):
-        field_value = updates[field_name]
-        if not isinstance(field_value, str):
-            raise TypeError(f"{field_name} update must be a string")
-        string_updates[field_name] = field_value
-    if "branch" in string_updates:
-        result = replace(result, branch=string_updates.pop("branch"))
-    if "dispatch_agent_id" in string_updates:
-        result = replace(result, dispatch_agent_id=string_updates.pop("dispatch_agent_id"))
-    if "dispatch_intent_id" in string_updates:
-        result = replace(result, dispatch_intent_id=string_updates.pop("dispatch_intent_id"))
-    if "worktree" in string_updates:
-        result = replace(result, worktree=string_updates.pop("worktree"))
+        result = replace(
+            result,
+            dispatch_invocation_id=_optional_string_update(
+                "dispatch_invocation_id", updates["dispatch_invocation_id"]
+            ),
+        )
+    if "worktree" in updates:
+        result = replace(
+            result, worktree=_optional_string_update("worktree", updates["worktree"])
+        )
     return result
+
+
+def test_updated_slice_for_test_accepts_nullable_updates_and_refuses_unknown_keys() -> None:
+    """An update clears a nullable field, and an unsupported key stays refused."""
+    child = SliceState(
+        id="child-controller",
+        status=SliceStatus.SPAWNED,
+        paths=(),
+        depends_on=(),
+        base_ref="main",
+        test_plan=(),
+        agent_type=None,
+        model=None,
+        branch="main.child-controller",
+        worktree=".worktrees/child-controller",
+        pr_number=None,
+        reviewed_head=None,
+        attempts=1,
+        verdict=None,
+        dispatch_agent_id="child-controller",
+        dispatch_intent_id="child-intent",
+        dispatch_invocation_id="child-invocation",
+    )
+
+    cleared = _updated_slice_for_test(child, {"dispatch_invocation_id": None})
+
+    assert cleared.dispatch_invocation_id is None
+    assert cleared.branch == "main.child-controller"
+    assert cleared.attempts == 1
+
+    with pytest.raises(ValueError, match=r"unsupported slice updates: \['status'\]"):
+        _updated_slice_for_test(child, {"status": SliceStatus.PENDING})
 
 
 def _shutdown_child_fixture(
