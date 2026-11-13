@@ -20,9 +20,13 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install TL loop dev dependencies
+        # Install the dev extra's tools directly. The tl-loop package has no
+        # runtime dependencies, so installing the project with its dev extra
+        # only built an empty wheel; these pins mirror the 'dev' extra in
+        # tl_loop/pyproject.toml and the contract test keeps them in sync.
         run: |
           python3 -m venv .venv-typecheck
-          .venv-typecheck/bin/python -m pip install './tl_loop[dev]'
+          .venv-typecheck/bin/python -m pip install 'pytest>=8' 'mypy==2.3.0' 'ruff==0.16.3'
 
       - name: Run TL loop strict typecheck ratchet
         env:

@@ -196,6 +196,29 @@ check-e2e-recreated-leaf-recovery:
     test -s tests/e2e/recursive-crash-convergence/e2e-test.md
     test -s tests/e2e/recursive-crash-convergence/testrunner.md
 
+# Run the real CI typecheck job against a disposable Forgejo, runner, and nested
+# dockerd (chainlink #1332). The run extracts the job from
+# .forgejo/workflows/ci.yml and the recipe from this justfile, typechecks a
+# scratch copy of the project, and prints one PASS/FAIL line per check: green
+# on the current tree, red after one injected strict error, the missing nested
+# image failure, the Phase 0 image precondition, and the project-agnostic
+# contract. It never pulls or builds an image and needs no network. Pass
+# `keep=true` to leave a failed run's stack and directory for inspection.
+e2e-typecheck-ci keep="false":
+    ./tests/e2e/typecheck-ci/run.sh {{ if keep == "true" { "--keep" } else { "" } }}
+
+# Check the typecheck CI acceptance without Docker: the real job and recipe are
+# what gets extracted, Phase 0 names a missing image instead of pulling it, the
+# docker helper refuses registry commands, the seeded image recipe keeps the
+# offline wheelhouse and checkout mirror, and the harness carries no
+# project-specific content.
+check-e2e-typecheck-ci:
+    bash -n tests/e2e/typecheck-ci/run.sh
+    {{py}} -m py_compile tests/e2e/typecheck-ci/*.py
+    {{py}} -m py_compile tests/e2e/lib/e2e_harness/*.py
+    {{py}} -m pytest -q tests/e2e/typecheck-ci/test_contract.py
+    {{py}} -m pytest -q tests/e2e/lib/forgejo/test_contract.py
+
 # Check the disposable Actions Forgejo template (chainlink #1337) without Docker:
 # no fixed name or port, a privileged docker:28-dind on an internal network, an
 # offline pull policy with the cache disabled, and the runner entrypoint's

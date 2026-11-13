@@ -57,10 +57,14 @@ pin must happen in the same commit that regenerates the baseline, with
 commit message must say why.
 
 CI runs the recipe in the `typecheck` job of `.forgejo/workflows/ci.yml`: it
-creates a throwaway virtualenv, installs the `dev` extra from
-`tl_loop/pyproject.toml` (which supplies the pinned mypy), and runs
-`just tl-loop-typecheck` with `EXOMONAD_PY` pointing at that virtualenv's
-python.
+creates a throwaway virtualenv, installs the `dev` extra's dependencies
+directly (`pytest`, the pinned `mypy`, and `ruff`, mirroring
+`tl_loop/pyproject.toml`), and runs `just tl-loop-typecheck` with `EXOMONAD_PY`
+pointing at that virtualenv's python. It does not install the `tl-loop` package:
+the package has no runtime dependencies and the job imports nothing from the
+installed wheel, so installing `./tl_loop[dev]` only built an empty wheel. The
+`tests/e2e/typecheck-ci/` contract test checks that the job's pins still match
+this file's `dev` extra.
 
 The runtime creates per-run state under `.exo/tl-loop/<run_id>/`. That directory
 is runtime state, not Python source, and must never be used as the package code

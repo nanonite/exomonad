@@ -307,7 +307,7 @@ network. `12-checkout-mirrored.log`:
 2026-11-13T03:31:10.9695300Z   ✅  Success - Post actions/checkout@v4
 ```
 
-The job image was `node:lts` (node 24, git, python3, venv). Checkout needs a
+The job image was `node:lts` (node 24, git, python3). Checkout needs a
 node runtime in the job image and the action source in the instance. If the
 workflow can avoid `uses: actions/checkout@v4`, a `run: git clone` with
 `$GITHUB_TOKEN` (or a pre-cloned workspace) is the simpler offline path; if the
@@ -455,14 +455,21 @@ The cached images were probed with
 | image | git | node | python3 | venv | just | pip3 |
 |-------|-----|------|---------|------|------|------|
 | `ubuntu:24.04` | no | no | no | no | no | no |
-| `node:lts` | yes | yes (24) | yes | yes | **no** | no |
+| `node:lts` | yes | yes (24) | yes | **no** | **no** | no |
 | `docker:dind` | yes | no | no | no | no | no |
 | `ghcr.io/catthehacker/ubuntu:rust-24.04` | yes | yes (24, toolcache) | yes | yes | **no** | yes |
 | `nixos/nix:latest` | yes | no | no | no | no | no |
 
-**No cached image has `just`.** `node:lts` is the closest: it has git, node,
-python3 and venv, so it needs only `just`. `catthehacker/ubuntu:rust-24.04` has
-pip as well but is 3.05 GB and still lacks `just`; it is not the smallest.
+The venv column records an actual `python3 -m venv <directory>` probe. The
+earlier probe ran `python3 -m venv --help`, which succeeds even when
+`ensurepip` is missing; `node:lts` has no working venv despite that help text.
+`ghcr.io/catthehacker/ubuntu:rust-24.04` was re-probed by creating a venv and
+installing into it.
+
+**No cached image has `just`.** `node:lts` is the closest: it has git, node and
+python3, but no working venv (`ensurepip` is missing), so a purpose image needs
+`python3-venv` plus `just`. `catthehacker/ubuntu:rust-24.04` has pip as well but
+is 3.05 GB and still lacks `just`; it is not the smallest.
 
 Recommendation:
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import secrets
 import string
@@ -43,9 +44,18 @@ from . import cleanup as cl
 #: The shared template every harness copies its own instance from.
 COMPOSE_TEMPLATE = Path("tests") / "e2e" / "lib" / "forgejo" / "docker-compose.yml"
 
+#: The Actions variant of the same template, for a run whose jobs execute in
+#: the template's nested dockerd.
+ACTIONS_COMPOSE_TEMPLATE = (
+    Path("tests") / "e2e" / "lib" / "forgejo" / "docker-compose.actions.yml"
+)
+
 #: The service and container port the template publishes ephemerally.
 SERVICE = "forgejo"
 CONTAINER_PORT = 3000
+
+#: Bounded wait for a freshly started runner to register itself.
+RUNNER_REGISTRATION_TIMEOUT_SECONDS = 60.0
 
 #: Bounded wait for the instance to report a passing health check.
 HEALTH_TIMEOUT_SECONDS = 120.0
@@ -151,19 +161,30 @@ def template_path(project_root: Path) -> Path:
     return path
 
 
+def actions_template_path(project_root: Path) -> Path:
+    """Return the Actions variant of the disposable template."""
+    path = project_root / ACTIONS_COMPOSE_TEMPLATE
+    if not path.is_file():
+        raise ForgejoError(f"the disposable Actions template is missing: {path}")
+    return path
+
+
 def _compose(
     project: str,
     compose_file: Path,
     *arguments: str,
     check: bool = True,
     timeout: float = cl.COMPOSE_TIMEOUT_SECONDS,
+    env: Mapping[str, str] | None = None,
 ) -> str:
+    child_env = None if env is None else {**os.environ, **env}
     result = subprocess.run(
         ["docker", "compose", "-p", project, "-f", str(compose_file), *arguments],
         text=True,
         capture_output=True,
         check=False,
         timeout=timeout,
+        env=child_env,
     )
     if check and result.returncode:
         raise ForgejoError(
@@ -425,6 +446,17 @@ def _create_account(instance: Instance, username: str) -> Account:
     return Account(username=username, token=_token_from(output, "account creation"))
 
 
+def create_account(instance: Instance, username: str) -> Account:
+    """Create one more account on the run's own instance and return its token.
+
+    A harness that needs a repository under a fixed namespace (the runner's
+    ``actions/checkout`` mirror, for example) creates that namespace as an
+    ordinary account rather than reaching into the instance database. The
+    account disappears with the instance's volume.
+    """
+    return _create_account(instance, username)
+
+
 def compose_project_name(scope: cl.RunScope, batch: str | None = None) -> str:
     """Return the compose project name one instance of this run is brought up under.
 
@@ -492,6 +524,119 @@ def provision(
     return instance
 
 
+def _runner_token(output: str) -> str:
+    """Return the registration token the Forgejo CLI printed, or fail closed."""
+    matches = re.findall(r"[A-Za-z0-9_-]{20,}", output)
+    if not matches:
+        raise ForgejoError(
+            f"forgejo actions generate-runner-token printed no token: {output.strip()!r}"
+        )
+    return matches[-1]
+
+
+def wait_runner_registered(
+    project: str,
+    compose_file: Path,
+    timeout: float = RUNNER_REGISTRATION_TIMEOUT_SECONDS,
+) -> None:
+    """Block until the template's runner has registered with this instance.
+
+    ``docker compose up --wait`` only waits for the container to be running;
+    registration happens a moment later inside it. A job pushed before that
+    window would sit in the queue until the runner appears, so the harness waits
+    for the runner's own success line instead of guessing at a delay.
+    """
+    deadline = time.monotonic() + timeout
+    last = ""
+    while time.monotonic() < deadline:
+        last = _compose(project, compose_file, "logs", "--no-color", "runner")
+        if "Runner registered successfully." in last or "declared successfully" in last:
+            return
+        time.sleep(0.25)
+    raise ForgejoError(
+        f"the runner for {project!r} did not register within {timeout:.0f}s: "
+        f"{last[-2000:].strip()}"
+    )
+
+
+def provision_actions(
+    scope: cl.RunScope,
+    project_root: Path,
+    run_id: str,
+    job_image: str,
+    batch: str | None = None,
+) -> Instance:
+    """Bring up the Actions template and provision this run's own instance.
+
+    This is :func:`provision` for a run that executes jobs in the template's
+    nested dockerd. The difference is the registration window: the runner must
+    be registered before a pushed workflow can be picked up, and the runner
+    needs the token the Forgejo container CLI prints. Forgejo and dind are
+    therefore started first, the token is generated, and only then is the
+    runner started with the label that maps ``ubuntu-latest`` to the caller's
+    job image.
+
+    The nested image store is deliberately left empty here. Loading the job
+    image is the caller's step, because only the caller knows which image the
+    workflow's ``runs-on`` label resolves to.
+    """
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{2,40}", run_id):
+        raise ForgejoError(f"run id is not a safe compose project name: {run_id!r}")
+    if batch is not None and not BATCH_LABEL.fullmatch(batch):
+        raise ForgejoError(f"batch label is not a safe compose name suffix: {batch!r}")
+    compose_file = actions_template_path(project_root)
+    project = scope.track_compose(compose_project_name(scope, batch), compose_file)
+    _compose(project, compose_file, "up", "-d", "--wait", "forgejo", "dind", timeout=600.0)
+    host = published_host(project, compose_file)
+    instance = Instance(
+        project=project,
+        compose_file=compose_file,
+        base_url=f"http://{host}",
+        host=host,
+        admin_username="",
+        author=Account(username="", token=""),
+        reviewer=Account(username="", token=""),
+        owner="",
+        repo=f"{run_id}-repo",
+    )
+    wait_healthy(instance)
+    admin = _create_admin(instance, f"{run_id}-admin")
+    author = _create_account(instance, f"{run_id}-author")
+    reviewer = _create_account(instance, f"{run_id}-reviewer")
+    instance = Instance(
+        project=project,
+        compose_file=compose_file,
+        base_url=instance.base_url,
+        host=host,
+        admin_username=admin,
+        author=author,
+        reviewer=reviewer,
+        owner=author.username,
+        repo=instance.repo,
+    )
+    token = _runner_token(
+        _cli(project, compose_file, "actions", "generate-runner-token")
+    )
+    _compose(
+        project,
+        compose_file,
+        "up",
+        "-d",
+        "--wait",
+        "runner",
+        timeout=600.0,
+        env={
+            "FORGEJO_RUNNER_TOKEN": token,
+            "FORGEJO_RUNNER_NAME": f"{project}-runner",
+            "FORGEJO_RUNNER_LABELS": f"ubuntu-latest:docker://{job_image}",
+        },
+    )
+    wait_runner_registered(project, compose_file)
+    create_repository(instance, instance.repo)
+    _add_collaborator(instance)
+    return instance
+
+
 def create_repository(instance: Instance, name: str) -> Instance:
     """Create one more repository on this run's own instance and select it.
 
@@ -518,8 +663,32 @@ def create_repository(instance: Instance, name: str) -> Instance:
     return scoped
 
 
-def _create_repository(instance: Instance) -> None:
+def create_repository_for(
+    instance: Instance, account: Account, name: str, auto_init: bool = True
+) -> Instance:
+    """Create one repository under ``account``'s namespace and select it.
+
+    The runner clones ``actions/checkout`` from the instance itself, so a
+    harness that mirrors the action needs a repository in that exact namespace.
+    The account is created through the same CLI path as every other account, so
+    the repository belongs to the disposable instance and disappears with it.
+
+    ``auto_init=False`` leaves the repository empty, which is what a mirror
+    push needs: Forgejo refuses to delete the default branch that auto-init
+    creates, and a mirror push deletes refs it does not carry.
+    """
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,99}", name):
+        raise ForgejoError(f"repository name is not one Forgejo will accept: {name!r}")
+    scoped = replace(instance, owner=account.username, repo=name)
+    _create_repository(scoped, token=account.token, auto_init=auto_init)
+    return scoped
+
+
+def _create_repository(
+    instance: Instance, token: str | None = None, auto_init: bool = True
+) -> None:
     """Create the run's own repository, and wait until the API can read it."""
+    credential = instance.author.token if token is None else token
     deadline = time.monotonic() + REPO_VISIBLE_TIMEOUT_SECONDS
     last: Any = None
     while time.monotonic() < deadline:
@@ -527,10 +696,10 @@ def _create_repository(instance: Instance) -> None:
             created = api(
                 "POST",
                 f"{instance.base_url}/api/v1/user/repos",
-                token=instance.author.token,
+                token=credential,
                 payload={
                     "name": instance.repo,
-                    "auto_init": True,
+                    "auto_init": auto_init,
                     "default_branch": "main",
                     "private": False,
                     "description": f"disposable acceptance repository for {instance.project}",
@@ -571,20 +740,27 @@ def _add_collaborator(instance: Instance) -> None:
 
 
 __all__ = [
+    "ACTIONS_COMPOSE_TEMPLATE",
     "ANSWERING_TIMEOUT_SECONDS",
     "COMPOSE_TEMPLATE",
+    "RUNNER_REGISTRATION_TIMEOUT_SECONDS",
     "Account",
     "ForgejoError",
     "Instance",
+    "actions_template_path",
     "api",
     "assert_answering",
     "compose_project_name",
+    "create_account",
     "create_repository",
+    "create_repository_for",
     "down",
     "provision",
+    "provision_actions",
     "published_host",
     "release",
     "template_path",
     "up",
     "wait_healthy",
+    "wait_runner_registered",
 ]

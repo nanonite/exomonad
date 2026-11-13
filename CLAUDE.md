@@ -764,6 +764,7 @@ just e2e-tl-loop-shadow    # Live TL trajectory beside the read-only shadow loop
 just e2e-tl-loop-active    # Programmatic TL loop over a scratch repository
 just e2e-slice-abandon-redispatch # Real-server closed-PR recovery acceptance
 just e2e-recreated-leaf-recovery # Recreated-leaf recovery acceptance (T1-T9)
+just e2e-typecheck-ci      # Real CI typecheck job in a disposable Forgejo (no network)
 ```
 
 `just e2e-recreated-leaf-recovery` is non-interactive like
@@ -789,9 +790,13 @@ counts and the mypy version that produced them, and may only shrink; run
 `tl_loop/.venv/bin/python scripts/check_typecheck_ratchet.py --update` after
 fixing errors, and pass `--allow-increase` only when deliberately accepting new
 type debt. CI runs the same recipe in the `typecheck` job of
-`.forgejo/workflows/ci.yml`, which installs the pinned `dev` extra from
-`tl_loop/pyproject.toml` into a throwaway virtualenv and points `EXOMONAD_PY`
-at its python. Run the tmux first-window environment integration tests with
+`.forgejo/workflows/ci.yml`: it creates a throwaway virtualenv and installs the
+`dev` extra's tools directly (`pytest`, the pinned `mypy`, and `ruff`) instead
+of installing the `tl-loop` package, whose wheel has no runtime dependencies
+and is never imported by the job. `EXOMONAD_PY` points at that virtualenv's
+python. `just e2e-typecheck-ci` runs the real job, extracted from the real
+workflow, against a disposable Forgejo (see § Real-server integration tests).
+Run the tmux first-window environment integration tests with
 `just tmux-session-environment-test [inside_nix] [tmpdir]`; the default is
 `true /tmp`. Pass `false` to use the host Rust toolchain and tmux binary.
 
@@ -895,6 +900,30 @@ instance. The diagnosis and its captured evidence are in
 `docs/decisions/forgejo-actions-nested-docker.md`;
 `just check-forgejo-actions-template` runs the template's contract and
 `just spike-forgejo-nested-docker` reproduces the failure and the fix.
+
+**The CI typecheck job runs in that disposable stack.**
+`tests/e2e/typecheck-ci/` (wired as `just e2e-typecheck-ci`) owns a fresh
+Forgejo, runner and `docker:28-dind` under its own compose project with an
+ephemeral port. It runs the *real* `typecheck` job, extracted from
+`.forgejo/workflows/ci.yml`, against a scratch repository holding a generic copy
+of `tl_loop`, the extracted `tl-loop-typecheck` recipe, and the ratchet script.
+The job image is `exomonad-typecheck-ci:local`, built once from
+`tests/e2e/lib/forgejo/typecheck-ci.Dockerfile` (node plus a working venv,
+`just`, an offline wheelhouse at `/opt/wheelhouse`, and a bare
+`actions/checkout` mirror at `/opt/mirror/actions-checkout.git`).
+
+Phase 0 inspects the Forgejo, runner, dind and job images with
+`docker image inspect` before anything starts. A missing image fails the run by
+name and prints the one-time seed command; the harness never pulls and never
+builds. Per run it copies the job image into the nested store with
+`docker save | docker exec -i <dind> docker load`, then pushes the image's
+checkout mirror into the instance as `actions/checkout`, so no step needs the
+internet. The run prints one PASS/FAIL line per check: green on the current
+tree, red after one injected strict error, the missing nested-image failure, the
+Phase 0 image precondition, and a project-agnostic contract. Teardown is
+run-scoped and the run fails if any container, network, or volume of its
+compose project survives. `just check-e2e-typecheck-ci` runs the Docker-free
+contract tests.
 
 **A run that walks many cases owns a Forgejo per batch, not one for the whole
 run.** A matrix case pushes, reviews, and merges; one container asked to carry
