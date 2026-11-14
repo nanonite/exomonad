@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Prove the controller restart sequence in one disposable actual-init run with `E2E_COMPOSED_RESTART=1` (#1288)
 - Run the TL-loop strict typecheck ratchet in CI from the pinned dev extra (#1326)
 - Gate TL-loop strict type checking behind a shrink-only ratchet baseline (#1323)
 - Reconcile configured worker and reviewer harnesses during init continuation (#1283)
@@ -41,6 +42,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Remove every redundant cast and `no-any-return` error from `tl_loop/**` in the strict mypy form (#1329)
 
 ### Fixed
+- Treat a committed root controller whose recorded tmux server lifetime has ended as not live at startup, so a fresh server that recycles the same window and pane ids no longer blocks init with an ownership conflict (#1285)
+- Reconcile a recycled tmux target against the exact pending startup target, and let `exomonad shutdown --workspace` quiesce a valid pending startup instead of rejecting it as stale (#1285)
+- Make `exomonad shutdown --workspace` retarget to a newer interrupted startup even when an earlier shutdown intent is already complete (#1288)
+- Reattach exit monitors for retained live invocations when the server starts, so workers that outlived a workspace shutdown record their terminal outcome (#1288)
+- Record an `agent.spawned` launch row for every blocked-leaf resume and keep a restarted child controller alive for its accepted spawn receipt, so continuation after workspace shutdown adopts the already-launched worker instead of stalling (#1314)
 - Keep a failed synchronization without an error as an unresolved decision instead of crashing while redacting its diagnostic (#1327)
 - Reject malformed recursive post-merge entries during run-state decode instead of storing a null state (#1327)
 - Distinguish a present non-phase recursive scope FSM from a missing one in TL transition diagnostics (#1325)
