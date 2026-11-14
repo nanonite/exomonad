@@ -72,6 +72,37 @@ The `record-plan-snapshot` stdin command persists plan bytes captured by a
 controller. It holds the plan transition lock, rejects any existing transition
 journal, and repairs a missing digest only for an identical snapshot.
 
+#### Controller startup handoff
+
+`init --continue` advances `.exo/tl-loop/root.controller-epoch`, persists the
+gated target as `controller-target.pending.json` with its tmux server and pane
+process identities, and writes a `controller-startup.json` fence before child
+repair. The committed `controller-target.json` remains the previous lifetime
+until startup release and commit. A fresh tmux server may recycle the same
+numeric `@window`/`%pane` IDs; identity, not the numeric ID, decides whether the
+old controller lifetime ended. Child repair and startup retries reuse a
+successor created in the same controller epoch. A failed handoff stays
+recoverable in the gated pane; the next init reconciles it, and an explicit
+workspace shutdown may quiesce the exact pending target. Init always persists
+the fence before the pending target, so a pending record whose fence is missing
+or conflicts is treated as a partial handoff and cannot select a shutdown or
+restart target. When the gated pane is found stopped, recovery commits the exact
+target for that epoch, clears both the pending record and the startup fence, and
+returns to the caller so a retry starts from a clean handoff instead of looping
+on the same interrupted startup.
+
+`exomonad shutdown` stays server-only. `exomonad shutdown --workspace` is the
+explicit control-plane operation: it fences dispatch, quiesces the root and
+shared sub-TL controllers, preserves independent worker panes, writes terminal
+interruption evidence, and releases server artifacts. Shutdown selects a valid
+pending startup target (current epoch, tmux server, pane process, root run scope,
+and startup fence) before the last committed target; a pending record from
+another scope or an unavailable inspection fails closed instead of being
+preferred. A bounded failure persists the intent as `blocked` with the precise
+owner/absence/inspection or retirement blocker while preserving the pane and
+worker evidence. Repeating shutdown is idempotent, and an unfinished shutdown
+intent is retargeted to the exact pending startup when init advanced the epoch.
+
 ### Revert Command
 
 `exomonad revert` removes workspace files created by `exomonad init` so the repository can be used without ExoMonad role enforcement or hook interception. It removes root MCP/hook configs, root agent runtime configs, companion worktrees/config files, and stale sockets when the server is not running. It leaves `.exo/config.toml`, `.exo/wasm/`, `.chainlink/`, `.exo/logs/`, and `.gitignore` intact. Use `--kill-session` to also kill the configured tmux session.

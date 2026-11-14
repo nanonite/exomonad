@@ -476,6 +476,37 @@ to a controller restart. Conflicting ownership, a live invocation bound to
 another route, or an unresolved prior outcome is held without replacement.
 The confirmed invocation ID is returned for the parent checkpoint to bind.
 
+A saved `Running` status is not proof of live execution. When the recorded
+delivery target is absent, or when a fresh tmux server recycles the same numeric
+`@window`/`%pane` IDs, `reconcile_controller_binding` compares the committed
+controller ownership with the exact pending startup target recorded by init:
+controller epoch, tmux server PID/start ticks, pane PID/start ticks, root run
+scope, and the optional startup fence. A proven-ended historical lifetime is
+terminalized under the invocation mutation lock with its routing target
+preserved as evidence, and one `controller_restart` successor is planned.
+`ControllerRestart` successors record the controller epoch that created them so
+a retry inside the same startup window reuses the successor instead of
+reconciling it. A verified live matching owner is reused; a wrong owner, a
+partial ownership record, a target from another root scope, or unavailable
+inspection is held with a distinct diagnostic and no replacement. Absent
+delivery alone never authorizes duplicating a separately running worker.
+
+Shared TL delivery is explicit. Several ledger-owned sibling controllers may
+share the exact root controller pane; a single window/pane ownership tag does
+not make one sibling the exclusive owner of the others. Provisioning accepts a
+scoped parent or a declared sibling only when both identities belong to the
+accepted root declaration and the delivery target is exactly the recorded
+controller target. A pending startup target without its `controller-startup.json`
+fence is a partial handoff and is never selected. Shutdown therefore
+distinguishes four outcomes: wrong owner (conflict, no kill), absent target
+(proven ended, scoped interruption), unknown inspection (unverified hold), and
+partial shutdown (bounded `blocked` intent with the remaining blocker).
+
+A delayed exit monitor from a superseded predecessor carries its invocation ID
+as well as its routing snapshot into
+`finish_invocation_and_tombstone_for_invocation`; a recycled numeric target can
+therefore never let the predecessor retire the successor generation.
+
 During `init --continue`, ordered sub-TL recovery uses the same provisioning
 decision as live execution. The accepted plan declaration must match the
 durable child identity; an existing invocation is classified as live reuse,

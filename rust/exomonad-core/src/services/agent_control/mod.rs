@@ -22,10 +22,11 @@ pub use codex_lifecycle::{
 pub use controller_lifecycle::{
     capture_controller_ownership, capture_controller_pane_target,
     clear_pending_controller_ownership, controller_ownership_is_live,
-    controller_pane_target_is_live, persist_controller_ownership,
-    persist_pending_controller_ownership, read_controller_ownership,
-    read_controller_target_for_routing, ControllerPaneOwnership, ControllerPaneTarget,
-    WorkspaceShutdownIntent, WorkspaceShutdownPhase, WorkspaceShutdownResult,
+    controller_pane_target_is_live, pending_startup_target_if_current,
+    persist_controller_ownership, persist_pending_controller_ownership, read_controller_ownership,
+    read_controller_target_for_routing, reconcile_controller_binding,
+    select_controller_shutdown_target, ControllerBindingReconciliation, ControllerPaneOwnership,
+    ControllerPaneTarget, WorkspaceShutdownIntent, WorkspaceShutdownPhase, WorkspaceShutdownResult,
     CONTROLLER_STARTUP_INTENT_RELATIVE_PATH, ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH,
     ROOT_CONTROLLER_PENDING_OWNERSHIP_RELATIVE_PATH, WORKSPACE_SHUTDOWN_RELATIVE_PATH,
 };
@@ -1593,6 +1594,7 @@ impl<
                 expected_live_invocation_id: None,
                 mode,
                 role_route: None,
+                controller_epoch: None,
             },
             false,
         )
@@ -1772,6 +1774,7 @@ impl<
                 invocation_id,
                 metadata.expected_live_invocation_id.as_deref(),
                 metadata.role_route,
+                metadata.controller_epoch,
             )
             .await?;
         for adoption in adoptions {
@@ -1939,9 +1942,10 @@ impl<
                             classification: Some(classification.to_string()),
                             stderr_tail: read_invocation_stderr_tail(&agent_dir).await,
                         };
-                        match invocation::finish_invocation_and_tombstone_with_context(
+                        match invocation::finish_invocation_and_tombstone_for_invocation(
                             &agent_dir,
                             &invocation.routing,
+                            &invocation.invocation_id,
                             status,
                             exit_code,
                             exit_context,

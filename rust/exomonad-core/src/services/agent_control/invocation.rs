@@ -105,6 +105,7 @@ pub struct InvocationMetadata {
     pub expected_live_invocation_id: Option<String>,
     pub mode: InvocationMode,
     pub role_route: Option<RoleRouteProvenance>,
+    pub controller_epoch: Option<String>,
 }
 
 /// Accepted controller route persisted with the invocation that used it.
@@ -207,6 +208,8 @@ pub struct InvocationRecord {
     pub authorization_source: Option<RecoveryAuthorization>,
     #[serde(default)]
     pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_epoch: Option<String>,
     #[serde(default)]
     pub runtime_agent_id: Option<String>,
     #[serde(default)]
@@ -467,6 +470,11 @@ pub(crate) async fn routing_owner_matches_invocation_or_parent(
     {
         return Ok(false);
     }
+    if shared_sibling_ordered_owner_matches(agent_dir, &child_identity, owner, delivery_target)
+        .await?
+    {
+        return Ok(true);
+    }
     let Ok(parent_name) = crate::domain::AgentName::try_from_str(&owner.agent_id) else {
         return Ok(false);
     };
@@ -509,6 +517,60 @@ pub(crate) async fn routing_owner_matches_invocation_or_parent(
         delivery_target,
     )
     .await
+}
+
+/// A shared TL pane can carry only one window-level ownership tag, but several
+/// ledger-owned sibling controllers may legitimately share that exact pane.
+/// Accept a sibling tag only when both identities are accepted declarations
+/// with the same parent branch, the sibling invocation is live, and the
+/// delivery target is exactly the recorded controller target.
+async fn shared_sibling_ordered_owner_matches(
+    agent_dir: &Path,
+    child_identity: &crate::services::agent_resolver::AgentIdentityRecord,
+    owner: &crate::services::tmux_ipc::TmuxOwnership,
+    delivery_target: &RoutingInfo,
+) -> Result<bool> {
+    let Some(registry) = agent_dir.parent() else {
+        return Ok(false);
+    };
+    if owner.agent_id == "root" {
+        // The root controller is the shared parent, never a sibling.
+        return Ok(false);
+    }
+    let owner_dir = registry.join(&owner.agent_id);
+    let owner_identity_path = owner_dir.join("identity.json");
+    let owner_identity = match tokio::fs::read(&owner_identity_path).await {
+        Ok(bytes) => {
+            serde_json::from_slice::<crate::services::agent_resolver::AgentIdentityRecord>(&bytes)?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if owner_identity.agent_name.as_str() != owner.agent_id
+        || !owner_identity.ledger_owned
+        || owner_identity.slice_id.is_none()
+        || owner_identity.parent_branch != child_identity.parent_branch
+        || owner_identity.birth_branch.parent().as_ref() != Some(&child_identity.parent_branch)
+    {
+        return Ok(false);
+    }
+    let Some(owner_invocation) = read_locked(&owner_dir).await? else {
+        return Ok(false);
+    };
+    if !owner_invocation.is_live()
+        || owner_invocation.invocation_id != owner.invocation_id
+        || owner_invocation.generation != owner.generation
+    {
+        return Ok(false);
+    }
+    let Some(project_dir) = registry.parent().and_then(Path::parent) else {
+        return Ok(false);
+    };
+    let target = read_controller_target_for_routing(project_dir).await?;
+    Ok(
+        Some(&target.window_id) == delivery_target.window_id.as_ref()
+            && Some(&target.pane_id) == delivery_target.pane_id.as_ref(),
+    )
 }
 
 async fn parent_window_route_matches_exact_controller_pane(
@@ -642,6 +704,7 @@ async fn start_invocation_with_context(
         model: None,
         effort: None,
         generation,
+        controller_epoch: None,
         runtime_agent_id: identity.runtime_agent_id,
         slice_id: identity.slice_id,
         branch: identity.branch,
@@ -783,6 +846,7 @@ pub async fn start_invocation_with_provenance_and_context_and_mode_with_id(
         invocation_id,
         None,
         None,
+        None,
     )
     .await
 }
@@ -803,6 +867,7 @@ pub async fn start_invocation_with_provenance_and_context_and_mode_with_id_guard
     invocation_id: String,
     expected_live_invocation_id: Option<&str>,
     role_route: Option<RoleRouteProvenance>,
+    controller_epoch: Option<String>,
 ) -> Result<InvocationRecord> {
     if invocation_id.trim().is_empty() {
         return Err(anyhow::anyhow!("invocation ID must not be empty"));
@@ -891,6 +956,7 @@ pub async fn start_invocation_with_provenance_and_context_and_mode_with_id_guard
             .as_ref()
             .map(|lineage| lineage.authorization_source),
         generation,
+        controller_epoch,
         runtime_agent_id: identity.runtime_agent_id,
         slice_id: identity.slice_id,
         branch: identity.branch,
@@ -1015,14 +1081,84 @@ pub async fn finish_invocation_and_tombstone_with_context(
     exit_code: Option<i32>,
     exit_context: InvocationExitContext,
 ) -> Result<InvocationFinishResult> {
+    finish_invocation_and_tombstone_checked(
+        agent_dir,
+        expected_routing,
+        None,
+        status,
+        exit_code,
+        exit_context,
+    )
+    .await
+}
+
+/// Finish and tombstone only the exact invocation captured by a monitor.
+///
+/// A monitor started for a superseded predecessor may observe a recycled
+/// `@window`/`%pane` after a fresh tmux server and report an exit. The
+/// invocation ID is the durable generation marker, so a delayed monitor must
+/// never retire the successor that now owns the same numeric target.
+pub(crate) async fn finish_invocation_and_tombstone_for_invocation(
+    agent_dir: &Path,
+    expected_routing: &RoutingInfo,
+    expected_invocation_id: &str,
+    status: InvocationStatus,
+    exit_code: Option<i32>,
+    exit_context: InvocationExitContext,
+) -> Result<InvocationFinishResult> {
+    finish_invocation_and_tombstone_checked(
+        agent_dir,
+        expected_routing,
+        Some(expected_invocation_id),
+        status,
+        exit_code,
+        exit_context,
+    )
+    .await
+}
+
+async fn finish_invocation_and_tombstone_checked(
+    agent_dir: &Path,
+    expected_routing: &RoutingInfo,
+    expected_invocation_id: Option<&str>,
+    status: InvocationStatus,
+    exit_code: Option<i32>,
+    exit_context: InvocationExitContext,
+) -> Result<InvocationFinishResult> {
     let _guard = mutation_lock().lock().await;
     let current = read_locked(agent_dir).await?;
     if let Some(record) = current.as_ref() {
+        if expected_invocation_id.is_some_and(|expected| expected != record.invocation_id) {
+            warn!(
+                path = %invocation_path(agent_dir).display(),
+                current_invocation_id = %record.invocation_id,
+                expected_invocation_id = ?expected_invocation_id,
+                "Ignoring stale invocation exit for a superseded controller generation"
+            );
+            return Ok(InvocationFinishResult::IgnoredStale);
+        }
         if !record.routing.same_delivery_target(expected_routing) {
             warn!(
                 path = %invocation_path(agent_dir).display(),
                 invocation_id = %record.invocation_id,
                 "Ignoring stale invocation exit for newer routing generation"
+            );
+            return Ok(InvocationFinishResult::IgnoredStale);
+        }
+        let routing_has_owner_fields = record.routing.owner_invocation_id.is_some()
+            || record.routing.owner_generation.is_some();
+        let expected_has_owner_fields = expected_routing.owner_invocation_id.is_some()
+            || expected_routing.owner_generation.is_some();
+        if routing_has_owner_fields
+            && expected_has_owner_fields
+            && record.routing.owner_invocation_id != expected_routing.owner_invocation_id
+        {
+            warn!(
+                path = %invocation_path(agent_dir).display(),
+                current_invocation_id = %record.invocation_id,
+                current_owner = ?record.routing.owner_invocation_id,
+                expected_owner = ?expected_routing.owner_invocation_id,
+                "Ignoring stale invocation exit for a different routing owner"
             );
             return Ok(InvocationFinishResult::IgnoredStale);
         }
@@ -1105,6 +1241,85 @@ pub(crate) async fn finish_invocation_for_missing_target(
     .await?;
     let InvocationFinishResult::Finished(finished) = finished else {
         anyhow::bail!("controller invocation could not be retired after target loss");
+    };
+    tokio::fs::write(agent_dir.join("exited_at"), unix_timestamp().to_string()).await?;
+    persisted_routing
+        .without_ownership()
+        .write_to_dir(agent_dir)
+        .await?;
+    Ok(finished)
+}
+
+/// Retire a controller invocation whose exact historical target lifetime is
+/// proven ended even though a fresh startup recycled the same numeric
+/// `@window`/`%pane` IDs. The caller must already have classified the binding
+/// as superseded; this function revalidates that proof under the invocation
+/// mutation lock so a concurrent successor cannot be retired instead.
+pub(crate) async fn finish_invocation_after_superseded_target(
+    agent_dir: &Path,
+    expected: &InvocationRecord,
+    tmux: &crate::services::tmux_ipc::TmuxIpc,
+    project_dir: &Path,
+    reason: &str,
+    classification: &str,
+) -> Result<InvocationRecord> {
+    let _guard = mutation_lock().lock().await;
+    let current = read_locked(agent_dir)
+        .await?
+        .context("controller invocation disappeared during liveness reconciliation")?;
+    if current != *expected || !current.is_live() {
+        anyhow::bail!("controller invocation changed during liveness reconciliation");
+    }
+    if current.routing.window_id.is_none() && current.routing.pane_id.is_none() {
+        anyhow::bail!("live controller has no stable delivery target to reconcile");
+    }
+    let persisted_routing = RoutingInfo::read_from_dir(agent_dir).await?;
+    if !persisted_routing.same_delivery_target(&current.routing) {
+        anyhow::bail!("controller routing changed during liveness reconciliation");
+    }
+    let owner_fields = persisted_routing.owner_agent_id.is_some()
+        || persisted_routing.owner_invocation_id.is_some()
+        || persisted_routing.owner_generation.is_some();
+    if owner_fields {
+        let owner_matches = persisted_routing.has_ownership_proof()
+            && persisted_routing.owner_agent_id.as_deref() == Some(agent_id_from_dir(agent_dir)?)
+            && persisted_routing.owner_invocation_id.as_deref()
+                == Some(current.invocation_id.as_str())
+            && persisted_routing.owner_generation == Some(current.generation);
+        if !owner_matches {
+            anyhow::bail!("controller routing ownership conflicts with the interrupted invocation");
+        }
+    }
+    match super::controller_lifecycle::reconcile_controller_binding(
+        project_dir,
+        tmux,
+        &current.routing,
+        current.controller_epoch.as_deref(),
+    )
+    .await?
+    {
+        super::ControllerBindingReconciliation::Superseded { .. } => {}
+        super::ControllerBindingReconciliation::Current => {
+            anyhow::bail!("controller target is still the current lifetime")
+        }
+        super::ControllerBindingReconciliation::Unverified { diagnostic } => {
+            anyhow::bail!("controller target lifetime is unverified: {diagnostic}")
+        }
+    }
+    let finished = finish_locked(
+        agent_dir,
+        &current.invocation_id,
+        InvocationStatus::Killed,
+        None,
+        InvocationExitContext {
+            reason: Some(reason.to_owned()),
+            classification: Some(classification.to_owned()),
+            stderr_tail: None,
+        },
+    )
+    .await?;
+    let InvocationFinishResult::Finished(finished) = finished else {
+        anyhow::bail!("controller invocation could not be retired after target supersession");
     };
     tokio::fs::write(agent_dir.join("exited_at"), unix_timestamp().to_string()).await?;
     persisted_routing

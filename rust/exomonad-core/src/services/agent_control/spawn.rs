@@ -2237,6 +2237,7 @@ impl<
                     expected_live_invocation_id: None,
                     mode: super::InvocationMode::OneShot,
                     role_route: options.role_route.clone(),
+                    controller_epoch: None,
                 },
                 false,
             )
@@ -2611,6 +2612,7 @@ impl<
                     identity: None,
                     mode: InvocationMode::from_role(options.role.as_ref().map(|role| role.as_str())),
                     role_route: None,
+                    controller_epoch: None,
                 },
                 false,
             )
@@ -3187,6 +3189,7 @@ impl<
                       identity: None,
                       mode: InvocationMode::from_role(options.role.as_ref().map(|role| role.as_str())),
                       role_route: options.role_route.clone(),
+                      controller_epoch: None,
                   },
                 false,
             )

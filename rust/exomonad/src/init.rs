@@ -6151,6 +6151,10 @@ async fn reconcile_interrupted_controller_startup(
             persist_controller_ownership(project_dir, &ownership).await?;
         }
         clear_pending_controller_ownership(project_dir, &intent.controller_epoch).await?;
+        // The stopped target is now recorded as the committed controller for
+        // this epoch. Leaving the startup fence behind would make every retry
+        // re-enter target recovery forever.
+        clear_controller_startup_intent(project_dir, &intent.controller_epoch)?;
         return Ok(InterruptedControllerStartup::TargetStopped {
             original_continue_mode: intent.continue_mode,
             root_run_id,
@@ -13458,6 +13462,354 @@ mod tests {
                 std::env::remove_var("EXOMONAD_TMUX_SOCKET");
             }
         }
+    }
+
+    struct InitSocketFixture {
+        socket: String,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl InitSocketFixture {
+        fn new(socket: String) -> Self {
+            let previous = std::env::var_os("EXOMONAD_TMUX_SOCKET");
+            std::env::set_var("EXOMONAD_TMUX_SOCKET", &socket);
+            Self { socket, previous }
+        }
+
+        fn command(&self) -> Command {
+            let mut command = Command::new("tmux");
+            command
+                .args(["-S", &self.socket])
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE");
+            command
+        }
+    }
+
+    impl Drop for InitSocketFixture {
+        fn drop(&mut self) {
+            let _ = self.command().arg("kill-server").status();
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var("EXOMONAD_TMUX_SOCKET", previous);
+            } else {
+                std::env::remove_var("EXOMONAD_TMUX_SOCKET");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_ordered_repair_leaves_pending_startup_recoverable_for_shutdown_and_retry() {
+        use exomonad_core::services::agent_control::{
+            AgentControlService, InvocationIdentityContext, InvocationMode, InvocationTrigger,
+            Topology,
+        };
+        use exomonad_core::services::tmux_ipc::TmuxIpc;
+        use exomonad_core::services::Services;
+        use exomonad_core::services::{AgentIdentityRecord, AgentType};
+
+        let project = tempfile::tempdir().unwrap();
+        let project_dir = project.path().to_path_buf();
+        let socket = project_dir
+            .join(format!("exo-init-recovery-{}.sock", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let fixture = InitSocketFixture::new(socket);
+        let session = format!("exo-init-recovery-{}", std::process::id());
+        let status = fixture
+            .command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "-n",
+                "root",
+                "sleep",
+                "300",
+            ])
+            .status()
+            .expect("start isolated init tmux server");
+        assert!(status.success(), "isolated init tmux session starts");
+        let ipc = TmuxIpc::new(&session);
+
+        let run_git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(&project_dir)
+                .status()
+                .expect("run git fixture command");
+            assert!(status.success(), "git command failed: {args:?}");
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "test@example.invalid"]);
+        run_git(&["config", "user.name", "Test"]);
+        std::fs::write(project_dir.join("seed"), "seed\n").unwrap();
+        run_git(&["add", "seed"]);
+        run_git(&["commit", "-q", "-m", "seed"]);
+        let child_worktree = project_dir.join(".exo/worktrees/child-a");
+        run_git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "main.child-a",
+            child_worktree.to_str().unwrap(),
+            "main",
+        ]);
+        std::fs::create_dir_all(project_dir.join(".exo/tl-loop/root")).unwrap();
+        std::fs::write(
+            project_dir.join(".exo/tl-loop/root/run.json"),
+            r#"{"run_id":"root","fsm":{"phase":"tl_running"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(project_dir.join(".exo/agents/root")).unwrap();
+        std::fs::write(project_dir.join(".exo/agents/root/.birth_branch"), "main\n").unwrap();
+
+        let record = AgentIdentityRecord {
+            agent_name: exomonad_core::domain::AgentName::try_from_str("child-a").unwrap(),
+            slug: exomonad_core::domain::Slug::try_from_str("child-a").unwrap(),
+            agent_type: AgentType::Codex,
+            birth_branch: exomonad_core::domain::BirthBranch::try_from_str("main.child-a").unwrap(),
+            parent_branch: exomonad_core::domain::BirthBranch::try_from_str("main").unwrap(),
+            working_dir: project_dir.join(".exo/worktrees/child-a"),
+            display_name: "🤖 child-a".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: None,
+            effort: None,
+            role_route: None,
+            ledger_owned: true,
+            slice_id: Some("child-a".to_string()),
+        };
+        let child_dir = project_dir.join(".exo/agents/child-a");
+        std::fs::create_dir_all(&child_dir).unwrap();
+        std::fs::write(
+            child_dir.join("identity.json"),
+            serde_json::to_vec_pretty(&record).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            project_dir.join(".exo/tl-loop/plan.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "sub_tls": [{"name": "child-a", "agent_id": "child-a"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let epoch = "controller-repair-failure";
+        std::fs::write(controller_epoch_path(&project_dir), format!("{epoch}\n")).unwrap();
+        let mut intent = ControllerStartupIntent {
+            schema_version: 1,
+            controller_epoch: epoch.to_owned(),
+            previous_controller_epoch: None,
+            tmux_session: session.clone(),
+            tmux_server_pid: 0,
+            tmux_server_start_ticks: 0,
+            continue_mode: true,
+            root_run_id: Some("root".to_owned()),
+            target: None,
+            phase: ControllerStartupPhase::Requested,
+        };
+        let server = ipc.server_identity().await.unwrap();
+        intent.tmux_server_pid = server.pid;
+        intent.tmux_server_start_ticks = server.start_ticks;
+        persist_controller_startup_intent(&project_dir, &intent).unwrap();
+        let created = ipc
+            .new_window_with_environment(
+                "TL",
+                &project_dir,
+                "/bin/sh",
+                "sleep 300",
+                &[("EXOMONAD_CONTROLLER_EPOCH", epoch)],
+            )
+            .await
+            .unwrap();
+        let target = capture_controller_pane_target(
+            &ipc,
+            epoch,
+            created.window_id.clone(),
+            created.pane_id.clone(),
+        )
+        .await
+        .unwrap();
+        intent.target = Some(target.clone());
+        intent.phase = ControllerStartupPhase::TargetCreated;
+        persist_controller_startup_intent(&project_dir, &intent).unwrap();
+        let pending = target.with_run_id("root");
+        persist_pending_controller_ownership(&project_dir, &pending)
+            .await
+            .unwrap();
+
+        // The durable child invocation is Running but has no server to repair
+        // it against, so startup preflight fails after the pending target and
+        // fence were persisted.
+        let child_routing = exomonad_core::domain::RoutingInfo::window_pane(
+            created.window_id.clone(),
+            created.pane_id.clone(),
+        );
+        let child = exomonad_core::services::agent_control::invocation::start_invocation_with_provenance_and_context_and_mode(
+            &child_dir,
+            AgentType::Codex,
+            InvocationTrigger::Spawn,
+            child_routing,
+            None,
+            None,
+            None,
+            None,
+            Some(InvocationIdentityContext {
+                runtime_agent_id: Some("child-a".to_string()),
+                slice_id: Some("child-a".to_string()),
+                branch: Some("main.child-a".to_string()),
+                worktree: Some(record.working_dir.to_string_lossy().into_owned()),
+            }),
+            None,
+            InvocationMode::Interactive,
+        )
+        .await
+        .unwrap();
+        let error = reconcile_continue_state_before_controller(&project_dir, &ipc, &target)
+            .await
+            .expect_err("child repair fails without the server socket");
+        assert!(
+            format!("{error:#}").contains("failed to repair ordered sub-TL child-a"),
+            "unexpected repair diagnostic: {error:#}"
+        );
+        assert!(
+            project_dir
+                .join(
+                    exomonad_core::services::agent_control::CONTROLLER_STARTUP_INTENT_RELATIVE_PATH
+                )
+                .exists(),
+            "the startup fence remains for retry"
+        );
+        assert!(project_dir
+            .join(exomonad_core::services::agent_control::ROOT_CONTROLLER_PENDING_OWNERSHIP_RELATIVE_PATH)
+            .exists());
+
+        let mut services = Services::benchmark(project_dir.clone()).unwrap();
+        services.agent_resolver = std::sync::Arc::new(
+            exomonad_core::services::agent_resolver::AgentResolver::load(project_dir.clone()).await,
+        );
+        services.git_wt = std::sync::Arc::new(
+            exomonad_core::services::git_worktree::GitWorktreeService::new(project_dir.clone()),
+        );
+        let service = AgentControlService::new(std::sync::Arc::new(services))
+            .with_tmux_session(session.clone());
+        let shutdown = service.shutdown_workspace_control_plane().await.unwrap();
+        assert_eq!(shutdown.status, "complete");
+        assert_eq!(shutdown.controllers_interrupted, 1);
+        let killed = read_invocation(&child_dir).await.unwrap().unwrap();
+        assert_eq!(killed.invocation_id, child.invocation_id);
+        assert!(!killed.is_live());
+        assert_eq!(
+            killed.exit_classification.as_deref(),
+            Some("workspace_control_plane_shutdown")
+        );
+
+        // The production init recovery path adopts the stopped pending startup
+        // instead of rejecting it as a stale committed epoch.
+        assert_eq!(
+            reconcile_interrupted_controller_startup(&ipc, &project_dir)
+                .await
+                .unwrap(),
+            InterruptedControllerStartup::TargetStopped {
+                original_continue_mode: true,
+                root_run_id: Some("root".to_owned()),
+            }
+        );
+        assert!(!project_dir
+            .join(exomonad_core::services::agent_control::ROOT_CONTROLLER_PENDING_OWNERSHIP_RELATIVE_PATH)
+            .exists());
+        assert!(!project_dir
+            .join(exomonad_core::services::agent_control::CONTROLLER_STARTUP_INTENT_RELATIVE_PATH)
+            .exists());
+        assert_eq!(
+            read_controller_ownership(&project_dir)
+                .await
+                .unwrap()
+                .controller_epoch,
+            epoch
+        );
+
+        // Retry startup after the interrupted child repair. The stale ordered
+        // spec is gone, so preflight succeeds and production provisioning
+        // creates exactly one current child controller.
+        std::fs::remove_file(project_dir.join(".exo/tl-loop/plan.json")).unwrap();
+        std::fs::write(
+            controller_epoch_path(&project_dir),
+            "controller-retry-after-shutdown\n",
+        )
+        .unwrap();
+        let retry_epoch = "controller-retry-after-shutdown";
+        let mut retry = ControllerStartupIntent {
+            schema_version: 1,
+            controller_epoch: retry_epoch.to_owned(),
+            previous_controller_epoch: Some(epoch.to_owned()),
+            tmux_session: session.clone(),
+            tmux_server_pid: server.pid,
+            tmux_server_start_ticks: server.start_ticks,
+            continue_mode: true,
+            root_run_id: Some("root".to_owned()),
+            target: None,
+            phase: ControllerStartupPhase::Requested,
+        };
+        persist_controller_startup_intent(&project_dir, &retry).unwrap();
+        let retried = ipc
+            .new_window_with_environment(
+                "TL",
+                &project_dir,
+                "/bin/sh",
+                "sleep 300",
+                &[("EXOMONAD_CONTROLLER_EPOCH", retry_epoch)],
+            )
+            .await
+            .unwrap();
+        let retry_target = capture_controller_pane_target(
+            &ipc,
+            retry_epoch,
+            retried.window_id.clone(),
+            retried.pane_id.clone(),
+        )
+        .await
+        .unwrap();
+        retry.target = Some(retry_target.clone());
+        retry.phase = ControllerStartupPhase::TargetCreated;
+        persist_controller_startup_intent(&project_dir, &retry).unwrap();
+        let retry_pending = retry_target.with_run_id("root");
+        persist_pending_controller_ownership(&project_dir, &retry_pending)
+            .await
+            .unwrap();
+        reconcile_continue_state_before_controller(&project_dir, &ipc, &retry_target)
+            .await
+            .expect("retry startup preflight succeeds once the stale repair is gone");
+        let successor_id = service
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .expect("retry provisions one current child controller");
+        let successor = read_invocation(&child_dir).await.unwrap().unwrap();
+        assert_eq!(successor.invocation_id, successor_id);
+        assert_ne!(successor_id, child.invocation_id);
+        assert_eq!(successor.generation, child.generation + 1);
+        assert!(successor.is_live());
+        assert_eq!(
+            successor.prior_invocation_id.as_deref(),
+            Some(child.invocation_id.as_str())
+        );
+        assert_eq!(
+            service.provision_ordered_sub_tl(record).await.unwrap(),
+            successor_id,
+            "a repeated retry does not duplicate the child controller"
+        );
+        assert_eq!(
+            read_invocation(&child_dir)
+                .await
+                .unwrap()
+                .unwrap()
+                .generation,
+            successor.generation
+        );
+        // The fixture owns its isolated server and removes it on drop.
     }
 
     #[test]

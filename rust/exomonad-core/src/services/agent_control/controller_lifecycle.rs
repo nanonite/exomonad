@@ -5,6 +5,7 @@
 //! pane whose exact owner was recorded by init.
 
 use super::AgentControlService;
+use crate::domain::RoutingInfo;
 use crate::services::agent_control::invocation;
 use crate::services::tmux_ipc::{PaneId, WindowId};
 use crate::services::{
@@ -16,6 +17,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 pub const ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH: &str =
@@ -296,6 +298,406 @@ pub async fn controller_ownership_is_live(
     }
 }
 
+/// Classification of a historical controller binding against the exact target
+/// that the current startup transaction recorded for routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControllerBindingReconciliation {
+    /// The prior binding is the same exact live controller target.
+    Current,
+    /// The prior controller lifetime is proven ended. The numeric target was
+    /// recycled by the current startup transaction, not reused by the same
+    /// process.
+    Superseded { classification: &'static str },
+    /// The prior binding cannot be classified safely; hold without replacement.
+    Unverified { diagnostic: &'static str },
+}
+
+/// Distinguish a historical ordered-controller binding from the exact pending
+/// startup target captured by init.
+///
+/// A committed `controller-target.json` record is the historical lifetime.
+/// `controller-target.pending.json` is the current startup transaction. The two
+/// may carry the same numeric `@window`/`%pane` IDs after a fresh tmux server or
+/// a window recreation, so only the saved server and process identities and the
+/// controller epoch decide whether the old lifetime ended.
+pub async fn reconcile_controller_binding(
+    project_dir: &Path,
+    tmux: &crate::services::tmux_ipc::TmuxIpc,
+    prior_routing: &RoutingInfo,
+    prior_controller_epoch: Option<&str>,
+) -> Result<ControllerBindingReconciliation> {
+    let committed = match read_controller_ownership(project_dir).await {
+        Ok(ownership) => ownership,
+        Err(error) => {
+            warn!(
+                project = %project_dir.display(),
+                target = %format!("{prior_routing:?}"),
+                error = %error,
+                error_chain = ?error.chain().collect::<Vec<_>>(),
+                "Controller reconciliation refused: the prior controller has no readable committed ownership record"
+            );
+            return Ok(ControllerBindingReconciliation::Unverified {
+                diagnostic: "the prior controller has no committed ownership record",
+            });
+        }
+    };
+    if !routing_matches_ownership(prior_routing, &committed) {
+        warn!(
+            project = %project_dir.display(),
+            prior_window = ?prior_routing.window_id,
+            prior_pane = ?prior_routing.pane_id,
+            committed_window = %committed.window_id,
+            committed_pane = %committed.pane_id,
+            "Controller reconciliation refused: the prior routing does not match the committed ownership record"
+        );
+        return Ok(ControllerBindingReconciliation::Unverified {
+            diagnostic:
+                "the prior controller routing does not match its committed ownership record",
+        });
+    }
+    if !pending_controller_ownership_path(project_dir).exists() {
+        // No current startup transaction exists. The prior binding may only be
+        // reused when its exact committed lifetime is still observable; a
+        // recycled numeric @window/%pane alone must never revive a stale
+        // invocation.
+        return match controller_ownership_is_live(project_dir, tmux, &committed).await {
+            Ok(true) => Ok(ControllerBindingReconciliation::Current),
+            Ok(false) => {
+                warn!(
+                    project = %project_dir.display(),
+                    target = %format!("{prior_routing:?}"),
+                    "Controller reconciliation refused: the prior controller target is absent and no current startup target was recorded"
+                );
+                Ok(ControllerBindingReconciliation::Unverified {
+                    diagnostic:
+                        "the prior controller target is absent and no current startup target was recorded",
+                })
+            }
+            Err(error) => {
+                warn!(
+                    project = %project_dir.display(),
+                    target = %format!("{prior_routing:?}"),
+                    error = %error,
+                    error_chain = ?error.chain().collect::<Vec<_>>(),
+                    "Controller reconciliation refused: the prior controller target identity could not be inspected and no current startup target was recorded"
+                );
+                Ok(ControllerBindingReconciliation::Unverified {
+                    diagnostic:
+                        "the prior controller target identity could not be inspected and no current startup target was recorded",
+                })
+            }
+        };
+    }
+    let pending = match read_controller_target_for_routing(project_dir).await {
+        Ok(target) => target,
+        Err(error) => {
+            warn!(
+                project = %project_dir.display(),
+                path = %pending_controller_ownership_path(project_dir).display(),
+                error = %error,
+                error_chain = ?error.chain().collect::<Vec<_>>(),
+                "Controller reconciliation refused: the pending startup target is unreadable or invalid"
+            );
+            return Ok(ControllerBindingReconciliation::Unverified {
+                diagnostic: "the pending startup target is unreadable or invalid",
+            });
+        }
+    };
+    if pending.run_id != committed.run_id || pending.tmux_session != committed.tmux_session {
+        warn!(
+            project = %project_dir.display(),
+            pending_run = %pending.run_id,
+            committed_run = %committed.run_id,
+            pending_session = %pending.tmux_session,
+            committed_session = %committed.tmux_session,
+            "Controller reconciliation refused: the pending startup target belongs to another root scope"
+        );
+        return Ok(ControllerBindingReconciliation::Unverified {
+            diagnostic: "the pending startup target belongs to another root scope",
+        });
+    }
+    if prior_controller_epoch.is_some_and(|epoch| epoch == pending.controller_epoch) {
+        return Ok(ControllerBindingReconciliation::Current);
+    }
+    if let Err(error) = validate_startup_handoff_evidence(project_dir, &pending).await {
+        warn!(
+            project = %project_dir.display(),
+            path = %controller_startup_intent_path(project_dir).display(),
+            error = %error,
+            error_chain = ?error.chain().collect::<Vec<_>>(),
+            "Controller reconciliation refused: the pending startup target does not match its startup fence"
+        );
+        return Ok(ControllerBindingReconciliation::Unverified {
+            diagnostic: "the pending startup target does not match its startup transaction",
+        });
+    }
+    match controller_ownership_is_live(project_dir, tmux, &pending).await {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!(
+                project = %project_dir.display(),
+                target = %format!("{pending:?}"),
+                "Controller reconciliation refused: the pending startup target is stopped"
+            );
+            return Ok(ControllerBindingReconciliation::Unverified {
+                diagnostic: "the pending startup target is stopped",
+            });
+        }
+        Err(error) => {
+            warn!(
+                project = %project_dir.display(),
+                target = %format!("{pending:?}"),
+                error = %error,
+                error_chain = ?error.chain().collect::<Vec<_>>(),
+                "Controller reconciliation refused: the pending startup target identity could not be inspected"
+            );
+            return Ok(ControllerBindingReconciliation::Unverified {
+                diagnostic: "the pending startup target identity could not be inspected",
+            });
+        }
+    }
+    if same_controller_lifetime(&committed, &pending) {
+        return Ok(ControllerBindingReconciliation::Current);
+    }
+    match proven_superseded_lifetime(&committed, &pending).await {
+        Ok(Some(classification)) => {
+            debug!(
+                project = %project_dir.display(),
+                classification,
+                committed_epoch = %committed.controller_epoch,
+                pending_epoch = %pending.controller_epoch,
+                "Classified the prior controller lifetime as superseded"
+            );
+            Ok(ControllerBindingReconciliation::Superseded { classification })
+        }
+        Ok(None) => {
+            warn!(
+                project = %project_dir.display(),
+                committed_epoch = %committed.controller_epoch,
+                pending_epoch = %pending.controller_epoch,
+                "Controller reconciliation refused: the recorded controller process may still own the delivery target"
+            );
+            Ok(ControllerBindingReconciliation::Unverified {
+                diagnostic: "the recorded controller process may still own the delivery target",
+            })
+        }
+        Err(error) => {
+            warn!(
+                project = %project_dir.display(),
+                committed_epoch = %committed.controller_epoch,
+                error = %error,
+                error_chain = ?error.chain().collect::<Vec<_>>(),
+                "Controller reconciliation refused: the prior controller process identity could not be inspected"
+            );
+            Err(error.context(
+                "the prior controller process identity could not be inspected; replacement is blocked",
+            ))
+        }
+    }
+}
+
+fn routing_matches_ownership(routing: &RoutingInfo, ownership: &ControllerPaneOwnership) -> bool {
+    routing.window_id.as_ref() == Some(&ownership.window_id)
+        && routing.pane_id.as_ref() == Some(&ownership.pane_id)
+}
+
+fn same_controller_lifetime(
+    left: &ControllerPaneOwnership,
+    right: &ControllerPaneOwnership,
+) -> bool {
+    left.controller_epoch == right.controller_epoch
+        && left.tmux_server_pid == right.tmux_server_pid
+        && left.tmux_server_start_ticks == right.tmux_server_start_ticks
+        && left.pane_pid == right.pane_pid
+        && left.pane_start_ticks == right.pane_start_ticks
+}
+
+async fn proven_superseded_lifetime(
+    committed: &ControllerPaneOwnership,
+    current: &ControllerPaneOwnership,
+) -> Result<Option<&'static str>> {
+    if committed.tmux_server_pid != current.tmux_server_pid
+        || committed.tmux_server_start_ticks != current.tmux_server_start_ticks
+    {
+        return Ok(Some(
+            "the tmux server lifetime that owned the prior controller ended",
+        ));
+    }
+    if committed.pane_pid == current.pane_pid
+        && committed.pane_start_ticks == current.pane_start_ticks
+    {
+        return Ok(None);
+    }
+    match process_start_ticks(committed.pane_pid).await {
+        Ok(start_ticks) if start_ticks == committed.pane_start_ticks => Ok(None),
+        Ok(_) => Ok(Some("the recorded controller pane process was replaced")),
+        Err(error) if process_missing(&error) => {
+            Ok(Some("the recorded controller pane process ended"))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn process_missing(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct ControllerStartupHandoffEvidence {
+    schema_version: u32,
+    controller_epoch: String,
+    tmux_session: String,
+    tmux_server_pid: u32,
+    tmux_server_start_ticks: u64,
+    #[serde(default)]
+    target: Option<ControllerPaneTarget>,
+}
+
+/// Validate the durable startup fence against the pending target.
+///
+/// `init` always persists the fence before it persists the pending target (see
+/// `launch_tl_recovery` and `reconcile_interrupted_controller_startup`), so a
+/// pending record without a fence is a partial or tampered handoff. Fail
+/// closed rather than letting an unexplained pending file select a shutdown or
+/// restart target.
+async fn validate_startup_handoff_evidence(
+    project_dir: &Path,
+    pending: &ControllerPaneOwnership,
+) -> Result<()> {
+    let path = controller_startup_intent_path(project_dir);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "controller startup fence {} is missing for a persisted pending target",
+                path.display()
+            )
+        }
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    };
+    let evidence: ControllerStartupHandoffEvidence = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse controller startup fence {}", path.display()))?;
+    anyhow::ensure!(
+        evidence.schema_version == 1
+            && evidence.controller_epoch == pending.controller_epoch
+            && evidence.tmux_session == pending.tmux_session
+            && evidence.tmux_server_pid == pending.tmux_server_pid
+            && evidence.tmux_server_start_ticks == pending.tmux_server_start_ticks,
+        "controller startup fence conflicts with the pending target identity"
+    );
+    if let Some(target) = evidence.target.as_ref() {
+        anyhow::ensure!(
+            target.controller_epoch == pending.controller_epoch
+                && target.tmux_session == pending.tmux_session
+                && target.window_id == pending.window_id
+                && target.pane_id == pending.pane_id
+                && target.pane_pid == pending.pane_pid
+                && target.pane_start_ticks == pending.pane_start_ticks
+                && target.tmux_server_pid == pending.tmux_server_pid
+                && target.tmux_server_start_ticks == pending.tmux_server_start_ticks,
+            "controller startup fence target conflicts with the pending target identity"
+        );
+    }
+    Ok(())
+}
+
+/// Return the exact pending startup target when it still matches the current
+/// controller epoch, tmux server, and recorded pane process. A stopped pending
+/// pane is still returned so shutdown can finish its interruption records; a
+/// stale or unreadable pending record is not selected.
+pub async fn pending_startup_target_if_current(
+    project_dir: &Path,
+    tmux: &crate::services::tmux_ipc::TmuxIpc,
+) -> Result<Option<ControllerPaneOwnership>> {
+    let pending_path = pending_controller_ownership_path(project_dir);
+    if !pending_path.exists() {
+        return Ok(None);
+    }
+    let pending = match read_controller_target_for_routing(project_dir).await {
+        Ok(target) => target,
+        Err(error) => {
+            warn!(
+                project = %project_dir.display(),
+                path = %pending_path.display(),
+                error = %error,
+                error_chain = ?error.chain().collect::<Vec<_>>(),
+                "Ignoring pending startup target: the record is unreadable or invalid"
+            );
+            return Ok(None);
+        }
+    };
+    if let Err(error) = validate_startup_handoff_evidence(project_dir, &pending).await {
+        warn!(
+            project = %project_dir.display(),
+            path = %controller_startup_intent_path(project_dir).display(),
+            error = %error,
+            error_chain = ?error.chain().collect::<Vec<_>>(),
+            "Ignoring pending startup target: the startup fence is missing or conflicts with the pending identity"
+        );
+        return Ok(None);
+    }
+    match controller_ownership_is_live(project_dir, tmux, &pending).await {
+        Ok(_) => Ok(Some(pending)),
+        Err(error) => {
+            warn!(
+                project = %project_dir.display(),
+                target = %format!("{pending:?}"),
+                error = %error,
+                error_chain = ?error.chain().collect::<Vec<_>>(),
+                "Ignoring pending startup target: its identity could not be inspected"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Select the target a workspace shutdown must quiesce. A valid pending
+/// startup target is preferred over the last committed controller because init
+/// advances the controller epoch before child repair and commit. Anything that
+/// cannot be validated falls back to the committed record, which still fails
+/// closed when its epoch is stale.
+pub async fn select_controller_shutdown_target(
+    project_dir: &Path,
+    tmux: &crate::services::tmux_ipc::TmuxIpc,
+) -> Result<ControllerPaneOwnership> {
+    if let Some(pending) = pending_startup_target_if_current(project_dir, tmux).await? {
+        match read_controller_ownership(project_dir).await {
+            Ok(committed)
+                if pending.run_id == committed.run_id
+                    && pending.tmux_session == committed.tmux_session =>
+            {
+                return Ok(pending);
+            }
+            Ok(committed) => {
+                warn!(
+                    project = %project_dir.display(),
+                    pending_run = %pending.run_id,
+                    committed_run = %committed.run_id,
+                    pending_session = %pending.tmux_session,
+                    committed_session = %committed.tmux_session,
+                    "Not selecting the pending startup target: it belongs to another root scope"
+                );
+            }
+            Err(error) => {
+                debug!(
+                    project = %project_dir.display(),
+                    error = %error,
+                    error_chain = ?error.chain().collect::<Vec<_>>(),
+                    "Selecting the validated pending startup target because no committed controller ownership is readable"
+                );
+                return Ok(pending);
+            }
+        }
+    }
+    let committed = read_controller_ownership(project_dir).await?;
+    verify_controller_epoch(project_dir, &committed).await?;
+    Ok(committed)
+}
+
 pub async fn persist_pending_controller_ownership(
     project_dir: &Path,
     ownership: &ControllerPaneOwnership,
@@ -356,39 +758,55 @@ where
             .await?;
         let project_dir = self.project_dir();
         let path = workspace_shutdown_path(project_dir);
-        let mut intent = load_or_create_intent(project_dir).await?;
+        let tmux = self.tmux()?;
+        let mut intent = load_or_create_intent(project_dir, &tmux).await?;
         if intent.phase == WorkspaceShutdownPhase::Complete {
             return Ok(result_for(&intent, "already_complete"));
         }
         persist_intent(&path, &mut intent, None).await?;
 
-        let tmux = self.tmux()?;
-        verify_controller_epoch(project_dir, &intent.target).await?;
-        let target_state = observe_controller_pane(&tmux, &intent.target).await?;
-        if target_state == ControllerPaneState::Live {
-            tmux.send_interrupt_to_pane(&intent.target.pane_id).await?;
-            let stopped =
-                wait_for_controller_pane(&tmux, &intent.target, WORKSPACE_SHUTDOWN_GRACE).await?;
-            if !stopped {
-                verify_controller_epoch(project_dir, &intent.target).await?;
-                let current = observe_controller_pane(&tmux, &intent.target).await?;
-                if current != ControllerPaneState::Live {
-                    anyhow::bail!("controller pane changed during bounded shutdown; refusing forced retirement");
+        let outcome: Result<WorkspaceShutdownResult> = async {
+            verify_controller_epoch(project_dir, &intent.target).await?;
+            let target_state = observe_controller_pane(&tmux, &intent.target).await?;
+            if target_state == ControllerPaneState::Live {
+                tmux.send_interrupt_to_pane(&intent.target.pane_id).await?;
+                let stopped = wait_for_controller_pane(
+                    &tmux,
+                    &intent.target,
+                    WORKSPACE_SHUTDOWN_GRACE,
+                )
+                .await?;
+                if !stopped {
+                    verify_controller_epoch(project_dir, &intent.target).await?;
+                    let current = observe_controller_pane(&tmux, &intent.target).await?;
+                    if current != ControllerPaneState::Live {
+                        anyhow::bail!("controller pane changed during bounded shutdown; refusing forced retirement");
+                    }
+                    tmux.kill_pane(&intent.target.pane_id).await?;
                 }
-                tmux.kill_pane(&intent.target.pane_id).await?;
+            }
+            wait_for_pane_absence(&tmux, &intent.target, WORKSPACE_SHUTDOWN_GRACE).await?;
+            intent.phase = WorkspaceShutdownPhase::ControllerStopped;
+            persist_intent(&path, &mut intent, None).await?;
+
+            for binding in intent.controllers.clone() {
+                finish_controller_binding(project_dir, &tmux, &intent.target, &binding).await?;
+            }
+            intent.phase = WorkspaceShutdownPhase::Complete;
+            intent.completed_at = Some(unix_timestamp());
+            persist_intent(&path, &mut intent, None).await?;
+            Ok(result_for(&intent, "complete"))
+        }
+        .await;
+
+        match outcome {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                intent.phase = WorkspaceShutdownPhase::Blocked;
+                let _ = persist_intent(&path, &mut intent, Some(format!("{error:#}"))).await;
+                Err(error)
             }
         }
-        wait_for_pane_absence(&tmux, &intent.target, WORKSPACE_SHUTDOWN_GRACE).await?;
-        intent.phase = WorkspaceShutdownPhase::ControllerStopped;
-        persist_intent(&path, &mut intent, None).await?;
-
-        for binding in intent.controllers.clone() {
-            finish_controller_binding(project_dir, &tmux, &intent.target, &binding).await?;
-        }
-        intent.phase = WorkspaceShutdownPhase::Complete;
-        intent.completed_at = Some(unix_timestamp());
-        persist_intent(&path, &mut intent, None).await?;
-        Ok(result_for(&intent, "complete"))
     }
 
     /// A dispatch permit shares the same cross-process mutation lease used by
@@ -513,21 +931,27 @@ enum ControllerPaneState {
     Stopped,
 }
 
-async fn load_or_create_intent(project_dir: &Path) -> Result<WorkspaceShutdownIntent> {
+async fn load_or_create_intent(
+    project_dir: &Path,
+    tmux: &crate::services::tmux_ipc::TmuxIpc,
+) -> Result<WorkspaceShutdownIntent> {
     let path = workspace_shutdown_path(project_dir);
     match tokio::fs::read(&path).await {
         Ok(bytes) => {
-            let intent: WorkspaceShutdownIntent = serde_json::from_slice(&bytes)
+            let mut intent: WorkspaceShutdownIntent = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse shutdown intent {}", path.display()))?;
             if intent.schema_version != 1 || intent.operation_id.trim().is_empty() {
                 anyhow::bail!(
                     "workspace shutdown intent is malformed; startup reconciliation is required"
                 );
             }
+            if intent.phase != WorkspaceShutdownPhase::Complete {
+                retarget_interrupted_shutdown(project_dir, tmux, &mut intent).await?;
+            }
             Ok(intent)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let target = read_controller_ownership(project_dir).await?;
+            let target = select_controller_shutdown_target(project_dir, tmux).await?;
             verify_controller_epoch(project_dir, &target).await?;
             let controllers = collect_shared_controller_bindings(project_dir, &target).await?;
             let preserved_worker_panes = count_worker_panes(project_dir, &target).await?;
@@ -547,6 +971,31 @@ async fn load_or_create_intent(project_dir: &Path) -> Result<WorkspaceShutdownIn
             Err(error).with_context(|| format!("read shutdown intent {}", path.display()))
         }
     }
+}
+
+/// A shutdown intent can survive a crash while init advances the controller
+/// epoch and persists a new pending startup target. Retarget the unfinished
+/// operation to that exact pending target only when it still belongs to the same
+/// root run and tmux session scope.
+async fn retarget_interrupted_shutdown(
+    project_dir: &Path,
+    tmux: &crate::services::tmux_ipc::TmuxIpc,
+    intent: &mut WorkspaceShutdownIntent,
+) -> Result<()> {
+    let Some(pending) = pending_startup_target_if_current(project_dir, tmux).await? else {
+        return Ok(());
+    };
+    let same_scope = pending.run_id == intent.target.run_id
+        && pending.tmux_session == intent.target.tmux_session;
+    if !same_scope || pending.controller_epoch == intent.target.controller_epoch {
+        return Ok(());
+    }
+    intent.target = pending;
+    intent.controllers = collect_shared_controller_bindings(project_dir, &intent.target).await?;
+    intent.preserved_worker_panes = count_worker_panes(project_dir, &intent.target).await?;
+    intent.phase = WorkspaceShutdownPhase::Requested;
+    intent.completed_at = None;
+    Ok(())
 }
 
 async fn collect_shared_controller_bindings(
@@ -923,11 +1372,17 @@ mod tests {
         window: WindowId,
         pane: PaneId,
         previous_socket: Option<OsString>,
+        _socket_dir: tempfile::TempDir,
     }
 
     impl IsolatedTmux {
         fn new() -> Self {
-            let socket = format!("exo-controller-lifecycle-{}", Uuid::new_v4());
+            let socket_dir = tempfile::tempdir().expect("isolated tmux socket directory");
+            let socket = socket_dir
+                .path()
+                .join(format!("exo-controller-lifecycle-{}.sock", Uuid::new_v4()))
+                .to_string_lossy()
+                .into_owned();
             let session = format!("exo-controller-lifecycle-{}", Uuid::new_v4());
             let previous_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
             std::env::set_var("EXOMONAD_TMUX_SOCKET", &socket);
@@ -970,12 +1425,17 @@ mod tests {
                 window,
                 pane,
                 previous_socket,
+                _socket_dir: socket_dir,
             }
         }
 
         fn command(socket: &str) -> Command {
             let mut command = Command::new("tmux");
-            command.args(["-L", socket]).stdout(Stdio::piped());
+            command
+                .args(["-S", socket])
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE")
+                .stdout(Stdio::piped());
             command
         }
 
@@ -1027,6 +1487,40 @@ mod tests {
                 .status()
                 .expect("restart controller pane with SIGINT ignored");
             assert!(status.success(), "tmux restarts the controller pane");
+            // `respawn-pane` returns before the shell installs its trap. Wait
+            // for the ignored-SIGINT mask so the bounded fallback test cannot
+            // race the interrupt against shell startup.
+            let output = Self::command(&self.socket)
+                .args(["list-panes", "-t", self.pane.as_str(), "-F", "#{pane_pid}"])
+                .output()
+                .expect("read respawned controller pane pid");
+            assert!(output.status.success(), "respawned pane is inspectable");
+            let pid: u32 = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .parse()
+                .expect("respawned pane has a numeric pid");
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
+                    if let Some(mask) = contents.lines().find_map(|line| {
+                        line.strip_prefix("SigIgn:").and_then(|value| {
+                            u64::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok()
+                        })
+                    }) {
+                        if mask & 0x2 != 0 {
+                            return;
+                        }
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "controller pane {pid} did not install its SIGINT trap"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
@@ -1372,6 +1866,325 @@ mod tests {
         assert_eq!(first, second);
     }
 
+    /// Persist the same startup fence that `init` writes before the pending
+    /// target. Tests must produce the production ordering, otherwise the
+    /// fail-closed fence validation is what they are exercising.
+    fn write_startup_fence(project_dir: &Path, pending: &ControllerPaneOwnership) {
+        let path = controller_startup_intent_path(project_dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let target = ControllerPaneTarget {
+            schema_version: pending.schema_version,
+            controller_epoch: pending.controller_epoch.clone(),
+            tmux_session: pending.tmux_session.clone(),
+            window_id: pending.window_id.clone(),
+            pane_id: pending.pane_id.clone(),
+            pane_pid: pending.pane_pid,
+            pane_start_ticks: pending.pane_start_ticks,
+            tmux_server_pid: pending.tmux_server_pid,
+            tmux_server_start_ticks: pending.tmux_server_start_ticks,
+        };
+        let intent = serde_json::json!({
+            "schema_version": 1,
+            "controller_epoch": pending.controller_epoch,
+            "previous_controller_epoch": serde_json::Value::Null,
+            "tmux_session": pending.tmux_session,
+            "tmux_server_pid": pending.tmux_server_pid,
+            "tmux_server_start_ticks": pending.tmux_server_start_ticks,
+            "continue_mode": true,
+            "root_run_id": pending.run_id,
+            "target": target,
+            "phase": "target_created",
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&intent).unwrap()).unwrap();
+    }
+
+    async fn seed_pending_startup_target(
+        project_dir: &Path,
+        committed: &ControllerPaneOwnership,
+        epoch: &str,
+        run_id: &str,
+    ) -> ControllerPaneOwnership {
+        tokio::fs::write(
+            project_dir.join(".exo/tl-loop/root.controller-epoch"),
+            format!("{epoch}\n"),
+        )
+        .await
+        .unwrap();
+        let mut pending = committed.clone();
+        pending.controller_epoch = epoch.to_owned();
+        pending.run_id = run_id.to_owned();
+        write_startup_fence(project_dir, &pending);
+        persist_pending_controller_ownership(project_dir, &pending)
+            .await
+            .unwrap();
+        pending
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn workspace_shutdown_quiesces_a_valid_pending_startup_target() {
+        let project = tempfile::tempdir().unwrap();
+        let tmux = IsolatedTmux::new();
+        let worker_pane = tmux.add_worker_pane();
+        tmux.retain_exited_panes();
+        let committed = seed_root_target(project.path(), &tmux).await;
+        let root_route = RoutingInfo::window_pane(tmux.window.clone(), committed.pane_id.clone());
+        let _root_invocation = seed_running_invocation(
+            project.path(),
+            "root",
+            root_route.clone(),
+            identity("root", "main", "main", true, Some("root")),
+        )
+        .await;
+        let _child_invocation = seed_running_invocation(
+            project.path(),
+            "architecture",
+            root_route,
+            identity(
+                "architecture",
+                "main.architecture",
+                "main",
+                true,
+                Some("architecture"),
+            ),
+        )
+        .await;
+        let mut worker_route = RoutingInfo::window(tmux.window.clone());
+        worker_route.pane_id = Some(worker_pane.clone());
+        let _worker_invocation = seed_running_invocation(
+            project.path(),
+            "worker-codex",
+            worker_route,
+            identity("worker-codex", "main", "main", false, None),
+        )
+        .await;
+
+        // Init advanced the epoch and persisted the exact pending startup
+        // target before child repair. The committed target still names the
+        // previous epoch, so selecting it would be stale.
+        let pending =
+            seed_pending_startup_target(project.path(), &committed, "epoch-2", "run-1").await;
+        assert_ne!(pending.controller_epoch, committed.controller_epoch);
+
+        let service = service_for(project.path(), &tmux.session).await;
+        let result = service
+            .shutdown_workspace_control_plane()
+            .await
+            .expect("a valid pending startup target can be quiesced");
+        assert_eq!(result.status, "complete");
+        assert_eq!(result.controllers_interrupted, 2);
+        assert_eq!(result.worker_panes_preserved, 1);
+
+        let intent: WorkspaceShutdownIntent = serde_json::from_slice(
+            &tokio::fs::read(workspace_shutdown_path(project.path()))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(intent.target.controller_epoch, "epoch-2");
+        assert_eq!(intent.target.pane_id, pending.pane_id);
+        let tmux_ipc = crate::services::tmux_ipc::TmuxIpc::new(&tmux.session);
+        assert!(tmux_ipc
+            .pane_snapshot(&tmux.session, &pending.window_id, &pending.pane_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(tmux_ipc.pane_exists(&worker_pane).await.unwrap());
+        for agent in ["root", "architecture"] {
+            let current =
+                invocation::read_invocation(&project.path().join(".exo/agents").join(agent))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(current.status, InvocationStatus::Killed);
+            assert_eq!(
+                current.exit_classification.as_deref(),
+                Some("workspace_control_plane_shutdown")
+            );
+        }
+        assert_eq!(
+            service
+                .shutdown_workspace_control_plane()
+                .await
+                .unwrap()
+                .status,
+            "already_complete"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn workspace_shutdown_does_not_prefer_a_pending_target_from_another_scope() {
+        let project = tempfile::tempdir().unwrap();
+        let tmux = IsolatedTmux::new();
+        let worker_pane = tmux.add_worker_pane();
+        let committed = seed_root_target(project.path(), &tmux).await;
+        let root_route = RoutingInfo::window_pane(tmux.window.clone(), committed.pane_id.clone());
+        let _root_invocation = seed_running_invocation(
+            project.path(),
+            "root",
+            root_route,
+            identity("root", "main", "main", true, Some("root")),
+        )
+        .await;
+        // The pending record is live and epoch-current but belongs to another
+        // root run, so it cannot authorize stopping this controller.
+        seed_pending_startup_target(project.path(), &committed, "epoch-2", "foreign-run").await;
+
+        let service = service_for(project.path(), &tmux.session).await;
+        let error = service
+            .shutdown_workspace_control_plane()
+            .await
+            .expect_err("a foreign pending target is not a shutdown owner");
+        assert!(
+            format!("{error:#}").contains("root controller epoch changed"),
+            "unexpected diagnostic: {error:#}"
+        );
+        let tmux_ipc = crate::services::tmux_ipc::TmuxIpc::new(&tmux.session);
+        assert!(tmux_ipc
+            .pane_snapshot(&tmux.session, &committed.window_id, &committed.pane_id)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(tmux_ipc.pane_exists(&worker_pane).await.unwrap());
+        assert!(
+            !tokio::fs::try_exists(workspace_shutdown_path(project.path()))
+                .await
+                .unwrap(),
+            "a refused selection persists no shutdown intent"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn interrupted_shutdown_intent_retargets_to_the_pending_startup() {
+        let project = tempfile::tempdir().unwrap();
+        let tmux = IsolatedTmux::new();
+        let _worker_pane = tmux.add_worker_pane();
+        tmux.retain_exited_panes();
+        let committed = seed_root_target(project.path(), &tmux).await;
+        let root_route = RoutingInfo::window_pane(tmux.window.clone(), committed.pane_id.clone());
+        let _root_invocation = seed_running_invocation(
+            project.path(),
+            "root",
+            root_route,
+            identity("root", "main", "main", true, Some("root")),
+        )
+        .await;
+        let mut intent = WorkspaceShutdownIntent {
+            schema_version: 1,
+            operation_id: "interrupted-operation".to_owned(),
+            phase: WorkspaceShutdownPhase::Requested,
+            requested_at: unix_timestamp(),
+            completed_at: None,
+            target: committed.clone(),
+            controllers: Vec::new(),
+            preserved_worker_panes: 0,
+            blocker: None,
+        };
+        persist_intent(&workspace_shutdown_path(project.path()), &mut intent, None)
+            .await
+            .unwrap();
+        let pending =
+            seed_pending_startup_target(project.path(), &committed, "epoch-2", "run-1").await;
+        let service = service_for(project.path(), &tmux.session).await;
+        let result = service
+            .shutdown_workspace_control_plane()
+            .await
+            .expect("an unfinished shutdown retargets to the exact pending startup");
+        assert_eq!(result.status, "complete");
+        let final_intent: WorkspaceShutdownIntent = serde_json::from_slice(
+            &tokio::fs::read(workspace_shutdown_path(project.path()))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(final_intent.operation_id, "interrupted-operation");
+        assert_eq!(final_intent.target.controller_epoch, "epoch-2");
+        assert_eq!(final_intent.target.pane_id, pending.pane_id);
+        let tmux_ipc = crate::services::tmux_ipc::TmuxIpc::new(&tmux.session);
+        assert!(tmux_ipc
+            .pane_snapshot(&tmux.session, &pending.window_id, &pending.pane_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pending_startup_target_without_a_startup_fence_fails_closed() {
+        let project = tempfile::tempdir().unwrap();
+        let tmux = IsolatedTmux::new();
+        let committed = seed_root_target(project.path(), &tmux).await;
+        let routing = RoutingInfo::window_pane(tmux.window.clone(), committed.pane_id.clone());
+        let _root_invocation = seed_running_invocation(
+            project.path(),
+            "root",
+            routing.clone(),
+            identity("root", "main", "main", true, Some("root")),
+        )
+        .await;
+
+        // Simulate a partial/tampered handoff: the pending target exists, but
+        // the startup fence that init always writes first does not.
+        tokio::fs::write(
+            project.path().join(".exo/tl-loop/root.controller-epoch"),
+            "epoch-2\n",
+        )
+        .await
+        .unwrap();
+        let mut pending = committed.clone();
+        pending.controller_epoch = "epoch-2".to_owned();
+        persist_pending_controller_ownership(project.path(), &pending)
+            .await
+            .unwrap();
+        assert!(!controller_startup_intent_path(project.path()).exists());
+
+        let tmux_ipc = crate::services::tmux_ipc::TmuxIpc::new(&tmux.session);
+        assert!(
+            pending_startup_target_if_current(project.path(), &tmux_ipc)
+                .await
+                .unwrap()
+                .is_none(),
+            "a pending target without its startup fence is not current"
+        );
+        assert!(
+            matches!(
+                reconcile_controller_binding(
+                    project.path(),
+                    &tmux_ipc,
+                    &routing,
+                    Some(&committed.controller_epoch),
+                )
+                .await
+                .unwrap(),
+                ControllerBindingReconciliation::Unverified { .. }
+            ),
+            "missing fence evidence must fail closed"
+        );
+
+        let service = service_for(project.path(), &tmux.session).await;
+        let error = service
+            .shutdown_workspace_control_plane()
+            .await
+            .expect_err("shutdown falls back to the stale committed target");
+        assert!(
+            format!("{error:#}").contains("root controller epoch changed"),
+            "unexpected diagnostic: {error:#}"
+        );
+        assert!(
+            !tokio::fs::try_exists(workspace_shutdown_path(project.path()))
+                .await
+                .unwrap(),
+            "a refused selection persists no shutdown intent"
+        );
+        assert!(tmux_ipc
+            .pane_snapshot(&tmux.session, &committed.window_id, &committed.pane_id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn changed_root_target_fails_closed_and_keeps_workers_untouched() {
@@ -1402,7 +2215,15 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(intent.phase, WorkspaceShutdownPhase::Requested);
+        assert_eq!(intent.phase, WorkspaceShutdownPhase::Blocked);
+        assert!(
+            intent
+                .blocker
+                .as_deref()
+                .is_some_and(|blocker| blocker.contains("pane PID changed")),
+            "unexpected shutdown blocker: {:?}",
+            intent.blocker
+        );
     }
 
     #[tokio::test]

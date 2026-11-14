@@ -407,8 +407,16 @@ pub async fn process_start_ticks(pid: u32) -> Result<u64> {
 fn tmux_command() -> Command {
     let mut command = Command::new("tmux");
     if let Ok(socket) = env::var("EXOMONAD_TMUX_SOCKET") {
-        if !socket.trim().is_empty() {
-            command.args(["-L", &socket]);
+        let socket = socket.trim();
+        if !socket.is_empty() {
+            // A bare name keeps the historical `-L` behaviour. An absolute
+            // path names its own socket file so tests can isolate the whole
+            // server inside a disposable directory.
+            if socket.contains(std::path::MAIN_SEPARATOR) {
+                command.args(["-S", socket]);
+            } else {
+                command.args(["-L", socket]);
+            }
         }
     }
     command
