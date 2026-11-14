@@ -2,9 +2,27 @@
 set -euo pipefail
 
 if [[ "${1:-}" == "models" && "${2:-}" == "--verbose" ]]; then
+    # Match the catalog format the production parser accepts: a model label
+    # followed by one pretty-printed JSON record. The record id omits the
+    # provider; providerID supplies the qualified catalog key.
     cat <<'JSON'
-{"id":"opencode-go/deepseek-v4.1-flash","providerID":"opencode-go","variants":{"high":{},"xhigh":{}}}
-{"id":"opencode-go/deepseek-v4.1-pro","providerID":"opencode-go","variants":{"high":{}}}
+opencode-go/deepseek-v4.1-flash
+{
+  "id": "deepseek-v4.1-flash",
+  "providerID": "opencode-go",
+  "variants": {
+    "high": {},
+    "xhigh": {}
+  }
+}
+opencode-go/deepseek-v4.1-pro
+{
+  "id": "deepseek-v4.1-pro",
+  "providerID": "opencode-go",
+  "variants": {
+    "high": {}
+  }
+}
 JSON
     exit 0
 fi

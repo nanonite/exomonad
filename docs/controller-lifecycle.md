@@ -16,10 +16,25 @@ ExoMonad has two shutdown scopes:
 
 The workspace shutdown intent remains present after the server exits. It is a
 recoverable transaction marker, not permission to clear RunStore state. The
-startup handoff work in #1290 will reconcile the stopped controller bindings
-before clearing this marker and accepting new dispatch. If shutdown reports a
-conflict or timeout, preserve the marker and use `exomonad init --continue` to
-run supported recovery after resolving the reported target evidence.
+startup handoff reconciles the stopped controller bindings before clearing this
+marker and accepting new dispatch. A completed intent is durable proof even
+while it is still active; the next successful controller startup archives it.
+If shutdown reports a conflict or timeout, preserve the marker and use
+`exomonad init --continue` to run supported recovery after resolving the
+reported target evidence.
+
+Continuation after a workspace shutdown reopens an ordered child dispatch whose
+controller stopped through that exact shutdown and re-provisions it through the
+supported ordered sub-TL endpoint. The successor records a new dispatch
+generation but keeps the stopped invocation as its predecessor binding, so the
+dead controller is never treated as live. When the stopped controller had
+already received a spawn receipt but had not checkpointed the host launch row,
+the restarted controller adopts that exact owner once, records the host launch
+row, and proceeds with the pending recovery. Replaying the blocked owner's
+terminal notification repeats the already-recorded human gate instead of
+failing the child, and no worker is relaunched or dispatch state reset. The
+`agent.spawned` row is the only launch proof; `agent.resumed` stays the
+human-facing resume audit and is never treated as confirmation.
 
 The implementation does not remove worktrees, branches, receipts, journals,
 publication evidence, or gates. A server-only restart does not terminate agent

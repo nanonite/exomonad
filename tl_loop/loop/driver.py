@@ -5583,6 +5583,42 @@ def _resolve_initial_spawn_identity(
     return expected_invocation_id, None
 
 
+def _host_launch_intent_id(
+    config: TLLoopConfig,
+    store: RunStore,
+    invocation_id: str,
+) -> str | None:
+    """Return the intent the host recorded on the launch row for one invocation.
+
+    This is the independent, per-invocation record a controller restart uses to
+    confirm a resumed dispatch. It is deliberately not derived from the
+    controller's own route receipt or action arguments.
+    """
+    if config.project_root is None or config.ledger_run_id is None:
+        return None
+    try:
+        reader = LedgerReader(
+            Path(config.project_root) / ".exo" / "ledger" / "segments",
+            run_dir=store.run_dir,
+            ledger_run_id=config.ledger_run_id,
+        )
+        rows = reader.read_from(cursor=0)
+    except (LedgerReadError, EnvelopeError, OSError, ValueError):
+        return None
+    if any(finding.kind is FindingKind.RUN_ID_MISMATCH for finding in rows.findings):
+        return None
+    intents = [
+        cast(str, event.data["intent_id"])
+        for event in rows.events
+        if event.event_type == "agent.spawned"
+        and event.data.get("invocation_id") == invocation_id
+        and isinstance(event.data.get("intent_id"), str)
+    ]
+    if len(intents) != 1:
+        return None
+    return intents[0]
+
+
 def _terminal_resume_history_proof(
     entries: Sequence[Mapping[str, object]],
     current: SliceState,
@@ -5823,14 +5859,36 @@ def _terminal_resume_history_proof(
                     model = next_arguments.get("prior_model")
                 if effort is None:
                     effort = next_arguments.get("prior_effort")
+        # The host response is the durable record of the launched owner. When a
+        # response-loss adoption omits the owner scope/intent fields, fall back
+        # to the host's own registry records: identity.json for scope/branch and
+        # the agent.spawned launch row for intent. Never rebuild them from the
+        # controller's route receipt or action arguments, which would let a
+        # route agree with itself. Only the response key alias for the owner id
+        # is accepted.
+        durable_scope = identity.get("slice_id") or identity.get("slug")
+        durable_branch = identity.get("birth_branch")
+        response_scope = agent.get("issue")
+        response_intent = agent.get("intent_id")
+        response_branch = agent.get("branch_name")
+        host_intent = (
+            _host_launch_intent_id(config, store, successor_id)
+            if isinstance(successor_id, str)
+            else None
+        )
+        evidence_intent = response_intent if response_intent is not None else host_intent
+        agent_owner_id = agent.get("id") or agent.get("agent_id")
         if (
             not isinstance(successor_id, str)
             or invocation.get("trigger") != "resume_blocked"
             or not isinstance(runtime, str)
-            or agent.get("id") != owner.agent_name
-            or agent.get("issue") != leaf.name
-            or agent.get("intent_id") != arguments.get("dispatch_intent_id")
-            or agent.get("branch_name") != owner.branch
+            or agent_owner_id != owner.agent_name
+            or durable_scope != leaf.name
+            or durable_branch != owner.branch
+            or (response_scope is not None and response_scope != durable_scope)
+            or (response_intent is not None and host_intent is not None and response_intent != host_intent)
+            or evidence_intent != arguments.get("dispatch_intent_id")
+            or (response_branch is not None and response_branch != durable_branch)
             or Path(str(agent.get("worktree_path", ""))).resolve() != owner.worktree
             or (model is not None and not isinstance(model, str))
             or (effort is not None and not isinstance(effort, str))
@@ -5897,7 +5955,7 @@ def _terminal_resume_history_proof(
                 result_invocation.get("effort") is not None
                 and result_invocation.get("effort") != invocation.get("effort")
             )
-            or result_agent.get("id") != owner.agent_name
+            or (result_agent.get("id") or result_agent.get("agent_id")) != owner.agent_name
             or result_agent.get("branch_name") != owner.branch
             or Path(str(result_agent.get("worktree_path", ""))).resolve() != owner.worktree
         ):
@@ -6979,11 +7037,15 @@ def _terminal_owner_ledger_proof(
     if len(spawn_rows) != 1:
         return None, "accepted spawn event is missing or ambiguous at its checkpoint sequence"
     spawn = spawn_rows[0]
+    recorded_intent_id = spawn.data.get("intent_id")
     if (
         spawn.run_id != config.ledger_run_id
         or spawn.agent_id != state.run_id
         or spawn.invocation_id != current.dispatch_invocation_id
-        or spawn.data.get("intent_id") != current.dispatch_intent_id
+        or (
+            recorded_intent_id is not None
+            and recorded_intent_id != current.dispatch_intent_id
+        )
         or spawn.data.get("invocation_id") != current.dispatch_invocation_id
         or spawn.data.get("child_agent") != current.dispatch_agent_id
         or spawn.data.get("branch") != current.branch
@@ -15986,6 +16048,71 @@ def _controller_event_was_committed(
         return False
 
 
+def _accepted_dispatch_launch_event(
+    current: SliceState,
+    state: RunState,
+    config: TLLoopConfig,
+    store: RunStore,
+) -> EventEnvelope | None:
+    """Find the exact host launch row for one accepted dispatch intent.
+
+    A controller restart reconciles an accepted dispatch from the host's
+    durable ``agent.spawned`` launch row before it can prove a terminal owner.
+    ``agent.resumed`` is only the human-facing resume audit row and is never
+    treated as launch proof; only an exact invocation/agent/branch match is
+    accepted.
+    """
+    if config.project_root is None or config.ledger_run_id is None:
+        return None
+    if (
+        current.dispatch_invocation_id is None
+        or current.dispatch_agent_id is None
+        or current.dispatch_intent_id is None
+        or current.branch is None
+    ):
+        return None
+    try:
+        reader = LedgerReader(
+            Path(config.project_root) / ".exo" / "ledger" / "segments",
+            run_dir=store.run_dir,
+            ledger_run_id=config.ledger_run_id,
+        )
+        rows = reader.read_from(cursor=current.dispatch_ledger_floor)
+    except (LedgerReadError, EnvelopeError, OSError, ValueError):
+        return None
+    if any(finding.kind is FindingKind.RUN_ID_MISMATCH for finding in rows.findings):
+        return None
+
+    def matches(event: EventEnvelope) -> bool:
+        if event.run_seq is None or event.run_seq > state.events.last_consumed_offset:
+            return False
+        if event.run_id != config.ledger_run_id or event.agent_id != state.run_id:
+            return False
+        invocation_id = event.data.get("invocation_id")
+        if invocation_id != current.dispatch_invocation_id:
+            return False
+        if (
+            event.invocation_id is not None
+            and event.invocation_id != current.dispatch_invocation_id
+        ):
+            return False
+        if event.data.get("child_agent") != current.dispatch_agent_id:
+            return False
+        if event.data.get("branch") != current.branch:
+            return False
+        intent_id = event.data.get("intent_id")
+        return intent_id is None or intent_id == current.dispatch_intent_id
+
+    spawned = [
+        event
+        for event in rows.events
+        if event.event_type == "agent.spawned" and matches(event)
+    ]
+    if len(spawned) != 1:
+        return None
+    return spawned[0]
+
+
 def _reconcile_dispatches(
     state: RunState,
     config: TLLoopConfig,
@@ -16051,14 +16178,23 @@ def _reconcile_dispatches(
                 effects,
                 effects_log,
             )
-            authoritative_seq = _controller_event_run_seq(confirmation)
+            launch_event = _accepted_dispatch_launch_event(current, state, config, store)
+            authoritative_seq = (
+                launch_event.run_seq
+                if launch_event is not None
+                else _controller_event_run_seq(confirmation)
+            )
             if authoritative_seq is not None:
                 adopted_slices = {
                     **state.slices,
                     current.id: replace(
                         slice_transition(current, SliceStatusChanged(SliceStatus.SPAWNED)),
                         park_cause=None,
-                        dispatch_last_boundary="owner_adopted",
+                        dispatch_last_boundary=(
+                            DISPATCH_CONFIRMED_BOUNDARY
+                            if launch_event is not None
+                            else "owner_adopted"
+                        ),
                         dispatch_error=None,
                         dispatch_agent_id=owner_id,
                         dispatch_authoritative_event_seq=authoritative_seq,
@@ -19847,10 +19983,18 @@ def _workspace_shutdown_recorded(
     invocation_id: str,
     generation: int,
 ) -> bool:
-    """Whether a completed workspace shutdown names this exact controller."""
-    archive = project_root / ".exo" / "controller-lifecycle" / "archive"
+    """Whether a completed workspace shutdown names this exact controller.
+
+    A completed intent is archived once a later startup owns the workspace, so
+    the archive normally carries the proof. A controller that was stopped after
+    the last successful startup leaves the same completed intent active until
+    that startup happens; the active record is equally durable and is accepted
+    only when it carries this exact agent, invocation and generation.
+    """
+    lifecycle = project_root / ".exo" / "controller-lifecycle"
+    archive = lifecycle / "archive"
     try:
-        records = tuple(archive.glob("*.json"))
+        records = (*archive.glob("*.json"), lifecycle / "workspace-shutdown.json")
     except OSError:
         return False
     for path in records:
@@ -19878,6 +20022,8 @@ def _child_controller_shutdown_matches(
     current: SliceState | None,
     task: SubTLTask,
     config: TLLoopConfig,
+    *,
+    require_dispatch_generation: bool = True,
 ) -> bool:
     """Whether this exact accepted dispatch points at a workspace-shutdown stop."""
     if config.project_root is None or current is None:
@@ -19931,7 +20077,7 @@ def _child_controller_shutdown_matches(
         shutdown_outcome
         and invocation.get("invocation_id") == current.dispatch_invocation_id
         and invocation.get("runtime_agent_id") == agent_id
-        and generation == current.dispatch_generation
+        and (not require_dispatch_generation or generation == current.dispatch_generation)
         and invocation.get("slice_id") == task.name
         and invocation.get("status") in {"exited", "failed", "killed"}
         and (current.branch is None or invocation.get("branch") == current.branch)
@@ -19940,6 +20086,29 @@ def _child_controller_shutdown_matches(
             or Path(str(invocation.get("worktree", ""))).resolve()
             == Path(current.worktree).resolve()
         )
+    )
+
+
+def _child_controller_reopened_after_shutdown(
+    current: SliceState | None,
+    task: SubTLTask,
+    config: TLLoopConfig,
+) -> bool:
+    """Whether this accepted dispatch replaced a workspace-shutdown controller.
+
+    ``_prepare_sub_tl_stage`` mints a fresh dispatch generation when a shutdown
+    dispatch is reopened, but it deliberately keeps the dead controller's
+    invocation id as the predecessor binding. The generation check therefore
+    cannot apply; the exact invocation id, agent, slice, branch, worktree and
+    completed-shutdown record still must.
+    """
+    if current is None or current.dispatch_generation is None:
+        return False
+    return _child_controller_shutdown_matches(
+        current,
+        task,
+        config,
+        require_dispatch_generation=False,
     )
 
 
@@ -20734,9 +20903,10 @@ def _run_sub_tl_batch(
         if child_store.path.exists():
             child_state = child_store.load()
             child_phase = _child_completion_phase(child_state)
+            current_binding = store.load().slices.get(task.name)
             controller_shutdown = _child_controller_shutdown_matches(
-                store.load().slices.get(task.name), task, config
-            )
+                current_binding, task, config
+            ) or _child_controller_reopened_after_shutdown(current_binding, task, config)
             retrying_terminal_owner = _terminal_owner_recovery_candidate(task.plan, child_state)
             blocked_leaf_resume_proof = (
                 _approved_blocked_leaf_child_retry_proof(task, child_state, config, store)
@@ -20830,9 +21000,10 @@ def _run_live_sub_tl_batch(
         if child_store.path.exists():
             child_state = child_store.load()
             child_phase = _child_completion_phase(child_state)
+            current_binding = store.load().slices.get(task.name)
             controller_shutdown = _child_controller_shutdown_matches(
-                store.load().slices.get(task.name), task, config
-            )
+                current_binding, task, config
+            ) or _child_controller_reopened_after_shutdown(current_binding, task, config)
             retrying_terminal_owner = _terminal_owner_recovery_candidate(task.plan, child_state)
             if retrying_terminal_owner:
                 terminal_owner_recovery_tasks.add(task.name)
@@ -21070,6 +21241,33 @@ class _SupervisedProcess(Protocol):
     def join(self, timeout: float | None = None) -> None: ...
 
 
+def _pending_dispatch_confirmation(
+    child_state: RunState | None,
+    task: SubTLTask | None,
+) -> bool:
+    """Keep a restarted child controller alive for its accepted launch row.
+
+    Only ``spawn_request_accepted`` is a pending confirmation: the host
+    returned a spawn receipt, so the controller may adopt that exact owner.
+    Ambiguous or not-executed boundaries prove nothing and stay bounded.
+    """
+    if child_state is None or task is None:
+        return False
+    plan = _accepted_work_plan(task.plan)
+    for leaf in plan.leaves:
+        current = child_state.slices.get(leaf.name)
+        if (
+            current is not None
+            and current.status is SliceStatus.DISPATCH_UNCONFIRMED
+            and current.dispatch_last_boundary == "spawn_request_accepted"
+            and current.dispatch_intent_id
+            and current.dispatch_agent_id
+            and current.dispatch_invocation_id
+        ):
+            return True
+    return False
+
+
 def _supervise_live_sub_tl(
     process: _SupervisedProcess,
     child_store: RunStore,
@@ -21103,6 +21301,7 @@ def _supervise_live_sub_tl(
             _child_recovery_projection(child_state, getattr(child_store, "run_id", "")) is not None
             and not _blocked_leaf_resume_is_pending(child_state, task, blocked_leaf_resume_proof)
             and not _terminal_owner_recovery_is_pending(child_state, task, terminal_owner_recovery)
+            and not _pending_dispatch_confirmation(child_state, task)
         ):
             return child_state
         process.join(timeout=poll_interval)
@@ -31407,6 +31606,29 @@ def _apply_child_completion(
 def _duplicate_event(
     phase: PhaseValue | RecursivePhaseValue, event: TLEvent, state: RunState
 ) -> bool:
+    if isinstance(event, ChildFailed):
+        current = state.slices.get(event.slug)
+        recovery = current.recovery if current is not None else None
+        recorded_invocation = (
+            recovery.evidence.get("invocation_id") if recovery is not None else None
+        )
+        if (
+            current is not None
+            and recovery is not None
+            and recovery.phase is RecoveryPhase.HUMAN_GATE
+            and recovery.cause == "human_decision_required"
+            and current.dispatch_invocation_id is not None
+            and recorded_invocation == current.dispatch_invocation_id
+            and recovery.slice_attempt == current.attempts
+        ):
+            # A blocked owner emits both ``agent.task_blocked`` and a terminal
+            # ``agent.notify_parent`` row for the same lifecycle. An approved
+            # recovery resumes that owner only after this blocked decision is
+            # already durable, so the replay of its terminal row is a repeat of
+            # the recorded gate, not a new failure. The recorded gate must still
+            # name this exact invocation and attempt: a failure from any other
+            # invocation or cause is a real event.
+            return True
     if isinstance(
         phase,
         (

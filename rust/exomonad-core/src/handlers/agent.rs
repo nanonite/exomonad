@@ -4277,6 +4277,16 @@ impl<
             "started",
         );
         if let Some(log) = self.ctx.event_log() {
+            record_blocked_resume_launch(
+                log,
+                ctx.agent_name.as_ref(),
+                owner,
+                &fresh_invocation,
+                &intent_id,
+                req.expected_branch.as_str(),
+            )?;
+        }
+        if let Some(log) = self.ctx.event_log() {
             let _ = log.append(
                 "agent.resumed",
                 ctx.agent_name.as_ref(),
@@ -4417,6 +4427,16 @@ impl<
             true,
             "adopted_after_response_loss",
         );
+        if let Some(log) = self.ctx.event_log() {
+            record_blocked_resume_launch(
+                log,
+                ctx.agent_name.as_ref(),
+                owner,
+                invocation,
+                intent_id,
+                req.expected_branch.as_str(),
+            )?;
+        }
         Ok(SpawnLeafSubtreeResponse {
             agent: Some(agent_info),
             invocation: Some(invocation_handoff),
@@ -4546,6 +4566,96 @@ fn validate_resume_request(req: &SpawnLeafSubtreeRequest) -> EffectResult<()> {
             "task is required for a PR resume",
         ));
     }
+    Ok(())
+}
+
+fn blocked_resume_launch_payload(
+    owner: &AgentIdentityRecord,
+    invocation: &InvocationRecord,
+    intent_id: &str,
+    branch: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "child_agent": owner.agent_name,
+        "agent_type": invocation.runtime.suffix(),
+        "spawn_type": "resume_blocked",
+        "branch": branch,
+        "model": invocation.model,
+        "effort": invocation.effort,
+        "topology": "worktree_per_agent",
+        "intent_id": intent_id,
+        "invocation_id": invocation.invocation_id,
+    })
+}
+
+/// Record the authoritative launch row a blocked-leaf resume owes its controller.
+///
+/// The dispatch lifecycle confirms an accepted spawn from this exact row. A
+/// resumed worker is a fresh invocation on the same owner, so it needs the same
+/// ``agent.spawned`` confirmation as a first launch; ``agent.resumed`` remains
+/// the human-facing resume audit. Repeated adoption of an already-recorded
+/// successor must not append a second row.
+///
+/// A ledger that cannot be read cannot prove the row is absent, and a failed
+/// append leaves the controller without its confirmation, so both fail the
+/// resume instead of silently continuing.
+fn record_blocked_resume_launch(
+    log: &crate::services::EventLog,
+    caller: &str,
+    owner: &AgentIdentityRecord,
+    invocation: &InvocationRecord,
+    intent_id: &str,
+    branch: &str,
+) -> EffectResult<()> {
+    let records = log.ledger().read_events().map_err(|error| {
+        error!(
+            child = %owner.agent_name,
+            intent_id,
+            invocation_id = %invocation.invocation_id,
+            %error,
+            "blocked-resume launch ledger read failed; refusing to append another launch row"
+        );
+        EffectError::custom(
+            "event_log_error",
+            format!("blocked-resume launch ledger is unreadable: {error}"),
+        )
+    })?;
+    let already_recorded = records.iter().any(|record| {
+        record.event.event_type == "agent.spawned"
+            && record
+                .event
+                .data
+                .get("invocation_id")
+                .and_then(|value| value.as_str())
+                == Some(invocation.invocation_id.as_str())
+            && record
+                .event
+                .data
+                .get("intent_id")
+                .and_then(|value| value.as_str())
+                == Some(intent_id)
+    });
+    if already_recorded {
+        return Ok(());
+    }
+    log.append(
+        "agent.spawned",
+        caller,
+        &blocked_resume_launch_payload(owner, invocation, intent_id, branch),
+    )
+    .map_err(|error| {
+        error!(
+            child = %owner.agent_name,
+            intent_id,
+            invocation_id = %invocation.invocation_id,
+            %error,
+            "blocked-resume launch confirmation could not be recorded"
+        );
+        EffectError::custom(
+            "event_log_error",
+            format!("blocked-resume launch confirmation could not be recorded: {error}"),
+        )
+    })?;
     Ok(())
 }
 
@@ -7985,6 +8095,195 @@ mod tests {
             human_approved: true,
             ..Default::default()
         }
+    }
+
+    fn blocked_resume_launch_fixture() -> (AgentIdentityRecord, InvocationRecord) {
+        let owner = AgentIdentityRecord {
+            agent_name: AgentName::try_from_str("issue-814-opencode").unwrap(),
+            slug: Slug::try_from_str("issue-814").unwrap(),
+            agent_type: ServiceAgentType::Codex,
+            birth_branch: BirthBranch::try_from_str("main.kani.issue-814-opencode").unwrap(),
+            parent_branch: BirthBranch::try_from_str("main.kani").unwrap(),
+            working_dir: PathBuf::from(".exo/worktrees/issue-814-opencode"),
+            display_name: "🤖 issue-814".to_string(),
+            topology: Topology::WorktreePerAgent,
+            model: Some("gpt-6-luna".to_string()),
+            effort: Some("xhigh".to_string()),
+            role_route: None,
+            ledger_owned: true,
+            slice_id: Some("issue-814-substitution-model-kani".to_string()),
+        };
+        let invocation = InvocationRecord {
+            invocation_id: "resumed-invocation".to_string(),
+            runtime: ServiceAgentType::Codex,
+            trigger: InvocationTrigger::ResumeBlocked,
+            mode: crate::services::agent_control::InvocationMode::OneShot,
+            routing: crate::domain::RoutingInfo {
+                window_id: None,
+                pane_id: None,
+                parent_tab: None,
+                owner_agent_id: None,
+                owner_invocation_id: None,
+                owner_generation: None,
+            },
+            started_at: 10,
+            ended_at: None,
+            status: InvocationStatus::Running,
+            exit_code: None,
+            pr_number: None,
+            head_sha: None,
+            model: Some("gpt-6-luna".to_string()),
+            effort: Some("xhigh".to_string()),
+            prior_invocation_id: Some("prior-invocation".to_string()),
+            recovery_round: 1,
+            authorization_source: Some(
+                crate::services::agent_control::RecoveryAuthorization::HumanApproved,
+            ),
+            generation: 3,
+            controller_epoch: None,
+            runtime_agent_id: Some("issue-814-opencode".to_string()),
+            slice_id: Some("issue-814-substitution-model-kani".to_string()),
+            branch: Some("main.kani.issue-814-opencode".to_string()),
+            worktree: Some(".exo/worktrees/issue-814-opencode".to_string()),
+            exit_reason: None,
+            exit_classification: None,
+            stderr_tail: None,
+            role_route: None,
+        };
+        (owner, invocation)
+    }
+
+    #[test]
+    fn blocked_resume_records_one_authoritative_spawn_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = crate::services::EventLog::open(temp.path().join(".exo/logs")).unwrap();
+        let (owner, invocation) = blocked_resume_launch_fixture();
+        record_blocked_resume_launch(
+            &log,
+            "kani",
+            &owner,
+            &invocation,
+            "blocked-resume:intent",
+            "main.kani.issue-814-opencode",
+        )
+        .unwrap();
+        record_blocked_resume_launch(
+            &log,
+            "kani",
+            &owner,
+            &invocation,
+            "blocked-resume:intent",
+            "main.kani.issue-814-opencode",
+        )
+        .unwrap();
+
+        let rows = log.ledger().read_events().unwrap();
+        let launches = rows
+            .iter()
+            .filter(|record| {
+                record.event.event_type == "agent.spawned"
+                    && record
+                        .event
+                        .data
+                        .get("invocation_id")
+                        .and_then(|value| value.as_str())
+                        == Some("resumed-invocation")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(launches.len(), 1, "adoption must not repeat the launch row");
+        let launch = &launches[0].event;
+        assert_eq!(launch.agent_id.as_deref(), Some("kani"));
+        assert_eq!(launch.invocation_id.as_deref(), Some("resumed-invocation"));
+        assert_eq!(
+            launch
+                .data
+                .get("intent_id")
+                .and_then(|value| value.as_str()),
+            Some("blocked-resume:intent")
+        );
+        assert_eq!(
+            launch
+                .data
+                .get("child_agent")
+                .and_then(|value| value.as_str()),
+            Some("issue-814-opencode")
+        );
+        assert_eq!(
+            launch.data.get("branch").and_then(|value| value.as_str()),
+            Some("main.kani.issue-814-opencode")
+        );
+        assert_eq!(
+            launch
+                .data
+                .get("agent_type")
+                .and_then(|value| value.as_str()),
+            Some("codex")
+        );
+        assert_eq!(
+            launch.data.get("model").and_then(|value| value.as_str()),
+            Some("gpt-6-luna")
+        );
+        assert_eq!(
+            launch.data.get("effort").and_then(|value| value.as_str()),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn blocked_resume_refuses_to_append_when_the_ledger_is_unreadable() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = crate::services::EventLog::open(temp.path().join(".exo/logs")).unwrap();
+        let (owner, invocation) = blocked_resume_launch_fixture();
+        let segment = log
+            .ledger()
+            .segments_dir()
+            .join("segment-000000000000.jsonl");
+        std::fs::write(&segment, b"{not valid json\n").unwrap();
+
+        let error = record_blocked_resume_launch(
+            &log,
+            "kani",
+            &owner,
+            &invocation,
+            "blocked-resume:intent",
+            "main.kani.issue-814-opencode",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("ledger is unreadable"));
+        assert_eq!(
+            std::fs::read(&segment).unwrap(),
+            b"{not valid json\n",
+            "an unreadable ledger must not gain a second launch row"
+        );
+    }
+
+    #[test]
+    fn blocked_resume_reports_a_failed_launch_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = crate::services::EventLog::open(temp.path().join(".exo/logs")).unwrap();
+        let (owner, invocation) = blocked_resume_launch_fixture();
+        std::fs::create_dir(log.ledger().segments_dir().join(".append.lock")).unwrap();
+
+        let error = record_blocked_resume_launch(
+            &log,
+            "kani",
+            &owner,
+            &invocation,
+            "blocked-resume:intent",
+            "main.kani.issue-814-opencode",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("launch confirmation could not be recorded"));
+        let appended = std::fs::read_dir(log.ledger().segments_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+            .count();
+        assert_eq!(appended, 0, "a failed append must not report a launch row");
     }
 
     #[test]

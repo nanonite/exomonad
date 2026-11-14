@@ -1165,7 +1165,9 @@ cleanup() {
         env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$AGGREGATE_TMUX_TMPDIR" \
             tmux kill-session -t "$AGGREGATE_SESSION" 2>/dev/null
         case "$AGGREGATE_TMUX_TMPDIR" in
-            /tmp/exo1283-tmux.*) rm -rf -- "$AGGREGATE_TMUX_TMPDIR" ;;
+            /tmp/exo1283-tmux.*|"${E2E_TMUX_TMPDIR_ROOT:-${TMPDIR:-/tmp}}"/exo1283-tmux.*)
+                rm -rf -- "$AGGREGATE_TMUX_TMPDIR"
+                ;;
         esac
     fi
     if [[ -n "$INITIAL_TMUX" ]]; then
@@ -1534,7 +1536,7 @@ AGG_HOME="$AGG_DIR/home"
 mkdir -p "$AGG_DIR" "$AGG_HOME/.exo" "$(dirname "$AGG_REMOTE")" "$AGG_REPO"
 # The earlier phases use another repository's Git transport. A separate tmux
 # server keeps its inherited GIT_* environment out of the aggregate controller.
-AGGREGATE_TMUX_TMPDIR="$(mktemp -d /tmp/exo1283-tmux.XXXXXX)"
+AGGREGATE_TMUX_TMPDIR="$(mktemp -d "${E2E_TMUX_TMPDIR_ROOT:-${TMPDIR:-/tmp}}/exo1283-tmux.XXXXXX")"
 unset TMUX TMUX_PANE
 export TMUX_TMPDIR="$AGGREGATE_TMUX_TMPDIR"
 e2e_log "Phase 8 tmux server isolated to $TMUX_TMPDIR"

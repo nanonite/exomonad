@@ -28,7 +28,7 @@ from tl_loop.events.envelope import EventEnvelope, EventKind, project
 from tl_loop.events.queue import LedgerQueue, QueueError
 from tl_loop.events.reader import LedgerReader, LedgerSnapshot, SequenceStatus
 from tl_loop.fsm.child import ChildKind, ChildRecord
-from tl_loop.fsm.event import ChildCompleted, PRFiled, PRUpdated
+from tl_loop.fsm.event import ChildCompleted, ChildFailed, PRFiled, PRUpdated
 from tl_loop.fsm.lane import LanePhase, LaneReserved, LaneState
 from tl_loop.fsm.phase import ChildHandle, TLFailed, TLPhase, TLPlanning, TLWaiting
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
@@ -27076,6 +27076,1113 @@ def test_workspace_shutdown_reopens_exact_child_dispatch_for_reprovision(
     (owner_dir / "invocation.json").write_text(json.dumps(invocation), encoding="utf-8")
     unchanged = driver_module._reopen_shutdown_sub_tl_dispatches(plan, store.load(), config, store)
     assert unchanged.slices["child-controller"].status is SliceStatus.SPAWNED
+
+
+def test_workspace_shutdown_recorded_accepts_completed_active_intent(tmp_path: Path) -> None:
+    """A completed shutdown intent is exact proof before the next startup archives it."""
+    project = tmp_path / "repo"
+    lifecycle = project / ".exo" / "controller-lifecycle"
+    lifecycle.mkdir(parents=True)
+    record = {
+        "schema_version": 1,
+        "operation_id": "shutdown-1314",
+        "phase": "complete",
+        "target": {"run_id": "root"},
+        "controllers": [
+            {
+                "agent_id": "kani",
+                "invocation_id": "kani-controller-invocation",
+                "generation": 3,
+            }
+        ],
+    }
+    active = lifecycle / "workspace-shutdown.json"
+    active.write_text(json.dumps(record), encoding="utf-8")
+
+    assert driver_module._workspace_shutdown_recorded(
+        project, "kani", "kani-controller-invocation", 3
+    )
+    assert not driver_module._workspace_shutdown_recorded(
+        project, "kani", "foreign-invocation", 3
+    )
+    assert not driver_module._workspace_shutdown_recorded(
+        project, "kani", "kani-controller-invocation", 4
+    )
+
+    record["phase"] = "requested"
+    active.write_text(json.dumps(record), encoding="utf-8")
+    assert not driver_module._workspace_shutdown_recorded(
+        project, "kani", "kani-controller-invocation", 3
+    )
+
+    archive = lifecycle / "archive"
+    archive.mkdir()
+    record["phase"] = "complete"
+    (archive / "shutdown-1314.json").write_text(json.dumps(record), encoding="utf-8")
+    active.unlink()
+    assert driver_module._workspace_shutdown_recorded(
+        project, "kani", "kani-controller-invocation", 3
+    )
+
+
+def _seed_pending_confirmation_child(tmp_path: Path) -> tuple[RunStore, SubTLTask]:
+    """Persist one child scope holding an accepted launch confirmation."""
+    plan = _plan()
+    config = replace(
+        _config(),
+        run_id="child",
+        root_dir=tmp_path,
+        branch="main.child",
+        worktree=tmp_path / "worktrees" / "child",
+        parent_run_id="root",
+        parent_branch="main",
+        parent_agent_id="child",
+    )
+    manifest = driver_module._candidate_manifest(plan, "child", config)
+    slices = _initial_slices(plan, config, tmp_path, "child")
+    create(
+        "child",
+        {
+            "plan_manifest": manifest.to_document(),
+            "slices": slices,
+            "owner_branch": "main.child",
+            "owner_worktree": str(config.worktree),
+            "parent_branch": "main",
+            "parent_run_id": "root",
+            "depth": 1,
+            "repository_identity": _required_repository_identity(config).to_document(),
+        },
+        root_dir=tmp_path,
+    )
+    store = RunStore("child", tmp_path)
+    store.set_plan_manifest(manifest, slices=slices)
+    state = store.load()
+    leaf = plan.leaves[0]
+    recovery = transition_recovery(
+        begin_recovery(
+            cause="human_decision_required",
+            owner_run_id="child",
+            slice_attempt=2,
+            owner_agent_id="leaf-owner",
+            invocation_generation=0,
+            plan_revision=manifest.manifest_revision,
+            evidence={
+                "slice_id": leaf.name,
+                "outcome": "blocked",
+                "invocation_id": "pending-launch-invocation",
+            },
+            next_action="open_human_gate",
+        ),
+        RecoveryPhase.HUMAN_GATE,
+        next_action="open_human_gate",
+    )
+    pending = replace(
+        state.slices[leaf.name],
+        status=SliceStatus.DISPATCH_UNCONFIRMED,
+        attempts=2,
+        dispatch_intent_id="pending-launch-intent",
+        dispatch_started_at=1.0,
+        dispatch_generation=3,
+        dispatch_last_boundary="spawn_request_accepted",
+        dispatch_agent_id="leaf-owner",
+        dispatch_invocation_id="pending-launch-invocation",
+        park_cause=ParkCause.DISPATCH_UNCONFIRMED,
+        recovery=recovery,
+    )
+    store.checkpoint(
+        state.fsm,
+        {**state.slices, leaf.name: pending},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    return store, SubTLTask("child", plan, order=1)
+
+
+def test_reopened_shutdown_dispatch_is_not_mistaken_for_a_live_child(
+    tmp_path: Path,
+) -> None:
+    """A regenerated dispatch generation still carries the exact dead controller."""
+    plan = WorkPlan(sub_tls=(SubTLTask("child-controller", WorkPlan(), order=1),))
+    config, store = _seed_nonroot_failed_scope(tmp_path / "state", "root-scope", plan)
+    project = tmp_path / "repo"
+    config = replace(config, project_root=project)
+    state = store.load()
+    child = state.slices["child-controller"]
+    assert child.branch is not None
+    worktree = str(project / ".exo" / "worktrees" / "child-controller")
+    spawned = replace(
+        child,
+        status=SliceStatus.SPAWNED,
+        attempts=1,
+        dispatch_agent_id="child-controller",
+        dispatch_invocation_id="workspace-shutdown-child-invocation",
+        dispatch_intent_id="workspace-shutdown-child-intent",
+        dispatch_authoritative_event_seq=1,
+        dispatch_generation=3,
+        dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
+        worktree=worktree,
+    )
+    store.checkpoint(
+        _phase_from_state(state),
+        {**state.slices, "child-controller": spawned},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+    owner_dir = project / ".exo" / "agents" / "child-controller"
+    owner_dir.mkdir(parents=True)
+    invocation = {
+        "invocation_id": "workspace-shutdown-child-invocation",
+        "generation": 3,
+        "status": "killed",
+        "runtime_agent_id": "child-controller",
+        "slice_id": "child-controller",
+        "branch": child.branch,
+        "worktree": worktree,
+        "exit_reason": "workspace control-plane shutdown",
+        "exit_classification": "workspace_control_plane_shutdown",
+    }
+    (owner_dir / "invocation.json").write_text(json.dumps(invocation), encoding="utf-8")
+
+    reopened = driver_module._reopen_shutdown_sub_tl_dispatches(plan, store.load(), config, store)
+    assert reopened.slices["child-controller"].status is SliceStatus.PENDING
+    regenerated = replace(
+        reopened.slices["child-controller"],
+        status=SliceStatus.SPAWNED,
+        dispatch_intent_id="next-directed-intent",
+        dispatch_generation=0,
+        dispatch_authoritative_event_seq=9,
+        dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
+    )
+    task = plan.sub_tls[0]
+    assert not driver_module._child_controller_shutdown_matches(regenerated, task, config)
+    assert driver_module._child_controller_reopened_after_shutdown(regenerated, task, config)
+
+    child_store, child_task = _seed_pending_confirmation_child(tmp_path / "child-state")
+    child_leaf = driver_module._accepted_work_plan(child_task.plan).leaves[0].name
+    child_state = child_store.load()
+    assert driver_module._pending_dispatch_confirmation(child_state, child_task)
+    ambiguous = replace(
+        child_state.slices[child_leaf],
+        dispatch_last_boundary="spawn_outcome_ambiguous",
+    )
+    child_store.checkpoint(
+        child_state.fsm,
+        {**child_state.slices, child_leaf: ambiguous},
+        child_state.budgets,
+        child_state.events.last_consumed_offset,
+    )
+    assert not driver_module._pending_dispatch_confirmation(
+        child_store.load(), child_task
+    ), "an ambiguous outcome must stay bounded"
+
+
+def test_supervisor_keeps_restarted_child_for_pending_confirmation(
+    tmp_path: Path,
+) -> None:
+    """A restarted controller must confirm its accepted launch before supervision stops."""
+    store, task = _seed_pending_confirmation_child(tmp_path)
+
+    class ConfirmingController:
+        exitcode = None
+
+        def __init__(self) -> None:
+            self.polls = 0
+            self.terminated = False
+
+        def is_alive(self) -> bool:
+            self.polls += 1
+            return True
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def join(self, timeout: float | None = None) -> None:
+            del timeout
+            state = store.load()
+            leaf = driver_module._accepted_work_plan(task.plan).leaves[0].name
+            if state.slices[leaf].dispatch_last_boundary == "spawn_request_accepted":
+                store.checkpoint(
+                    state.fsm,
+                    {
+                        **state.slices,
+                        leaf: replace(
+                            state.slices[leaf],
+                            status=SliceStatus.SPAWNED,
+                            dispatch_last_boundary=driver_module.DISPATCH_CONFIRMED_BOUNDARY,
+                            dispatch_authoritative_event_seq=42,
+                        ),
+                    },
+                    state.budgets,
+                    state.events.last_consumed_offset,
+                )
+
+    process = ConfirmingController()
+    observed = driver_module._supervise_live_sub_tl(
+        process,
+        store,
+        replace(_config(), run_id="child", root_dir=tmp_path, project_root=None),
+        task=task,
+    )
+
+    assert process.polls >= 2, "supervision stopped before the confirmation was processed"
+    assert not process.terminated
+    assert observed is not None
+    leaf = observed.slices[
+        driver_module._accepted_work_plan(task.plan).leaves[0].name
+    ]
+    assert leaf.status is SliceStatus.SPAWNED
+    assert leaf.dispatch_last_boundary == driver_module.DISPATCH_CONFIRMED_BOUNDARY
+
+
+def test_replayed_blocked_terminal_notification_repeats_the_recorded_gate(
+    tmp_path: Path,
+) -> None:
+    """A blocked owner's terminal row cannot preempt its approved recovery."""
+    store, task = _seed_pending_confirmation_child(tmp_path)
+    leaf_name = driver_module._accepted_work_plan(task.plan).leaves[0].name
+    state = store.load()
+    terminal = ChildFailed(leaf_name, "assignment blocked")
+
+    active = TLWaiting({leaf_name: ChildHandle(leaf_name, "main.child", "codex")})
+    assert driver_module._duplicate_event(active, terminal, state)
+    released = replace(state.slices[leaf_name], recovery=None)
+    without_recovery = replace(state, slices={**state.slices, leaf_name: released})
+    assert not driver_module._duplicate_event(active, terminal, without_recovery)
+
+
+def _write_ledger_segment(project: Path, rows: Sequence[Mapping[str, object]]) -> Path:
+    segments = project / ".exo" / "ledger" / "segments"
+    segments.mkdir(parents=True, exist_ok=True)
+    path = segments / "segment-000000000000.jsonl"
+    path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _launch_event_row(
+    run_seq: int,
+    *,
+    run_id: str,
+    agent_id: str,
+    invocation_id: str,
+    child_agent: str,
+    branch: str,
+    intent_id: str | None,
+    event_type: str = "agent.spawned",
+) -> dict[str, object]:
+    data: dict[str, object] = {
+        "agent_type": "codex",
+        "branch": branch,
+        "child_agent": child_agent,
+        "effort": "xhigh",
+        "invocation_id": invocation_id,
+        "model": "gpt-6-luna",
+    }
+    if intent_id is not None:
+        data["intent_id"] = intent_id
+    return {
+        "schema_version": 1,
+        "event_id": f"launch-{run_seq}",
+        "id": f"launch-{run_seq}",
+        "event_time": "2026-11-13T00:00:00Z",
+        "observed_at": "2026-11-13T00:00:00Z",
+        "run_seq": run_seq,
+        "type": event_type,
+        "agent_id": agent_id,
+        "run_id": run_id,
+        "session_id": "session-1",
+        "invocation_id": invocation_id,
+        "generation": None,
+        "lifecycle_state": "emitted",
+        "data": data,
+    }
+
+
+def _launch_event_case(
+    tmp_path: Path,
+) -> tuple[TLLoopConfig, RunStore, RunState, SliceState, Path]:
+    child_store, task = _seed_pending_confirmation_child(tmp_path / "child")
+    project = tmp_path / "repo"
+    state = child_store.load()
+    leaf_name = driver_module._accepted_work_plan(task.plan).leaves[0].name
+    current = replace(
+        state.slices[leaf_name],
+        status=SliceStatus.DISPATCH_UNCONFIRMED,
+        branch="main.child.leaf-a",
+        dispatch_intent_id="dispatch-intent-1314",
+        dispatch_agent_id="leaf-owner",
+        dispatch_invocation_id="dispatch-invocation-1314",
+        dispatch_ledger_floor=0,
+        dispatch_authoritative_event_seq=5,
+        dispatch_generation=3,
+        dispatch_last_boundary="spawn_request_accepted",
+    )
+    state = replace(
+        state,
+        slices={**state.slices, leaf_name: current},
+        events=EventCursor(10),
+    )
+    config = replace(
+        _config(),
+        run_id="child",
+        project_root=project,
+        ledger_run_id="ledger-run-1314",
+        root_dir=tmp_path / "child",
+    )
+    _write_ledger_segment(project, ())
+    return config, child_store, state, current, project
+
+
+def _exact_launch_row(
+    config: TLLoopConfig,
+    state: RunState,
+    current: SliceState,
+    run_seq: int = 5,
+) -> dict[str, object]:
+    assert config.ledger_run_id is not None
+    assert current.dispatch_invocation_id is not None
+    assert current.dispatch_agent_id is not None
+    assert current.dispatch_intent_id is not None
+    assert current.branch is not None
+    return _launch_event_row(
+        run_seq,
+        run_id=config.ledger_run_id,
+        agent_id=state.run_id,
+        invocation_id=current.dispatch_invocation_id,
+        child_agent=current.dispatch_agent_id,
+        branch=current.branch,
+        intent_id=current.dispatch_intent_id,
+    )
+
+
+def test_accepted_dispatch_launch_event_returns_the_exact_host_row(tmp_path: Path) -> None:
+    config, store, state, current, project = _launch_event_case(tmp_path)
+    row = _exact_launch_row(config, state, current)
+    _write_ledger_segment(project, (row,))
+
+    event = driver_module._accepted_dispatch_launch_event(current, state, config, store)
+
+    assert event is not None
+    assert event.event_id == "launch-5"
+    assert event.run_seq == 5
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing",
+        "ambiguous",
+        "wrong_invocation",
+        "wrong_child_agent",
+        "wrong_branch",
+        "wrong_run_id",
+        "wrong_agent",
+        "conflicting_intent",
+        "beyond_offset",
+        "unreadable",
+        "foreign_run_row",
+        "resume_audit_only",
+    ),
+)
+def test_accepted_dispatch_launch_event_refuses_non_exact_rows(
+    tmp_path: Path, case: str
+) -> None:
+    config, store, state, current, project = _launch_event_case(tmp_path)
+    row = _exact_launch_row(config, state, current)
+    rows: list[dict[str, object]] = [row]
+    if case == "missing":
+        rows = []
+    elif case == "ambiguous":
+        rows = [row, {**row, "event_id": "launch-6", "id": "launch-6", "run_seq": 6}]
+    elif case == "wrong_invocation":
+        cast(dict[str, object], row["data"])["invocation_id"] = "foreign-invocation"
+    elif case == "wrong_child_agent":
+        cast(dict[str, object], row["data"])["child_agent"] = "foreign-agent"
+    elif case == "wrong_branch":
+        cast(dict[str, object], row["data"])["branch"] = "main.foreign"
+    elif case == "wrong_run_id":
+        row["run_id"] = "foreign-run"
+    elif case == "wrong_agent":
+        row["agent_id"] = "foreign-controller"
+    elif case == "conflicting_intent":
+        cast(dict[str, object], row["data"])["intent_id"] = "conflicting-intent"
+    elif case == "beyond_offset":
+        row["run_seq"] = 11
+    elif case == "unreadable":
+        segments = project / ".exo" / "ledger" / "segments"
+        (segments / "segment-000000000000.jsonl").write_text(
+            "{not valid json\n", encoding="utf-8"
+        )
+        rows = []
+    elif case == "foreign_run_row":
+        rows = [row, {**row, "run_id": "foreign-run", "event_id": "launch-4", "run_seq": 4}]
+    elif case == "resume_audit_only":
+        row["type"] = "agent.resumed"
+        row["event_id"] = "resumed-5"
+        row["id"] = "resumed-5"
+    if rows:
+        _write_ledger_segment(project, rows)
+
+    assert driver_module._accepted_dispatch_launch_event(current, state, config, store) is None
+
+
+def _terminal_ledger_events(
+    config: TLLoopConfig,
+) -> tuple[Path, list[dict[str, object]]]:
+    project = _required_project_root(config)
+    path = next((project / ".exo" / "ledger" / "segments").glob("*.jsonl"))
+    rows = [
+        cast(dict[str, object], json.loads(line))
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    return path, rows
+
+
+def _rewrite_terminal_ledger(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
+    path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def test_terminal_owner_ledger_proof_accepts_absent_intent_with_exact_identity(
+    tmp_path: Path,
+) -> None:
+    plan, config, store, _owner_dir, _owner_name, _invocation_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    path, rows = _terminal_ledger_events(config)
+    spawn = next(row for row in rows if row["type"] == "agent.spawned")
+    cast(dict[str, object], spawn["data"]).pop("intent_id")
+    _rewrite_terminal_ledger(path, rows)
+    state = store.load()
+    leaf = state.slices[plan.leaves[0].name]
+    assert leaf.recovery is not None
+
+    proof, reason = driver_module._terminal_owner_ledger_proof(
+        leaf, leaf.recovery, state, config, store
+    )
+
+    assert proof is not None, reason
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("conflicting_intent", "wrong_sequence", "wrong_invocation", "ambiguous"),
+)
+def test_terminal_owner_ledger_proof_refuses_non_exact_launch_rows(
+    tmp_path: Path, case: str
+) -> None:
+    plan, config, store, _owner_dir, _owner_name, _invocation_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    path, rows = _terminal_ledger_events(config)
+    spawn = next(row for row in rows if row["type"] == "agent.spawned")
+    state = store.load()
+    leaf = state.slices[plan.leaves[0].name]
+    current = leaf
+    if case == "conflicting_intent":
+        cast(dict[str, object], spawn["data"])["intent_id"] = "conflicting-intent"
+    elif case == "wrong_sequence":
+        current = replace(current, dispatch_authoritative_event_seq=108044)
+    elif case == "wrong_invocation":
+        current = replace(current, dispatch_invocation_id="foreign-invocation")
+    elif case == "ambiguous":
+        rows.append({**spawn, "event_id": "duplicate-launch", "id": "duplicate-launch"})
+    _rewrite_terminal_ledger(path, rows)
+    assert current.recovery is not None
+
+    proof, reason = driver_module._terminal_owner_ledger_proof(
+        current, current.recovery, state, config, store
+    )
+
+    assert proof is None
+    assert reason is not None
+
+
+def test_terminal_owner_ledger_proof_refuses_resume_audit_row(tmp_path: Path) -> None:
+    plan, config, store, _owner_dir, _owner_name, _invocation_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    path, rows = _terminal_ledger_events(config)
+    spawn = next(row for row in rows if row["type"] == "agent.spawned")
+    spawn["type"] = "agent.resumed"
+    _rewrite_terminal_ledger(path, rows)
+    state = store.load()
+    leaf = state.slices[plan.leaves[0].name]
+    assert leaf.recovery is not None
+
+    proof, reason = driver_module._terminal_owner_ledger_proof(
+        leaf, leaf.recovery, state, config, store
+    )
+
+    assert proof is None
+    assert reason == "accepted spawn event is missing or ambiguous at its checkpoint sequence"
+
+
+def _confirmed_terminal_resume_proof(
+    tmp_path: Path,
+    *,
+    omit_agent_fields: tuple[str, ...] = (),
+    agent_overrides: Mapping[str, object] | None = None,
+    owner_key: str = "id",
+    write_host_launch_row: bool = False,
+) -> tuple[WorkPlan, TLLoopConfig, RunStore, _TerminalOwnerRecoveryProof | None, str | None]:
+    plan, config, store, owner_dir, owner_name, original_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert proof is not None, reason
+    driver_module._persist_terminal_route_authorization(proof, store.load(), store)
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    identity_path = owner_dir / "identity.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    runtime = proof.resume.desired_agent_type
+    assert isinstance(runtime, str)
+    arguments = dict(
+        driver_module._blocked_leaf_resume_action_arguments(proof.resume, store.load())
+    )
+    route = driver_module._blocked_resume_role_route_response(proof.resume)
+    assert route is not None
+    intent = EffectIntent("resume_blocked_leaf", plan.leaves[0].name, arguments, True)
+    journal.append(intent)
+    successor_id = "owner-scope-successor"
+    generation = proof.resume.owner.generation + 1
+    route_document = cast(JsonObject, route)
+    agent: JsonObject = {
+        owner_key: owner_name,
+        "issue": plan.leaves[0].name,
+        "intent_id": proof.resume.intent_id,
+        "agent_type": runtime,
+        "branch_name": proof.resume.owner.branch,
+        "worktree_path": str(proof.resume.owner.worktree),
+        "role_route": route_document,
+    }
+    for field in omit_agent_fields:
+        agent.pop(field, None)
+    if agent_overrides is not None:
+        for key, value in agent_overrides.items():
+            agent[key] = cast(JsonValue, value)
+    result_document: JsonObject = {
+        "success": True,
+        "result": {
+            "chainlink_issue_id": 814,
+            "agent": agent,
+            "invocation": {
+                "invocation_id": successor_id,
+                "generation": generation,
+                "trigger": "resume_blocked",
+                "runtime": runtime,
+                "model": proof.resume.desired_model,
+                "effort": proof.resume.desired_effort,
+                "branch_name": proof.resume.owner.branch,
+                "ready": True,
+                "fresh": True,
+                "outcome": "started",
+                "role_route": route_document,
+            },
+        },
+    }
+    journal.mark_result(intent, ToolResult.from_raw(result_document))
+    identity.update(
+        {
+            "agent_type": runtime,
+            "model": proof.resume.desired_model,
+            "effort": proof.resume.desired_effort,
+            "role_route": route,
+        }
+    )
+    identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    (owner_dir / "invocation.json").write_text(
+        json.dumps(
+            {
+                "invocation_id": successor_id,
+                "generation": generation,
+                "status": "exited",
+                "runtime": runtime,
+                "model": proof.resume.desired_model,
+                "effort": proof.resume.desired_effort,
+                "trigger": "resume_blocked",
+                "branch": proof.resume.owner.branch,
+                "worktree": str(proof.resume.owner.worktree),
+                "slice_id": plan.leaves[0].name,
+                "prior_invocation_id": original_id,
+                "pr_number": None,
+                "head_sha": None,
+                "ended_at": 1792734800 + generation,
+                "exit_code": 0,
+                "exit_reason": "one_shot_complete",
+                "exit_classification": "one_shot_complete",
+                "one_shot_complete": True,
+                "role_route": route,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (owner_dir / "dispatch_intent").write_text(
+        proof.resume.intent_id + "\n", encoding="utf-8"
+    )
+    (owner_dir / "routing.json").write_text(
+        json.dumps(
+            {
+                "owner_agent_id": owner_name,
+                "owner_invocation_id": successor_id,
+                "owner_generation": generation,
+            }
+        ),
+        encoding="utf-8",
+    )
+    if write_host_launch_row:
+        ledger_path, ledger_rows = _terminal_ledger_events(config)
+        ledger_rows.append(
+            {
+                "schema_version": 1,
+                "event_id": "successor-host-launch",
+                "id": "successor-host-launch",
+                "event_time": "2026-11-13T00:00:00Z",
+                "observed_at": "2026-11-13T00:00:00Z",
+                "run_seq": max(
+                    cast(int, row.get("run_seq", 0)) for row in ledger_rows
+                )
+                + 1,
+                "type": "agent.spawned",
+                "agent_id": store.run_id,
+                "run_id": config.ledger_run_id,
+                "session_id": "session-1",
+                "invocation_id": successor_id,
+                "generation": None,
+                "lifecycle_state": "emitted",
+                "data": {
+                    "agent_type": runtime,
+                    "branch": proof.resume.owner.branch,
+                    "child_agent": owner_name,
+                    "effort": proof.resume.desired_effort,
+                    "intent_id": proof.resume.intent_id,
+                    "invocation_id": successor_id,
+                    "model": proof.resume.desired_model,
+                    "spawn_type": "resume_blocked",
+                    "topology": "worktree_per_agent",
+                },
+            }
+        )
+        _rewrite_terminal_ledger(ledger_path, ledger_rows)
+    accepted, accepted_reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    return plan, config, store, accepted, accepted_reason
+
+
+def test_terminal_resume_history_accepts_host_owned_owner_scope(tmp_path: Path) -> None:
+    _plan_value, _config_value, _store, proof, reason = _confirmed_terminal_resume_proof(
+        tmp_path
+    )
+
+    assert proof is not None, reason
+
+
+def test_terminal_resume_history_accepts_agent_id_alias_for_the_owner(tmp_path: Path) -> None:
+    _plan_value, _config_value, _store, proof, reason = _confirmed_terminal_resume_proof(
+        tmp_path, owner_key="agent_id"
+    )
+
+    assert proof is not None, reason
+
+
+def test_terminal_resume_history_uses_host_records_for_response_loss_adoption(
+    tmp_path: Path,
+) -> None:
+    """An adopted successor omits the owner scope/intent fields.
+
+    The host registry supplies the scope and the host launch row supplies the
+    intent; neither is rebuilt from the controller's own route.
+    """
+    _plan_value, _config_value, _store, proof, reason = _confirmed_terminal_resume_proof(
+        tmp_path,
+        omit_agent_fields=("issue", "intent_id"),
+        write_host_launch_row=True,
+    )
+
+    assert proof is not None, reason
+
+
+def test_terminal_resume_history_refuses_response_loss_adoption_without_a_launch_row(
+    tmp_path: Path,
+) -> None:
+    _plan_value, _config_value, _store, proof, reason = _confirmed_terminal_resume_proof(
+        tmp_path, omit_agent_fields=("issue", "intent_id")
+    )
+
+    assert proof is None
+    assert reason == "confirmed resume result conflicts with its owner, scope, or worktree"
+
+
+def test_terminal_resume_history_refuses_owner_scope_rebuilt_from_the_route(
+    tmp_path: Path,
+) -> None:
+    """A host response must carry its own scope and intent.
+
+    Rebuilding them from ``validated_route`` lets the controller's route agree
+    with itself. The old fallback accepted this forged response.
+    """
+    _plan_value, _config_value, _store, proof, reason = _confirmed_terminal_resume_proof(
+        tmp_path, omit_agent_fields=("issue", "intent_id")
+    )
+
+    assert proof is None
+    assert reason == "confirmed resume result conflicts with its owner, scope, or worktree"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("issue", "foreign-slice"),
+        ("intent_id", "foreign-intent"),
+        ("branch_name", "main.foreign"),
+        ("id", "foreign-owner"),
+    ),
+)
+def test_terminal_resume_history_refuses_conflicting_owner_fields(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    _plan_value, _config_value, _store, proof, reason = _confirmed_terminal_resume_proof(
+        tmp_path, agent_overrides={field: value}
+    )
+
+    assert proof is None
+    assert reason == "confirmed resume result conflicts with its owner, scope, or worktree"
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ("spawn_outcome_ambiguous", "spawn_not_executed", "dispatch_intent_recorded"),
+)
+def test_pending_dispatch_confirmation_requires_an_accepted_spawn_receipt(
+    tmp_path: Path, boundary: str
+) -> None:
+    store, task = _seed_pending_confirmation_child(tmp_path)
+    leaf_name = driver_module._accepted_work_plan(task.plan).leaves[0].name
+    state = store.load()
+    assert driver_module._pending_dispatch_confirmation(state, task)
+
+    unproven = replace(state.slices[leaf_name], dispatch_last_boundary=boundary)
+    state = replace(state, slices={**state.slices, leaf_name: unproven})
+
+    assert not driver_module._pending_dispatch_confirmation(state, task)
+
+
+@pytest.mark.parametrize(
+    "field", ("dispatch_intent_id", "dispatch_agent_id", "dispatch_invocation_id")
+)
+def test_pending_dispatch_confirmation_requires_complete_identity(
+    tmp_path: Path, field: str
+) -> None:
+    store, task = _seed_pending_confirmation_child(tmp_path)
+    leaf_name = driver_module._accepted_work_plan(task.plan).leaves[0].name
+    state = store.load()
+    updates: dict[str, Any] = {field: None}
+    incomplete = replace(state.slices[leaf_name], **updates)
+    state = replace(state, slices={**state.slices, leaf_name: incomplete})
+
+    assert not driver_module._pending_dispatch_confirmation(state, task)
+
+
+def test_supervisor_ends_for_an_unproven_confirmation_without_restarting(
+    tmp_path: Path,
+) -> None:
+    store, task = _seed_pending_confirmation_child(tmp_path)
+    leaf_name = driver_module._accepted_work_plan(task.plan).leaves[0].name
+    state = store.load()
+    unproven = replace(
+        state.slices[leaf_name], dispatch_last_boundary="spawn_outcome_ambiguous"
+    )
+    store.checkpoint(
+        state.fsm,
+        {**state.slices, leaf_name: unproven},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+    class ExitingController:
+        exitcode = 7
+
+        def __init__(self) -> None:
+            self.polls = 0
+            self.terminated = False
+
+        def is_alive(self) -> bool:
+            self.polls += 1
+            return False
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def join(self, timeout: float | None = None) -> None:
+            del timeout
+
+    process = ExitingController()
+    observed = driver_module._supervise_live_sub_tl(
+        process,
+        store,
+        replace(_config(), run_id="child", root_dir=tmp_path, project_root=None),
+        task=task,
+    )
+
+    assert process.polls == 1, "an unproven confirmation must not extend supervision"
+    assert not process.terminated
+    assert observed is not None
+
+
+def _seed_reopened_child_dispatch(
+    tmp_path: Path,
+) -> tuple[WorkPlan, TLLoopConfig, RunStore, SliceState, Path]:
+    plan = WorkPlan(sub_tls=(SubTLTask("child-controller", WorkPlan(), order=1),))
+    config, store = _seed_nonroot_failed_scope(tmp_path / "state", "root-scope", plan)
+    project = tmp_path / "repo"
+    config = replace(config, project_root=project)
+    state = store.load()
+    child = state.slices["child-controller"]
+    assert child.branch is not None
+    worktree = str(project / ".exo" / "worktrees" / "child-controller")
+    spawned = replace(
+        child,
+        status=SliceStatus.SPAWNED,
+        attempts=1,
+        dispatch_agent_id="child-controller",
+        dispatch_invocation_id="workspace-shutdown-child-invocation",
+        dispatch_intent_id="workspace-shutdown-child-intent",
+        dispatch_authoritative_event_seq=1,
+        dispatch_generation=3,
+        dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
+        worktree=worktree,
+    )
+    store.checkpoint(
+        _phase_from_state(state),
+        {**state.slices, "child-controller": spawned},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+    owner_dir = project / ".exo" / "agents" / "child-controller"
+    owner_dir.mkdir(parents=True)
+    (owner_dir / "invocation.json").write_text(
+        json.dumps(
+            {
+                "invocation_id": "workspace-shutdown-child-invocation",
+                "generation": 3,
+                "status": "killed",
+                "runtime_agent_id": "child-controller",
+                "slice_id": "child-controller",
+                "branch": child.branch,
+                "worktree": worktree,
+                "exit_reason": "workspace control-plane shutdown",
+                "exit_classification": "workspace_control_plane_shutdown",
+            }
+        ),
+        encoding="utf-8",
+    )
+    reopened = driver_module._reopen_shutdown_sub_tl_dispatches(
+        plan, store.load(), config, store
+    )
+    assert reopened.slices["child-controller"].status is SliceStatus.PENDING
+    regenerated = replace(
+        reopened.slices["child-controller"],
+        status=SliceStatus.SPAWNED,
+        dispatch_intent_id="next-directed-intent",
+        dispatch_generation=0,
+        dispatch_authoritative_event_seq=9,
+        dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
+    )
+    return plan, config, store, regenerated, owner_dir
+
+
+def test_child_controller_reopened_after_shutdown_requires_the_exact_dead_controller(
+    tmp_path: Path,
+) -> None:
+    plan, config, store, regenerated, _owner_dir = _seed_reopened_child_dispatch(tmp_path)
+    task = plan.sub_tls[0]
+    assert driver_module._child_controller_reopened_after_shutdown(regenerated, task, config)
+    assert not driver_module._child_controller_shutdown_matches(regenerated, task, config)
+
+    assert not driver_module._child_controller_reopened_after_shutdown(
+        replace(regenerated, dispatch_invocation_id="foreign-invocation"), task, config
+    )
+    assert not driver_module._child_controller_reopened_after_shutdown(
+        replace(regenerated, dispatch_agent_id="foreign-agent"), task, config
+    )
+    assert not driver_module._child_controller_reopened_after_shutdown(
+        regenerated, SubTLTask("other-controller", WorkPlan(), order=1), config
+    )
+    assert not driver_module._child_controller_reopened_after_shutdown(
+        replace(regenerated, branch="main.foreign"), task, config
+    )
+    assert not driver_module._child_controller_reopened_after_shutdown(
+        replace(regenerated, worktree=str(tmp_path / "foreign-worktree")), task, config
+    )
+    assert not driver_module._child_controller_reopened_after_shutdown(
+        replace(regenerated, dispatch_generation=cast(Any, None)), task, config
+    )
+
+
+def test_child_controller_reopened_after_shutdown_requires_a_completed_record(
+    tmp_path: Path,
+) -> None:
+    plan, config, store, _regenerated, owner_dir = _seed_reopened_child_dispatch(tmp_path)
+    lifecycle = _required_project_root(config) / ".exo" / "controller-lifecycle"
+    lifecycle.mkdir(parents=True)
+    record = {
+        "schema_version": 1,
+        "operation_id": "shutdown-1314",
+        "phase": "requested",
+        "target": {"run_id": "root"},
+        "controllers": [
+            {
+                "agent_id": "child-controller",
+                "invocation_id": "workspace-shutdown-child-invocation",
+                "generation": 3,
+            }
+        ],
+    }
+    active = lifecycle / "workspace-shutdown.json"
+    active.write_text(json.dumps(record), encoding="utf-8")
+    (owner_dir / "invocation.json").write_text(
+        json.dumps(
+            {
+                "invocation_id": "workspace-shutdown-child-invocation",
+                "generation": 3,
+                "status": "exited",
+                "runtime_agent_id": "child-controller",
+                "slice_id": "child-controller",
+                "branch": store.load().slices["child-controller"].branch,
+                "worktree": store.load().slices["child-controller"].worktree,
+                "exit_reason": None,
+                "exit_classification": "missing_exit_marker",
+            }
+        ),
+        encoding="utf-8",
+    )
+    current = replace(
+        store.load().slices["child-controller"],
+        status=SliceStatus.SPAWNED,
+        dispatch_invocation_id="workspace-shutdown-child-invocation",
+        dispatch_agent_id="child-controller",
+        dispatch_intent_id="next-directed-intent",
+        dispatch_generation=0,
+        dispatch_authoritative_event_seq=9,
+        dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
+    )
+    task = plan.sub_tls[0]
+
+    assert not driver_module._child_controller_reopened_after_shutdown(current, task, config)
+
+    record["phase"] = "complete"
+    active.write_text(json.dumps(record), encoding="utf-8")
+
+    assert driver_module._child_controller_reopened_after_shutdown(current, task, config)
+
+
+def test_replayed_blocked_terminal_notification_only_repeats_its_own_gate(
+    tmp_path: Path,
+) -> None:
+    store, task = _seed_pending_confirmation_child(tmp_path)
+    leaf_name = driver_module._accepted_work_plan(task.plan).leaves[0].name
+    state = store.load()
+    current = state.slices[leaf_name]
+    assert current.recovery is not None
+    terminal = ChildFailed(leaf_name, "assignment blocked")
+    active = TLWaiting({leaf_name: ChildHandle(leaf_name, "main.child", "codex")})
+
+    assert driver_module._duplicate_event(active, terminal, state)
+
+    successor = replace(current, dispatch_invocation_id="successor-invocation")
+    assert not driver_module._duplicate_event(
+        active, terminal, replace(state, slices={**state.slices, leaf_name: successor})
+    )
+
+    other_cause = replace(current.recovery, cause="external_dependency")
+    assert not driver_module._duplicate_event(
+        active,
+        terminal,
+        replace(
+            state,
+            slices={
+                **state.slices,
+                leaf_name: replace(current, recovery=other_cause),
+            },
+        ),
+    )
+
+    resolved_gate = replace(current.recovery, phase=RecoveryPhase.DIAGNOSING)
+    assert not driver_module._duplicate_event(
+        active,
+        terminal,
+        replace(
+            state,
+            slices={
+                **state.slices,
+                leaf_name: replace(current, recovery=resolved_gate),
+            },
+        ),
+    )
+
+
+def test_live_child_controller_is_reused_not_reopened(tmp_path: Path) -> None:
+    plan, config, store, _regenerated, _owner_dir = _seed_reopened_child_dispatch(tmp_path)
+    state = store.load()
+    live = replace(
+        state.slices["child-controller"],
+        status=SliceStatus.SPAWNED,
+        dispatch_invocation_id="live-child-invocation",
+        dispatch_agent_id="child-controller",
+        dispatch_intent_id="live-child-intent",
+        dispatch_generation=3,
+        dispatch_authoritative_event_seq=4,
+        dispatch_last_boundary=driver_module.SUB_TL_DISPATCH_STARTED_BOUNDARY,
+    )
+    owner_dir = _required_project_root(config) / ".exo" / "agents" / "child-controller"
+    (owner_dir / "invocation.json").write_text(
+        json.dumps(
+            {
+                "invocation_id": "live-child-invocation",
+                "generation": 3,
+                "status": "running",
+                "runtime_agent_id": "child-controller",
+                "slice_id": "child-controller",
+                "branch": live.branch,
+                "worktree": live.worktree,
+                "exit_reason": None,
+                "exit_classification": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    store.checkpoint(
+        _phase_from_state(state),
+        {**state.slices, "child-controller": live},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+    task = plan.sub_tls[0]
+
+    assert not driver_module._child_controller_shutdown_matches(live, task, config)
+    assert not driver_module._child_controller_reopened_after_shutdown(live, task, config)
+    unchanged = driver_module._reopen_shutdown_sub_tl_dispatches(
+        plan, store.load(), config, store
+    )
+    assert unchanged.slices["child-controller"].status is SliceStatus.SPAWNED
+    assert unchanged.slices["child-controller"].dispatch_invocation_id == "live-child-invocation"
 
 
 _NULLABLE_STRING_SLICE_UPDATES = (

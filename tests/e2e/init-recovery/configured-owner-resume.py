@@ -2216,7 +2216,7 @@ def verify_repeated_transitions(
         arguments = entry.get("arguments") or {}
         result = entry.get("result") or {}
         payload = result.get("result") or {}
-        invocation = payload.get("invocation") or {}
+        successor = payload.get("invocation") or {}
         agent = payload.get("agent") or {}
         if entry.get("status") != "confirmed":
             raise RuntimeError(f"repeated transition {index} was not confirmed")
@@ -2246,7 +2246,7 @@ def verify_repeated_transitions(
         if intent_id in intent_ids:
             raise RuntimeError(f"repeated transition {index} reused an earlier intent")
         intent_ids.add(intent_id)
-        invocation_id = invocation.get("invocation_id")
+        invocation_id = successor.get("invocation_id")
         if not isinstance(invocation_id, str) or not invocation_id:
             raise RuntimeError(
                 f"repeated transition {index} lacks its actual invocation"
@@ -2268,13 +2268,13 @@ def verify_repeated_transitions(
             raise RuntimeError(
                 f"repeated transition {index} did not advance generation once"
             )
-        if invocation.get("trigger") != "resume_blocked":
+        if successor.get("trigger") != "resume_blocked":
             raise RuntimeError(f"repeated transition {index} was not a blocked resume")
-        route_receipt = invocation.get("role_route") or agent.get("role_route")
+        route_receipt = successor.get("role_route") or agent.get("role_route")
         if not isinstance(route_receipt, dict):
             raise RuntimeError(f"repeated transition {index} lacks its route receipt")
         if (
-            invocation.get("runtime") != route.get("agent_type")
+            successor.get("runtime") != route.get("agent_type")
             or route_receipt.get("model") != route.get("model")
             or route_receipt.get("effort") != route.get("effort")
         ):
@@ -2301,7 +2301,9 @@ def verify_repeated_transitions(
                 raise RuntimeError(
                     f"repeated transition {index} route receipt field {field} conflicts"
                 )
-        if agent.get("id") != baseline.get("owner_agent_name"):
+        if (agent.get("id") or agent.get("agent_id")) != baseline.get(
+            "owner_agent_name"
+        ):
             raise RuntimeError(f"repeated transition {index} changed the logical owner")
         previous_id = invocation_id
         previous_generation = actual_generation
