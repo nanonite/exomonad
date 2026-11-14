@@ -1,9 +1,11 @@
 use super::{
     capture_managed_process_identity_with, parse_start_time_ticks, record_proof_with,
-    ManagedProcessIdentity, ProcFsInspector, ProcessInspector, LOCK_HELD_EVENT,
+    try_record_proof_with, ManagedProcessIdentity, ProcFsInspector, ProcessInspector,
+    LOCK_HELD_EVENT,
 };
 use crate::services::event_log::EventLog;
 use crate::services::git_mutation::{GitMutationError, GitMutationResource, GitMutationSafety};
+use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -430,6 +432,199 @@ fn a_lock_changed_after_ownership_observation_is_not_audited_as_proven() {
         b"changed during ownership check"
     );
     assert!(fixture.event_log.ledger().read_events().unwrap().is_empty());
+}
+
+#[test]
+fn lock_released_after_ownership_observation_is_retried_not_audited() {
+    let fixture = Fixture::new();
+    let lock_path = fixture.lock_path();
+    let _held_lock = File::create(&lock_path).expect("native lock");
+    let lease = fixture
+        .service
+        .acquire(
+            &fixture.root,
+            GitMutationResource::Index,
+            "operation",
+            std::time::Duration::ZERO,
+        )
+        .expect("index lease");
+    let owner = ManagedProcessIdentity {
+        pid: 62,
+        start_time_ticks: 9,
+    };
+    let inspector = LockReleasingInspector {
+        pid: owner.pid,
+        start_ticks: owner.start_time_ticks,
+        lock_path: lock_path.clone(),
+    };
+
+    assert_eq!(
+        try_record_proof_with(&lease, &owner, &fixture.event_log, &inspector)
+            .expect("a released lock is not an uncertain proof"),
+        None
+    );
+    assert!(!lock_path.exists());
+    assert!(fixture.event_log.ledger().read_events().unwrap().is_empty());
+}
+
+#[test]
+fn process_exit_after_ownership_observation_is_retried_not_audited() {
+    let fixture = Fixture::new();
+    let lock_path = fixture.lock_path();
+    let _held_lock = File::create(&lock_path).expect("native lock");
+    let lease = fixture
+        .service
+        .acquire(
+            &fixture.root,
+            GitMutationResource::Index,
+            "operation",
+            std::time::Duration::ZERO,
+        )
+        .expect("index lease");
+    let owner = ManagedProcessIdentity {
+        pid: 63,
+        start_time_ticks: 10,
+    };
+    let inspector = ExitingProcessInspector {
+        pid: owner.pid,
+        start_ticks: owner.start_time_ticks,
+        observations: Cell::new(0),
+    };
+
+    assert_eq!(
+        try_record_proof_with(&lease, &owner, &fixture.event_log, &inspector)
+            .expect("an exited process is not an uncertain proof"),
+        None
+    );
+    assert!(fixture.event_log.ledger().read_events().unwrap().is_empty());
+}
+
+#[test]
+fn lock_rewritten_after_ownership_observation_is_retried_not_audited() {
+    let fixture = Fixture::new();
+    let lock_path = fixture.lock_path();
+    let _held_lock = File::create(&lock_path).expect("native lock");
+    let lease = fixture
+        .service
+        .acquire(
+            &fixture.root,
+            GitMutationResource::Index,
+            "operation",
+            std::time::Duration::ZERO,
+        )
+        .expect("index lease");
+    let owner = ManagedProcessIdentity {
+        pid: 64,
+        start_time_ticks: 11,
+    };
+    let inspector = MutatingInspector {
+        pid: owner.pid,
+        start_ticks: owner.start_time_ticks,
+        lock_path: lock_path.clone(),
+    };
+
+    assert_eq!(
+        try_record_proof_with(&lease, &owner, &fixture.event_log, &inspector)
+            .expect("a lock still being written is not an uncertain proof"),
+        None
+    );
+    assert_eq!(
+        fs::read(lock_path).unwrap(),
+        b"changed during ownership check"
+    );
+    assert!(fixture.event_log.ledger().read_events().unwrap().is_empty());
+}
+
+#[test]
+fn lock_replaced_after_ownership_observation_is_retried_not_audited() {
+    let fixture = Fixture::new();
+    let lock_path = fixture.lock_path();
+    let _held_lock = File::create(&lock_path).expect("native lock");
+    let lease = fixture
+        .service
+        .acquire(
+            &fixture.root,
+            GitMutationResource::Index,
+            "operation",
+            std::time::Duration::ZERO,
+        )
+        .expect("index lease");
+    let owner = ManagedProcessIdentity {
+        pid: 65,
+        start_time_ticks: 12,
+    };
+    let inspector = LockReplacingInspector {
+        pid: owner.pid,
+        start_ticks: owner.start_time_ticks,
+        lock_path: lock_path.clone(),
+    };
+
+    assert_eq!(
+        try_record_proof_with(&lease, &owner, &fixture.event_log, &inspector)
+            .expect("a replaced lock is not an uncertain proof"),
+        None
+    );
+    assert!(fixture.event_log.ledger().read_events().unwrap().is_empty());
+}
+
+struct LockReleasingInspector {
+    pid: u32,
+    start_ticks: u64,
+    lock_path: PathBuf,
+}
+
+impl ProcessInspector for LockReleasingInspector {
+    fn start_time_ticks(&self, pid: u32) -> Result<Option<u64>, String> {
+        assert_eq!(pid, self.pid);
+        Ok(Some(self.start_ticks))
+    }
+
+    fn holds_inode(&self, pid: u32, _device: u64, _inode: u64) -> Result<bool, String> {
+        assert_eq!(pid, self.pid);
+        fs::remove_file(&self.lock_path).map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+}
+
+struct ExitingProcessInspector {
+    pid: u32,
+    start_ticks: u64,
+    observations: Cell<usize>,
+}
+
+impl ProcessInspector for ExitingProcessInspector {
+    fn start_time_ticks(&self, pid: u32) -> Result<Option<u64>, String> {
+        assert_eq!(pid, self.pid);
+        let observation = self.observations.get();
+        self.observations.set(observation + 1);
+        Ok((observation == 0).then_some(self.start_ticks))
+    }
+
+    fn holds_inode(&self, pid: u32, _device: u64, _inode: u64) -> Result<bool, String> {
+        assert_eq!(pid, self.pid);
+        Ok(true)
+    }
+}
+
+struct LockReplacingInspector {
+    pid: u32,
+    start_ticks: u64,
+    lock_path: PathBuf,
+}
+
+impl ProcessInspector for LockReplacingInspector {
+    fn start_time_ticks(&self, pid: u32) -> Result<Option<u64>, String> {
+        assert_eq!(pid, self.pid);
+        Ok(Some(self.start_ticks))
+    }
+
+    fn holds_inode(&self, pid: u32, _device: u64, _inode: u64) -> Result<bool, String> {
+        assert_eq!(pid, self.pid);
+        let replacement = self.lock_path.with_extension("replacement");
+        fs::write(&replacement, b"replacement lock").map_err(|error| error.to_string())?;
+        fs::rename(&replacement, &self.lock_path).map_err(|error| error.to_string())?;
+        Ok(true)
+    }
 }
 
 struct MutatingInspector {

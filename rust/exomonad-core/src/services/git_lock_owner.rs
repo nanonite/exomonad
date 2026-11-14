@@ -162,11 +162,18 @@ fn try_record_proof_with(
         ));
     }
 
-    verify_process_identity(inspector, owner, &paths.index_lock_file)?;
-    let lock = match snapshot_lock(&paths.index_lock_file) {
-        Ok(lock) => lock,
-        Err(_error) if native_lock_is_absent(&paths.index_lock_file) => return Ok(None),
-        Err(error) => return Err(error),
+    match process_identity_state(inspector, owner, &paths.index_lock_file)? {
+        ProcessIdentityState::Current => {}
+        ProcessIdentityState::Exited => return Ok(None),
+        ProcessIdentityState::Reused => {
+            return Err(uncertain(
+                &paths.index_lock_file,
+                "managed process PID was reused before lock ownership was recorded",
+            ));
+        }
+    }
+    let Some(lock) = try_snapshot_lock(&paths.index_lock_file)? else {
+        return Ok(None);
     };
     if !inspector
         .holds_inode(owner.pid, lock.device, lock.inode)
@@ -174,12 +181,18 @@ fn try_record_proof_with(
     {
         return Ok(None);
     }
-    verify_process_identity(inspector, owner, &paths.index_lock_file)?;
-    if snapshot_lock(&paths.index_lock_file)? != lock {
-        return Err(uncertain(
-            &paths.index_lock_file,
-            "native lock changed while process ownership was being recorded",
-        ));
+    match process_identity_state(inspector, owner, &paths.index_lock_file)? {
+        ProcessIdentityState::Current => {}
+        ProcessIdentityState::Exited => return Ok(None),
+        ProcessIdentityState::Reused => {
+            return Err(uncertain(
+                &paths.index_lock_file,
+                "managed process PID was reused while lock ownership was being recorded",
+            ));
+        }
+    }
+    if try_snapshot_lock(&paths.index_lock_file)?.as_ref() != Some(&lock) {
+        return Ok(None);
     }
 
     let proof = ManagedNativeLockProof {
@@ -205,28 +218,26 @@ fn try_record_proof_with(
     Ok(Some(RecordedManagedNativeLockProof { event_id, proof }))
 }
 
-fn native_lock_is_absent(path: &Path) -> bool {
-    matches!(
-        fs::symlink_metadata(path),
-        Err(error) if error.kind() == io::ErrorKind::NotFound
-    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessIdentityState {
+    Current,
+    Exited,
+    Reused,
 }
 
-fn verify_process_identity(
+fn process_identity_state(
     inspector: &dyn ProcessInspector,
     owner: &ManagedProcessIdentity,
     lock_path: &Path,
-) -> Result<(), GitMutationError> {
-    let current = inspector
+) -> Result<ProcessIdentityState, GitMutationError> {
+    match inspector
         .start_time_ticks(owner.pid)
-        .map_err(|reason| uncertain(lock_path, &reason))?;
-    if current != Some(owner.start_time_ticks) {
-        return Err(uncertain(
-            lock_path,
-            "managed process is absent or its PID was reused",
-        ));
+        .map_err(|reason| uncertain(lock_path, &reason))?
+    {
+        Some(current) if current == owner.start_time_ticks => Ok(ProcessIdentityState::Current),
+        Some(_) => Ok(ProcessIdentityState::Reused),
+        None => Ok(ProcessIdentityState::Exited),
     }
-    Ok(())
 }
 
 fn append_proof_once(
@@ -264,56 +275,115 @@ fn find_proof_event(
 }
 
 pub(crate) fn snapshot_lock(path: &Path) -> Result<NativeGitLockSnapshot, GitMutationError> {
-    let before = fs::symlink_metadata(path).map_err(|error| {
-        uncertain(
+    match observe_lock_file(path)? {
+        LockObservation::Stable(snapshot) => Ok(snapshot),
+        LockObservation::Absent => Err(uncertain(
             path,
-            &format!("cannot inspect native lock ({})", error.kind()),
-        )
-    })?;
-    if before.file_type().is_symlink() || !before.is_file() {
-        return Err(uncertain(path, "native lock is not a regular file"));
-    }
-    if before.len() > LOCK_EVIDENCE_MAX_BYTES {
-        return Err(uncertain(
-            path,
-            "native lock exceeds the evidence size limit",
-        ));
-    }
-
-    let file = open_readonly_nofollow(path)?;
-    let opened = file.metadata().map_err(|error| {
-        uncertain(
-            path,
-            &format!("cannot inspect native lock inode ({})", error.kind()),
-        )
-    })?;
-    verify_same_inode(path, &before, &opened)?;
-    let contents_sha256 = hash_file(path, &file)?;
-    let after = file.metadata().map_err(|error| {
-        uncertain(
-            path,
-            &format!("cannot recheck native lock ({})", error.kind()),
-        )
-    })?;
-    let current = fs::symlink_metadata(path).map_err(|error| {
-        uncertain(
-            path,
-            &format!("native lock path changed ({})", error.kind()),
-        )
-    })?;
-    verify_same_inode(path, &before, &after)?;
-    verify_same_inode(path, &before, &current)?;
-    if before.len() != after.len() || before.len() != current.len() {
-        return Err(uncertain(
+            &format!("cannot inspect native lock ({})", io::ErrorKind::NotFound),
+        )),
+        LockObservation::Changing => Err(uncertain(
             path,
             "native lock changed while being fingerprinted",
-        ));
+        )),
     }
+}
 
+/// Observe the lock without treating a lock that is still changing as a failure.
+///
+/// Returns `None` when the lock is absent or has not settled, so the caller can
+/// observe it again while the managed process is still running.
+fn try_snapshot_lock(path: &Path) -> Result<Option<NativeGitLockSnapshot>, GitMutationError> {
+    match observe_lock_file(path)? {
+        LockObservation::Stable(snapshot) => Ok(Some(snapshot)),
+        LockObservation::Absent | LockObservation::Changing => Ok(None),
+    }
+}
+
+enum LockObservation {
+    Stable(NativeGitLockSnapshot),
+    Absent,
+    Changing,
+}
+
+fn observe_lock_file(path: &Path) -> Result<LockObservation, GitMutationError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        Ok(NativeGitLockSnapshot {
+
+        let before = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(LockObservation::Absent);
+            }
+            Err(error) => {
+                return Err(uncertain(
+                    path,
+                    &format!("cannot inspect native lock ({})", error.kind()),
+                ));
+            }
+        };
+        if before.file_type().is_symlink() || !before.is_file() {
+            return Err(uncertain(path, "native lock is not a regular file"));
+        }
+        if before.len() > LOCK_EVIDENCE_MAX_BYTES {
+            return Err(uncertain(
+                path,
+                "native lock exceeds the evidence size limit",
+            ));
+        }
+
+        let file = match open_readonly_nofollow(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(LockObservation::Absent);
+            }
+            Err(error) => {
+                return Err(uncertain(
+                    path,
+                    &format!("cannot open native lock ({})", error.kind()),
+                ));
+            }
+        };
+        let opened = file.metadata().map_err(|error| {
+            uncertain(
+                path,
+                &format!("cannot inspect native lock inode ({})", error.kind()),
+            )
+        })?;
+        if !same_inode(&before, &opened) || !same_version(&before, &opened) {
+            return Ok(LockObservation::Changing);
+        }
+        let contents_sha256 = hash_file(path, &file)?;
+        let after = file.metadata().map_err(|error| {
+            uncertain(
+                path,
+                &format!("cannot recheck native lock ({})", error.kind()),
+            )
+        })?;
+        let current = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(LockObservation::Changing);
+            }
+            Err(error) => {
+                return Err(uncertain(
+                    path,
+                    &format!("native lock path changed ({})", error.kind()),
+                ));
+            }
+        };
+        if current.file_type().is_symlink() || !current.is_file() {
+            return Err(uncertain(path, "native lock is not a regular file"));
+        }
+        if !same_inode(&before, &after)
+            || !same_inode(&before, &current)
+            || !same_version(&before, &after)
+            || !same_version(&before, &current)
+        {
+            return Ok(LockObservation::Changing);
+        }
+
+        Ok(LockObservation::Stable(NativeGitLockSnapshot {
             device: before.dev(),
             inode: before.ino(),
             size: before.len(),
@@ -322,50 +392,32 @@ pub(crate) fn snapshot_lock(path: &Path) -> Result<NativeGitLockSnapshot, GitMut
             changed_seconds: before.ctime(),
             changed_nanoseconds: before.ctime_nsec(),
             contents_sha256,
-        })
+        }))
     }
     #[cfg(not(unix))]
     {
-        let _ = contents_sha256;
+        let _ = path;
         Err(GitMutationError::UnsupportedPlatform)
     }
 }
 
-fn verify_same_inode(
-    path: &Path,
-    expected: &fs::Metadata,
-    observed: &fs::Metadata,
-) -> Result<(), GitMutationError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if expected.dev() != observed.dev() || expected.ino() != observed.ino() {
-            return Err(uncertain(
-                path,
-                "native lock inode changed during inspection",
-            ));
-        }
-        if expected.len() != observed.len()
-            || expected.mtime() != observed.mtime()
-            || expected.mtime_nsec() != observed.mtime_nsec()
-            || expected.ctime() != observed.ctime()
-            || expected.ctime_nsec() != observed.ctime_nsec()
-        {
-            return Err(uncertain(
-                path,
-                "native lock metadata changed during inspection",
-            ));
-        }
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (expected, observed);
-        Err(GitMutationError::UnsupportedPlatform)
-    }
+#[cfg(unix)]
+fn same_inode(expected: &fs::Metadata, observed: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    expected.dev() == observed.dev() && expected.ino() == observed.ino()
 }
 
-fn open_readonly_nofollow(path: &Path) -> Result<File, GitMutationError> {
+#[cfg(unix)]
+fn same_version(expected: &fs::Metadata, observed: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    expected.len() == observed.len()
+        && expected.mtime() == observed.mtime()
+        && expected.mtime_nsec() == observed.mtime_nsec()
+        && expected.ctime() == observed.ctime()
+        && expected.ctime_nsec() == observed.ctime_nsec()
+}
+
+fn open_readonly_nofollow(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -373,9 +425,7 @@ fn open_readonly_nofollow(path: &Path) -> Result<File, GitMutationError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
     }
-    options
-        .open(path)
-        .map_err(|error| uncertain(path, &format!("cannot open native lock ({})", error.kind())))
+    options.open(path)
 }
 
 fn hash_file(path: &Path, file: &File) -> Result<String, GitMutationError> {

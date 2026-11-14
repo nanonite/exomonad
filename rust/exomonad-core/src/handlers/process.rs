@@ -646,7 +646,8 @@ mod tests {
             "[submodule \"reference\"]\n\tpath = tools/reference\n\turl = https://example.invalid/reference.git\n",
         )
         .unwrap();
-        let add_modules = ["add", ".gitmodules"];
+        std::fs::write(root.join(".gitignore"), ".exo/\n").unwrap();
+        let add_modules = ["add", ".gitmodules", ".gitignore"];
         assert_git_fixture_succeeded(run_git_fixture_output(&root, &add_modules), &add_modules);
         let gitlink = format!("160000,{reference_oid},tools/reference");
         assert_git_fixture_succeeded(
@@ -969,7 +970,8 @@ mod tests {
             "[submodule \"reference\"]\n\tpath = tools/reference\n\turl = https://example.invalid/reference.git\n",
         )
         .unwrap();
-        let add_modules = ["add", ".gitmodules"];
+        std::fs::write(root.join(".gitignore"), ".exo/\n").unwrap();
+        let add_modules = ["add", ".gitmodules", ".gitignore"];
         assert_git_fixture_succeeded(run_git_fixture_output(&root, &add_modules), &add_modules);
         let gitlink = format!("160000,{original_oid},tools/reference");
         assert_git_fixture_succeeded(

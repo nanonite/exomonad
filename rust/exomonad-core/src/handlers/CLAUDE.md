@@ -40,8 +40,12 @@ Handles effects in the `process.*` namespace, providing ad-hoc process execution
   index leases before spawn and append requested, started, and finished
   records to the existing `.exo/logs` event ledger. On Linux, an index-lock
   proof is recorded only after `/proc` confirms that exact child identity holds
-  the exact lock inode. Other platforms keep Git's native locking behavior but
-  cannot authorize automatic quarantine without a durable owner proof.
+  the exact lock inode. An observation that catches the lock mid-write, already
+  released or replaced, or the child exiting is retried by the supervision
+  poll and never recorded as a partial proof; only a stable inode snapshot
+  bound to a live matching child identity produces a proof. Other platforms
+  keep Git's native locking behavior but cannot authorize automatic quarantine
+  without a durable owner proof.
 - Managed direct Git calls reject repository path overrides such as `-C`,
   `--git-dir`, `--work-tree`, and `GIT_*` path selectors. A requested
   subdirectory must resolve inside the declared worktree and Git must resolve
