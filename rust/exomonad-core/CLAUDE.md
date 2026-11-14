@@ -486,10 +486,15 @@ terminalized under the invocation mutation lock with its routing target
 preserved as evidence, and one `controller_restart` successor is planned.
 `ControllerRestart` successors record the controller epoch that created them so
 a retry inside the same startup window reuses the successor instead of
-reconciling it. A verified live matching owner is reused; a wrong owner, a
-partial ownership record, a target from another root scope, or unavailable
-inspection is held with a distinct diagnostic and no replacement. Absent
-delivery alone never authorizes duplicating a separately running worker.
+reconciling it. The epoch comes from the exact current controller target; an
+absent target records no epoch and logs why, while an unreadable, malformed, or
+incomplete target fails provisioning closed with `LifecycleBlocked`, creates no
+successor, and leaves the prior invocation untouched. Silently omitting the
+epoch for an unreadable target would make a same-window retry reconcile the
+successor as a stale lifetime. A verified live matching owner is reused; a
+wrong owner, a partial ownership record, a target from another root scope, or
+unavailable inspection is held with a distinct diagnostic and no replacement.
+Absent delivery alone never authorizes duplicating a separately running worker.
 
 Shared TL delivery is explicit. Several ledger-owned sibling controllers may
 share the exact root controller pane; a single window/pane ownership tag does

@@ -42,6 +42,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Remove every redundant cast and `no-any-return` error from `tl_loop/**` in the strict mypy form (#1329)
 
 ### Fixed
+- Fail ordered sub-TL provisioning closed, with a logged cause, when the controller target is unreadable or malformed instead of silently recording no controller epoch on the restart successor (#1344)
 - Treat a committed root controller whose recorded tmux server lifetime has ended as not live at startup, so a fresh server that recycles the same window and pane ids no longer blocks init with an ownership conflict (#1285)
 - Reconcile a recycled tmux target against the exact pending startup target, and let `exomonad shutdown --workspace` quiesce a valid pending startup instead of rejecting it as stale (#1285)
 - Make `exomonad shutdown --workspace` retarget to a newer interrupted startup even when an earlier shutdown intent is already complete (#1288)

@@ -19,6 +19,17 @@ fn ordered_provision_failure(
     anyhow::Error::new(super::OrderedSubTLProvisionFailure { kind, message })
 }
 
+/// A missing controller target is the one read outcome that legitimately has no
+/// epoch to record. Every other `read_controller_target_for_routing` failure
+/// means a target record exists but cannot be trusted, and must fail closed.
+fn controller_target_is_missing(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
 fn validate_prior_ordered_invocation(
     prior: &invocation::InvocationRecord,
     identity: &AgentIdentityRecord,
@@ -888,7 +899,14 @@ impl<
             branch: Some(durable_identity.birth_branch.to_string()),
             worktree: Some(durable_identity.working_dir.to_string_lossy().into_owned()),
         };
-        let controller_epoch = self.ordered_sub_tl_controller_epoch().await;
+        let controller_epoch = self
+            .ordered_sub_tl_controller_epoch(
+                &agent_name,
+                prior_invocation
+                    .as_ref()
+                    .map(|prior| prior.invocation_id.as_str()),
+            )
+            .await?;
         self.finalize_spawn_with_invocation(
             &agent_name,
             routing,
@@ -946,15 +964,56 @@ impl<
     /// The controller epoch of the exact target that owns this provisioning
     /// transaction. Recorded with the successor so a retry inside the same
     /// startup window reuses it instead of reconciling it as a stale lifetime.
-    async fn ordered_sub_tl_controller_epoch(&self) -> Option<String> {
+    ///
+    /// A controller target that is absent records no epoch: there is nothing to
+    /// read and no epoch to record, which is the established outcome for the
+    /// synthetic test routing seam and for callers without a durable root
+    /// controller target. Every other read failure is an unreadable, malformed
+    /// or incomplete target; recording no epoch there would make a same-window
+    /// retry reconcile the successor as a stale lifetime, so provisioning fails
+    /// closed instead.
+    async fn ordered_sub_tl_controller_epoch(
+        &self,
+        agent_name: &AgentName,
+        prior_invocation_id: Option<&str>,
+    ) -> Result<Option<String>> {
         #[cfg(test)]
         if self.ordered_sub_tl_routing_override.is_some() {
-            return None;
+            debug!(
+                agent = %agent_name,
+                invocation = ?prior_invocation_id,
+                "Ordered controller provisioning uses the synthetic test route and records no controller epoch"
+            );
+            return Ok(None);
         }
-        super::read_controller_target_for_routing(self.project_dir())
-            .await
-            .ok()
-            .map(|target| target.controller_epoch)
+        match super::read_controller_target_for_routing(self.project_dir()).await {
+            Ok(target) => Ok(Some(target.controller_epoch)),
+            Err(error) if controller_target_is_missing(&error) => {
+                warn!(
+                    project = %self.project_dir().display(),
+                    agent = %agent_name,
+                    invocation = ?prior_invocation_id,
+                    error = %error,
+                    error_chain = ?error.chain().collect::<Vec<_>>(),
+                    "Ordered controller provisioning found no controller target and records no controller epoch"
+                );
+                Ok(None)
+            }
+            Err(error) => {
+                warn!(
+                    project = %self.project_dir().display(),
+                    agent = %agent_name,
+                    invocation = ?prior_invocation_id,
+                    error = %error,
+                    error_chain = ?error.chain().collect::<Vec<_>>(),
+                    "Ordered controller provisioning refused: the controller target is unreadable or malformed, so no controller epoch can be recorded"
+                );
+                Err(ordered_provision_failure(
+                    super::OrderedSubTLProvisionFailureKind::LifecycleBlocked,
+                    "the controller target is unreadable or malformed; controller epoch recording is blocked",
+                ))
+            }
+        }
     }
 
     pub(crate) fn runtime_role_context(&self, role: &crate::domain::Role) -> Result<String> {
@@ -2592,6 +2651,89 @@ mod tests {
         Arc::new(services)
     }
 
+    fn ordered_epoch_service(project_dir: &Path) -> AgentControlService<crate::services::Services> {
+        AgentControlService::new(test_services(project_dir.to_path_buf()))
+    }
+
+    fn persist_test_readable_controller_target(project_dir: &Path, epoch: &str) {
+        let root = project_dir.join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).expect("create test root checkpoint directory");
+        let target = super::ControllerPaneOwnership {
+            schema_version: 1,
+            controller_epoch: epoch.to_string(),
+            run_id: "root".to_string(),
+            tmux_session: "test-session".to_string(),
+            window_id: super::super::tmux_ipc::WindowId::parse("@1").unwrap(),
+            pane_id: super::super::tmux_ipc::PaneId::parse("%1").unwrap(),
+            pane_pid: 1234,
+            pane_start_ticks: 5678,
+            tmux_server_pid: 9012,
+            tmux_server_start_ticks: 3456,
+        };
+        std::fs::write(
+            super::controller_lifecycle::controller_ownership_path(project_dir),
+            serde_json::to_vec(&target).unwrap(),
+        )
+        .expect("write readable test controller target");
+    }
+
+    /// One process-wide capture sink keeps the log assertions independent of
+    /// which test thread polls the asynchronous future. Per-thread scoped
+    /// subscribers race with concurrent test threads over tracing callsite
+    /// interest, which can drop an otherwise emitted event.
+    fn global_test_event_sink() -> &'static Arc<std::sync::Mutex<Vec<String>>> {
+        static SINK: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<String>>>> =
+            std::sync::OnceLock::new();
+        SINK.get_or_init(|| {
+            let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
+            if let Err(error) =
+                tracing::subscriber::set_global_default(capture_test_events(sink.clone()))
+            {
+                eprintln!("test tracing capture was not installed: {error}");
+            }
+            sink
+        })
+    }
+
+    /// A tracing subscriber that records every event's level and fields, so a
+    /// test can assert that a degraded controller-epoch read was reported
+    /// rather than silently swallowed.
+    fn capture_test_events(
+        sink: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> impl tracing::Subscriber + Send + Sync + 'static {
+        use std::fmt::Write as _;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+
+        struct Capture(Arc<std::sync::Mutex<Vec<String>>>);
+
+        #[derive(Default)]
+        struct Fields(String);
+
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                let _ = write!(self.0, " {}={:?}", field.name(), value);
+            }
+        }
+
+        impl<S> Layer<S> for Capture
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.0.lock().expect("capture lock").push(format!(
+                    "LEVEL_{:?}{}",
+                    event.metadata().level(),
+                    fields.0
+                ));
+            }
+        }
+
+        tracing_subscriber::registry().with(Capture(sink))
+    }
+
     #[test]
     fn ordered_sub_tl_route_requires_one_existing_tl_window() {
         use super::super::tmux_ipc::{PaneId, WindowId, WindowInfo};
@@ -2664,6 +2806,162 @@ mod tests {
         assert!(
             format!("{error:#}").contains("exact root controller ownership is unavailable"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_sub_tl_controller_epoch_records_the_readable_target_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        persist_test_readable_controller_target(&project_dir, "epoch-readable");
+        let service = ordered_epoch_service(&project_dir);
+        let agent_name = AgentName::try_from_str("ordered-epoch").unwrap();
+
+        let epoch = service
+            .ordered_sub_tl_controller_epoch(&agent_name, Some("prior-invocation"))
+            .await
+            .expect("a readable controller target yields its epoch");
+
+        assert_eq!(epoch.as_deref(), Some("epoch-readable"));
+    }
+
+    #[tokio::test]
+    async fn ordered_sub_tl_controller_epoch_records_none_for_an_absent_target_and_logs_why() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        let service = ordered_epoch_service(&project_dir);
+        let agent_name = AgentName::try_from_str("ordered-epoch-absent").unwrap();
+        let sink = global_test_event_sink().clone();
+
+        let epoch = service
+            .ordered_sub_tl_controller_epoch(&agent_name, Some("prior-invocation"))
+            .await
+            .expect("an absent controller target records no epoch");
+
+        assert_eq!(epoch, None);
+        let captured = sink.lock().unwrap().join("\n");
+        let logs = captured
+            .lines()
+            .filter(|line| line.contains("ordered-epoch-absent"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(logs.contains("LEVEL_Level(Warn)"), "{logs}");
+        assert!(
+            logs.contains("found no controller target and records no controller epoch"),
+            "{logs}"
+        );
+        assert!(logs.contains("prior-invocation"), "{logs}");
+        assert!(logs.contains("error_chain"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn ordered_sub_tl_controller_epoch_refuses_a_malformed_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        let root = project_dir.join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            super::controller_lifecycle::controller_ownership_path(&project_dir),
+            b"{not-json",
+        )
+        .unwrap();
+        let service = ordered_epoch_service(&project_dir);
+        let agent_name = AgentName::try_from_str("ordered-epoch-malformed").unwrap();
+        let sink = global_test_event_sink().clone();
+
+        let error = service
+            .ordered_sub_tl_controller_epoch(&agent_name, Some("prior-invocation"))
+            .await
+            .expect_err("a malformed controller target must fail closed");
+
+        assert_eq!(
+            error
+                .downcast_ref::<super::OrderedSubTLProvisionFailure>()
+                .expect("the epoch failure carries a provisioning failure")
+                .code(),
+            "ordered_sub_tl_lifecycle_blocked"
+        );
+        assert!(
+            format!("{error:#}").contains("controller target is unreadable or malformed"),
+            "{error:#}"
+        );
+        let captured = sink.lock().unwrap().join("\n");
+        let logs = captured
+            .lines()
+            .filter(|line| line.contains("ordered-epoch-malformed"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(logs.contains("LEVEL_Level(Warn)"), "{logs}");
+        assert!(
+            logs.contains("the controller target is unreadable or malformed"),
+            "{logs}"
+        );
+        assert!(logs.contains("prior-invocation"), "{logs}");
+        assert!(logs.contains("error_chain"), "{logs}");
+    }
+
+    #[tokio::test]
+    async fn ordered_sub_tl_controller_epoch_refuses_an_unreadable_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        std::fs::create_dir_all(super::controller_lifecycle::controller_ownership_path(
+            &project_dir,
+        ))
+        .unwrap();
+        let service = ordered_epoch_service(&project_dir);
+        let agent_name = AgentName::try_from_str("ordered-epoch-unreadable").unwrap();
+
+        let error = service
+            .ordered_sub_tl_controller_epoch(&agent_name, Some("prior-invocation"))
+            .await
+            .expect_err("an unreadable controller target must fail closed");
+
+        assert_eq!(
+            error
+                .downcast_ref::<super::OrderedSubTLProvisionFailure>()
+                .expect("the epoch failure carries a provisioning failure")
+                .code(),
+            "ordered_sub_tl_lifecycle_blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordered_sub_tl_controller_epoch_refuses_an_incomplete_target_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        let root = project_dir.join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).unwrap();
+        let target = super::ControllerPaneOwnership {
+            schema_version: 1,
+            controller_epoch: "epoch-incomplete".to_string(),
+            run_id: "root".to_string(),
+            tmux_session: "test-session".to_string(),
+            window_id: super::super::tmux_ipc::WindowId::parse("@1").unwrap(),
+            pane_id: super::super::tmux_ipc::PaneId::parse("%1").unwrap(),
+            pane_pid: 0,
+            pane_start_ticks: 5678,
+            tmux_server_pid: 9012,
+            tmux_server_start_ticks: 3456,
+        };
+        std::fs::write(
+            super::controller_lifecycle::controller_ownership_path(&project_dir),
+            serde_json::to_vec(&target).unwrap(),
+        )
+        .unwrap();
+        let service = ordered_epoch_service(&project_dir);
+        let agent_name = AgentName::try_from_str("ordered-epoch-incomplete").unwrap();
+
+        let error = service
+            .ordered_sub_tl_controller_epoch(&agent_name, None)
+            .await
+            .expect_err("an incomplete controller target identity must fail closed");
+
+        assert_eq!(
+            error
+                .downcast_ref::<super::OrderedSubTLProvisionFailure>()
+                .expect("the epoch failure carries a provisioning failure")
+                .code(),
+            "ordered_sub_tl_lifecycle_blocked"
         );
     }
 
@@ -2940,6 +3238,65 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(identity_path).unwrap(),
             identity_before
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ordered_sub_tl_provisioning_refuses_a_malformed_controller_target_without_a_successor()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        init_ordered_test_repo(&project_dir);
+        let tmux = OrderedTestTmux::new();
+        let target = tmux.window_id_for_session();
+        let record = ordered_test_record(&project_dir, "ordered-malformed");
+        let agent_dir = project_dir.join(".exo/agents/ordered-malformed");
+        let first_id = ordered_service_using_tmux_route(&project_dir, &tmux.session, &target)
+            .await
+            .provision_ordered_sub_tl(record.clone())
+            .await
+            .unwrap();
+        let invocation_before = std::fs::read(agent_dir.join("invocation.json")).unwrap();
+        std::fs::write(
+            project_dir.join(super::ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH),
+            b"{not-json",
+        )
+        .unwrap();
+
+        // Routing reads the same target first, so this exercises the end-to-end
+        // refusal; the direct epoch tests above cover the epoch read itself.
+        let error = ordered_service_using_tmux_route(&project_dir, &tmux.session, &target)
+            .await
+            .provision_ordered_sub_tl(record)
+            .await
+            .expect_err("a malformed controller target must not create a successor");
+        assert_eq!(
+            error
+                .downcast_ref::<super::OrderedSubTLProvisionFailure>()
+                .expect("the refusal carries a provisioning failure")
+                .code(),
+            "ordered_sub_tl_lifecycle_blocked"
+        );
+        assert_eq!(
+            std::fs::read(agent_dir.join("invocation.json")).unwrap(),
+            invocation_before,
+            "the prior invocation must remain byte-for-byte untouched"
+        );
+        let invocation = read_invocation(&agent_dir).await.unwrap().unwrap();
+        assert_eq!(invocation.invocation_id, first_id);
+        assert!(invocation.is_live());
+        assert_eq!(
+            invocation_start_count(&project_dir, "ordered-malformed", &first_id),
+            1,
+            "no successor invocation is registered"
+        );
+        let lifecycle =
+            std::fs::read_to_string(project_dir.join(".exo/events/ordered-malformed.jsonl"))
+                .unwrap();
+        assert!(
+            !lifecycle.contains("\"trigger\":\"controller_restart\""),
+            "a refused target must not plan a controller restart: {lifecycle}"
         );
     }
 
