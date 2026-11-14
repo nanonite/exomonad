@@ -2042,6 +2042,11 @@ Run `exomonad recompile` first to build it.",
     agent_control = agent_control.with_forgejo_spawn_env(forgejo_spawn_env);
     let event_session_id = uuid::Uuid::new_v4().to_string();
     let agent_control = Arc::new(agent_control);
+    // A workspace shutdown preserves worker panes while stopping the server
+    // that owned their exit monitors. Revalidate retained live invocations so
+    // continuation records their terminal outcome instead of leaving them
+    // "running" forever.
+    agent_control.resume_invocation_monitors().await;
     // Shutdown signal shared by the /shutdown endpoint and shutdown_server effect.
     let shutdown_signal = Arc::new(tokio::sync::Notify::new());
 

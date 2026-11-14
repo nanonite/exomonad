@@ -827,7 +827,12 @@ check-e2e-one-shot-lifecycle:
 
 # Drive the real exomonad init binary + tmux through Server/Watcher/TL crash
 # recovery, concurrent-init locking, and nonterminal-checkpoint continuation
-# through the embedded controller, watcher, and ledger (chainlink #907)
+# through the embedded controller, watcher, and ledger (chainlink #907).
+# Set E2E_COMPOSED_RESTART=1 (with E2E_AGGREGATE_ONLY=1) for the single
+# composed acceptance run: legacy spawn shape, full isolated tmux server
+# restart with numeric id reuse, interrupted-startup shutdown/retry, one
+# Luna/xhigh worker, shutdown/continue adoption, reviewer/bookkeeping and
+# duplicate-free repeat init.
 e2e-init-recovery:
     ./tests/e2e/init-recovery/run.sh
 

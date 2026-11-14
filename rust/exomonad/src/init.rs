@@ -11,7 +11,8 @@ use exomonad_core::services::tmux_ipc::{PaneId, WindowId};
 use exomonad_core::services::{
     agent_control::{
         capture_controller_pane_target, clear_pending_controller_ownership, codex_lifecycle,
-        controller_ownership_is_live, controller_pane_target_is_live, persist_controller_ownership,
+        controller_ownership_is_live, controller_ownership_is_live_for_startup,
+        controller_pane_target_is_live, persist_controller_ownership,
         persist_pending_controller_ownership, read_controller_ownership,
         read_controller_target_for_routing, read_invocation, read_invocation_conservatively,
         CapturedCodexTrust, ControllerPaneOwnership, ControllerPaneTarget, InvocationRecord,
@@ -6557,7 +6558,7 @@ async fn reconcile_existing_session(
                     "root controller ownership names another tmux session; refusing replacement"
                 );
             }
-            controller_ownership_is_live(project_dir, ipc, target).await?
+            controller_ownership_is_live_for_startup(project_dir, ipc, target).await?
         }
         None => false,
     };

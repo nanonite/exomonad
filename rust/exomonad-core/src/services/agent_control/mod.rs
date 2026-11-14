@@ -22,8 +22,9 @@ pub use codex_lifecycle::{
 pub use controller_lifecycle::{
     capture_controller_ownership, capture_controller_pane_target,
     clear_pending_controller_ownership, controller_ownership_is_live,
-    controller_pane_target_is_live, pending_startup_target_if_current,
-    persist_controller_ownership, persist_pending_controller_ownership, read_controller_ownership,
+    controller_ownership_is_live_for_startup, controller_pane_target_is_live,
+    pending_startup_target_if_current, persist_controller_ownership,
+    persist_pending_controller_ownership, read_controller_ownership,
     read_controller_target_for_routing, reconcile_controller_binding,
     select_controller_shutdown_target, ControllerBindingReconciliation, ControllerPaneOwnership,
     ControllerPaneTarget, WorkspaceShutdownIntent, WorkspaceShutdownPhase, WorkspaceShutdownResult,
@@ -1849,6 +1850,85 @@ impl<
         self.monitor_invocation(agent_config_dir.clone(), invocation);
 
         Ok(agent_config_dir)
+    }
+
+    /// Reattach exit reconciliation for invocations that outlived a server
+    /// restart.
+    ///
+    /// Workspace shutdown preserves worker panes but stops the server process
+    /// that was monitoring them. A later `init --continue` starts a fresh
+    /// server; without revalidation those adopted workers would never record
+    /// their terminal outcome. Only live records whose exact routing ownership
+    /// still proves this invocation are attached.
+    pub async fn resume_invocation_monitors(&self) {
+        let agents = self.project_dir().join(".exo/agents");
+        let mut entries = match tokio::fs::read_dir(&agents).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                warn!(
+                    path = %agents.display(),
+                    %error,
+                    "Could not inspect retained invocations for monitor recovery"
+                );
+                return;
+            }
+        };
+        let Ok(tmux) = self.tmux() else {
+            warn!("Skipping invocation monitor recovery because tmux is not configured");
+            return;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if !entry
+                .file_type()
+                .await
+                .map(|kind| kind.is_dir())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let agent_dir = entry.path();
+            let current = match invocation::read_invocation(&agent_dir).await {
+                Ok(Some(current)) => current,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(
+                        path = %agent_dir.display(),
+                        %error,
+                        "Could not read a retained invocation for monitor recovery"
+                    );
+                    continue;
+                }
+            };
+            if !current.is_live() {
+                continue;
+            }
+            match invocation::reconcile_live_invocation_startup(
+                &agent_dir,
+                &current,
+                &current.routing,
+                Some(&tmux),
+            )
+            .await
+            {
+                Ok(reconciled) => {
+                    info!(
+                        path = %agent_dir.display(),
+                        invocation_id = %reconciled.invocation_id,
+                        "Reattached exit reconciliation for a retained invocation"
+                    );
+                    self.monitor_invocation(agent_dir, reconciled);
+                }
+                Err(error) => {
+                    warn!(
+                        path = %agent_dir.display(),
+                        invocation_id = %current.invocation_id,
+                        %error,
+                        "Retained invocation routing could not be revalidated; leaving it unmonitored"
+                    );
+                }
+            }
+        }
     }
 
     /// Reconcile a tmux-owned invocation as soon as its exact target exits.

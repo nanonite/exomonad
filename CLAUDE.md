@@ -844,6 +844,12 @@ All E2E tests live in `tests/e2e/{name}/` and follow the same structure:
 - A harness never inherits the caller's `CHAINLINK_DB`: it initializes and
   exports each disposable repository's own `.chainlink/issues.db` before any
   phase that runs Chainlink, `exomonad init`/`serve`, or the TL controller.
+- Tmux isolation is per run: set `TMUX_TMPDIR` to a run-owned directory, unset
+  `TMUX`/`TMUX_PANE`, and before any `kill-server` assert the socket path is
+  inside that directory and is not the default `/tmp/tmux-*` server. The
+  init-recovery harness's `E2E_COMPOSED_RESTART=1` mode restarts only its own
+  isolated server to reuse numeric ids; it never touches the operator's default
+  server.
 
 **Adding a new E2E test:**
 1. Create `tests/e2e/{name}/run.sh` following the pattern above

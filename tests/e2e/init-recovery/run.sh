@@ -36,6 +36,15 @@ export EXOMONAD_CODEX_MODEL="${EXOMONAD_CODEX_MODEL:-e2e-unused-model}"
 # which would defeat literal matches on startup fields.
 export NO_COLOR=1
 
+# The composed acceptance mode is self-contained: it selects the aggregate
+# fixture, the accepted terminal-provider shape and the historical parent
+# stall without requiring the caller to pass those flags separately.
+if [[ "${E2E_COMPOSED_RESTART:-0}" == "1" ]]; then
+    export E2E_AGGREGATE_ONLY=1
+    export E2E_TERMINAL_PROVIDER_FAILURE=1
+    export E2E_HISTORICAL_PARENT_STALL=1
+fi
+
 SESSION="e2e-init-recovery"
 CONTINUATION_SESSION="e2e-init-recovery-continuation"
 AGGREGATE_SESSION="e2e-init-aggregate-recovery"
@@ -589,6 +598,622 @@ restart_repeated_server() {
     tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
     wait_for_repeated_server_socket \
         || e2e_fail "repeated-route server did not create its socket for attempt $attempt"
+}
+
+composed_target_fields() {
+    python3 - "$1" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    record = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(0)
+print(
+    record.get("window_id", ""),
+    record.get("pane_id", ""),
+    record.get("pane_pid", ""),
+    record.get("pane_start_ticks", ""),
+    record.get("controller_epoch", ""),
+    record.get("tmux_server_pid", ""),
+    record.get("tmux_server_start_ticks", ""),
+)
+PY
+}
+
+restart_entire_aggregate_tmux_server() {
+    [[ -n "${AGGREGATE_TMUX_TMPDIR:-}" ]] \
+        || e2e_fail "refusing to restart tmux without this run's isolated TMUX_TMPDIR"
+    [[ -z "${TMUX:-}" ]] \
+        || e2e_fail "refusing to restart tmux from a shell that inherited TMUX"
+    local socket
+    socket="$(tmux display-message -p '#{socket_path}')" \
+        || e2e_fail "could not resolve the aggregate tmux server socket before restart"
+    case "$socket" in
+        "$AGGREGATE_TMUX_TMPDIR"/tmux-*/*) ;;
+        *) e2e_fail "refusing to kill tmux socket $socket outside this run's isolated TMUX_TMPDIR $AGGREGATE_TMUX_TMPDIR" ;;
+    esac
+    [[ "$socket" != /tmp/tmux-* ]] \
+        || e2e_fail "refusing to kill the default tmux server socket $socket"
+    e2e_log "Restarting the whole isolated tmux server at $socket"
+    tmux kill-server 2>/dev/null || true
+    for _ in $(seq 1 200); do
+        if ! python3 - "$socket" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(0.2)
+client.connect(sys.argv[1])
+client.close()
+PY
+        then
+            break
+        fi
+        sleep 0.05
+    done
+    python3 - "$socket" <<'PY' \
+        || e2e_fail "isolated tmux server at $socket still accepts connections after kill-server"
+import socket
+import sys
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(0.2)
+try:
+    client.connect(sys.argv[1])
+except OSError:
+    raise SystemExit(0)
+finally:
+    client.close()
+raise SystemExit(1)
+PY
+
+    # Recreate the same first window (the original bootstrap TL) so the fresh
+    # server allocates the same numeric ids the recorded controller used. The
+    # Server window follows, and init will create Watcher and the new TL in the
+    # same order as the recorded startup.
+    tmux new-session -d -s "$AGGREGATE_SESSION" -n TL "exec sleep 300"
+    COMPOSED_BOOTSTRAP_WINDOW="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_name} #{window_id}' | awk '$1 == "TL" { print $2; exit }')"
+    tmux set-window-option -t "$AGGREGATE_SESSION:TL" remain-on-exit on
+    tmux set-environment -t "$AGGREGATE_SESSION" GIT_SSH_COMMAND "$AGG_DIR/git-ssh"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_GIT_REMOTE_DIR "$AGG_REMOTE"
+    tmux set-environment -t "$AGGREGATE_SESSION" PATH "$PATH"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_AGENT_LOG "$AGENT_EVENT_LOG"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_SOURCE_WORKTREE "$HANDOFF_WORKTREE"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_ROOT_ONLY_DIRTY_FILE "$ROOT_ONLY_DIRTY_FILE"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_HANDOFF_HEAD_FILE "$HANDOFF_HEAD_FILE"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_MOCK_URL "$AGG_MOCK_URL"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_MCP_SOCKET "$AGG_REPO/.exo/server.sock"
+    tmux set-environment -t "$AGGREGATE_SESSION" E2E_AGG_REPO "$AGG_REPO"
+    tmux set-environment -t "$AGGREGATE_SESSION" CODEX_HOME "$CODEX_HOME"
+    tmux set-environment -t "$AGGREGATE_SESSION" HOME "$AGG_HOME"
+    tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_SERVER_COMMAND"
+    tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
+
+    # init creates the Watcher and then the controller TL window when neither
+    # exists. Fill the fresh server's numeric window sequence up to the same
+    # point as the recorded startup so Watcher and TL receive the recorded ids.
+    # Each filler also advances the pane sequence by one, so the reused TL pane
+    # id matches too.
+    local old_index="${COMPOSED_OLD_WINDOW#@}" filler max_window
+    [[ "$old_index" =~ ^[0-9]+$ && "$old_index" -ge 3 ]] \
+        || e2e_fail "recorded controller window $COMPOSED_OLD_WINDOW cannot be reproduced on a fresh server"
+    filler=2
+    while (( filler < old_index - 1 )); do
+        tmux new-window -d -t "$AGGREGATE_SESSION" -n "ComposedFiller$filler" "exec sleep 300"
+        filler=$((filler + 1))
+    done
+    max_window="$(tmux list-windows -t "$AGGREGATE_SESSION" -F '#{window_id}' \
+        | sed 's/^@//' | sort -n | tail -1)"
+    [[ -n "$max_window" && $((max_window + 1)) -eq $((old_index - 1)) ]] \
+        || e2e_fail "fresh tmux server window sequence is at @$((max_window + 1)); cannot reuse recorded Watcher @$((old_index - 1)) and controller $COMPOSED_OLD_WINDOW"
+    wait_for_repeated_server_socket \
+        || { tmux capture-pane -p -t "$AGGREGATE_SESSION:Server" > "$AGG_DIR/composed-server-pane.log" 2>&1 || true; cat "$AGG_DIR/composed-server-pane.log"; e2e_fail "fresh composed tmux server did not start its Server socket"; }
+}
+
+# Interrupt init after it has persisted the pending controller target, quiesce
+# that pending startup through the supported workspace shutdown command, and
+# retry. The first startup must reconcile the recorded historical controller
+# whose numeric target the fresh tmux server recycled.
+run_composed_failed_startup_and_retry() {
+    local startup_path="$AGG_REPO/.exo/tl-loop/root/controller-startup.json"
+    local pending_path="$AGG_REPO/.exo/tl-loop/root/controller-target.pending.json"
+    local first_pid first_status target_window target_pane target_pid target_ticks target_epoch
+    local target_server_pid target_server_ticks phase
+    local retry_status=0
+    HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
+        "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
+        > "$AGG_DIR/composed-interrupted-startup.log" 2>&1 &
+    first_pid=$!
+
+    for _ in $(seq 1 1200); do
+        if [[ -s "$pending_path" ]]; then
+            # Freeze the startup as soon as the pending target is durable so the
+            # interruption point is deterministic and precedes the release fence.
+            kill -STOP "$first_pid" 2>/dev/null || true
+            break
+        fi
+        if ! kill -0 "$first_pid" 2>/dev/null; then
+            wait "$first_pid" || first_status=$?
+            cat "$AGG_DIR/composed-interrupted-startup.log"
+            e2e_fail "init exited before persisting the pending controller target (status ${first_status:-0})"
+        fi
+        sleep 0.05
+    done
+    [[ -s "$pending_path" ]] \
+        || e2e_fail "first composed startup did not persist a pending controller target within the bounded wait"
+    phase="$(python3 - "$startup_path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    record = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    print("")
+else:
+    print(record.get("phase", ""))
+PY
+)"
+    read -r target_window target_pane target_pid target_ticks target_epoch target_server_pid target_server_ticks \
+        < <(composed_target_fields "$pending_path")
+    [[ -n "$target_window" && -n "$target_pane" && -n "$target_epoch" ]] \
+        || { cat "$pending_path"; e2e_fail "pending controller target is incomplete"; }
+    [[ "$target_window" == "$COMPOSED_OLD_WINDOW" && "$target_pane" == "$COMPOSED_OLD_PANE" ]] \
+        || e2e_fail "fresh tmux server did not reuse the recorded controller ids: old=$COMPOSED_OLD_WINDOW/$COMPOSED_OLD_PANE new=$target_window/$target_pane"
+    [[ "$target_pid" != "$COMPOSED_OLD_PANE_PID" || "$target_ticks" != "$COMPOSED_OLD_PANE_TICKS" ]] \
+        || e2e_fail "reused controller target kept the historical pane process identity $target_pid/$target_ticks"
+    [[ "$target_server_pid" != "$COMPOSED_OLD_SERVER_PID" || "$target_server_ticks" != "$COMPOSED_OLD_SERVER_TICKS" ]] \
+        || e2e_fail "reused controller target kept the historical tmux server identity $target_server_pid/$target_server_ticks"
+    [[ "$target_epoch" != "$COMPOSED_OLD_EPOCH" ]] \
+        || e2e_fail "reused controller target kept the historical controller epoch $target_epoch"
+    case "$phase" in
+        target_created|state_reconciled|released) ;;
+        *) e2e_fail "interrupted startup reached unexpected phase '$phase' with a pending target" ;;
+    esac
+    e2e_log "PASS: COMPOSED-2 tmux server restarted; numeric ids reused"
+
+    # The recreated bootstrap TL existed only to advance the fresh server's
+    # numeric ids to the recorded controller target. It is not a controller.
+    if [[ -n "${COMPOSED_BOOTSTRAP_WINDOW:-}" ]]; then
+        tmux kill-window -t "$COMPOSED_BOOTSTRAP_WINDOW" 2>/dev/null || true
+    fi
+
+    # End the interrupted startup before the release fence lets the controller
+    # run. The fence and pending target must survive for the supported shutdown.
+    kill -KILL "$first_pid" 2>/dev/null || true
+    wait "$first_pid" 2>/dev/null || true
+    [[ -s "$startup_path" && -s "$pending_path" ]] \
+        || e2e_fail "interrupted startup removed its fence or pending target before shutdown"
+
+    local shutdown_status=0
+    (
+        cd "$AGG_REPO"
+        HOME="$AGG_HOME" "$EXOMONAD_BIN" shutdown --workspace
+    ) > "$AGG_DIR/composed-failed-startup-shutdown.log" 2>&1 || shutdown_status=$?
+    [[ "$shutdown_status" == "0" ]] \
+        || { cat "$AGG_DIR/composed-failed-startup-shutdown.log"; e2e_fail "supported workspace shutdown did not quiesce the interrupted pending startup"; }
+    python3 - "$AGG_REPO" "$target_window" "$target_pane" "$target_epoch" <<'PY' \
+        || e2e_fail "workspace shutdown did not record the interrupted pending target"
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+window, pane, epoch = sys.argv[2:]
+target = json.loads((repo / ".exo/tl-loop/root/controller-target.pending.json").read_text(encoding="utf-8"))
+shutdown = json.loads((repo / ".exo/controller-lifecycle/workspace-shutdown.json").read_text(encoding="utf-8"))
+assert shutdown["phase"] == "complete"
+assert shutdown["target"]["controller_epoch"] == epoch
+assert shutdown["target"]["window_id"] == window
+assert shutdown["target"]["pane_id"] == pane
+assert target["controller_epoch"] == epoch
+PY
+    for _ in $(seq 1 100); do
+        [[ ! -S "$AGG_REPO/.exo/server.sock" ]] && break
+        sleep 0.1
+    done
+    [[ ! -S "$AGG_REPO/.exo/server.sock" ]] \
+        || e2e_fail "workspace shutdown did not retire the Server before the retry"
+    COMPOSED_PENDING_PANE_ALIVE="$(tmux list-panes -s -t "$AGGREGATE_SESSION" \
+        -F '#{pane_id} #{pane_dead}' | awk -v pane="$target_pane" '$1 == pane && $2 == "0" { print "yes" }')"
+    [[ -z "$COMPOSED_PENDING_PANE_ALIVE" ]] \
+        || e2e_fail "workspace shutdown left the interrupted pending controller pane $target_pane live"
+
+    HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
+        "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
+        > "$AGG_DIR/init-after-terminal-approval.log" 2>&1 || retry_status=$?
+    COMPOSED_RETRY_STATUS="$retry_status"
+    assert_init_status "$retry_status" "$AGG_DIR/init-after-terminal-approval.log" \
+        "composed retry init --continue after quiescing a failed startup"
+    for _ in $(seq 1 200); do
+        [[ ! -e "$startup_path" && ! -e "$pending_path" ]] && break
+        sleep 0.05
+    done
+    [[ ! -e "$startup_path" && ! -e "$pending_path" ]] \
+        || e2e_fail "successful retry kept the interrupted startup fence or pending target"
+    local retry_epoch
+    retry_epoch="$(composed_target_fields "$AGG_REPO/.exo/tl-loop/root/controller-target.json" | awk '{ print $5 }')"
+    [[ -n "$retry_epoch" && "$retry_epoch" != "$target_epoch" ]] \
+        || e2e_fail "retry startup did not advance the controller epoch past the interrupted target"
+    e2e_log "PASS: COMPOSED-3 failed startup shut down through the supported command and retried"
+}
+
+# Wait for the one accepted Luna/xhigh worker, then prove its route in the
+# outgoing request, the generated runtime configuration and the durable owner
+# record.
+assert_composed_luna_worker() {
+    local state=""
+    for _ in $(seq 1 1200); do
+        state="$(python3 - "$AGG_REPO" "$AGENT_EVENT_LOG" "$AGG_DIR/preexisting-opencode-owner.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+agent_log = Path(sys.argv[2])
+baseline = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+root_dir = repo / ".exo/tl-loop/root"
+try:
+    child = json.loads((root_dir / "kani/run.json").read_text(encoding="utf-8"))
+    owner = json.loads((Path(baseline["owner_dir"]) / "invocation.json").read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    print("waiting checkpoint=unavailable")
+    raise SystemExit(0)
+leaf = child.get("slices", {}).get("issue-814-substitution-model-kani", {})
+try:
+    journal = json.loads((root_dir / "kani/action-journal.json").read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    journal = []
+resumes = [
+    row for row in journal
+    if row.get("operation") == "resume_blocked_leaf"
+    and row.get("target") == "issue-814-substitution-model-kani"
+    and row.get("status") == "confirmed"
+]
+current = resumes[-1] if resumes else {}
+result = (current.get("result") or {}).get("result") or {}
+invocation = result.get("invocation") or {}
+arguments = current.get("arguments") or {}
+route = invocation.get("role_route") or {}
+role_route = owner.get("role_route") or {}
+try:
+    events = [json.loads(line) for line in agent_log.read_text(encoding="utf-8").splitlines()]
+except (OSError, json.JSONDecodeError):
+    events = []
+ledger = [
+    json.loads(line)
+    for segment in sorted((repo / ".exo/ledger/segments").glob("segment-*.jsonl"))
+    for line in segment.read_text(encoding="utf-8").splitlines()
+]
+launch_rows = [
+    row for row in ledger
+    if row.get("type") == "agent.spawned"
+    and row.get("data", {}).get("invocation_id") == owner.get("invocation_id")
+]
+worker_starts = [row for row in events if row.get("event") == "recovery_worker_started"]
+ready = (
+    len(worker_starts) == 1
+    and len(launch_rows) == 1
+    and leaf.get("dispatch_last_boundary") == "agent.spawned"
+    and owner.get("runtime") == "codex"
+    and owner.get("model") == "gpt-6-luna"
+    and owner.get("effort") == "xhigh"
+    and owner.get("generation", 0) >= 3
+    and leaf.get("dispatch_invocation_id") == owner.get("invocation_id")
+    and leaf.get("dispatch_agent_id") == baseline["owner_agent_name"]
+    and invocation.get("invocation_id") == owner.get("invocation_id")
+    and arguments.get("desired_harness") == "codex/gpt-6-luna"
+    and arguments.get("desired_model") == "gpt-6-luna"
+    and arguments.get("desired_effort") == "xhigh"
+    and route.get("harness") == "codex/gpt-6-luna"
+    and route.get("model") == "gpt-6-luna"
+    and route.get("effort") == "xhigh"
+    and role_route == route
+)
+print("ready" if ready else "waiting worker=%s/%s/%s resumes=%s" % (
+    owner.get("runtime"), owner.get("model"), owner.get("effort"),
+    len(resumes),
+))
+PY
+)"
+        [[ "$state" == "ready" ]] && break
+        sleep 0.1
+    done
+    [[ "$state" == "ready" ]] \
+        || { cat "$AGG_REPO/.exo/tl-loop/root/controller-output.log" 2>/dev/null || true; e2e_fail "composed run did not reach exactly one accepted Luna/xhigh worker: '$state'"; }
+
+    python3 - "$AGG_REPO" "$AGENT_EVENT_LOG" "$AGG_DIR/preexisting-opencode-owner.json" <<'PY' \
+        || e2e_fail "composed worker route differs across request, runtime config, shim argv and durable records"
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+agent_log = Path(sys.argv[2])
+baseline = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+root_dir = repo / ".exo/tl-loop/root"
+child = json.loads((root_dir / "kani/run.json").read_text(encoding="utf-8"))
+leaf = child["slices"]["issue-814-substitution-model-kani"]
+owner = json.loads((Path(baseline["owner_dir"]) / "invocation.json").read_text(encoding="utf-8"))
+journal = json.loads((root_dir / "kani/action-journal.json").read_text(encoding="utf-8"))
+resumes = [
+    row for row in journal
+    if row.get("operation") == "resume_blocked_leaf"
+    and row.get("target") == "issue-814-substitution-model-kani"
+    and row.get("status") == "confirmed"
+]
+assert len(resumes) == 2, f"expected the retained Sol successor plus one Luna resume, found {len(resumes)}"
+assert resumes[0]["result"]["result"]["invocation"]["model"] == "gpt-6.1-sol"
+current = resumes[-1]
+arguments = current["arguments"]
+result = current["result"]["result"]
+invocation = result["invocation"]
+assert arguments["desired_harness"] == "codex/gpt-6-luna"
+assert arguments["desired_model"] == "gpt-6-luna"
+assert arguments["desired_effort"] == "xhigh"
+assert invocation["invocation_id"] == owner["invocation_id"]
+assert owner["generation"] == 3
+assert owner["runtime"] == "codex"
+assert owner["model"] == "gpt-6-luna"
+assert owner["effort"] == "xhigh"
+route = invocation["role_route"]
+assert route["role"] == "worker"
+assert route["harness"] == "codex/gpt-6-luna"
+assert route["model"] == "gpt-6-luna"
+assert route["effort"] == "xhigh"
+assert owner["role_route"] == route
+assert result["agent"]["role_route"] == route
+assert result["invocation"]["role_route"] == route
+init_records = [
+    json.loads(line)
+    for line in (repo / ".exo/logs/init.jsonl").read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+resolved = [
+    row["resolved"] for row in init_records
+    if isinstance(row.get("resolved"), dict)
+    and row["resolved"].get("role_route_config_fingerprint")
+]
+assert resolved, "generated runtime configuration was not recorded"
+latest = resolved[-1]
+assert latest["spawn_agent_type"] == "codex"
+assert latest["worker_effort"]["level"] == "xhigh"
+assert latest["reviewer_model"] == "gpt-6.1-sol"
+assert latest["reviewer_effort"]["level"] == "medium"
+events = [json.loads(line) for line in agent_log.read_text(encoding="utf-8").splitlines()]
+worker_starts = [row for row in events if row.get("event") == "recovery_worker_started"]
+assert len(worker_starts) == 1
+ledger = [
+    json.loads(line)
+    for segment in sorted((repo / ".exo/ledger/segments").glob("segment-*.jsonl"))
+    for line in segment.read_text(encoding="utf-8").splitlines()
+]
+launch_rows = [
+    row for row in ledger
+    if row.get("type") == "agent.spawned"
+    and row.get("data", {}).get("invocation_id") == owner["invocation_id"]
+]
+assert len(launch_rows) == 1, f"expected one host launch row for the resumed worker, found {len(launch_rows)}"
+assert leaf.get("dispatch_last_boundary") == "agent.spawned"
+worker = worker_starts[0]
+assert worker["model"].split("#", 1)[0] == "gpt-6-luna"
+assert worker["effort"] == "xhigh"
+reviews = [row for row in events if row.get("event") == "reviewer_approved"]
+assert all(row.get("model") == "gpt-6.1-sol" and row.get("effort") == "medium" for row in reviews)
+print(json.dumps({"worker_invocation": owner["invocation_id"], "generation": owner["generation"]}))
+PY
+    e2e_log "PASS: COMPOSED-4 exactly one accepted Luna xhigh worker; Sol medium TL/reviewer"
+}
+
+# Shut down while the accepted worker is outstanding, continue again, and prove
+# the child controller restarts while adopting the same worker invocation once.
+assert_composed_shutdown_continue() {
+    local before="$AGG_DIR/composed-effects-before-continue.json"
+    python3 - "$AGG_REPO" "$AGENT_EVENT_LOG" "$AGG_REPO/.exo/agents/kani/invocation.json" "$before" <<'PY' \
+        || e2e_fail "could not capture the pre-continuation worker and effect identities"
+import json
+import sys
+from pathlib import Path
+
+repo, agent_log, controller_path, output = map(Path, sys.argv[1:])
+root_dir = repo / ".exo/tl-loop/root"
+child = json.loads((root_dir / "kani/run.json").read_text(encoding="utf-8"))
+leaf = child["slices"]["issue-814-substitution-model-kani"]
+controller = json.loads(controller_path.read_text(encoding="utf-8"))
+try:
+    events = [json.loads(line) for line in agent_log.read_text(encoding="utf-8").splitlines()]
+except (OSError, json.JSONDecodeError):
+    events = []
+ledger = [
+    json.loads(line)
+    for segment in sorted((repo / ".exo/ledger/segments").glob("segment-*.jsonl"))
+    for line in segment.read_text(encoding="utf-8").splitlines()
+]
+dispatch = [
+    row for row in ledger
+    if row.get("type") in {"tl.dispatch_intended", "tl.spawn_requested", "tl.spawn_request_accepted", "tl.dispatch_confirmed"}
+    and row.get("data", {}).get("slice_id") == "issue-814-substitution-model-kani"
+]
+try:
+    published_heads = json.loads(
+        (repo / ".exo/published-heads.json").read_text(encoding="utf-8")
+    ).get("heads", [])
+except (OSError, json.JSONDecodeError):
+    published_heads = []
+publications = sum(
+    isinstance(row, dict)
+    and row.get("slice_id") == "issue-814-substitution-model-kani"
+    for row in published_heads
+)
+journal = json.loads((root_dir / "kani/action-journal.json").read_text(encoding="utf-8"))
+resumes = [
+    row for row in journal
+    if row.get("operation") == "resume_blocked_leaf"
+    and row.get("target") == "issue-814-substitution-model-kani"
+    and row.get("status") == "confirmed"
+]
+output.write_text(json.dumps({
+    "controller_invocation_id": controller["invocation_id"],
+    "controller_generation": controller["generation"],
+    "worker_invocation_id": leaf["dispatch_invocation_id"],
+    "leaf_pr_number": leaf.get("pr_number"),
+    "leaf_head_sha": (leaf.get("publication") or {}).get("head_sha"),
+    "resume_count": len(resumes),
+    "worker_starts": sum(row.get("event") == "recovery_worker_started" for row in events),
+    "worker_prs": sum(row.get("event") == "recovery_worker_filed_pr" for row in events),
+    "reviewer_approvals": sum(row.get("event") == "reviewer_approved" for row in events),
+    "publications": publications,
+    "dispatch_event_ids": [row.get("event_id") for row in dispatch],
+}, sort_keys=True) + "\n", encoding="utf-8")
+PY
+
+    local shutdown_status=0
+    (
+        cd "$AGG_REPO"
+        HOME="$AGG_HOME" "$EXOMONAD_BIN" shutdown --workspace
+    ) > "$AGG_DIR/composed-worker-shutdown.log" 2>&1 || shutdown_status=$?
+    [[ "$shutdown_status" == "0" ]] \
+        || { cat "$AGG_DIR/composed-worker-shutdown.log"; e2e_fail "workspace shutdown did not quiesce the controller with an outstanding accepted worker"; }
+    for _ in $(seq 1 100); do
+        [[ ! -S "$AGG_REPO/.exo/server.sock" ]] && break
+        sleep 0.1
+    done
+    [[ ! -S "$AGG_REPO/.exo/server.sock" ]] \
+        || e2e_fail "workspace shutdown with an outstanding worker did not retire the Server"
+
+    local continue_status=0
+    HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
+        "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
+        > "$AGG_DIR/composed-worker-continue.log" 2>&1 || continue_status=$?
+    COMPOSED_CONTINUE_STATUS="$continue_status"
+    assert_init_status "$continue_status" "$AGG_DIR/composed-worker-continue.log" \
+        "composed init --continue after shutting down with an accepted worker"
+
+    local resumed=""
+    for _ in $(seq 1 1200); do
+        resumed="$(python3 - "$AGG_REPO" "$before" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+before = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+try:
+    controller = json.loads((repo / ".exo/agents/kani/invocation.json").read_text(encoding="utf-8"))
+    child = json.loads((repo / ".exo/tl-loop/root/kani/run.json").read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    print("waiting checkpoint=unavailable")
+    raise SystemExit(0)
+leaf = child.get("slices", {}).get("issue-814-substitution-model-kani", {})
+ready = (
+    controller.get("invocation_id") != before["controller_invocation_id"]
+    and controller.get("generation", 0) == before["controller_generation"] + 1
+    and controller.get("prior_invocation_id") == before["controller_invocation_id"]
+    and leaf.get("dispatch_invocation_id") == before["worker_invocation_id"]
+)
+print("ready" if ready else "waiting controller=%s/%s leaf=%s" % (
+    controller.get("generation"), controller.get("invocation_id"),
+    leaf.get("dispatch_invocation_id"),
+))
+PY
+)"
+        [[ "$resumed" == "ready" ]] && break
+        sleep 0.1
+    done
+    [[ "$resumed" == "ready" ]] \
+        || { cat "$AGG_REPO/.exo/tl-loop/root/controller-output.log" 2>/dev/null || true; e2e_fail "continued root did not restart the child controller and adopt the same worker: '$resumed'"; }
+
+    local summary
+    summary="$(python3 - "$AGG_REPO" "$AGENT_EVENT_LOG" "$before" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo, agent_log, before_path = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
+before = json.loads(before_path.read_text(encoding="utf-8"))
+root_dir = repo / ".exo/tl-loop/root"
+child = json.loads((root_dir / "kani/run.json").read_text(encoding="utf-8"))
+leaf = child["slices"]["issue-814-substitution-model-kani"]
+controller = json.loads((repo / ".exo/agents/kani/invocation.json").read_text(encoding="utf-8"))
+events = [json.loads(line) for line in agent_log.read_text(encoding="utf-8").splitlines()]
+ledger = [
+    json.loads(line)
+    for segment in sorted((repo / ".exo/ledger/segments").glob("segment-*.jsonl"))
+    for line in segment.read_text(encoding="utf-8").splitlines()
+]
+dispatch = [
+    row for row in ledger
+    if row.get("type") in {"tl.dispatch_intended", "tl.spawn_requested", "tl.spawn_request_accepted", "tl.dispatch_confirmed"}
+    and row.get("data", {}).get("slice_id") == "issue-814-substitution-model-kani"
+]
+try:
+    published_heads = json.loads(
+        (repo / ".exo/published-heads.json").read_text(encoding="utf-8")
+    ).get("heads", [])
+except (OSError, json.JSONDecodeError):
+    published_heads = []
+publications = sum(
+    isinstance(row, dict)
+    and row.get("slice_id") == "issue-814-substitution-model-kani"
+    for row in published_heads
+)
+journal = json.loads((root_dir / "kani/action-journal.json").read_text(encoding="utf-8"))
+resumes = [
+    row for row in journal
+    if row.get("operation") == "resume_blocked_leaf"
+    and row.get("target") == "issue-814-substitution-model-kani"
+    and row.get("status") == "confirmed"
+]
+assert controller["invocation_id"] != before["controller_invocation_id"]
+assert controller["generation"] == before["controller_generation"] + 1
+assert controller["prior_invocation_id"] == before["controller_invocation_id"]
+assert controller["trigger"] == "controller_restart"
+assert leaf["dispatch_invocation_id"] == before["worker_invocation_id"]
+assert leaf.get("pr_number") == before["leaf_pr_number"]
+assert (leaf.get("publication") or {}).get("head_sha") == before["leaf_head_sha"]
+assert len(resumes) == before["resume_count"]
+assert sum(row.get("event") == "recovery_worker_started" for row in events) == before["worker_starts"]
+# The already-accepted worker may complete its single publication after the
+# continuation. That is the same invocation finishing, never a second worker.
+worker_prs = sum(row.get("event") == "recovery_worker_filed_pr" for row in events)
+assert worker_prs in {before["worker_prs"], before["worker_prs"] + 1}
+assert worker_prs <= 1
+assert [row.get("event_id") for row in dispatch] == before["dispatch_event_ids"]
+assert before["publications"] <= publications <= before["publications"] + 1
+assert publications <= 1
+review_head = before["leaf_head_sha"]
+if review_head is not None:
+    matching_reviews = [
+        row for row in events
+        if row.get("event") == "reviewer_approved"
+        and row.get("pr_number") == before["leaf_pr_number"]
+        and row.get("head_sha") == review_head
+    ]
+    assert len(matching_reviews) <= 1, "continuation duplicated the exact-head reviewer approval"
+controller_events = [
+    json.loads(line)
+    for line in (repo / ".exo/events/kani.jsonl").read_text(encoding="utf-8").splitlines()
+]
+controller_restarts = sum(
+    row.get("type") == "agent.invocation.started"
+    and row.get("data", {}).get("trigger") == "controller_restart"
+    for row in controller_events
+)
+print(json.dumps({
+    "controller_invocation": controller["invocation_id"],
+    "controller_generation": controller["generation"],
+    "controller_restarts": controller_restarts,
+    "worker_invocation": leaf["dispatch_invocation_id"],
+}))
+PY
+)" || e2e_fail "shutdown/continue duplicated or rewrote worker, PR, review, successor or dispatch effects"
+    printf '%s\n' "$summary"
+    COMPOSED_CONTROLLER_INVOCATION_ID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["controller_invocation"])' <<< "$summary")"
+    COMPOSED_CONTROLLER_GENERATION="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["controller_generation"])' <<< "$summary")"
+    COMPOSED_CONTROLLER_RESTARTS="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["controller_restarts"])' <<< "$summary")"
+    e2e_log "PASS: COMPOSED-5 shutdown and continue again; child controller resumed; same worker adopted"
 }
 
 run_repeated_route_transitions() {
@@ -2282,6 +2907,14 @@ fi
     || { cat "$AGG_DIR/init.log"; e2e_fail "legacy lock was misreported as a managed orphan"; }
 [[ "$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)" != "$PRE_RECOVERY_CONTROLLER_EPOCH" ]] \
     || e2e_fail "post-recovery init did not start the fresh controller to reconcile the root run"
+if [[ "${E2E_COMPOSED_RESTART:-0}" == "1" ]]; then
+    read -r COMPOSED_OLD_WINDOW COMPOSED_OLD_PANE COMPOSED_OLD_PANE_PID COMPOSED_OLD_PANE_TICKS \
+        COMPOSED_OLD_EPOCH COMPOSED_OLD_SERVER_PID COMPOSED_OLD_SERVER_TICKS \
+        < <(composed_target_fields "$AGG_REPO/.exo/tl-loop/root/controller-target.json")
+    [[ -n "$COMPOSED_OLD_WINDOW" && -n "$COMPOSED_OLD_PANE" && -n "$COMPOSED_OLD_EPOCH" ]] \
+        || e2e_fail "composed run could not record the accepted controller target before restart"
+    e2e_log "Recorded accepted controller target $COMPOSED_OLD_WINDOW/$COMPOSED_OLD_PANE pane=$COMPOSED_OLD_PANE_PID/$COMPOSED_OLD_PANE_TICKS epoch=$COMPOSED_OLD_EPOCH"
+fi
 assert_one_live_window Server
 if [[ -n "$KANI_BLOCKER_EVENT_ID" && -n "$KANI_BLOCKER_RUN_SEQ" ]]; then
     assert_active_kani_blocker_replayed "$KANI_BLOCKER_EVENT_ID" "$KANI_BLOCKER_RUN_SEQ"
@@ -2428,10 +3061,16 @@ PY
         > "$AGG_DIR/legacy-wrong-route-successor-seed.json" \
         || { cat "$AGG_DIR/legacy-wrong-route-successor-seed.json"; e2e_fail "could not seed the exact f446-to-f285 legacy route mismatch after explicit gate approval"; }
     e2e_log "Seeded immutable Luna/xhigh generation-1 intent and terminal Sol/xhigh generation-2 successor; generation 1 remains in the Kani checkpoint"
-    tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_SERVER_COMMAND"
-    tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
-    for _ in $(seq 1 100); do
-        if python3 - "$AGG_REPO/.exo/server.sock" <<'PY' >/dev/null 2>&1
+    if [[ "${E2E_COMPOSED_RESTART:-0}" == "1" ]]; then
+        e2e_log "PASS: COMPOSED-1 legacy spawn shape and stopped Sol successor"
+    fi
+    if [[ "${E2E_COMPOSED_RESTART:-0}" == "1" ]]; then
+        restart_entire_aggregate_tmux_server
+    else
+        tmux new-window -d -t "$AGGREGATE_SESSION" -n Server -c "$AGG_REPO" "$PHASE8_SERVER_COMMAND"
+        tmux set-window-option -t "$AGGREGATE_SESSION:Server" remain-on-exit on
+        for _ in $(seq 1 100); do
+            if python3 - "$AGG_REPO/.exo/server.sock" <<'PY' >/dev/null 2>&1
 import socket
 import sys
 
@@ -2440,20 +3079,26 @@ client.settimeout(0.2)
 client.connect(sys.argv[1])
 client.close()
 PY
-        then
-            break
-        fi
-        sleep 0.1
-    done
-    [[ -S "$AGG_REPO/.exo/server.sock" ]] \
-        || { tmux capture-pane -p -t "$AGGREGATE_SESSION:Server" > "$AGG_DIR/server-after-terminal-approval-restart.log" 2>&1 || true; cat "$AGG_DIR/server-after-terminal-approval-restart.log"; e2e_fail "Server did not restart after the approved recovery controller shutdown"; }
+            then
+                break
+            fi
+            sleep 0.1
+        done
+        [[ -S "$AGG_REPO/.exo/server.sock" ]] \
+            || { tmux capture-pane -p -t "$AGGREGATE_SESSION:Server" > "$AGG_DIR/server-after-terminal-approval-restart.log" 2>&1 || true; cat "$AGG_DIR/server-after-terminal-approval-restart.log"; e2e_fail "Server did not restart after the approved recovery controller shutdown"; }
+    fi
     if [[ "${E2E_REPEATED_ROUTE_TRANSITIONS:-0}" == "1" ]]; then
         run_repeated_route_transitions
     fi
     APPROVED_RESTART_STATUS=0
-    HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
-        "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
-        > "$AGG_DIR/init-after-terminal-approval.log" 2>&1 || APPROVED_RESTART_STATUS=$?
+    if [[ "${E2E_COMPOSED_RESTART:-0}" == "1" ]]; then
+        run_composed_failed_startup_and_retry
+        APPROVED_RESTART_STATUS="$COMPOSED_RETRY_STATUS"
+    else
+        HOME="$AGG_HOME" FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
+            "$EXOMONAD_BIN" init --continue --session "$AGGREGATE_SESSION" \
+            > "$AGG_DIR/init-after-terminal-approval.log" 2>&1 || APPROVED_RESTART_STATUS=$?
+    fi
     assert_init_status "$APPROVED_RESTART_STATUS" "$AGG_DIR/init-after-terminal-approval.log" \
         "fresh init --continue after explicit terminal-recovery approval"
     [[ "$(cat "$CONTROLLER_EPOCH_PATH" 2>/dev/null || true)" != "$APPROVED_CONTROLLER_EPOCH" ]] \
@@ -2463,6 +3108,10 @@ PY
         || { cat "$AGG_DIR/init-after-terminal-approval.log"; e2e_fail "approved recovery used an unexpected runtime artifact"; }
     assert_one_live_window Server
     e2e_log "Disposable terminal-owner recovery proceeded only after recorded rejection, explicit fresh approval, supported workspace shutdown, and a new controller startup"
+    if [[ "${E2E_COMPOSED_RESTART:-0}" == "1" ]]; then
+        assert_composed_luna_worker
+        assert_composed_shutdown_continue
+    fi
     python3 "$SCRIPT_DIR/configured-owner-resume.py" verify-controller \
         --repo "$AGG_REPO" --baseline "$AGG_DIR/preexisting-opencode-owner.json" \
         --gate-approval "$AGG_DIR/terminal-recovery-approval.json" \
@@ -3010,6 +3659,61 @@ assert before["dispatch_event_count"] == 4
 PY
     assert_one_live_window Server
     assert_one_live_window Watcher
+    if [[ "${E2E_COMPOSED_RESTART:-0}" == "1" ]]; then
+        python3 - "$AGG_REPO" "$AGENT_EVENT_LOG" "$COMPOSED_CONTROLLER_INVOCATION_ID" \
+            "$COMPOSED_CONTROLLER_GENERATION" "$COMPOSED_CONTROLLER_RESTARTS" <<'PY' \
+            || e2e_fail "composed repeat init did not retain exactly one successor, worker, PR, review and controller restart"
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+agent_log = Path(sys.argv[2])
+expected_invocation, expected_generation, expected_restarts = (
+    sys.argv[3],
+    int(sys.argv[4]),
+    int(sys.argv[5]),
+)
+root_dir = repo / ".exo/tl-loop/root"
+kani = json.loads((root_dir / "kani/run.json").read_text(encoding="utf-8"))
+leaf = kani["slices"]["issue-814-substitution-model-kani"]
+journal = json.loads((root_dir / "kani/action-journal.json").read_text(encoding="utf-8"))
+resumes = [
+    row for row in journal
+    if row.get("operation") == "resume_blocked_leaf"
+    and row.get("target") == "issue-814-substitution-model-kani"
+    and row.get("status") == "confirmed"
+]
+assert len(resumes) == 2, f"expected one retained Sol and one Luna successor, found {len(resumes)}"
+events = [json.loads(line) for line in agent_log.read_text(encoding="utf-8").splitlines()]
+assert sum(row.get("event") == "recovery_worker_started" for row in events) == 1
+assert sum(row.get("event") == "recovery_worker_filed_pr" for row in events) == 1
+approvals = [
+    row for row in events
+    if row.get("event") == "reviewer_approved"
+    and row.get("pr_number") == leaf["pr_number"]
+]
+assert len(approvals) == 1
+controller = json.loads((repo / ".exo/agents/kani/invocation.json").read_text(encoding="utf-8"))
+controller_events = [
+    json.loads(line)
+    for line in (repo / ".exo/events/kani.jsonl").read_text(encoding="utf-8").splitlines()
+]
+restarts = [
+    row for row in controller_events
+    if row.get("type") == "agent.invocation.started"
+    and row.get("data", {}).get("trigger") == "controller_restart"
+]
+assert controller["invocation_id"] == expected_invocation
+assert controller["generation"] == expected_generation
+assert len(restarts) == expected_restarts, (
+    f"repeat init changed the controller restart history: {len(restarts)} != {expected_restarts}"
+)
+assert leaf["status"] == "merged"
+PY
+        e2e_log "PASS: COMPOSED-6 reviewer and bookkeeping complete; repeat init adds no duplicate effect"
+        e2e_log "PASS: COMPOSED-ALL PASS"
+    fi
     e2e_log "PASS: accepted terminal OpenCode owner recovered through the production controller to one Codex successor, exact PR/head, configured reviewer, complete bookkeeping and idempotent repeat init"
     exit 0
 fi

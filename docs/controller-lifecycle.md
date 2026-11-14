@@ -41,3 +41,22 @@ publication evidence, or gates. A server-only restart does not terminate agent
 panes. A SIGKILL or host crash can leave stale Running records; continuation
 must use the liveness reconciliation path rather than treating the saved status
 as proof of a live process.
+
+A committed root controller record whose exact tmux server process (PID and
+start ticks) has ended is not live even when a fresh server recycles the same
+`@window`/`%pane` ids. Startup relaunches the root controller and classifies the
+historical lifetime as superseded; same-server pane and process-start checks
+remain strict.
+
+A completed workspace shutdown intent is not permission to ignore a newer
+interrupted startup. When init persisted a pending startup target with a newer
+controller epoch in the same root scope and the completed operation has not yet
+been archived, `exomonad shutdown --workspace` retargets to that exact pending
+target and quiesces it. Repeated shutdown with no newer pending epoch still
+reports `already_complete`.
+
+Workspace shutdown preserves worker panes. The fresh server that starts with
+`init --continue` revalidates retained live invocations against their recorded
+routing ownership and reattaches their exit monitors, so an adopted worker
+records its terminal outcome instead of staying `running` forever. Workers whose
+routing cannot be revalidated are left untouched and are not monitored.

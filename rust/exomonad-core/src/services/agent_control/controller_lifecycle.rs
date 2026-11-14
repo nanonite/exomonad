@@ -286,10 +286,45 @@ pub async fn controller_ownership_is_live(
     tmux: &crate::services::tmux_ipc::TmuxIpc,
     target: &ControllerPaneOwnership,
 ) -> Result<bool> {
+    controller_ownership_liveness(project_dir, tmux, target, false).await
+}
+
+/// Startup liveness for a committed root controller. A recorded tmux server
+/// lifetime that has ended proves the historical pane is gone even when a fresh
+/// server recycles the same numeric ids, so replacement may proceed. Other
+/// callers keep the strict conflict error from [`controller_ownership_is_live`].
+pub async fn controller_ownership_is_live_for_startup(
+    project_dir: &Path,
+    tmux: &crate::services::tmux_ipc::TmuxIpc,
+    target: &ControllerPaneOwnership,
+) -> Result<bool> {
+    controller_ownership_liveness(project_dir, tmux, target, true).await
+}
+
+async fn controller_ownership_liveness(
+    project_dir: &Path,
+    tmux: &crate::services::tmux_ipc::TmuxIpc,
+    target: &ControllerPaneOwnership,
+    ended_server_is_stopped: bool,
+) -> Result<bool> {
     verify_controller_epoch(project_dir, target).await?;
     let server = tmux.server_identity().await?;
     if server.pid != target.tmux_server_pid || server.start_ticks != target.tmux_server_start_ticks
     {
+        if ended_server_is_stopped {
+            // The recorded tmux server lifetime has ended. Its numeric
+            // @window/%pane IDs may be recycled by the fresh server for a
+            // different process, so the historical pane cannot be live.
+            // Same-server identity checks below remain strict.
+            warn!(
+                recorded_server_pid = target.tmux_server_pid,
+                recorded_server_start_ticks = target.tmux_server_start_ticks,
+                current_server_pid = server.pid,
+                current_server_start_ticks = server.start_ticks,
+                "Recorded tmux server lifetime ended; controller ownership is not live"
+            );
+            return Ok(false);
+        }
         anyhow::bail!("tmux server identity changed; root controller ownership is stale");
     }
     match observe_controller_pane(tmux, target).await? {
@@ -945,9 +980,12 @@ async fn load_or_create_intent(
                     "workspace shutdown intent is malformed; startup reconciliation is required"
                 );
             }
-            if intent.phase != WorkspaceShutdownPhase::Complete {
-                retarget_interrupted_shutdown(project_dir, tmux, &mut intent).await?;
-            }
+            // A completed intent normally proves the prior controller is gone.
+            // It can still predate an interrupted startup that has not yet
+            // archived it. A newer live pending target in the same root scope is
+            // a different controller lifetime and must be quiesced by this
+            // supported command instead of reporting the old operation complete.
+            retarget_interrupted_shutdown(project_dir, tmux, &mut intent).await?;
             Ok(intent)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1654,6 +1692,60 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn ended_tmux_server_lifetime_makes_root_ownership_not_live() {
+        let project = tempfile::tempdir().unwrap();
+        let tmux = IsolatedTmux::new();
+        let target = seed_root_target(project.path(), &tmux).await;
+        let tmux_ipc = crate::services::tmux_ipc::TmuxIpc::new(&tmux.session);
+        assert!(
+            controller_ownership_is_live(project.path(), &tmux_ipc, &target)
+                .await
+                .unwrap()
+        );
+
+        // A fresh server may hand out the same @window/%pane ids. The saved
+        // server identity proves the recorded lifetime ended, so the historical
+        // pane must not be reported live even though those ids exist again.
+        let mut replaced_server_pid = target.clone();
+        replaced_server_pid.tmux_server_pid = target.tmux_server_pid.saturating_add(1);
+        assert!(!controller_ownership_is_live_for_startup(
+            project.path(),
+            &tmux_ipc,
+            &replaced_server_pid
+        )
+        .await
+        .unwrap());
+        assert!(
+            controller_ownership_is_live(project.path(), &tmux_ipc, &replaced_server_pid)
+                .await
+                .is_err(),
+            "non-startup callers keep the strict server conflict"
+        );
+
+        let mut replaced_server_ticks = target.clone();
+        replaced_server_ticks.tmux_server_start_ticks =
+            target.tmux_server_start_ticks.saturating_add(1);
+        assert!(!controller_ownership_is_live_for_startup(
+            project.path(),
+            &tmux_ipc,
+            &replaced_server_ticks
+        )
+        .await
+        .unwrap());
+
+        // Within the same server lifetime a changed pane process is still an
+        // identity conflict, not an absence.
+        let mut replaced_pane = target;
+        replaced_pane.pane_pid = replaced_pane.pane_pid.saturating_add(1);
+        assert!(
+            controller_ownership_is_live(project.path(), &tmux_ipc, &replaced_pane)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn pending_target_cleanup_requires_its_exact_startup_epoch() {
         let project = tempfile::tempdir().unwrap();
         let target = ControllerPaneOwnership {
@@ -2112,6 +2204,62 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn completed_shutdown_intent_quiesces_a_later_interrupted_startup() {
+        let project = tempfile::tempdir().unwrap();
+        let tmux = IsolatedTmux::new();
+        let _worker_pane = tmux.add_worker_pane();
+        let committed = seed_root_target(project.path(), &tmux).await;
+        let mut completed = WorkspaceShutdownIntent {
+            schema_version: 1,
+            operation_id: "completed-old-operation".to_owned(),
+            phase: WorkspaceShutdownPhase::Complete,
+            requested_at: unix_timestamp(),
+            completed_at: Some(unix_timestamp()),
+            target: committed.clone(),
+            controllers: Vec::new(),
+            preserved_worker_panes: 0,
+            blocker: None,
+        };
+        persist_intent(
+            &workspace_shutdown_path(project.path()),
+            &mut completed,
+            None,
+        )
+        .await
+        .unwrap();
+        let pending =
+            seed_pending_startup_target(project.path(), &committed, "epoch-2", "run-1").await;
+        let service = service_for(project.path(), &tmux.session).await;
+        let result = service
+            .shutdown_workspace_control_plane()
+            .await
+            .expect("a completed intent still quiesces a newer interrupted startup");
+        assert_eq!(result.status, "complete");
+        assert_eq!(result.operation_id, "completed-old-operation");
+        let final_intent: WorkspaceShutdownIntent = serde_json::from_slice(
+            &tokio::fs::read(workspace_shutdown_path(project.path()))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(final_intent.target.controller_epoch, "epoch-2");
+        assert_eq!(final_intent.target.pane_id, pending.pane_id);
+        let tmux_ipc = crate::services::tmux_ipc::TmuxIpc::new(&tmux.session);
+        assert!(tmux_ipc
+            .pane_snapshot(&tmux.session, &pending.window_id, &pending.pane_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Without another startup epoch this is now a genuine repeat and must
+        // not manufacture a second shutdown operation.
+        let repeated = service.shutdown_workspace_control_plane().await.unwrap();
+        assert_eq!(repeated.status, "already_complete");
+        assert_eq!(repeated.operation_id, "completed-old-operation");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn pending_startup_target_without_a_startup_fence_fails_closed() {
         let project = tempfile::tempdir().unwrap();
         let tmux = IsolatedTmux::new();
@@ -2335,5 +2483,68 @@ mod tests {
             .await
             .expect_err("completed workspace shutdown keeps dispatch fenced");
         assert!(error.to_string().contains("shutdown is pending"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn server_restart_reattaches_retained_live_worker_monitor() {
+        let project = tempfile::tempdir().unwrap();
+        let tmux = IsolatedTmux::new();
+        let worker_pane = tmux.add_worker_pane();
+        let route = RoutingInfo::window_pane(tmux.window.clone(), worker_pane.clone());
+        let worker = seed_running_invocation(
+            project.path(),
+            "worker-codex",
+            route,
+            identity("worker-codex", "main", "main", false, None),
+        )
+        .await;
+        let agent_dir = project.path().join(".exo/agents/worker-codex");
+        let service = service_for(project.path(), &tmux.session).await;
+        service.resume_invocation_monitors().await;
+        assert!(
+            crate::services::agent_control::invocation_monitor_registered(
+                &agent_dir,
+                &worker.invocation_id
+            ),
+            "a retained live invocation is monitored after a server restart"
+        );
+
+        let tmux_ipc = crate::services::tmux_ipc::TmuxIpc::new(&tmux.session);
+        tmux_ipc.kill_pane(&worker_pane).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let current = invocation::read_invocation(&agent_dir)
+                .await
+                .unwrap()
+                .unwrap();
+            if !current.is_live() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reattached monitor did not retire the exited worker"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while crate::services::agent_control::invocation_monitor_registered(
+            &agent_dir,
+            &worker.invocation_id,
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "finished invocation monitor did not deregister"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        service.resume_invocation_monitors().await;
+        assert!(
+            !crate::services::agent_control::invocation_monitor_registered(
+                &agent_dir,
+                &worker.invocation_id
+            ),
+            "a terminal invocation is not reattached"
+        );
     }
 }
