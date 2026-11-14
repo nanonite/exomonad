@@ -1395,6 +1395,7 @@ async fn process_start_ticks(pid: u32) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::domain::{AgentName, BirthBranch, RoutingInfo, Slug};
+    use crate::services::agent_control::test_tracing::global_test_event_sink;
     use crate::services::agent_control::{
         AgentIdentityRecord, AgentType, InvocationRecord, InvocationStatus, InvocationTrigger,
         Topology,
@@ -2546,5 +2547,245 @@ mod tests {
             ),
             "a terminal invocation is not reattached"
         );
+    }
+
+    async fn read_invocation_bytes(agent_dir: &Path) -> Vec<u8> {
+        tokio::fs::read(agent_dir.join("invocation.json"))
+            .await
+            .unwrap()
+    }
+
+    fn captured_lines_containing(
+        sink: &Arc<std::sync::Mutex<Vec<String>>>,
+        needle: &str,
+    ) -> String {
+        sink.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter(|line| line.contains(needle))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn server_restart_leaves_a_wrong_owner_invocation_unmonitored() {
+        let project = tempfile::tempdir().unwrap();
+        let tmux = IsolatedTmux::new();
+        let worker_pane = tmux.add_worker_pane();
+        let route = RoutingInfo::window_pane(tmux.window.clone(), worker_pane.clone());
+        let worker = seed_running_invocation(
+            project.path(),
+            "worker-wrong-owner",
+            route.clone(),
+            identity("worker-wrong-owner", "main", "main", false, None),
+        )
+        .await;
+        let agent_dir = project.path().join(".exo/agents/worker-wrong-owner");
+        let tmux_ipc = crate::services::tmux_ipc::TmuxIpc::new(&tmux.session);
+        tmux_ipc
+            .set_routing_owner(&route, "another-agent", "another-invocation", 7)
+            .await
+            .unwrap();
+        let before = read_invocation_bytes(&agent_dir).await;
+        let sink = global_test_event_sink().clone();
+        let service = service_for(project.path(), &tmux.session).await;
+
+        service.resume_invocation_monitors().await;
+
+        assert!(
+            !crate::services::agent_control::invocation_monitor_registered(
+                &agent_dir,
+                &worker.invocation_id
+            ),
+            "an invocation whose pane is owned by another agent stays unmonitored"
+        );
+        assert_eq!(
+            read_invocation_bytes(&agent_dir).await,
+            before,
+            "an unrevalidatable invocation record is left untouched"
+        );
+        let logs = captured_lines_containing(&sink, &worker.invocation_id);
+        assert!(logs.contains("LEVEL_Level(Warn)"), "{logs}");
+        assert!(
+            logs.contains(
+                "Retained invocation routing could not be revalidated; leaving it unmonitored"
+            ),
+            "{logs}"
+        );
+        assert!(logs.contains("ownership conflicts"), "{logs}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reconcile_live_invocation_startup_refuses_a_missing_delivery_target() {
+        let project = tempfile::tempdir().unwrap();
+        let tmux = IsolatedTmux::new();
+        let worker_pane = tmux.add_worker_pane();
+        let route = RoutingInfo::window_pane(tmux.window.clone(), worker_pane.clone());
+        let worker = seed_running_invocation(
+            project.path(),
+            "worker-missing-target",
+            route,
+            identity("worker-missing-target", "main", "main", false, None),
+        )
+        .await;
+        let agent_dir = project.path().join(".exo/agents/worker-missing-target");
+        let tmux_ipc = crate::services::tmux_ipc::TmuxIpc::new(&tmux.session);
+        tmux_ipc.kill_pane(&worker_pane).await.unwrap();
+        let before = read_invocation_bytes(&agent_dir).await;
+
+        let error = invocation::reconcile_live_invocation_startup(
+            &agent_dir,
+            &worker,
+            &worker.routing,
+            Some(&tmux_ipc),
+            invocation::DeliveryTargetRequirement::MustExist,
+        )
+        .await
+        .expect_err("a recorded delivery target that no longer exists cannot be revalidated");
+
+        assert!(
+            format!("{error:#}").contains("no longer exists"),
+            "unexpected diagnostic: {error:#}"
+        );
+        assert_eq!(
+            read_invocation_bytes(&agent_dir).await,
+            before,
+            "a refused reconciliation leaves the invocation record untouched"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn server_restart_leaves_a_missing_target_invocation_unmonitored() {
+        let project = tempfile::tempdir().unwrap();
+        let tmux = IsolatedTmux::new();
+        let worker_pane = tmux.add_worker_pane();
+        let route = RoutingInfo::window_pane(tmux.window.clone(), worker_pane.clone());
+        let worker = seed_running_invocation(
+            project.path(),
+            "worker-missing-pane",
+            route,
+            identity("worker-missing-pane", "main", "main", false, None),
+        )
+        .await;
+        let agent_dir = project.path().join(".exo/agents/worker-missing-pane");
+        let tmux_ipc = crate::services::tmux_ipc::TmuxIpc::new(&tmux.session);
+        tmux_ipc.kill_pane(&worker_pane).await.unwrap();
+        let before = read_invocation_bytes(&agent_dir).await;
+        let sink = global_test_event_sink().clone();
+        let service = service_for(project.path(), &tmux.session).await;
+
+        service.resume_invocation_monitors().await;
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while crate::services::agent_control::invocation_monitor_registered(
+            &agent_dir,
+            &worker.invocation_id,
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an invocation whose recorded pane no longer exists stays unmonitored"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            invocation::read_invocation(&agent_dir)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_live(),
+            "a refused reconciliation does not terminalize the retained invocation"
+        );
+        assert_eq!(
+            read_invocation_bytes(&agent_dir).await,
+            before,
+            "a missing delivery target leaves the invocation record untouched"
+        );
+        let logs = captured_lines_containing(&sink, &worker.invocation_id);
+        assert!(logs.contains("LEVEL_Level(Warn)"), "{logs}");
+        assert!(
+            logs.contains(
+                "Retained invocation routing could not be revalidated; leaving it unmonitored"
+            ),
+            "{logs}"
+        );
+        assert!(logs.contains("no longer exists"), "{logs}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn server_restart_skips_an_unreadable_invocation_record() {
+        let project = tempfile::tempdir().unwrap();
+        let tmux = IsolatedTmux::new();
+        let agent_dir = project.path().join(".exo/agents/worker-malformed");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        let contents = b"{\"invocation_id\":\"malformed-invocation\",\"status\":".to_vec();
+        tokio::fs::write(agent_dir.join("invocation.json"), &contents)
+            .await
+            .unwrap();
+        let sink = global_test_event_sink().clone();
+        let service = service_for(project.path(), &tmux.session).await;
+
+        service.resume_invocation_monitors().await;
+
+        assert_eq!(
+            crate::services::agent_control::invocation_monitor_count(&agent_dir),
+            0,
+            "an unreadable invocation record is not monitored"
+        );
+        assert_eq!(
+            read_invocation_bytes(&agent_dir).await,
+            contents,
+            "an unreadable invocation record is left untouched"
+        );
+        let logs = captured_lines_containing(&sink, "worker-malformed");
+        assert!(logs.contains("LEVEL_Level(Warn)"), "{logs}");
+        assert!(
+            logs.contains("Could not read a retained invocation for monitor recovery"),
+            "{logs}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn server_restart_skips_monitor_recovery_without_tmux() {
+        let project = tempfile::tempdir().unwrap();
+        let route = RoutingInfo::window(WindowId::parse("@1").unwrap());
+        let _worker = seed_running_invocation(
+            project.path(),
+            "worker-no-tmux",
+            route,
+            identity("worker-no-tmux", "main", "main", false, None),
+        )
+        .await;
+        let agent_dir = project.path().join(".exo/agents/worker-no-tmux");
+        let before = read_invocation_bytes(&agent_dir).await;
+        let sink = global_test_event_sink().clone();
+        let mut services = crate::services::Services::test();
+        services.project_dir = project.path().to_path_buf();
+        services.agent_resolver = Arc::new(AgentResolver::load(project.path().to_path_buf()).await);
+        let service = AgentControlService::new(Arc::new(services));
+
+        service.resume_invocation_monitors().await;
+
+        assert_eq!(
+            crate::services::agent_control::invocation_monitor_count(&agent_dir),
+            0,
+            "monitor recovery without a tmux session registers nothing"
+        );
+        assert_eq!(
+            read_invocation_bytes(&agent_dir).await,
+            before,
+            "monitor recovery without a tmux session leaves the record untouched"
+        );
+        let logs = captured_lines_containing(
+            &sink,
+            "Skipping invocation monitor recovery because tmux is not configured",
+        );
+        assert!(logs.contains("LEVEL_Level(Warn)"), "{logs}");
+        assert!(!logs.is_empty(), "the skip must be reported: {logs}");
     }
 }

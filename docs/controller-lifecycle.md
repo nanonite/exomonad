@@ -60,3 +60,16 @@ Workspace shutdown preserves worker panes. The fresh server that starts with
 routing ownership and reattaches their exit monitors, so an adopted worker
 records its terminal outcome instead of staying `running` forever. Workers whose
 routing cannot be revalidated are left untouched and are not monitored.
+
+Revalidation requires the recorded delivery target to still exist and its tmux
+ownership tag to prove this exact invocation, or a declared parent or shared
+sibling. A recorded pane or window that no longer exists, an ownership tag that
+names another agent or invocation, a malformed invocation record, and a server
+started without a configured tmux session all leave the invocation record
+unchanged and unmonitored. Only an existing, unowned target or one already
+tagged for this invocation is adopted; a missing target is not treated as a
+terminal outcome because no exit marker can be observed.
+
+Live reuse inside a server that is already running is a separate case. Its own
+exit monitor is responsible for the terminal outcome, so a target that disappears
+while that monitor is finishing does not invalidate the live checkpoint.

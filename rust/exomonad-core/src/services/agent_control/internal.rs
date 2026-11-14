@@ -2447,6 +2447,7 @@ impl<
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_tracing::global_test_event_sink;
     use super::*;
     #[allow(clippy::upper_case_acronyms)]
     type ACS = AgentControlService<crate::services::Services>;
@@ -2675,63 +2676,6 @@ mod tests {
             serde_json::to_vec(&target).unwrap(),
         )
         .expect("write readable test controller target");
-    }
-
-    /// One process-wide capture sink keeps the log assertions independent of
-    /// which test thread polls the asynchronous future. Per-thread scoped
-    /// subscribers race with concurrent test threads over tracing callsite
-    /// interest, which can drop an otherwise emitted event.
-    fn global_test_event_sink() -> &'static Arc<std::sync::Mutex<Vec<String>>> {
-        static SINK: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<String>>>> =
-            std::sync::OnceLock::new();
-        SINK.get_or_init(|| {
-            let sink = Arc::new(std::sync::Mutex::new(Vec::new()));
-            if let Err(error) =
-                tracing::subscriber::set_global_default(capture_test_events(sink.clone()))
-            {
-                eprintln!("test tracing capture was not installed: {error}");
-            }
-            sink
-        })
-    }
-
-    /// A tracing subscriber that records every event's level and fields, so a
-    /// test can assert that a degraded controller-epoch read was reported
-    /// rather than silently swallowed.
-    fn capture_test_events(
-        sink: Arc<std::sync::Mutex<Vec<String>>>,
-    ) -> impl tracing::Subscriber + Send + Sync + 'static {
-        use std::fmt::Write as _;
-        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
-        use tracing_subscriber::registry::LookupSpan;
-
-        struct Capture(Arc<std::sync::Mutex<Vec<String>>>);
-
-        #[derive(Default)]
-        struct Fields(String);
-
-        impl tracing::field::Visit for Fields {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                let _ = write!(self.0, " {}={:?}", field.name(), value);
-            }
-        }
-
-        impl<S> Layer<S> for Capture
-        where
-            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
-        {
-            fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
-                let mut fields = Fields::default();
-                event.record(&mut fields);
-                self.0.lock().expect("capture lock").push(format!(
-                    "LEVEL_{:?}{}",
-                    event.metadata().level(),
-                    fields.0
-                ));
-            }
-        }
-
-        tracing_subscriber::registry().with(Capture(sink))
     }
 
     #[test]

@@ -183,6 +183,74 @@ pub(crate) fn invocation_monitor_registered(agent_dir: &Path, invocation_id: &st
         })
 }
 
+#[cfg(test)]
+pub(crate) fn invocation_monitor_count(agent_dir: &Path) -> usize {
+    active_invocation_monitors()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .iter()
+        .filter(|key| key.agent_dir == agent_dir)
+        .count()
+}
+
+/// Process-wide tracing capture for tests that must observe a warning after
+/// the emitting future has returned. A single global sink is shared because
+/// per-thread scoped subscribers race with concurrent test threads over
+/// callsite interest, which can drop an otherwise emitted event.
+#[cfg(test)]
+pub(crate) mod test_tracing {
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    pub(crate) fn global_test_event_sink() -> &'static Arc<Mutex<Vec<String>>> {
+        static SINK: OnceLock<Arc<Mutex<Vec<String>>>> = OnceLock::new();
+        SINK.get_or_init(|| {
+            let sink = Arc::new(Mutex::new(Vec::new()));
+            if let Err(error) =
+                tracing::subscriber::set_global_default(capture_test_events(sink.clone()))
+            {
+                eprintln!("test tracing capture was not installed: {error}");
+            }
+            sink
+        })
+    }
+
+    fn capture_test_events(
+        sink: Arc<Mutex<Vec<String>>>,
+    ) -> impl tracing::Subscriber + Send + Sync + 'static {
+        use std::fmt::Write as _;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+
+        struct Capture(Arc<Mutex<Vec<String>>>);
+
+        #[derive(Default)]
+        struct Fields(String);
+
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                let _ = write!(self.0, " {}={:?}", field.name(), value);
+            }
+        }
+
+        impl<S> Layer<S> for Capture
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.0.lock().expect("capture lock").push(format!(
+                    "LEVEL_{:?}{}",
+                    event.metadata().level(),
+                    fields.0
+                ));
+            }
+        }
+
+        tracing_subscriber::registry().with(Capture(sink))
+    }
+}
+
 async fn read_invocation_stderr_tail(agent_dir: &Path) -> Option<String> {
     for filename in ["stderr_tail", "stderr.log", "stderr"] {
         let Ok(bytes) = fs::read(agent_dir.join(filename)).await else {
@@ -1715,6 +1783,7 @@ impl<
                     previous,
                     &routing,
                     tmux.as_ref(),
+                    invocation::DeliveryTargetRequirement::MayBeGone,
                 )
                 .await
                 .with_context(|| format!("failed to reconcile startup effects for {agent_name}"))?;
@@ -1908,6 +1977,7 @@ impl<
                 &current,
                 &current.routing,
                 Some(&tmux),
+                invocation::DeliveryTargetRequirement::MustExist,
             )
             .await
             {

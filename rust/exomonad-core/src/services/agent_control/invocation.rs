@@ -370,11 +370,25 @@ async fn persist_routing_ownership(
         .await
 }
 
+/// Whether startup reconciliation requires the recorded delivery target to
+/// still exist.
+///
+/// A live reuse may race an exit monitor that has already observed its target
+/// disappear and will record the terminal outcome. Startup recovery has no such
+/// monitor, so a vanished target cannot be revalidated and must not be
+/// reattached to an empty monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeliveryTargetRequirement {
+    MayBeGone,
+    MustExist,
+}
+
 pub(crate) async fn reconcile_live_invocation_startup(
     agent_dir: &Path,
     expected: &InvocationRecord,
     requested_routing: &RoutingInfo,
     tmux: Option<&crate::services::tmux_ipc::TmuxIpc>,
+    delivery_target: DeliveryTargetRequirement,
 ) -> Result<InvocationRecord> {
     let _guard = mutation_lock().lock().await;
     let current = require_expected_live_invocation(agent_dir, expected, requested_routing).await?;
@@ -397,7 +411,13 @@ pub(crate) async fn reconcile_live_invocation_startup(
         let target_alive = crate::services::tmux_ipc::routing_target_alive(&current.routing, tmux)
             .await
             .context("failed to validate the live invocation delivery target")?;
-        if target_alive {
+        if !target_alive {
+            if delivery_target == DeliveryTargetRequirement::MustExist {
+                anyhow::bail!(
+                    "live invocation delivery target no longer exists; refusing to reattach its monitor"
+                );
+            }
+        } else {
             match tmux.routing_owner_state(&current.routing).await? {
                 crate::services::tmux_ipc::RoutingOwnerState::Unowned => {
                     tmux.set_routing_owner(
