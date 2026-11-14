@@ -1287,6 +1287,16 @@ pub(crate) async fn finish_invocation_after_superseded_target(
     let current = read_locked(agent_dir)
         .await?
         .context("controller invocation disappeared during liveness reconciliation")?;
+    if current.invocation_id == expected.invocation_id
+        && current.generation == expected.generation
+        && !current.is_live()
+    {
+        // A concurrent exit monitor can retire the same controller generation
+        // after it observed the target lifetime end. The crash boundary is then
+        // already durable, so converge on that record instead of rejecting the
+        // stale observation and blocking successor creation.
+        return Ok(current);
+    }
     if current != *expected || !current.is_live() {
         anyhow::bail!("controller invocation changed during liveness reconciliation");
     }

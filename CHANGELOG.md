@@ -42,6 +42,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Remove every redundant cast and `no-any-return` error from `tl_loop/**` in the strict mypy form (#1329)
 
 ### Fixed
+- Let a replay of the same scope handoff wait for its in-flight owner's Git mutation lease (bounded by the Git timeout) and adopt its commit, instead of failing after the two-second conflict window; a different owner still fails at two seconds (#1347)
+- Converge when an exit monitor has already retired a superseded controller invocation before reprovisioning reconciles it, instead of refusing with a spurious lifecycle block; a different invocation or generation still fails closed (#1347)
+- Keep tmux test fixtures' socket paths short and fail with the measured length when a deep TMPDIR would exceed the Unix socket limit (#1347)
 - Keep a managed Git run alive when its index-lock ownership observation catches the child exiting or the lock released, replaced or still being written, instead of aborting it with an unresolved-cleanup error; a reused process id still fails closed (#1346)
 - Refuse to reattach an exit monitor at server start when a retained invocation's recorded delivery target no longer exists, and cover the wrong-owner, missing-target, unreadable-record and no-tmux cases with tests (#1345)
 - Fail ordered sub-TL provisioning closed, with a logged cause, when the controller target is unreadable or malformed instead of silently recording no controller epoch on the restart successor (#1344)

@@ -24,6 +24,10 @@ use tokio::sync::oneshot;
 
 const LEASE_WAIT: Duration = Duration::from_secs(2);
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// A replay of the same handoff waits for its in-flight owner instead of
+/// failing in the conflict window. The owner's Git commands are separately
+/// bounded by `GIT_TIMEOUT`.
+const LEASE_REPLAY_WAIT: Duration = GIT_TIMEOUT;
 const COMMIT_SUBJECT: &str = "Prepare parent worktree for ordered subTL handoff";
 const SNAPSHOT_FINGERPRINT_PREFIX: &str = "git-snapshot-v2:";
 
@@ -147,11 +151,12 @@ impl HandoffContext {
         let operation_identity = operation_identity.to_string();
         let lease_operation_identity = operation_identity.clone();
         let leases = tokio::task::spawn_blocking(move || {
-            safety.acquire_set_with_index_override(
+            safety.acquire_set_for_replay_with_index_override(
                 &target,
                 &[GitMutationResource::SharedRefs, GitMutationResource::Index],
                 &lease_operation_identity,
                 LEASE_WAIT,
+                LEASE_REPLAY_WAIT,
                 None,
             )
         })
@@ -2874,6 +2879,57 @@ mod tests {
             second.outcome.as_str(),
             "committed" | "recovered_commit"
         ));
+    }
+
+    #[tokio::test]
+    async fn identical_handoff_replay_waits_for_the_in_flight_operation() {
+        let repository = TestRepository::new();
+        repository.write("tracked.txt", "handoff change\n");
+        let inspected = run(&repository, request(false, "", "")).await;
+        let handoff = request(true, &inspected.head_after, &inspected.source_fingerprint);
+
+        // Hold the same operation's leases for longer than the conflict wait,
+        // exactly as the first of two concurrent replays does while it
+        // inspects, stages, and commits.
+        let operation_id = operation_identity(
+            &handoff,
+            &fs::canonicalize(repository.path()).expect("canonical repository path"),
+        );
+        let (acquired_sender, acquired) = std::sync::mpsc::channel();
+        let (release_sender, release) = std::sync::mpsc::channel();
+        let holder_root = repository.path().to_path_buf();
+        let holder = std::thread::spawn(move || {
+            let safety = GitMutationSafety::new(holder_root.clone());
+            let _leases = safety
+                .acquire_set(
+                    &holder_root,
+                    &[GitMutationResource::SharedRefs, GitMutationResource::Index],
+                    &operation_id,
+                    Duration::from_secs(5),
+                )
+                .expect("the test holder acquires the in-flight operation leases");
+            acquired_sender.send(()).expect("report acquired leases");
+            release
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the test releases the in-flight leases");
+        });
+        acquired
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the test holder acquired its leases");
+
+        let release_at = Duration::from_secs(4);
+        let release_holder = async move {
+            tokio::time::sleep(release_at).await;
+            release_sender
+                .send(())
+                .expect("the test holder still waits for its release");
+        };
+        let (replayed, ()) = tokio::join!(run(&repository, handoff), release_holder);
+        holder.join().expect("the test holder releases its leases");
+
+        assert!(replayed.ready, "{}", replayed.error);
+        assert_eq!(replayed.outcome, "committed");
+        assert_eq!(repository.commit_count(), 2);
     }
 
     #[test]

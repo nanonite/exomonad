@@ -251,6 +251,41 @@ pub(crate) mod test_tracing {
     }
 }
 
+/// Isolated tmux servers for service tests.
+///
+/// A tmux `-S` target is a Unix domain socket path, and Linux limits that path
+/// to 108 bytes including the terminating NUL. Test scratch directories live
+/// under `TMPDIR` and can be deeply nested, so both the temporary directory
+/// prefix and the socket file name stay short. A path that still cannot fit
+/// panics with the measured length instead of letting tmux fail to connect.
+#[cfg(test)]
+pub(crate) mod test_tmux {
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
+
+    const UNIX_SOCKET_PATH_LIMIT: usize = 108;
+    const SOCKET_FILE_NAME: &str = "s.sock";
+
+    pub(crate) fn isolated_socket_directory() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("e")
+            .tempdir()
+            .expect("isolated tmux socket directory")
+    }
+
+    pub(crate) fn socket_path(directory: &Path) -> PathBuf {
+        let path = directory.join(SOCKET_FILE_NAME);
+        let length = path.as_os_str().as_bytes().len();
+        assert!(
+            length < UNIX_SOCKET_PATH_LIMIT,
+            "tmux test socket path is {length} bytes, over the \
+             {UNIX_SOCKET_PATH_LIMIT}-byte Unix socket limit including the NUL terminator: {}",
+            path.display()
+        );
+        path
+    }
+}
+
 async fn read_invocation_stderr_tail(agent_dir: &Path) -> Option<String> {
     for filename in ["stderr_tail", "stderr.log", "stderr"] {
         let Ok(bytes) = fs::read(agent_dir.join(filename)).await else {

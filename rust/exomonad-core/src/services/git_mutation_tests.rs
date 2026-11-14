@@ -305,6 +305,54 @@ fn acquire_set_uses_refs_before_index_and_deduplicates_resources() {
     assert_eq!(leases.leases()[1].resource, GitMutationResource::Index);
 }
 
+#[test]
+fn replay_wait_extends_only_for_the_identical_operation() {
+    let fixture = RepositoryFixture::new();
+    let holder_root = fixture.root.clone();
+    let (acquired_sender, acquired) = std::sync::mpsc::channel();
+    let (release_sender, release) = std::sync::mpsc::channel();
+    let holder = thread::spawn(move || {
+        let service = GitMutationSafety::new(holder_root.clone());
+        let leases = service
+            .acquire_set(
+                &holder_root,
+                &[GitMutationResource::SharedRefs, GitMutationResource::Index],
+                "identical-replay",
+                Duration::from_secs(5),
+            )
+            .expect("the holder acquires its leases");
+        acquired_sender.send(()).expect("report acquired leases");
+        release
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the test releases the holder");
+        drop(leases);
+    });
+    acquired
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the holder acquired its leases");
+
+    let started = std::time::Instant::now();
+    let conflict = fixture.service.acquire_set_for_replay_with_index_override(
+        &fixture.root,
+        &[GitMutationResource::SharedRefs, GitMutationResource::Index],
+        "different-operation",
+        Duration::from_millis(150),
+        Duration::from_secs(10),
+        None,
+    );
+    assert!(
+        matches!(conflict, Err(GitMutationError::Busy { .. })),
+        "a conflicting owner is not mistaken for an identical replay"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a conflicting owner keeps the fail-fast conflict window"
+    );
+
+    release_sender.send(()).expect("release the holder");
+    holder.join().expect("the holder exits");
+}
+
 #[cfg(unix)]
 #[test]
 fn symlinked_worktree_index_and_lease_directory_fail_closed() {

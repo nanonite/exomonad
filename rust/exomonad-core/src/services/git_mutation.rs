@@ -10,7 +10,7 @@ use nix::fcntl::{Flock, FlockArg};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -230,7 +230,7 @@ impl GitMutationSafety {
     ) -> Result<GitMutationLease, GitMutationError> {
         validate_operation_id(operation_id)?;
         let paths = self.resolve_paths_with_index_override(worktree, index_override)?;
-        self.acquire_resolved(paths, resource, operation_id, wait, index_override)
+        self.acquire_resolved(paths, resource, operation_id, wait, None, index_override)
     }
 
     /// Acquire multiple resources in a consistent order to avoid lease deadlocks.
@@ -260,6 +260,50 @@ impl GitMutationSafety {
         wait: Duration,
         index_override: Option<&std::ffi::OsStr>,
     ) -> Result<GitMutationLeaseSet, GitMutationError> {
+        self.acquire_set_with_replay_wait(
+            worktree,
+            resources,
+            operation_id,
+            wait,
+            None,
+            index_override,
+        )
+    }
+
+    /// Acquire multiple leases, waiting for an identical in-flight operation.
+    ///
+    /// A different owner still fails after `conflict_wait`. When the durable
+    /// lease record names `operation_id`, the owner is replaying this exact
+    /// operation, so the caller waits until the owner releases the lease or
+    /// `replay_wait` expires.
+    pub fn acquire_set_for_replay_with_index_override(
+        &self,
+        worktree: &Path,
+        resources: &[GitMutationResource],
+        operation_id: &str,
+        conflict_wait: Duration,
+        replay_wait: Duration,
+        index_override: Option<&std::ffi::OsStr>,
+    ) -> Result<GitMutationLeaseSet, GitMutationError> {
+        self.acquire_set_with_replay_wait(
+            worktree,
+            resources,
+            operation_id,
+            conflict_wait,
+            Some(replay_wait),
+            index_override,
+        )
+    }
+
+    fn acquire_set_with_replay_wait(
+        &self,
+        worktree: &Path,
+        resources: &[GitMutationResource],
+        operation_id: &str,
+        wait: Duration,
+        replay_wait: Option<Duration>,
+        index_override: Option<&std::ffi::OsStr>,
+    ) -> Result<GitMutationLeaseSet, GitMutationError> {
         validate_operation_id(operation_id)?;
         let paths = self.resolve_paths_with_index_override(worktree, index_override)?;
         let deadline = Instant::now() + wait;
@@ -268,12 +312,21 @@ impl GitMutationSafety {
         ordered.dedup();
         let mut leases = Vec::with_capacity(ordered.len());
         for resource in ordered {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            // An identical owner holds the whole set, so it releases every
+            // resource together. Give each resource its own conflict budget
+            // when a replay may extend the wait; otherwise keep the shared
+            // acquisition deadline.
+            let remaining = if replay_wait.is_some() {
+                wait
+            } else {
+                deadline.saturating_duration_since(Instant::now())
+            };
             leases.push(self.acquire_resolved(
                 paths.clone(),
                 resource,
                 operation_id,
                 remaining,
+                replay_wait,
                 index_override,
             )?);
         }
@@ -286,6 +339,7 @@ impl GitMutationSafety {
         resource: GitMutationResource,
         operation_id: &str,
         wait: Duration,
+        replay_wait: Option<Duration>,
         index_override: Option<&std::ffi::OsStr>,
     ) -> Result<GitMutationLease, GitMutationError> {
         #[cfg(not(all(unix, not(any(target_os = "redox", target_os = "solaris")))))]
@@ -296,6 +350,9 @@ impl GitMutationSafety {
             let lease_path = resource.lease_path(&paths).to_path_buf();
             ensure_safe_lease_directory(lease_path.parent().unwrap_or(&paths.git_dir))?;
             let started = Instant::now();
+            let mut deadline = started + wait;
+            let replay_deadline = replay_wait.map(|wait| started + wait);
+            let mut replayed = false;
             loop {
                 let file = open_lease_file(&lease_path)?;
                 match try_exclusive_lock(file) {
@@ -321,17 +378,32 @@ impl GitMutationSafety {
                             index_override: index_override.map(PathBuf::from),
                         });
                     }
-                    Ok(None) if started.elapsed() < wait => {
-                        thread::sleep(
-                            LEASE_POLL_INTERVAL.min(wait.saturating_sub(started.elapsed())),
-                        );
-                    }
                     Ok(None) => {
-                        return Err(GitMutationError::Busy {
-                            resource: resource.label(),
-                            path: lease_path,
-                            waited_ms: started.elapsed().as_millis(),
-                        });
+                        if let Some(replay_deadline) = replay_deadline {
+                            match lease_record_owner(&lease_path)? {
+                                Some(owner) if owner == operation_digest(operation_id) => {
+                                    deadline = deadline.max(replay_deadline);
+                                    replayed = true;
+                                }
+                                Some(_) if replayed => {
+                                    return Err(GitMutationError::Busy {
+                                        resource: resource.label(),
+                                        path: lease_path,
+                                        waited_ms: started.elapsed().as_millis(),
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Err(GitMutationError::Busy {
+                                resource: resource.label(),
+                                path: lease_path,
+                                waited_ms: started.elapsed().as_millis(),
+                            });
+                        }
+                        thread::sleep(LEASE_POLL_INTERVAL.min(deadline - now));
                     }
                     Err(error) => return Err(uncertain(&lease_path, &error.to_string())),
                 }
@@ -609,6 +681,57 @@ fn try_exclusive_lock(_file: File) -> Result<Option<NativeLeaseLock>, io::Error>
 }
 
 #[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
+fn operation_digest(operation_id: &str) -> String {
+    format!("{:x}", Sha256::digest(operation_id.as_bytes()))
+}
+
+/// The operation identity the current lease owner persisted.
+///
+/// A missing or partial record while the owner writes is not proof of an
+/// identical operation, so it returns `None` and the caller keeps its conflict
+/// deadline instead of extending the wait.
+#[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
+fn lease_record_owner(path: &Path) -> Result<Option<String>, GitMutationError> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    #[derive(serde::Deserialize)]
+    struct LeaseIdentity {
+        schema_version: u32,
+        operation_id_sha256: String,
+    }
+
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(uncertain(
+                path,
+                &format!("cannot read mutation lease ({})", error.kind()),
+            ))
+        }
+    };
+    verify_open_path(&file, path)?;
+    let mut bytes = Vec::new();
+    file.take(4096).read_to_end(&mut bytes).map_err(|error| {
+        uncertain(
+            path,
+            &format!("cannot read mutation lease ({})", error.kind()),
+        )
+    })?;
+    let Ok(identity) = serde_json::from_slice::<LeaseIdentity>(&bytes) else {
+        return Ok(None);
+    };
+    if identity.schema_version != LEASE_SCHEMA_VERSION {
+        return Ok(None);
+    }
+    Ok(Some(identity.operation_id_sha256))
+}
+
+#[cfg(all(unix, not(any(target_os = "redox", target_os = "solaris"))))]
 fn write_lease_record(
     lock: &mut NativeLeaseLock,
     paths: &GitMutationPaths,
@@ -617,7 +740,7 @@ fn write_lease_record(
 ) -> Result<(), GitMutationError> {
     let record = LeaseRecord {
         schema_version: LEASE_SCHEMA_VERSION,
-        operation_id_sha256: format!("{:x}", Sha256::digest(operation_id.as_bytes())),
+        operation_id_sha256: operation_digest(operation_id),
         resource: resource.label(),
         resource_sha256: path_digest(resource.lease_path(paths)),
         owner_pid: std::process::id(),

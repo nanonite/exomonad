@@ -3525,13 +3525,8 @@ mod tests {
 
     impl OrderedTestTmux {
         fn new() -> Self {
-            let socket_dir = tempfile::tempdir().expect("isolated tmux socket directory");
-            let socket = socket_dir
-                .path()
-                .join(format!(
-                    "exo-ordered-recovery-{}.sock",
-                    uuid::Uuid::new_v4()
-                ))
+            let socket_dir = super::super::test_tmux::isolated_socket_directory();
+            let socket = super::super::test_tmux::socket_path(socket_dir.path())
                 .to_string_lossy()
                 .into_owned();
             let session = format!("exo-ordered-recovery-{}", uuid::Uuid::new_v4());
@@ -3762,6 +3757,45 @@ mod tests {
                 std::env::remove_var("EXOMONAD_TMUX_SOCKET");
             }
         }
+    }
+
+    struct TempDirOverride {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl TempDirOverride {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("TMPDIR");
+            std::env::set_var("TMPDIR", path);
+            Self { previous }
+        }
+    }
+
+    impl Drop for TempDirOverride {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("TMPDIR", value),
+                None => std::env::remove_var("TMPDIR"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ordered_tmux_fixture_starts_under_a_long_temp_directory() {
+        // A tmux `-S` target is a Unix domain socket path, limited to 108
+        // bytes including the terminating NUL. Hold TMPDIR at a length where a
+        // uuid-suffixed socket name cannot fit and the short fixture name can.
+        let base = tempfile::tempdir().unwrap();
+        let base_length = base.path().as_os_str().len();
+        let nested = base
+            .path()
+            .join("x".repeat(60usize.saturating_sub(base_length + 1).max(1)));
+        std::fs::create_dir(&nested).unwrap();
+        let _tmpdir = TempDirOverride::set(&nested);
+
+        let tmux = OrderedTestTmux::new();
+        assert!(tmux.window_id_for_session().as_str().starts_with('@'));
     }
 
     async fn ordered_service_with_tmux(
@@ -5616,6 +5650,56 @@ mod tests {
             first.generation + 1,
         )
         .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn superseded_terminalization_converges_after_the_monitor_retires_the_predecessor() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = temp.path().to_path_buf();
+        init_ordered_test_repo(&project_dir);
+        let record = ordered_test_record(&project_dir, "ordered-monitor-retires-predecessor");
+        let agent_dir = project_dir.join(".exo/agents/ordered-monitor-retires-predecessor");
+        let tmux = OrderedTestTmux::new();
+        let target = tmux.window_id_for_session();
+        tmux.rename_window(&target, "TL");
+        provision_initial_ordered_controller(&project_dir, &tmux, record).await;
+        let predecessor = read_invocation(&agent_dir).await.unwrap().unwrap();
+        let tmux_ipc = super::super::tmux_ipc::TmuxIpc::new(&tmux.session);
+
+        // The invocation monitor owns the same retirement boundary: when the
+        // controller target disappears it retires this exact generation.
+        invocation::finish_invocation_and_tombstone_for_invocation(
+            &agent_dir,
+            &predecessor.routing,
+            &predecessor.invocation_id,
+            InvocationStatus::Killed,
+            None,
+            invocation::InvocationExitContext {
+                reason: Some("tmux_target_exited_without_exit_marker".to_string()),
+                classification: Some("missing_exit_marker".to_string()),
+                stderr_tail: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // A reprovision that observed the crash boundary before the monitor's
+        // write must adopt the durable terminal generation instead of failing
+        // closed against its now-stale observation.
+        let finished = invocation::finish_invocation_after_superseded_target(
+            &agent_dir,
+            &predecessor,
+            &tmux_ipc,
+            &project_dir,
+            "the tmux server lifetime that owned the prior controller ended",
+            "controller_target_superseded_on_reprovision",
+        )
+        .await
+        .unwrap();
+        assert_eq!(finished.invocation_id, predecessor.invocation_id);
+        assert_eq!(finished.generation, predecessor.generation);
+        assert!(!finished.is_live());
     }
 
     #[tokio::test]

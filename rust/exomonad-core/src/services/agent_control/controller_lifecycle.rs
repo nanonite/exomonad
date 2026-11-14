@@ -1416,10 +1416,8 @@ mod tests {
 
     impl IsolatedTmux {
         fn new() -> Self {
-            let socket_dir = tempfile::tempdir().expect("isolated tmux socket directory");
-            let socket = socket_dir
-                .path()
-                .join(format!("exo-controller-lifecycle-{}.sock", Uuid::new_v4()))
+            let socket_dir = super::super::test_tmux::isolated_socket_directory();
+            let socket = super::super::test_tmux::socket_path(socket_dir.path())
                 .to_string_lossy()
                 .into_owned();
             let session = format!("exo-controller-lifecycle-{}", Uuid::new_v4());

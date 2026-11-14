@@ -511,6 +511,21 @@ A delayed exit monitor from a superseded predecessor carries its invocation ID
 as well as its routing snapshot into
 `finish_invocation_and_tombstone_for_invocation`; a recycled numeric target can
 therefore never let the predecessor retire the successor generation.
+`finish_invocation_after_superseded_target` also converges when an exit monitor
+already retired the exact observed generation: a terminal record with the same
+invocation ID and generation is the same crash boundary, not a conflicting
+successor, and it must not block reprovisioning with `LifecycleBlocked`.
+
+### Scope handoff commit leases
+
+`prepare_scope_handoff` holds the shared-refs and index mutation leases across
+inspection, staging, and commit. A different owner still fails fast after the
+two-second conflict window. When the durable lease record names the same
+operation identity, the second caller is a replay of one handoff and waits for
+the in-flight owner (bounded by the Git command timeout) instead of returning a
+spurious `Git mutation readiness is unavailable`. Once the owner releases the
+leases, the replay adopts the existing handoff commit, so concurrent replays
+create exactly one commit.
 
 During `init --continue`, ordered sub-TL recovery uses the same provisioning
 decision as live execution. The accepted plan declaration must match the

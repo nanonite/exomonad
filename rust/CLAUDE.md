@@ -271,6 +271,13 @@ The `wasm_integration` target is assigned to a one-permit nextest group because
 its tests share WASM runtime state and use `serial_test`; the group makes that
 serialization work across nextest's process-per-test execution model.
 
+Isolated tmux servers in unit tests use `agent_control::test_tmux`, which keeps
+the temporary directory prefix and the `tmux -S` socket file name short. A Unix
+domain socket path is limited to 108 bytes including the NUL terminator, and
+test scratch directories live under `TMPDIR`; a deeply nested `TMPDIR` must not
+decide whether a tmux-backed test can start. The helper panics with the measured
+length instead of letting tmux report `File name too long`.
+
 The Teams bridge lock publishes complete metadata through a temporary file and
 an atomic hard-link claim. Lock acquisition reclaims only temporary artifacts
 whose recorded owner PID is dead; artifacts belonging to live PIDs are retained.
