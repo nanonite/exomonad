@@ -17,7 +17,7 @@ use std::fs::{self, File};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 struct Fixture {
@@ -103,10 +103,26 @@ fn git(directory: &Path, args: &[&str]) -> Output {
     output
 }
 
+/// Spawn the recorded process-group leader.
+///
+/// The leader forks its supervised helper *before* it opens the recorded lock.
+/// A durable lock proof requires the open lock descriptor, so every recorded
+/// proof already covers a member of the recorded process group: no scheduler
+/// preemption between opening the lock and forking the helper can produce a
+/// proof for an empty group.
 fn managed_lock_holder(lock_path: &Path) -> Child {
+    spawn_lock_holder(lock_path, "wait")
+}
+
+/// Spawn the recorded process-group leader with `boundary` in place of `wait`.
+///
+/// `boundary` runs after the leader opened the recorded lock (the exact point at
+/// which a durable lock proof can be recorded) and after it forked the helper.
+fn spawn_lock_holder(lock_path: &Path, boundary: &str) -> Child {
+    let script = format!("sleep 30 & exec 9<\"$1\"; {boundary}");
     let mut command = Command::new("sh");
     command
-        .args(["-c", "exec 9<\"$1\"; sleep 30 & wait", "git-lock-holder"])
+        .args(["-c", &script, "git-lock-holder"])
         .arg(lock_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -124,6 +140,148 @@ fn kill_managed_group(child: &mut Child) {
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// How long a fixture waits for one durable `/proc` observation before failing.
+#[cfg(target_os = "linux")]
+const PROCESS_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecordedGroupMember {
+    pid: u32,
+    state: char,
+}
+
+impl RecordedGroupMember {
+    fn is_alive(&self) -> bool {
+        !matches!(self.state, 'Z' | 'X')
+    }
+}
+
+/// Enumerate the members of one recorded process group from `/proc`.
+///
+/// The kernel's process-group identity is what the production inspection asks
+/// about, so the fixture observes exactly that and nothing weaker.
+#[cfg(target_os = "linux")]
+fn recorded_group_members(process_group_id: u32) -> Vec<RecordedGroupMember> {
+    let entries = fs::read_dir("/proc").expect("enumerate /proc");
+    let mut members = Vec::new();
+    for entry in entries {
+        let entry = entry.expect("read /proc entry");
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some((state, process_group)) = process_state_and_group(pid) else {
+            continue;
+        };
+        if process_group == process_group_id {
+            members.push(RecordedGroupMember { pid, state });
+        }
+    }
+    members.sort_by_key(|member| member.pid);
+    members
+}
+
+#[cfg(target_os = "linux")]
+fn process_state_and_group(pid: u32) -> Option<(char, u32)> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("cannot inspect fixture process {pid}: {error}"),
+    };
+    let (_, fields) = stat
+        .rsplit_once(')')
+        .expect("fixture process stat record has a command name");
+    let fields: Vec<&str> = fields.split_whitespace().collect();
+    let state = fields
+        .first()
+        .and_then(|state| state.chars().next())
+        .expect("fixture process stat record has a state");
+    let process_group = fields
+        .get(2)
+        .expect("fixture process stat record has a process group")
+        .parse::<u32>()
+        .expect("fixture process stat process group is numeric");
+    Some((state, process_group))
+}
+
+/// Wait until the recorded process group holds a live supervised helper.
+#[cfg(target_os = "linux")]
+fn wait_for_supervised_helper(process_group_id: u32) -> Vec<RecordedGroupMember> {
+    let deadline = Instant::now() + PROCESS_OBSERVATION_TIMEOUT;
+    loop {
+        let members = recorded_group_members(process_group_id);
+        let helper = members
+            .iter()
+            .any(|member| member.pid != process_group_id && member.is_alive());
+        if helper {
+            return members;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "the recorded process group {process_group_id} still has no supervised helper \
+                 after {PROCESS_OBSERVATION_TIMEOUT:?}: {members:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Wait until `leader` stopped itself while holding the recorded lock.
+///
+/// This is the exact boundary at which a durable lock proof can be recorded: the
+/// leader holds the lock descriptor and no further instruction has run.
+#[cfg(target_os = "linux")]
+fn wait_for_stopped_lock_proof_boundary(
+    leader: &mut Child,
+    lock_path: &Path,
+) -> Vec<RecordedGroupMember> {
+    let deadline = Instant::now() + PROCESS_OBSERVATION_TIMEOUT;
+    loop {
+        let Some((state, process_group)) = process_state_and_group(leader.id()) else {
+            panic!(
+                "the fixture leader exited before it stopped at the recorded lock-proof boundary"
+            );
+        };
+        let holds_lock = leader_holds_lock(leader.id(), lock_path);
+        if state == 'T' && holds_lock {
+            // Observe the group only after the stopped leader was seen: a /proc
+            // snapshot taken before the stop can predate the helper's fork and
+            // miss the member the recorded group already has.
+            return recorded_group_members(leader.id());
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "the fixture leader did not stop at the recorded lock-proof boundary after \
+                 {PROCESS_OBSERVATION_TIMEOUT:?}: state={state:?} process_group={process_group} \
+                 holds_lock={holds_lock} members={:?}",
+                recorded_group_members(leader.id())
+            );
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn leader_holds_lock(pid: u32, lock_path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let lock = match fs::metadata(lock_path) {
+        Ok(lock) => lock,
+        Err(error) => panic!(
+            "cannot inspect the fixture lock {}: {error}",
+            lock_path.display()
+        ),
+    };
+    match fs::metadata(format!("/proc/{pid}/fd/9")) {
+        Ok(descriptor) => descriptor.dev() == lock.dev() && descriptor.ino() == lock.ino(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => panic!("cannot inspect fixture process {pid} descriptors: {error}"),
+    }
 }
 
 fn record_process_scope(
@@ -377,9 +535,9 @@ fn production_scoped_inspection_holds_recovery_for_a_surviving_supervised_helper
     let mut child = managed_lock_holder(&lock_path);
     let owner = capture_managed_process_identity(&child).expect("managed owner identity");
     record_process_scope(&lease, &owner, &fixture.event_log);
-    let proof = record_until_proven(&lease, &mut child, &owner, &fixture.event_log)
-        .expect("managed lock proof")
-        .proof;
+    record_until_proven(&lease, &mut child, &owner, &fixture.event_log)
+        .expect("managed lock proof");
+    wait_for_supervised_helper(owner.pid);
 
     child.kill().expect("stop process-group leader");
     child.wait().expect("reap process-group leader");
@@ -395,8 +553,34 @@ fn production_scoped_inspection_holds_recovery_for_a_surviving_supervised_helper
     );
     assert!(fixture.lock_path().exists());
 
-    let group = nix::unistd::Pid::from_raw(proof.owner.pid as i32);
+    let group = nix::unistd::Pid::from_raw(owner.pid as i32);
     let _ = nix::sys::signal::killpg(group, Some(nix::sys::signal::Signal::SIGKILL));
+}
+
+/// Regression coverage for the fixture race in #1348.
+///
+/// The leader stops itself at the exact boundary where a durable lock proof can
+/// be recorded, which is the same preemption point that produced a proof for an
+/// empty recorded process group under load. The supervised helper must already
+/// be a member of the recorded group at that boundary.
+#[cfg(target_os = "linux")]
+#[test]
+fn recorded_lock_proof_boundary_already_contains_the_supervised_helper() {
+    let fixture = Fixture::new();
+    let lock_path = fixture.lock_path();
+    fixture.empty_lock();
+    let mut leader = spawn_lock_holder(&lock_path, "kill -STOP $$");
+    let members = wait_for_stopped_lock_proof_boundary(&mut leader, &lock_path);
+    let supervised: Vec<RecordedGroupMember> = members
+        .iter()
+        .filter(|member| member.pid != leader.id())
+        .copied()
+        .collect();
+    assert!(
+        supervised.iter().any(RecordedGroupMember::is_alive),
+        "a durable lock proof must not predate the supervised helper: {members:?}"
+    );
+    kill_managed_group(&mut leader);
 }
 
 #[test]

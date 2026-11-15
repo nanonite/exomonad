@@ -284,6 +284,16 @@ whose recorded owner PID is dead; artifacts belonging to live PIDs are retained.
 Successful claims are logged at debug level, while stale-lock breaks are logged
 at warn level with the recorded owner PID.
 
+Process-group lock fixtures establish the supervised helper before the recorded
+lock is opened: `git_lock_recovery_tests` spawns the helper first and only then
+opens the lock descriptor, so a durable lock proof can never be recorded for a
+group that has no member yet. A fixture that opens the lock first and forks the
+helper afterwards has a real window in which the recovery inspection correctly
+reports `Recovered` because the recorded group is empty; that window is a
+scheduler preemption, not a bug in the inspection. Tests that freeze a leader at
+the lock-proof boundary must observe `/proc` after the stop, because a snapshot
+taken before the stop can miss a member that joins afterwards.
+
 ## Design Decisions
 
 | Decision | Rationale |
