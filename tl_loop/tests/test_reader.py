@@ -126,6 +126,50 @@ def test_reader_keeps_empty_recorded_slice_compatible_with_agent_match(tmp_path:
     }
 
 
+def test_reader_returns_named_lifecycle_rows_in_sequence_order(tmp_path: Path) -> None:
+    """Unprojected lifecycle rows are readable without guessing their identity."""
+    segments = tmp_path / "segments"
+    _write_segment(
+        segments,
+        1,
+        [
+            {
+                "type": "agent.resumed",
+                "run_seq": 12,
+                "agent_id": "run",
+                "data": {"invocation_id": "inv-2", "previous_invocation_id": "inv-1"},
+            },
+            {
+                "type": "agent.spawned",
+                "run_seq": 10,
+                "agent_id": "run",
+                "data": {"invocation_id": "inv-1"},
+            },
+            {
+                "type": "agent.invocation.finished",
+                "run_seq": 13,
+                "agent_id": "owner",
+                "data": {"invocation_id": "inv-2", "status": "exited"},
+            },
+        ],
+    )
+
+    rows = LedgerReader(segments).lifecycle_records(
+        ("agent.resumed", "agent.invocation.finished")
+    )
+
+    assert [row["run_seq"] for row in rows] == [12, 13]
+    assert rows[0]["data"] == {
+        "invocation_id": "inv-2",
+        "previous_invocation_id": "inv-1",
+    }
+
+
+def test_reader_rejects_empty_lifecycle_type_list(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        LedgerReader(tmp_path).lifecycle_records(())
+
+
 def test_reader_reuses_unchanged_segment_for_terminal_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

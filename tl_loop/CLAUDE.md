@@ -279,6 +279,78 @@ envelope `invocation_id` from `data.invocation_id`, so a genuine
 `agent.spawned` row carries both values or neither; an envelope-only or
 data-only row is rejected as conflicting evidence.
 
+## Terminal owner recovery from historical resume receipts
+
+A terminal-owner recovery continues from a confirmed `resume_blocked_leaf`
+result. The receipt is classified before it is validated:
+
+- **Modern** — the action carries a `route_fingerprint`, or the result carries
+  any modern key (`id`/`agent_id`, `issue`, `intent_id`, `role_route`,
+  `model`, `effort`, `generation`, `prior_invocation_id`), or the durable
+  owner record for this exact successor carries `role_route`. These receipts
+  use the full modern proof: the response owner, scope, and intent, the
+  `agent.spawned` launch row, and the complete accepted route receipts.
+  Missing fields never move a modern receipt onto the legacy path.
+- **Supported historical** — the action has no route binding and the response
+  is exactly the pre-launch-event projection. `agent` holds only
+  `agent_type`, `branch_name`, `worktree_path`, `tab_name`, `issue_title`,
+  `pane_id`, the invocation handoff keys (`invocation_id`,
+  `invocation_trigger`, `invocation_runtime`, `invocation_fresh`,
+  `invocation_ready`, `invocation_outcome`), and the routing target keys.
+  `invocation` holds only `invocation_id`, `trigger`, `runtime`, `fresh`,
+  `ready`, `outcome`, `target_id`, and `target_type`. The result adds only
+  `chainlink_issue_id`.
+- **Anything else** is held with a specific diagnostic.
+
+The supported historical proof joins one confirmed action to one effect:
+
+1. The journal supplies the action. Exactly one confirmed
+   `resume_blocked_leaf` action may name the successor invocation.
+2. The durable owner invocation names the successor, its immediate
+   predecessor, `trigger=resume_blocked`, the next invocation generation, the
+   owner branch and worktree, and the actual runtime, model, and effort.
+   After the registry rotates to a newer successor, the immediately following
+   confirmed action's `expected_invocation_id` and `prior_*` values retain the
+   same lineage.
+3. `identity.json` corroborates the stable owner, slice, branch, parent
+   branch, and worktree, and — before rotation — the actual route.
+4. Exactly one `agent.invocation.started`, one `agent.resumed`, and one
+   `agent.invocation.finished` row name the successor. The `agent.resumed`
+   row is reported by the run identity, names the owner as `child_agent`,
+   carries both invocation ids, the invocation generation, the branch,
+   `spawn_type=resume_blocked`, and the same actual model and effort. The
+   started and finished rows are reported by the owner. A
+   successor-specific `agent.spawned` row means the record is not the
+   historical shape, so it is held.
+
+The resolved owner and intent association exists only in memory as a proof
+record; the saved response, journal, ledger rows, identity, and invocation
+history are never rewritten. The intent is attributed to the unique confirmed
+action/result/effect join, not to an `intent_id` the historical host never
+emitted. The proof logs its evidence source
+(`durable_owner_invocation+agent.resumed` or
+`next_confirmed_successor_action+agent.resumed`).
+
+After the historical successor is proven terminal, the controller leaves its
+recorded request and actual route unchanged and dispatches exactly one new
+successor from the currently accepted configured route, linked to the proven
+invocation. Diagnostics distinguish an omitted owner, an explicit owner
+conflict, missing lineage, an ambiguous action, and missing modern
+provenance, and are redacted to a single printable line.
+
+The init-recovery fixture seeds those historical host rows, so they are written
+as the production producers wrote them: the invocation started/finished rows are
+`source="lifecycle"` with the lifecycle payload fields, and `agent.resumed` is
+`source="rust"` without a top-level harness/provider/role/runtime or an
+`intent_id`. Seeded rows go through the ledger writer's own append path (the
+current segment, rotating only at its size bound) rather than a segment named
+after a `run_seq` value. `just check-e2e-init-recovery` runs
+`tests/e2e/init-recovery/check_ledger_fixture_schema.py`, which derives the
+non-optional `LedgerEvent` fields from
+`rust/exomonad-core/src/services/immutable_ledger.rs`, seeds the chronology into
+a throwaway repository, and fails when any row lacks a field the server parser
+requires or the seed invents a segment layout.
+
 ## Aggregate publication block gate
 
 When a completed ordered sub-TL needs an aggregate PR and `file_pr` returns a

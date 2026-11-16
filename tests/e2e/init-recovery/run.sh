@@ -945,7 +945,28 @@ resumes = [
     and row.get("status") == "confirmed"
 ]
 assert len(resumes) == 2, f"expected the retained Sol successor plus one Luna resume, found {len(resumes)}"
-assert resumes[0]["result"]["result"]["invocation"]["model"] == "gpt-6.1-sol"
+historical = resumes[0]
+historical_result = historical["result"]["result"]
+historical_agent = historical_result["agent"]
+historical_invocation = historical_result["invocation"]
+# The saved historical result is the genuine pre-launch-row projection: the
+# old host never wrote owner/scope/intent/route fields, so the actual Sol/xhigh
+# outcome is proven only by the durable invocation/identity lineage that the
+# fixture records before registry rotation.
+modern_response_fields = {
+    "id", "agent_id", "issue", "intent_id", "model", "effort",
+    "generation", "prior_invocation_id", "role_route",
+}
+assert not set(historical_agent) & modern_response_fields, historical_agent
+assert not set(historical_invocation) & modern_response_fields, historical_invocation
+assert historical_invocation["invocation_id"] == "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d"
+historical_baseline = baseline["historical_wrong_route_successor"]
+assert historical_baseline["response"] == historical_result
+assert historical_baseline["invocation"]["runtime"] == "codex"
+assert historical_baseline["invocation"]["model"] == "gpt-6.1-sol"
+assert historical_baseline["invocation"]["effort"] == "xhigh"
+assert historical_baseline["invocation"]["generation"] == 2
+assert historical_baseline["invocation"]["prior_invocation_id"] == "f4460477-40bf-4824-941b-dcc3d0ebc9a1"
 current = resumes[-1]
 arguments = current["arguments"]
 result = current["result"]["result"]
@@ -953,6 +974,10 @@ invocation = result["invocation"]
 assert arguments["desired_harness"] == "codex/gpt-6-luna"
 assert arguments["desired_model"] == "gpt-6-luna"
 assert arguments["desired_effort"] == "xhigh"
+assert arguments["prior_runtime"] == "codex"
+assert arguments["prior_model"] == "gpt-6.1-sol"
+assert arguments["prior_effort"] == "xhigh"
+assert arguments["expected_invocation_id"] == historical_invocation["invocation_id"]
 assert invocation["invocation_id"] == owner["invocation_id"]
 assert owner["generation"] == 3
 assert owner["runtime"] == "codex"
@@ -3879,13 +3904,25 @@ if terminal_provider_failure:
     if isinstance(historical, dict):
         assert resume_actions[0] == historical["action"], "historical Sol result changed"
         assert resume_actions[0]["arguments"]["desired_model"] == "gpt-6-luna"
-        assert resume_actions[0]["result"]["result"]["invocation"]["model"] == "gpt-6.1-sol"
-        assert resume_actions[0]["result"]["result"]["invocation"]["generation"] == 2
+        historical_response = resume_actions[0]["result"]["result"]
+        assert not set(historical_response["agent"]) & {
+            "id", "agent_id", "issue", "intent_id", "model", "effort",
+            "generation", "prior_invocation_id", "role_route",
+        }, historical_response["agent"]
+        assert not set(historical_response["invocation"]) & {
+            "model", "effort", "generation", "prior_invocation_id", "role_route",
+        }, historical_response["invocation"]
+        assert historical["invocation"]["runtime"] == "codex"
+        assert historical["invocation"]["model"] == "gpt-6.1-sol"
+        assert historical["invocation"]["effort"] == "xhigh"
+        assert historical["invocation"]["generation"] == 2
         current_resume = resume_actions[1]
         assert current_resume["arguments"]["expected_invocation_id"] == historical["invocation"]["invocation_id"]
         assert current_resume["arguments"]["prior_generation"] == 2
+        assert current_resume["arguments"]["prior_model"] == "gpt-6.1-sol"
         assert current_resume["arguments"]["desired_model"] == "gpt-6-luna"
-        assert current_resume["result"]["result"]["invocation"]["generation"] == 3
+        assert current_resume["result"]["result"]["invocation"]["role_route"]["model"] == "gpt-6-luna"
+        assert owner_invocation["generation"] == 3
     else:
         current_resume = resume_actions[0]
     assert current_resume["arguments"]["route_reconciliation_source"] == "proven_terminal_provider_failure"

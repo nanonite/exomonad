@@ -57,6 +57,134 @@ def advance_seeded_ledger_sequence(
             os.replace(temporary, sequence_path)
 
 
+# The non-optional, non-defaulted fields of the Rust `LedgerEvent` envelope in
+# rust/exomonad-core/src/services/immutable_ledger.rs. The fixture-schema check
+# derives the same set from the Rust source and fails when they diverge.
+LEDGER_EVENT_REQUIRED_FIELDS = (
+    "schema_version",
+    "event_id",
+    "id",
+    "event_time",
+    "observed_at",
+    "type",
+    "source",
+    "lifecycle_state",
+    "data",
+)
+LEDGER_SEGMENT_MAX_BYTES = 4 * 1024 * 1024
+
+
+def validate_ledger_event_row(row: Mapping[str, Any]) -> None:
+    """Reject a seeded row the production ledger parser could not read back."""
+    missing = [name for name in LEDGER_EVENT_REQUIRED_FIELDS if name not in row]
+    if missing:
+        raise RuntimeError(
+            f"seeded ledger row {row.get('type')!r} is missing required fields: {missing}"
+        )
+    if row.get("id") != row.get("event_id"):
+        raise RuntimeError(
+            f"seeded ledger row {row.get('type')!r} has a mismatched id/event_id"
+        )
+    if not isinstance(row.get("data"), Mapping):
+        raise RuntimeError(
+            f"seeded ledger row {row.get('type')!r} has a non-object data payload"
+        )
+
+
+def ledger_event_row(
+    *,
+    event_id: str,
+    event_time: str,
+    run_seq: int,
+    event_type: str,
+    agent_id: str | None,
+    run_id: str | None,
+    invocation_id: str | None,
+    generation: int | None,
+    source: str,
+    session_id: str | None,
+    data: Mapping[str, Any],
+    **envelope: object,
+) -> dict[str, Any]:
+    """Build one production-shaped immutable ledger row."""
+    row: dict[str, Any] = {
+        "schema_version": 1,
+        "id": event_id,
+        "event_id": event_id,
+        "event_time": event_time,
+        "observed_at": event_time,
+        "run_seq": run_seq,
+        "type": event_type,
+        "agent_id": agent_id,
+        "run_id": run_id,
+        "session_id": session_id,
+        "invocation_id": invocation_id,
+        "generation": generation,
+        "source": source,
+        "lifecycle_state": "emitted",
+        "data": dict(data),
+    }
+    row.update(envelope)
+    validate_ledger_event_row(row)
+    return row
+
+
+def _ledger_segment_paths(segment_dir: Path) -> list[Path]:
+    return sorted(segment_dir.glob("segment-*.jsonl"))
+
+
+def _next_ledger_segment_path(segment_dir: Path) -> Path:
+    next_index = (
+        max(
+            (
+                int(index)
+                for path in _ledger_segment_paths(segment_dir)
+                if (index := path.stem.removeprefix("segment-")).isdigit()
+            ),
+            default=0,
+        )
+        + 1
+    )
+    return segment_dir / f"segment-{next_index:012}.jsonl"
+
+
+def append_seeded_ledger_rows(
+    repository: Path, rows: list[dict[str, Any]]
+) -> Path:
+    """Append seeded rows through the ledger writer's own segment layout.
+
+    The production ``LedgerWriter::append`` appends to the last existing
+    segment (``segment-000000000000.jsonl`` when none exists) and rotates only
+    at its size bound. Seeding follows that same rule so historical rows share
+    the writer's segment instead of inventing a segment named after a
+    ``run_seq`` value.
+    """
+    segment_dir = repository / ".exo/ledger/segments"
+    segment_dir.mkdir(parents=True, exist_ok=True)
+    existing_segments = _ledger_segment_paths(segment_dir)
+    target = (
+        existing_segments[-1]
+        if existing_segments
+        else segment_dir / "segment-000000000000.jsonl"
+    )
+    existing = target.read_text(encoding="utf-8") if target.is_file() else ""
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    for row in rows:
+        validate_ledger_event_row(row)
+    appended = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
+    if (
+        existing
+        and len(existing.encode("utf-8")) + len(appended.encode("utf-8"))
+        > LEDGER_SEGMENT_MAX_BYTES
+    ):
+        target = _next_ledger_segment_path(segment_dir)
+        existing = ""
+    target.write_text(existing + appended, encoding="utf-8")
+    advance_seeded_ledger_sequence(repository, rows)
+    return target
+
+
 def owner_for(repository: Path) -> tuple[Path, dict[str, Any]]:
     owners = []
     for directory in (repository / ".exo/agents").iterdir():
@@ -422,37 +550,6 @@ def seed_terminal_provider_failure(
         "trigger": "spawn",
         "worktree": str(worktree),
     }
-    spawn_event = {
-        "schema_version": 1,
-        "id": event_ids[1],
-        "event_id": event_ids[1],
-        "event_time": datetime.fromtimestamp(timestamps[1], timezone.utc)
-        .isoformat(timespec="milliseconds")
-        .replace("+00:00", "Z"),
-        "observed_at": datetime.fromtimestamp(timestamps[1], timezone.utc)
-        .isoformat(timespec="milliseconds")
-        .replace("+00:00", "Z"),
-        "run_seq": spawn_seq,
-        "type": "agent.spawned",
-        "agent_id": "kani",
-        "run_id": runtime_run_id,
-        "invocation_id": invocation_id,
-        "generation": None,
-        "lifecycle_state": "emitted",
-        "source": "rust",
-        "session_id": session_id,
-        "data": {
-            "agent_type": "OpenCode",
-            "branch": branch,
-            "child_agent": owner_name,
-            "effort": "high",
-            "intent_id": intent_id,
-            "invocation_id": invocation_id,
-            "model": "opencode-go/deepseek-v4.1-flash",
-            "spawn_type": "leaf_subtree",
-            "topology": "worktreeperagent",
-        },
-    }
     ledger_rows = []
     for index, (event_type, outcome, status) in enumerate(
         (
@@ -461,14 +558,38 @@ def seed_terminal_provider_failure(
             ("agent.invocation.finished", "finished", "failed"),
         )
     ):
-        if index == 1:
-            ledger_rows.append(spawn_event)
-            continue
         event_time = (
             datetime.fromtimestamp(timestamps[index], timezone.utc)
             .isoformat(timespec="milliseconds")
             .replace("+00:00", "Z")
         )
+        if index == 1:
+            ledger_rows.append(
+                ledger_event_row(
+                    event_id=event_ids[index],
+                    event_time=event_time,
+                    run_seq=first_sequence + index,
+                    event_type=event_type,
+                    agent_id="kani",
+                    run_id=runtime_run_id,
+                    invocation_id=invocation_id,
+                    generation=None,
+                    source="rust",
+                    session_id=session_id,
+                    data={
+                        "agent_type": "OpenCode",
+                        "branch": branch,
+                        "child_agent": owner_name,
+                        "effort": "high",
+                        "intent_id": intent_id,
+                        "invocation_id": invocation_id,
+                        "model": "opencode-go/deepseek-v4.1-flash",
+                        "spawn_type": "leaf_subtree",
+                        "topology": "worktreeperagent",
+                    },
+                )
+            )
+            continue
         row_data = {
             **owner_data,
             "exit_classification": "nonzero_exit" if status == "failed" else None,
@@ -480,46 +601,26 @@ def seed_terminal_provider_failure(
             "status": status,
             "stderr_tail": "Insufficient account funds" if status == "failed" else None,
         }
-        event_id = event_ids[index]
         ledger_rows.append(
-            {
-                "schema_version": 1,
-                "id": event_id,
-                "event_id": event_id,
-                "event_time": event_time,
-                "observed_at": event_time,
-                "run_seq": first_sequence + index,
-                "type": event_type,
-                "agent_id": owner_name,
-                "run_id": runtime_run_id,
-                "invocation_id": invocation_id,
-                "generation": 1,
-                "lifecycle_state": "emitted",
-                "harness": "exomonad",
-                "provider": "opencode",
-                "runtime": "opencode",
-                "role": "dev",
-                "source": "lifecycle",
-                "session_id": session_id,
-                "data": row_data,
-            }
+            ledger_event_row(
+                event_id=event_ids[index],
+                event_time=event_time,
+                run_seq=first_sequence + index,
+                event_type=event_type,
+                agent_id=owner_name,
+                run_id=runtime_run_id,
+                invocation_id=invocation_id,
+                generation=1,
+                source="lifecycle",
+                session_id=session_id,
+                data=row_data,
+                harness="exomonad",
+                provider="opencode",
+                runtime="opencode",
+                role="dev",
+            )
         )
-    segment_dir = repository / ".exo/ledger/segments"
-    segment_dir.mkdir(parents=True, exist_ok=True)
-    existing_segments = tuple(segment_dir.glob("segment-*.jsonl"))
-    segment_index = (
-        max(
-            (int(path.stem.removeprefix("segment-")) for path in existing_segments),
-            default=0,
-        )
-        + 1
-    )
-    segment_path = segment_dir / f"segment-{segment_index:012}.jsonl"
-    segment_path.write_text(
-        "".join(json.dumps(row, sort_keys=True) + "\n" for row in ledger_rows),
-        encoding="utf-8",
-    )
-    advance_seeded_ledger_sequence(repository, ledger_rows)
+    append_seeded_ledger_rows(repository, ledger_rows)
     history = repository / ".exo/events" / f"{owner_name}.jsonl"
     history.parent.mkdir(parents=True, exist_ok=True)
     history_rows = []
@@ -765,6 +866,212 @@ def seed_terminal_provider_failure(
     )
 
 
+LEGACY_MODERN_MARKERS = frozenset(
+    {
+        "id",
+        "agent_id",
+        "issue",
+        "intent_id",
+        "role_route",
+        "model",
+        "effort",
+        "generation",
+        "prior_invocation_id",
+    }
+)
+
+
+def legacy_successor_lifecycle_rows(
+    *,
+    owner_name: str,
+    controller_run_id: str,
+    ledger_run_id: str,
+    successor_id: str,
+    predecessor_id: str,
+    branch: str,
+    worktree: str,
+    session_id: str | None,
+    first_sequence: int,
+    ended_at: int,
+    fingerprint: str,
+) -> list[dict[str, Any]]:
+    """Build the historical host chronology for an old blocked resume.
+
+    The pre-launch-row host wrote ``agent.invocation.started``,
+    ``agent.resumed`` and ``agent.invocation.finished`` for the resumed
+    successor and no ``agent.spawned`` confirmation. Each row carries the same
+    envelope and payload fields the real producer emitted; in particular the
+    invocation rows are ``source="lifecycle"`` and the resume audit row is
+    ``source="rust"`` with no top-level harness/provider/role/runtime and no
+    ``intent_id``.
+    """
+
+    def event_time(index: int) -> str:
+        return (
+            datetime.fromtimestamp(ended_at - 2 + index, timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+
+    def invocation_data(
+        *,
+        status: str,
+        outcome: str,
+        exit_classification: str | None = None,
+        exit_code: int | None = None,
+        exit_reason: str | None = None,
+        stderr_tail: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "batch_id": None,
+            "branch": branch,
+            "channel": None,
+            "delivery_vs_authoritative": "metadata_only",
+            "exit_classification": exit_classification,
+            "exit_code": exit_code,
+            "exit_reason": exit_reason,
+            "generation": 2,
+            "harness": "exomonad",
+            "head_sha": None,
+            "invocation_id": successor_id,
+            "issue_number": None,
+            "item_id": None,
+            "outcome": outcome,
+            "pr_number": None,
+            "provider": "codex",
+            "queue_class": None,
+            "queue_seq": None,
+            "role": "dev",
+            "rollout_mode": "enabled",
+            "run_id": None,
+            "runtime": "codex",
+            "runtime_agent_id": owner_name,
+            "session_id": None,
+            "slice_id": OWNER_SLICE,
+            "source": "lifecycle",
+            "source_agent": None,
+            "status": status,
+            "stderr_tail": stderr_tail,
+            "trigger": "resume_blocked",
+            "worktree": worktree,
+        }
+
+    return [
+        ledger_event_row(
+            event_id="legacy-f285-agent-invocation-started-0",
+            event_time=event_time(0),
+            run_seq=first_sequence,
+            event_type="agent.invocation.started",
+            agent_id=owner_name,
+            run_id=ledger_run_id,
+            invocation_id=successor_id,
+            generation=2,
+            source="lifecycle",
+            session_id=session_id,
+            data=invocation_data(status="running", outcome="started"),
+            harness="exomonad",
+            provider="codex",
+            role="dev",
+            runtime="codex",
+        ),
+        ledger_event_row(
+            event_id="legacy-f285-agent-resumed-1",
+            event_time=event_time(1),
+            run_seq=first_sequence + 1,
+            event_type="agent.resumed",
+            agent_id=controller_run_id,
+            run_id=ledger_run_id,
+            invocation_id=successor_id,
+            generation=2,
+            source="rust",
+            session_id=session_id,
+            data={
+                "agent_type": "codex",
+                "branch": branch,
+                "chainlink_issue_id": BLOCKED_ISSUE_ID,
+                "child_agent": owner_name,
+                "effort": "xhigh",
+                "generation": 2,
+                "invocation_id": successor_id,
+                "model": "gpt-6.1-sol",
+                "previous_invocation_id": predecessor_id,
+                "same_owner": True,
+                "spawn_type": "resume_blocked",
+                "worktree_fingerprint": fingerprint,
+            },
+        ),
+        ledger_event_row(
+            event_id="legacy-f285-agent-invocation-finished-2",
+            event_time=event_time(2),
+            run_seq=first_sequence + 2,
+            event_type="agent.invocation.finished",
+            agent_id=owner_name,
+            run_id=ledger_run_id,
+            invocation_id=successor_id,
+            generation=2,
+            source="lifecycle",
+            session_id=session_id,
+            data=invocation_data(
+                status="exited",
+                outcome="finished",
+                exit_classification="one_shot_complete",
+                exit_code=0,
+                exit_reason="one_shot_invocation_completed",
+                stderr_tail="one-shot invocation completed without a pull request",
+            ),
+            harness="exomonad",
+            provider="codex",
+            role="dev",
+            runtime="codex",
+        ),
+    ]
+
+
+def _seed_legacy_successor_lifecycle(
+    repository: Path,
+    *,
+    owner_name: str,
+    controller_run_id: str,
+    successor_id: str,
+    predecessor_id: str,
+    branch: str,
+    worktree: str,
+    ended_at: int,
+) -> None:
+    """Append the historical host chronology for an old blocked resume."""
+    from tl_loop.__main__ import _authoritative_ledger_run_id
+
+    ledger_run_id = _authoritative_ledger_run_id(repository)
+    if ledger_run_id is None:
+        raise RuntimeError("historical resume fixture requires the authoritative run_id")
+    events = canonical_events(repository)
+    session_id = next(
+        (row.get("session_id") for row in reversed(events) if row.get("session_id")),
+        None,
+    )
+    first_sequence = (
+        max(
+            (sequence for row in events if type(sequence := row.get("run_seq")) is int),
+            default=0,
+        )
+        + 1
+    )
+    rows = legacy_successor_lifecycle_rows(
+        owner_name=owner_name,
+        controller_run_id=controller_run_id,
+        ledger_run_id=ledger_run_id,
+        successor_id=successor_id,
+        predecessor_id=predecessor_id,
+        branch=branch,
+        worktree=worktree,
+        session_id=session_id,
+        first_sequence=first_sequence,
+        ended_at=ended_at,
+        fingerprint=worktree_fingerprint(Path(worktree)),
+    )
+    append_seeded_ledger_rows(repository, rows)
+
+
 def seed_confirmed_wrong_route_successor(repository: Path, baseline_path: Path) -> None:
     """Retain the historical Luna-intent/Sol-successor record from #1299."""
     from tl_loop.__main__ import _authoritative_ledger_run_id
@@ -894,43 +1201,44 @@ def seed_confirmed_wrong_route_successor(repository: Path, baseline_path: Path) 
     journal = EffectJournal("kani", child_store.run_dir / "action-journal.json")
     intent = EffectIntent("resume_blocked_leaf", OWNER_SLICE, arguments, True)
     journal.append(intent)
+    predecessor_id = baseline["prior_invocation"]["invocation_id"]
+    legacy_agent = {
+        "agent_type": "codex",
+        "branch_name": branch,
+        "worktree_path": str(worktree),
+        "tab_name": "@43",
+        "issue_title": "",
+        "pane_id": None,
+        "invocation_id": successor_id,
+        "invocation_trigger": "resume_blocked",
+        "invocation_runtime": "codex",
+        "invocation_fresh": True,
+        "invocation_ready": True,
+        "invocation_outcome": "started",
+        "routing_target_id": "@43",
+        "routing_target_type": "window",
+    }
+    legacy_invocation = {
+        "invocation_id": successor_id,
+        "trigger": "resume_blocked",
+        "runtime": "codex",
+        "fresh": True,
+        "ready": True,
+        "outcome": "started",
+        "target_id": "@43",
+        "target_type": "window",
+    }
+    if set(legacy_agent) & LEGACY_MODERN_MARKERS or set(
+        legacy_invocation
+    ) & LEGACY_MODERN_MARKERS:
+        raise RuntimeError("historical f285 response must omit modern provenance")
     response = ToolResult.from_raw(
         {
             "success": True,
             "result": {
                 "chainlink_issue_id": BLOCKED_ISSUE_ID,
-                "agent": {
-                    "id": owner_name,
-                    "issue": OWNER_SLICE,
-                    "intent_id": intent_id,
-                    "agent_type": "codex",
-                    "model": "gpt-6.1-sol",
-                    "effort": "xhigh",
-                    "branch_name": branch,
-                    "worktree_path": str(worktree),
-                },
-                "invocation": {
-                    "invocation_id": successor_id,
-                    "generation": 2,
-                    "trigger": "resume_blocked",
-                    "runtime": "codex",
-                    "model": "gpt-6.1-sol",
-                    "effort": "xhigh",
-                    "status": "exited",
-                    "ended_at": int(time.time()) - 1,
-                    "exit_code": 0,
-                    "exit_reason": "one_shot_complete",
-                    "exit_classification": "one_shot_complete",
-                    "one_shot_complete": True,
-                    "branch": branch,
-                    "worktree": str(worktree),
-                    "prior_invocation_id": baseline["prior_invocation"][
-                        "invocation_id"
-                    ],
-                    "slice_id": OWNER_SLICE,
-                    "pr_number": None,
-                    "head_sha": None,
-                },
+                "agent": legacy_agent,
+                "invocation": legacy_invocation,
             },
         }
     )
@@ -943,21 +1251,38 @@ def seed_confirmed_wrong_route_successor(repository: Path, baseline_path: Path) 
         )
     identity.update({"agent_type": "codex", "model": "gpt-6.1-sol", "effort": "xhigh"})
     identity_path.write_text(json.dumps(identity, sort_keys=True, indent=2) + "\n")
-    successor = response.result["invocation"]
-    successor["runtime_agent_id"] = owner_name
-    invocation_path = owner_dir / "invocation.json"
+    ended_at = int(time.time()) - 1
     persisted_successor = {
-        **successor,
-        "started_at": int(successor["ended_at"]) - 1,
-        "routing": {"window_id": "@999999"},
+        "invocation_id": successor_id,
+        "generation": 2,
+        "status": "exited",
+        "runtime": "codex",
+        "model": "gpt-6.1-sol",
+        "effort": "xhigh",
+        "trigger": "resume_blocked",
+        "branch": branch,
+        "worktree": str(worktree),
+        "runtime_agent_id": owner_name,
+        "slice_id": OWNER_SLICE,
+        "prior_invocation_id": predecessor_id,
+        "pr_number": None,
+        "head_sha": None,
+        "started_at": ended_at - 1,
+        "ended_at": ended_at,
+        "exit_code": 0,
+        "exit_reason": "one_shot_complete",
+        "exit_classification": "one_shot_complete",
+        "one_shot_complete": True,
+        "routing": {"window_id": "@43"},
     }
-    invocation_path.write_text(
-        json.dumps(persisted_successor, sort_keys=True, indent=2) + "\n"
-    )
-    if "role_route" in successor:
+    if "role_route" in persisted_successor:
         raise RuntimeError(
             "legacy Sol successor unexpectedly has a modern route receipt"
         )
+    invocation_path = owner_dir / "invocation.json"
+    invocation_path.write_text(
+        json.dumps(persisted_successor, sort_keys=True, indent=2) + "\n"
+    )
     (owner_dir / "dispatch_intent").write_text(intent_id + "\n", encoding="utf-8")
     (owner_dir / "routing.json").write_text(
         json.dumps(
@@ -971,14 +1296,34 @@ def seed_confirmed_wrong_route_successor(repository: Path, baseline_path: Path) 
         + "\n",
         encoding="utf-8",
     )
+    _seed_legacy_successor_lifecycle(
+        repository,
+        owner_name=owner_name,
+        controller_run_id=state.run_id,
+        successor_id=successor_id,
+        predecessor_id=predecessor_id,
+        branch=branch,
+        worktree=str(worktree),
+        ended_at=ended_at,
+    )
+    retained = canonical_events(repository)
+    if any(
+        row.get("type") == "agent.spawned"
+        and (row.get("data") or {}).get("invocation_id") == successor_id
+        for row in retained
+    ):
+        raise RuntimeError(
+            "historical f285 fixture must not synthesize an agent.spawned launch row"
+        )
     confirmed = journal.entries_for("resume_blocked_leaf", OWNER_SLICE)
     if len(confirmed) != 1 or confirmed[0].get("status") != "confirmed":
         raise RuntimeError("legacy confirmed resume action was not durably recorded")
     baseline["historical_wrong_route_successor"] = {
         "action": confirmed[0],
-        "invocation": successor,
+        "invocation": persisted_successor,
+        "response": response.result,
         "identity": identity,
-        "checkpoint_invocation_id": baseline["prior_invocation"]["invocation_id"],
+        "checkpoint_invocation_id": predecessor_id,
         "checkpoint_generation": 1,
     }
     baseline_path.write_text(json.dumps(baseline, sort_keys=True, indent=2) + "\n")
@@ -1597,6 +1942,7 @@ def verify_controller(
         old_result = (old_action.get("result") or {}).get("result") or {}
         old_agent = old_result.get("agent") or {}
         old_invocation = old_result.get("invocation") or {}
+        durable_history = historical_wrong_route.get("invocation") or {}
         if (
             old_action.get("arguments", {}).get("expected_invocation_id")
             != baseline["prior_invocation"]["invocation_id"]
@@ -1604,38 +1950,73 @@ def verify_controller(
             or old_action.get("arguments", {}).get("desired_model") != "gpt-6-luna"
             or old_action.get("arguments", {}).get("desired_effort") != "xhigh"
             or "route_fingerprint" in old_action.get("arguments", {})
+            or set(old_agent) & LEGACY_MODERN_MARKERS
+            or set(old_invocation) & LEGACY_MODERN_MARKERS
+            or old_result.get("chainlink_issue_id") != BLOCKED_ISSUE_ID
             or old_agent.get("agent_type") != "codex"
-            or old_agent.get("model") != "gpt-6.1-sol"
-            or old_agent.get("effort") != "xhigh"
-            or old_invocation.get("invocation_id")
-            != historical_wrong_route.get("invocation", {}).get("invocation_id")
-            or old_invocation.get("generation") != 2
+            or old_agent.get("invocation_id") != durable_history.get("invocation_id")
+            or old_invocation.get("invocation_id") != durable_history.get("invocation_id")
+            or old_invocation.get("trigger") != "resume_blocked"
             or old_invocation.get("runtime") != "codex"
-            or old_invocation.get("model") != "gpt-6.1-sol"
-            or old_invocation.get("effort") != "xhigh"
-            or old_invocation.get("exit_code") != 0
-            or old_invocation.get("exit_classification") != "one_shot_complete"
-            or old_invocation.get("pr_number") is not None
-            or old_invocation.get("head_sha") is not None
+            or old_invocation.get("outcome") != "started"
+            or durable_history.get("generation") != 2
+            or durable_history.get("model") != "gpt-6.1-sol"
+            or durable_history.get("effort") != "xhigh"
+            or durable_history.get("prior_invocation_id")
+            != baseline["prior_invocation"]["invocation_id"]
+            or durable_history.get("status") != "exited"
+            or durable_history.get("exit_code") != 0
+            or durable_history.get("exit_classification") != "one_shot_complete"
+            or durable_history.get("pr_number") is not None
+            or durable_history.get("head_sha") is not None
             or resume_arguments.get("expected_invocation_id")
-            != old_invocation.get("invocation_id")
+            != durable_history.get("invocation_id")
             or resume_arguments.get("prior_generation") != 2
             or successor.get("generation") != 3
             or successor.get("prior_invocation_id")
-            != old_invocation.get("invocation_id")
+            != durable_history.get("invocation_id")
         ):
             raise RuntimeError(
                 "generation-three recovery did not preserve and supersede the exact Sol/xhigh generation-two history"
             )
     ledger = canonical_events(repository)
+    legacy_invocation_id = None
+    if isinstance(historical_wrong_route, dict):
+        legacy_invocation_id = historical_wrong_route.get("invocation", {}).get(
+            "invocation_id"
+        )
+        legacy_chronology = sorted(
+            row.get("type")
+            for row in ledger
+            if row.get("invocation_id") == legacy_invocation_id
+        )
+        if legacy_chronology != [
+            "agent.invocation.finished",
+            "agent.invocation.started",
+            "agent.resumed",
+        ]:
+            raise RuntimeError(
+                "historical f285 chronology is not the old started/resumed/finished shape: "
+                f"{legacy_chronology!r}"
+            )
     owner_invocations = [
         row
         for row in ledger
         if row.get("type") == "agent.invocation.started"
         and row.get("agent_id") == baseline["owner_agent_name"]
     ]
+    expected_owner_invocations = 3 if isinstance(historical_wrong_route, dict) else 2
+    expected_codex_invocations = 2 if isinstance(historical_wrong_route, dict) else 1
+    codex_invocation_ids = sorted(
+        row.get("invocation_id")
+        for row in owner_invocations
+        if row.get("data", {}).get("runtime") == "codex"
+    )
+    codex_ids_match = legacy_invocation_id is None or codex_invocation_ids == sorted(
+        [successor.get("invocation_id"), legacy_invocation_id]
+    )
     if (
-        len(owner_invocations) != 2
+        len(owner_invocations) != expected_owner_invocations
         or sum(
             row.get("data", {}).get("runtime") == "opencode"
             for row in owner_invocations
@@ -1644,10 +2025,12 @@ def verify_controller(
         or sum(
             row.get("data", {}).get("runtime") == "codex" for row in owner_invocations
         )
-        != 1
+        != expected_codex_invocations
+        or not codex_ids_match
     ):
         raise RuntimeError(
-            f"owner history does not show exactly one OpenCode predecessor and Codex successor: {owner_invocations!r}"
+            "owner history does not show the expected OpenCode predecessor, "
+            f"legacy Sol successor and Codex successor: {owner_invocations!r}"
         )
     lifecycle = [
         row
@@ -2035,8 +2418,13 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
         if row.get("type") == "agent.invocation.started"
         and row.get("agent_id") == evidence["owner_agent_name"]
     ]
-    assert len(owner_invocations) == 2, (
-        f"expected one OpenCode and one Codex invocation, got {len(owner_invocations)}"
+    historical_successor = evidence.get("historical_wrong_route_successor")
+    expected_owner_invocations = (
+        3 if isinstance(historical_successor, dict) else 2
+    )
+    assert len(owner_invocations) == expected_owner_invocations, (
+        "expected the OpenCode predecessor, an optional legacy Codex successor "
+        f"and one Codex invocation, got {len(owner_invocations)}"
     )
     reviewer_invocations = [
         row
@@ -2056,7 +2444,7 @@ def verify_repeat(repository: Path, evidence_path: Path) -> None:
     )
     assert (
         sum(row.get("data", {}).get("runtime") == "codex" for row in owner_invocations)
-        == 1
+        == (2 if isinstance(historical_successor, dict) else 1)
     )
     activity = event_counts(Path(os.environ["E2E_AGENT_LOG"]))
     historical = evidence.get("prior_invocation")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import multiprocessing
 import queue
 import subprocess
@@ -26128,7 +26129,13 @@ def _stage_wrong_route_history(
     owner_name: str,
     original_invocation_id: str,
 ) -> str:
-    """Retain the exact legacy f446 -> confirmed Sol f285 mismatch."""
+    """Retain a route-unbound modern f446 -> confirmed Sol f285 mismatch.
+
+    This receipt still carries the modern owner, scope, and intent keys, so it
+    exercises the modern path without route receipts. The genuine historical
+    projection with no owner, scope, or intent is covered by
+    ``_seed_legacy_terminal_resume``.
+    """
     initial, reason = driver_module._terminal_owner_recovery_proof(
         plan, store.load(), config, store
     )
@@ -27821,7 +27828,7 @@ def test_terminal_resume_history_refuses_response_loss_adoption_without_a_launch
     )
 
     assert proof is None
-    assert reason == "confirmed resume result conflicts with its owner, scope, or worktree"
+    assert reason == "confirmed resume result lacks its modern host intent proof"
 
 
 def test_terminal_resume_history_refuses_owner_scope_rebuilt_from_the_route(
@@ -27837,27 +27844,1042 @@ def test_terminal_resume_history_refuses_owner_scope_rebuilt_from_the_route(
     )
 
     assert proof is None
-    assert reason == "confirmed resume result conflicts with its owner, scope, or worktree"
+    assert reason == "confirmed resume result lacks its modern host intent proof"
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
+    ("field", "value", "reason"),
     (
-        ("issue", "foreign-slice"),
-        ("intent_id", "foreign-intent"),
-        ("branch_name", "main.foreign"),
-        ("id", "foreign-owner"),
+        (
+            "issue",
+            "foreign-slice",
+            "confirmed resume result scope conflicts with its durable owner",
+        ),
+        (
+            "intent_id",
+            "foreign-intent",
+            "confirmed resume result intent conflicts with its accepted action",
+        ),
+        (
+            "branch_name",
+            "main.foreign",
+            "confirmed resume result branch conflicts with its durable owner",
+        ),
+        (
+            "id",
+            "foreign-owner",
+            "confirmed resume result owner conflicts with the accepted logical owner",
+        ),
     ),
 )
 def test_terminal_resume_history_refuses_conflicting_owner_fields(
-    tmp_path: Path, field: str, value: str
+    tmp_path: Path, field: str, value: str, reason: str
 ) -> None:
-    _plan_value, _config_value, _store, proof, reason = _confirmed_terminal_resume_proof(
+    _plan_value, _config_value, _store, proof, observed = _confirmed_terminal_resume_proof(
         tmp_path, agent_overrides={field: value}
     )
 
     assert proof is None
-    assert reason == "confirmed resume result conflicts with its owner, scope, or worktree"
+    assert observed == reason
+
+
+@dataclass
+class _LegacyResumeFixture:
+    """Disposable records for one historical f446 -> f285 resume receipt."""
+
+    plan: WorkPlan
+    config: TLLoopConfig
+    store: RunStore
+    owner_dir: Path
+    owner_name: str
+    original_id: str
+    successor_id: str
+    intent: EffectIntent
+    arguments: dict[str, object]
+    entry: Mapping[str, object]
+    result: ToolResult
+    identity: dict[str, Any]
+    persisted: dict[str, Any]
+    ledger_rows: list[dict[str, Any]]
+
+    def proof(self) -> tuple[Any, str | None]:
+        return driver_module._terminal_owner_recovery_proof(
+            self.plan, self.store.load(), self.config, self.store
+        )
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "journal": (self.store.run_dir / "action-journal.json").read_bytes(),
+            "identity": (self.owner_dir / "identity.json").read_bytes(),
+            "invocation": (self.owner_dir / "invocation.json").read_bytes(),
+            "dispatch_intent": (self.owner_dir / "dispatch_intent").read_bytes(),
+            "ledger": _ledger_bytes(self.config),
+        }
+
+
+def _ledger_bytes(config: TLLoopConfig) -> dict[str, bytes]:
+    project = _required_project_root(config)
+    return {
+        path.name: path.read_bytes()
+        for path in sorted((project / ".exo" / "ledger" / "segments").glob("*.jsonl"))
+    }
+
+
+def _legacy_resume_row(
+    *,
+    event_type: str,
+    run_seq: int,
+    agent_id: str,
+    run_id: str,
+    generation: int | None,
+    invocation_id: str,
+    data: Mapping[str, object],
+) -> dict[str, Any]:
+    event_id = f"legacy-f285-{event_type.replace('.', '-')}-{run_seq}"
+    timestamp = f"2026-11-15T23:14:{run_seq % 60:02d}.000Z"
+    return {
+        "schema_version": 1,
+        "event_id": event_id,
+        "id": event_id,
+        "event_time": timestamp,
+        "observed_at": timestamp,
+        "run_seq": run_seq,
+        "type": event_type,
+        "agent_id": agent_id,
+        "run_id": run_id,
+        "invocation_id": invocation_id,
+        "generation": generation,
+        "lifecycle_state": "emitted",
+        "data": dict(data),
+    }
+
+
+def _seed_legacy_terminal_resume(
+    tmp_path: Path,
+    *,
+    agent_overrides: Mapping[str, object] | None = None,
+    invocation_overrides: Mapping[str, object] | None = None,
+    identity_overrides: Mapping[str, object] | None = None,
+    persisted_overrides: Mapping[str, object] | None = None,
+    started_overrides: Mapping[str, object] | None = None,
+    resumed_overrides: Mapping[str, object] | None = None,
+    finished_overrides: Mapping[str, object] | None = None,
+    row_overrides: Mapping[int, Mapping[str, Any]] | None = None,
+    omit_rows: Sequence[str] = (),
+    duplicate_resumed_row: bool = False,
+    write_host_launch_row: bool = False,
+    competing_confirmed_action: bool = False,
+    strip_route_fingerprint: bool = True,
+    journal_status: str | None = None,
+    drop_result: bool = False,
+) -> _LegacyResumeFixture:
+    """Seed the genuine historical resume receipt and old host chronology.
+
+    The saved response carries none of the modern owner, scope, intent, route,
+    generation, or predecessor keys, and the host wrote no ``agent.spawned``
+    row for the successor. Only the durable invocation lineage and the
+    ``started``/``resumed``/``finished`` rows corroborate the effect.
+    """
+    plan, config, store, owner_dir, owner_name, original_id = (
+        _seed_terminal_provider_failure_leaf(
+            tmp_path, legacy_spawn_result=True, omit_initial_spawn_effort=True
+        )
+    )
+    initial_proof, initial_reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert initial_proof is not None, initial_reason
+    driver_module._persist_terminal_route_authorization(initial_proof, store.load(), store)
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    arguments = dict(
+        driver_module._blocked_leaf_resume_action_arguments(initial_proof.resume, store.load())
+    )
+    if strip_route_fingerprint:
+        arguments.pop("route_fingerprint", None)
+    leaf_name = plan.leaves[0].name
+    intent = EffectIntent("resume_blocked_leaf", leaf_name, arguments, True)
+    journal.append(intent)
+    successor_id = "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d"
+    branch = initial_proof.resume.owner.branch
+    worktree = initial_proof.resume.owner.worktree
+    agent: dict[str, Any] = {
+        "agent_type": "codex",
+        "branch_name": branch,
+        "worktree_path": str(worktree),
+        "tab_name": "@43",
+        "issue_title": "",
+        "pane_id": None,
+        "invocation_id": successor_id,
+        "invocation_trigger": "resume_blocked",
+        "invocation_runtime": "codex",
+        "invocation_fresh": True,
+        "invocation_ready": True,
+        "invocation_outcome": "started",
+        "routing_target_id": "@43",
+        "routing_target_type": "window",
+    }
+    invocation: dict[str, Any] = {
+        "invocation_id": successor_id,
+        "trigger": "resume_blocked",
+        "runtime": "codex",
+        "fresh": True,
+        "ready": True,
+        "outcome": "started",
+        "target_id": "@43",
+        "target_type": "window",
+    }
+    agent.update(agent_overrides or {})
+    invocation.update(invocation_overrides or {})
+    result_document: JsonObject = {
+        "success": True,
+        "result": {
+            "chainlink_issue_id": 814,
+            "agent": cast(JsonValue, agent),
+            "invocation": cast(JsonValue, invocation),
+        },
+    }
+    result = ToolResult.from_raw(result_document)
+    journal.mark_result(intent, result)
+    identity_path = owner_dir / "identity.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    identity.update({"agent_type": "codex", "model": "gpt-6.1-sol", "effort": "xhigh"})
+    identity.update(identity_overrides or {})
+    assert "role_route" not in identity
+    identity_path.write_text(json.dumps(identity, sort_keys=True), encoding="utf-8")
+    persisted: dict[str, Any] = {
+        "invocation_id": successor_id,
+        "generation": 2,
+        "status": "exited",
+        "runtime": "codex",
+        "model": "gpt-6.1-sol",
+        "effort": "xhigh",
+        "trigger": "resume_blocked",
+        "branch": branch,
+        "worktree": str(worktree),
+        "runtime_agent_id": owner_name,
+        "slice_id": leaf_name,
+        "prior_invocation_id": original_id,
+        "pr_number": None,
+        "head_sha": None,
+        "ended_at": 1792734900,
+        "exit_code": 0,
+        "exit_reason": "one_shot_complete",
+        "exit_classification": "one_shot_complete",
+        "one_shot_complete": True,
+    }
+    persisted.update(persisted_overrides or {})
+    (owner_dir / "invocation.json").write_text(
+        json.dumps(persisted, sort_keys=True), encoding="utf-8"
+    )
+    (owner_dir / "dispatch_intent").write_text(
+        str(arguments["dispatch_intent_id"]) + "\n", encoding="utf-8"
+    )
+    (owner_dir / "routing.json").write_text(
+        json.dumps(
+            {
+                "owner_agent_id": owner_name,
+                "owner_invocation_id": successor_id,
+                "owner_generation": 2,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    ledger_run_id = cast(str, config.ledger_run_id)
+    workbook = str(worktree)
+    started_data: dict[str, Any] = {
+        "branch": branch,
+        "generation": 2,
+        "invocation_id": successor_id,
+        "outcome": "started",
+        "runtime": "codex",
+        "slice_id": leaf_name,
+        "status": "running",
+        "trigger": "resume_blocked",
+        "worktree": workbook,
+        "runtime_agent_id": owner_name,
+    }
+    resumed_data: dict[str, Any] = {
+        "child_agent": owner_name,
+        "agent_type": "codex",
+        "model": "gpt-6.1-sol",
+        "effort": "xhigh",
+        "branch": branch,
+        "spawn_type": "resume_blocked",
+        "chainlink_issue_id": 814,
+        "previous_invocation_id": original_id,
+        "invocation_id": successor_id,
+        "generation": 2,
+        "worktree_fingerprint": "sha256:" + "0" * 64,
+        "same_owner": True,
+    }
+    finished_data: dict[str, Any] = {
+        "branch": branch,
+        "exit_classification": "one_shot_complete",
+        "exit_code": 0,
+        "generation": 2,
+        "invocation_id": successor_id,
+        "outcome": "finished",
+        "runtime": "codex",
+        "slice_id": leaf_name,
+        "status": "exited",
+        "trigger": "resume_blocked",
+        "worktree": workbook,
+    }
+    started_data.update(started_overrides or {})
+    resumed_data.update(resumed_overrides or {})
+    finished_data.update(finished_overrides or {})
+    rows = [
+        _legacy_resume_row(
+            event_type="agent.invocation.started",
+            run_seq=150409,
+            agent_id=owner_name,
+            run_id=ledger_run_id,
+            generation=2,
+            invocation_id=successor_id,
+            data=started_data,
+        ),
+        _legacy_resume_row(
+            event_type="agent.resumed",
+            run_seq=150410,
+            agent_id=store.run_id,
+            run_id=ledger_run_id,
+            generation=2,
+            invocation_id=successor_id,
+            data=resumed_data,
+        ),
+        _legacy_resume_row(
+            event_type="agent.invocation.finished",
+            run_seq=150424,
+            agent_id=owner_name,
+            run_id=ledger_run_id,
+            generation=2,
+            invocation_id=successor_id,
+            data=finished_data,
+        ),
+    ]
+    for index, override in (row_overrides or {}).items():
+        rows[index] = {**rows[index], **override}
+    if duplicate_resumed_row:
+        rows.append(
+            _legacy_resume_row(
+                event_type="agent.resumed",
+                run_seq=150425,
+                agent_id=store.run_id,
+                run_id=ledger_run_id,
+                generation=2,
+                invocation_id=successor_id,
+                data=resumed_data,
+            )
+        )
+    if write_host_launch_row:
+        rows.append(
+            _legacy_resume_row(
+                event_type="agent.spawned",
+                run_seq=150426,
+                agent_id=store.run_id,
+                run_id=ledger_run_id,
+                generation=None,
+                invocation_id=successor_id,
+                data={
+                    "agent_type": "codex",
+                    "branch": branch,
+                    "child_agent": owner_name,
+                    "effort": "xhigh",
+                    "intent_id": arguments["dispatch_intent_id"],
+                    "invocation_id": successor_id,
+                    "model": "gpt-6.1-sol",
+                    "spawn_type": "resume_blocked",
+                    "topology": "worktree_per_agent",
+                },
+            )
+        )
+    rows = [
+        row
+        for row in rows
+        if row["type"].removeprefix("agent.") not in set(omit_rows)
+    ]
+    segment = (
+        _required_project_root(config)
+        / ".exo"
+        / "ledger"
+        / "segments"
+        / "segment-000000150409.jsonl"
+    )
+    segment.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    if competing_confirmed_action:
+        journal_path = store.run_dir / "action-journal.json"
+        recorded = json.loads(journal_path.read_text(encoding="utf-8"))
+        original_entry = next(
+            row
+            for row in recorded
+            if row.get("operation") == "resume_blocked_leaf"
+            and row.get("status") == "confirmed"
+        )
+        recorded.append({**original_entry, "key": original_entry["key"] + "-duplicate"})
+        journal_path.write_text(json.dumps(recorded), encoding="utf-8")
+    if drop_result:
+        journal_path = store.run_dir / "action-journal.json"
+        recorded = json.loads(journal_path.read_text(encoding="utf-8"))
+        for row in recorded:
+            if row.get("operation") == "resume_blocked_leaf":
+                row.pop("result", None)
+        journal_path.write_text(json.dumps(recorded), encoding="utf-8")
+    if journal_status is not None:
+        journal_path = store.run_dir / "action-journal.json"
+        recorded = json.loads(journal_path.read_text(encoding="utf-8"))
+        for row in recorded:
+            if row.get("operation") == "resume_blocked_leaf":
+                row["status"] = journal_status
+        journal_path.write_text(json.dumps(recorded), encoding="utf-8")
+    entries = journal.entries_for("resume_blocked_leaf", leaf_name)
+    assert entries
+    confirmed = [entry for entry in entries if entry.get("status") == "confirmed"]
+    return _LegacyResumeFixture(
+        plan,
+        config,
+        store,
+        owner_dir,
+        owner_name,
+        original_id,
+        successor_id,
+        intent,
+        arguments,
+        confirmed[0] if confirmed else entries[-1],
+        result,
+        identity,
+        persisted,
+        rows,
+    )
+
+
+def test_legacy_resume_receipt_accepts_the_old_live_shape(tmp_path: Path) -> None:
+    """The confirmed f285 result and the old host rows prove one successor.
+
+    The saved response has no owner, scope, intent, model, effort, or route
+    receipt, and the host wrote no ``agent.spawned`` row. The proof resolves
+    both from the unchanged durable lineage and the authoritative
+    ``agent.resumed`` row.
+    """
+    fixture = _seed_legacy_terminal_resume(tmp_path)
+    before = fixture.snapshot()
+
+    proof, reason = fixture.proof()
+    repeated, repeated_reason = fixture.proof()
+
+    assert proof is not None, reason
+    assert repeated is not None, repeated_reason
+    assert fixture.snapshot() == before
+
+
+def test_legacy_resume_receipt_resolves_owner_and_intent_without_a_launch_row(
+    tmp_path: Path,
+) -> None:
+    """Both owner aliases and every modern launch row are genuinely absent."""
+    fixture = _seed_legacy_terminal_resume(tmp_path)
+    payload = fixture.result.result
+    assert isinstance(payload, Mapping)
+    agent = payload["agent"]
+    invocation = payload["invocation"]
+    assert isinstance(agent, Mapping)
+    assert isinstance(invocation, Mapping)
+
+    assert "id" not in agent
+    assert "agent_id" not in agent
+    assert "intent_id" not in agent
+    assert "issue" not in agent
+    assert "role_route" not in invocation
+    assert not [
+        row
+        for row in fixture.ledger_rows
+        if row.get("type") == "agent.spawned"
+        and cast(Mapping[str, object], row["data"]).get("invocation_id")
+        == fixture.successor_id
+    ]
+
+    proof, reason = fixture.proof()
+
+    assert proof is not None, reason
+    assert proof.resume.owner.agent_name == fixture.owner_name
+    assert proof.resume.owner.prior_invocation_id == fixture.successor_id
+
+
+def test_legacy_resume_receipt_dispatches_one_generation_three_luna_successor(
+    tmp_path: Path,
+) -> None:
+    """The historical successor is followed by exactly one current-route launch."""
+    fixture = _seed_legacy_terminal_resume(tmp_path)
+    transport = RepeatedTransitionTransport(
+        owner_dir=fixture.owner_dir,
+        owner_name=fixture.owner_name,
+        slice_id=fixture.plan.leaves[0].name,
+    )
+    journal = EffectJournal(
+        fixture.store.run_id, fixture.store.run_dir / "action-journal.json"
+    )
+
+    state = driver_module._resume_terminal_owner_failure(
+        fixture.plan,
+        fixture.store.load(),
+        fixture.config,
+        EffectClient(transport),
+        fixture.store,
+        journal,
+    )
+
+    assert len(transport.successors) == 1
+    launched = transport.successors[0]
+    assert launched["prior_invocation_id"] == fixture.successor_id
+    assert launched["generation"] == 3
+    assert launched["harness"] == "codex/gpt-6-luna"
+    assert launched["model"] == "gpt-6-luna"
+    assert launched["effort"] == "xhigh"
+    leaf = state.slices[fixture.plan.leaves[0].name]
+    assert leaf.dispatch_invocation_id == launched["invocation_id"]
+    assert leaf.dispatch_agent_id == fixture.owner_name
+    entries = journal.entries_for(
+        "resume_blocked_leaf", fixture.plan.leaves[0].name
+    )
+    assert [entry["status"] for entry in entries] == ["confirmed", "confirmed"]
+    latest_arguments = _required_mapping(entries[-1]["arguments"], "arguments")
+    assert latest_arguments["expected_invocation_id"] == fixture.successor_id
+    assert latest_arguments["prior_generation"] == 2
+    assert latest_arguments["prior_model"] == "gpt-6.1-sol"
+    assert latest_arguments["prior_effort"] == "xhigh"
+    assert latest_arguments["desired_model"] == "gpt-6-luna"
+    assert latest_arguments["desired_effort"] == "xhigh"
+
+
+def test_legacy_resume_receipt_records_its_evidence_source(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    fixture = _seed_legacy_terminal_resume(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="tl_loop.loop.driver"):
+        proof, reason = fixture.proof()
+
+    assert proof is not None, reason
+    assert (
+        "evidence=durable_owner_invocation+agent.resumed" in caplog.text
+    )
+
+
+def _record_modern_successor_for_legacy_history(
+    fixture: _LegacyResumeFixture,
+    *,
+    successor_id: str = "generation-three-successor",
+) -> None:
+    """Adopt one modern successor so a later replay sees a rotated registry."""
+    proof, reason = fixture.proof()
+    assert proof is not None, reason
+    driver_module._persist_terminal_route_authorization(
+        proof, fixture.store.load(), fixture.store
+    )
+    journal = EffectJournal(
+        fixture.store.run_id, fixture.store.run_dir / "action-journal.json"
+    )
+    arguments = dict(
+        driver_module._blocked_leaf_resume_action_arguments(
+            proof.resume, fixture.store.load()
+        )
+    )
+    route = driver_module._blocked_resume_role_route_response(proof.resume)
+    assert route is not None
+    route_document = cast(JsonObject, route)
+    intent = EffectIntent(
+        "resume_blocked_leaf", fixture.plan.leaves[0].name, arguments, True
+    )
+    journal.append(intent)
+    journal.mark_result(
+        intent,
+        ToolResult.from_raw(
+            {
+                "success": True,
+                "result": {
+                    "chainlink_issue_id": 814,
+                    "agent": {
+                        "id": fixture.owner_name,
+                        "issue": fixture.plan.leaves[0].name,
+                        "intent_id": proof.resume.intent_id,
+                        "agent_type": "codex",
+                        "branch_name": proof.resume.owner.branch,
+                        "worktree_path": str(proof.resume.owner.worktree),
+                        "role_route": route_document,
+                    },
+                    "invocation": {
+                        "invocation_id": successor_id,
+                        "generation": 3,
+                        "trigger": "resume_blocked",
+                        "runtime": "codex",
+                        "model": proof.resume.desired_model,
+                        "effort": proof.resume.desired_effort,
+                        "prior_invocation_id": fixture.successor_id,
+                        "role_route": route_document,
+                    },
+                },
+            }
+        ),
+    )
+    identity = json.loads(
+        (fixture.owner_dir / "identity.json").read_text(encoding="utf-8")
+    )
+    identity.update(
+        {
+            "agent_type": "codex",
+            "model": proof.resume.desired_model,
+            "effort": proof.resume.desired_effort,
+            "role_route": route,
+        }
+    )
+    (fixture.owner_dir / "identity.json").write_text(
+        json.dumps(identity, sort_keys=True), encoding="utf-8"
+    )
+    persisted = {
+        **fixture.persisted,
+        "invocation_id": successor_id,
+        "generation": 3,
+        "status": "exited",
+        "model": proof.resume.desired_model,
+        "effort": proof.resume.desired_effort,
+        "prior_invocation_id": fixture.successor_id,
+        "ended_at": 1792735000,
+        "role_route": route,
+    }
+    (fixture.owner_dir / "invocation.json").write_text(
+        json.dumps(persisted, sort_keys=True), encoding="utf-8"
+    )
+    (fixture.owner_dir / "dispatch_intent").write_text(
+        proof.resume.intent_id + "\n", encoding="utf-8"
+    )
+    (fixture.owner_dir / "routing.json").write_text(
+        json.dumps(
+            {
+                "owner_agent_id": fixture.owner_name,
+                "owner_invocation_id": successor_id,
+                "owner_generation": 3,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    ledger_run_id = cast(str, fixture.config.ledger_run_id)
+    segment = (
+        _required_project_root(fixture.config)
+        / ".exo"
+        / "ledger"
+        / "segments"
+        / "segment-000000160000.jsonl"
+    )
+    segment.write_text(
+        "".join(
+            json.dumps(row, sort_keys=True) + "\n"
+            for row in (
+                _legacy_resume_row(
+                    event_type="agent.spawned",
+                    run_seq=160000,
+                    agent_id=fixture.store.run_id,
+                    run_id=ledger_run_id,
+                    generation=None,
+                    invocation_id=successor_id,
+                    data={
+                        "agent_type": "codex",
+                        "branch": proof.resume.owner.branch,
+                        "child_agent": fixture.owner_name,
+                        "effort": proof.resume.desired_effort,
+                        "intent_id": proof.resume.intent_id,
+                        "invocation_id": successor_id,
+                        "model": proof.resume.desired_model,
+                        "spawn_type": "resume_blocked",
+                        "topology": "worktree_per_agent",
+                    },
+                ),
+                _legacy_resume_row(
+                    event_type="agent.invocation.started",
+                    run_seq=160001,
+                    agent_id=fixture.owner_name,
+                    run_id=ledger_run_id,
+                    generation=3,
+                    invocation_id=successor_id,
+                    data={
+                        "branch": proof.resume.owner.branch,
+                        "generation": 3,
+                        "invocation_id": successor_id,
+                        "outcome": "started",
+                        "runtime": "codex",
+                        "slice_id": fixture.plan.leaves[0].name,
+                        "status": "running",
+                        "trigger": "resume_blocked",
+                    },
+                ),
+                _legacy_resume_row(
+                    event_type="agent.resumed",
+                    run_seq=160002,
+                    agent_id=fixture.store.run_id,
+                    run_id=ledger_run_id,
+                    generation=3,
+                    invocation_id=successor_id,
+                    data={
+                        "child_agent": fixture.owner_name,
+                        "agent_type": "codex",
+                        "model": proof.resume.desired_model,
+                        "effort": proof.resume.desired_effort,
+                        "branch": proof.resume.owner.branch,
+                        "spawn_type": "resume_blocked",
+                        "previous_invocation_id": fixture.successor_id,
+                        "invocation_id": successor_id,
+                        "generation": 3,
+                    },
+                ),
+                _legacy_resume_row(
+                    event_type="agent.invocation.finished",
+                    run_seq=160003,
+                    agent_id=fixture.owner_name,
+                    run_id=ledger_run_id,
+                    generation=3,
+                    invocation_id=successor_id,
+                    data={
+                        "branch": proof.resume.owner.branch,
+                        "exit_classification": "one_shot_complete",
+                        "exit_code": 0,
+                        "generation": 3,
+                        "invocation_id": successor_id,
+                        "outcome": "finished",
+                        "runtime": "codex",
+                        "slice_id": fixture.plan.leaves[0].name,
+                        "status": "exited",
+                        "trigger": "resume_blocked",
+                    },
+                ),
+            )
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_legacy_resume_receipt_survives_registry_rotation(tmp_path: Path) -> None:
+    """A later replay still proves f285 after the registry holds generation 3."""
+    fixture = _seed_legacy_terminal_resume(tmp_path)
+    _record_modern_successor_for_legacy_history(fixture)
+
+    proof, reason = fixture.proof()
+
+    assert proof is not None, reason
+    assert proof.resume.owner.generation == 3
+    assert proof.resume.owner.prior_invocation_id == "generation-three-successor"
+    assert proof.resume.desired_model == "gpt-6-luna"
+
+
+def test_legacy_resume_receipt_refuses_missing_agent_resumed_row(tmp_path: Path) -> None:
+    """Without the authoritative resume row the lineage is unproven."""
+    fixture = _seed_legacy_terminal_resume(tmp_path, omit_rows=("resumed",))
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason == "legacy resume lineage requires exactly one agent.resumed row"
+
+
+def test_legacy_resume_receipt_refuses_duplicate_agent_resumed_rows(tmp_path: Path) -> None:
+    """Two resume rows for one successor are ambiguous, not corroboration."""
+    fixture = _seed_legacy_terminal_resume(tmp_path, duplicate_resumed_row=True)
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason == "legacy resume lineage requires exactly one agent.resumed row"
+
+
+def test_legacy_resume_receipt_refuses_competing_confirmed_actions(tmp_path: Path) -> None:
+    """Two confirmed actions claiming one successor cannot lend it an intent."""
+    fixture = _seed_legacy_terminal_resume(tmp_path, competing_confirmed_action=True)
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason == "multiple confirmed resume actions claim one successor invocation"
+
+
+def test_legacy_resume_receipt_refuses_a_successor_launch_row(tmp_path: Path) -> None:
+    """A successor agent.spawned row means the record is not the historical shape."""
+    fixture = _seed_legacy_terminal_resume(tmp_path, write_host_launch_row=True)
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason == "legacy resume result has a modern launch row"
+
+
+def test_legacy_resume_receipt_refuses_wrong_persisted_owner(tmp_path: Path) -> None:
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path, persisted_overrides={"runtime_agent_id": "foreign-owner"}
+    )
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason == "legacy resume result conflicts with its durable invocation lineage"
+
+
+def test_legacy_resume_receipt_refuses_a_live_successor(tmp_path: Path) -> None:
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path, persisted_overrides={"status": "running"}
+    )
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason == "legacy resume successor is not terminal"
+
+
+def test_legacy_resume_receipt_refuses_existing_publication_evidence(tmp_path: Path) -> None:
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path, persisted_overrides={"pr_number": 46}
+    )
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason == "legacy resume result conflicts with its durable invocation lineage"
+
+
+def test_legacy_resume_receipt_refuses_unsupported_runtime_labels(tmp_path: Path) -> None:
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path, invocation_overrides={"runtime": "gemini"}
+    )
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason == "legacy resume result has an unsupported runtime label"
+
+
+@pytest.mark.parametrize(
+    ("fixture_kwargs", "reason"),
+    (
+        (
+            {"omit_rows": ("invocation.started",)},
+            "legacy resume lineage requires exactly one invocation started row",
+        ),
+        (
+            {"omit_rows": ("invocation.finished",)},
+            "legacy resume lineage requires exactly one invocation finished row",
+        ),
+    ),
+)
+def test_legacy_resume_receipt_refuses_unproven_or_ambiguous_history(
+    tmp_path: Path,
+    fixture_kwargs: dict[str, Any],
+    reason: str,
+) -> None:
+    fixture = _seed_legacy_terminal_resume(tmp_path, **fixture_kwargs)
+
+    proof, observed = fixture.proof()
+
+    assert proof is None
+    assert observed == reason
+
+
+@pytest.mark.parametrize(
+    ("fixture_kwargs", "reason"),
+    (
+        (
+            {"invocation_overrides": {"invocation_id": "foreign-successor"}},
+            "legacy resume result lacks its durable invocation lineage",
+        ),
+        (
+            {"persisted_overrides": {"slice_id": "foreign-slice"}},
+            "legacy resume result conflicts with its durable invocation lineage",
+        ),
+        (
+            {"persisted_overrides": {"head_sha": "0" * 40}},
+            "legacy resume result conflicts with its durable invocation lineage",
+        ),
+        (
+            {"invocation_overrides": {"runtime": "codex-ultra"}},
+            "legacy resume result has an unsupported runtime label",
+        ),
+        (
+            {"persisted_overrides": {"runtime": "codex-ultra"}},
+            "legacy resume invocation has an unsupported runtime label",
+        ),
+        (
+            {"resumed_overrides": {"previous_invocation_id": "foreign-predecessor"}},
+            "legacy resume agent.resumed row conflicts with its confirmed action",
+        ),
+        (
+            {"resumed_overrides": {"generation": 3}},
+            "legacy resume agent.resumed row conflicts with its durable lineage",
+        ),
+        (
+            {"resumed_overrides": {"branch": "main.foreign"}},
+            "legacy resume agent.resumed row conflicts with its durable lineage",
+        ),
+        (
+            {"resumed_overrides": {"agent_type": "gemini"}},
+            "legacy resume agent.resumed row conflicts with its durable lineage",
+        ),
+        (
+            {"resumed_overrides": {"child_agent": "foreign-owner"}},
+            "legacy resume agent.resumed row conflicts with its confirmed action",
+        ),
+        (
+            {"resumed_overrides": {"intent_id": "foreign-intent"}},
+            "legacy resume agent.resumed row conflicts with its confirmed action",
+        ),
+        (
+            {"resumed_overrides": {"model": "gpt-6-luna"}},
+            "legacy resume agent.resumed row conflicts with its confirmed action",
+        ),
+        (
+            {"resumed_overrides": {"effort": "medium"}},
+            "legacy resume agent.resumed row conflicts with its confirmed action",
+        ),
+        (
+            {"row_overrides": {0: {"run_id": "foreign-run"}}},
+            "legacy resume invocation started row conflicts with its durable lineage",
+        ),
+        (
+            {"row_overrides": {1: {"run_id": "foreign-run"}}},
+            "legacy resume agent.resumed row conflicts with its durable lineage",
+        ),
+        (
+            {"row_overrides": {1: {"agent_id": "foreign-reporter"}}},
+            "legacy resume reporter conflicts with its controller run",
+        ),
+        (
+            {"row_overrides": {0: {"agent_id": "foreign-reporter"}}},
+            "legacy resume invocation lifecycle reporter conflicts with its owner",
+        ),
+        (
+            {"row_overrides": {2: {"agent_id": "foreign-reporter"}}},
+            "legacy resume invocation lifecycle reporter conflicts with its owner",
+        ),
+        (
+            {"finished_overrides": {"status": "running"}},
+            "legacy resume invocation finished row conflicts with its terminal record",
+        ),
+        (
+            {"finished_overrides": {"exit_code": 1}},
+            "legacy resume invocation finished row conflicts with its terminal record",
+        ),
+    ),
+)
+def test_legacy_resume_receipt_refuses_conflicting_evidence(
+    tmp_path: Path,
+    fixture_kwargs: dict[str, Any],
+    reason: str,
+) -> None:
+    fixture = _seed_legacy_terminal_resume(tmp_path, **fixture_kwargs)
+
+    proof, observed = fixture.proof()
+
+    assert proof is None
+    assert observed == reason
+
+
+@pytest.mark.parametrize(
+    ("fixture_kwargs", "reason_fragment"),
+    (
+        (
+            {"identity_overrides": {"birth_branch": "main.foreign"}},
+            "terminal owner registry evidence is unavailable or conflicting",
+        ),
+        (
+            {"persisted_overrides": {"prior_invocation_id": "foreign-predecessor"}},
+            "terminal owner registry evidence is unavailable or conflicting",
+        ),
+        (
+            {"persisted_overrides": {"generation": 3}},
+            "terminal owner registry evidence is unavailable or conflicting",
+        ),
+        (
+            {"persisted_overrides": {"trigger": "spawn"}},
+            "terminal owner registry evidence is unavailable or conflicting",
+        ),
+        (
+            {"persisted_overrides": {"branch": "main.foreign"}},
+            "terminal owner registry evidence is unavailable or conflicting",
+        ),
+    ),
+)
+def test_legacy_resume_receipt_refuses_wrong_owner_coordinates_or_effects(
+    tmp_path: Path,
+    fixture_kwargs: dict[str, Any],
+    reason_fragment: str,
+) -> None:
+    fixture = _seed_legacy_terminal_resume(tmp_path, **fixture_kwargs)
+
+    proof, observed = fixture.proof()
+
+    assert proof is None
+    assert observed is not None
+    assert reason_fragment in observed
+
+
+@pytest.mark.parametrize(
+    ("journal_status", "reason"),
+    (
+        (
+            "unknown",
+            (
+                "unresolved legacy blocked-leaf resume lacks a route binding; "
+                "reconcile its outcome before retry"
+            ),
+        ),
+        ("rejected", "the exact blocked-leaf resume request was rejected"),
+    ),
+)
+def test_legacy_resume_receipt_refuses_an_unresolved_or_rejected_effect(
+    tmp_path: Path, journal_status: str, reason: str
+) -> None:
+    fixture = _seed_legacy_terminal_resume(tmp_path, journal_status=journal_status)
+
+    proof, observed = fixture.proof()
+
+    assert proof is None
+    assert observed is not None
+    assert reason in observed
+
+
+def test_legacy_resume_receipt_refuses_a_lost_confirmed_response(tmp_path: Path) -> None:
+    """A confirmed action without its saved result cannot be reconciled."""
+    fixture = _seed_legacy_terminal_resume(tmp_path, drop_result=True)
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason == "confirmed terminal-owner result is missing or malformed"
+
+
+def test_legacy_resume_receipt_does_not_admit_a_stripped_modern_receipt(
+    tmp_path: Path,
+) -> None:
+    """A modern route-bound action cannot opt into the legacy proof."""
+    fixture = _seed_legacy_terminal_resume(tmp_path, strip_route_fingerprint=False)
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason is not None
+    assert reason.startswith(
+        "terminal owner role-route provenance is incomplete or conflicting"
+    )
+
+
+def test_legacy_resume_receipt_does_not_admit_a_modern_receipt_without_owner(
+    tmp_path: Path,
+) -> None:
+    fixture = _seed_legacy_terminal_resume(tmp_path, agent_overrides={"id": None})
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason == "confirmed resume result omitted its owner identity"
+
+
 
 
 @pytest.mark.parametrize(

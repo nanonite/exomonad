@@ -256,6 +256,38 @@ class LedgerReader:
         projected.sort(key=lambda event: cast(int, event.run_seq))
         return ReadResult(tuple(projected), status, tuple(findings), read_rows.active_tail)
 
+    def lifecycle_records(
+        self,
+        event_types: Iterable[str],
+    ) -> tuple[Mapping[str, object], ...]:
+        """Return raw rows for the named lifecycle types in run-sequence order.
+
+        Invocation lifecycle and resume-audit types sit outside the closed TL
+        projection, so callers that must correlate them with a durable owner
+        read the parsed documents here. Parsing, supersession, and ordering are
+        the same as :meth:`read_from`; identity is never interpreted.
+        """
+        wanted = frozenset(event_types)
+        if not wanted or any(
+            not isinstance(event_type, str) or not event_type for event_type in wanted
+        ):
+            raise ValueError("lifecycle event types must be non-empty strings")
+        rows = _resolve_superseded(list(self._read_rows().rows))
+        matches = [
+            row.document
+            for row in rows
+            if _raw_event_type(row.document) in wanted
+        ]
+
+        def sequence_key(document: LedgerDocument) -> tuple[bool, int]:
+            value = document.get("run_seq")
+            if type(value) is int:
+                return False, value
+            return True, 0
+
+        matches.sort(key=sequence_key)
+        return tuple(matches)
+
     def find_invocation_finished(
         self,
         runtime_agent_id: str,

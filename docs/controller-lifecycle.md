@@ -34,7 +34,17 @@ row, and proceeds with the pending recovery. Replaying the blocked owner's
 terminal notification repeats the already-recorded human gate instead of
 failing the child, and no worker is relaunched or dispatch state reset. The
 `agent.spawned` row is the only launch proof; `agent.resumed` stays the
-human-facing resume audit and is never treated as confirmation.
+human-facing resume audit and is never treated as confirmation for this
+adoption path.
+
+Terminal-owner human recovery of a historical resume result whose host
+predates the launch confirmation is a separate, bounded case. It proves the
+saved result from the durable owner invocation lineage, the immediately
+following confirmed action, and the exact
+`agent.invocation.started`/`agent.resumed`/`agent.invocation.finished` trio,
+and it holds when any `agent.spawned` row names that successor. It never
+synthesizes a launch row or rewrites the saved response, and the modern
+adoption above is unchanged.
 
 The implementation does not remove worktrees, branches, receipts, journals,
 publication evidence, or gates. A server-only restart does not terminate agent

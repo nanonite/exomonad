@@ -5489,6 +5489,98 @@ _LEGACY_SPAWN_ARGUMENT_FIELDS = frozenset(
 )
 
 
+# Historical resume_blocked_leaf result projection and host lifecycle
+# chronology emitted before the host wrote an agent.spawned launch
+# confirmation and route receipts. Any other key is modern provenance.
+_LEGACY_RESUME_RESULT_FIELDS = frozenset({"chainlink_issue_id", "agent", "invocation"})
+_LEGACY_RESUME_AGENT_FIELDS = frozenset(
+    {
+        "agent_type",
+        "branch_name",
+        "worktree_path",
+        "tab_name",
+        "issue_title",
+        "pane_id",
+        "invocation_id",
+        "invocation_trigger",
+        "invocation_runtime",
+        "invocation_fresh",
+        "invocation_ready",
+        "invocation_outcome",
+        "routing_target_id",
+        "routing_target_type",
+    }
+)
+_LEGACY_RESUME_INVOCATION_FIELDS = frozenset(
+    {
+        "invocation_id",
+        "trigger",
+        "runtime",
+        "fresh",
+        "ready",
+        "outcome",
+        "target_id",
+        "target_type",
+    }
+)
+_LEGACY_RESUME_LIFECYCLE_TYPES = (
+    "agent.spawned",
+    "agent.invocation.started",
+    "agent.resumed",
+    "agent.invocation.finished",
+)
+# Any of these keys marks a resume receipt as modern producer output, even when
+# its value is null or the route was not bound. A historical receipt carries
+# none of them.
+_MODERN_RESUME_RESPONSE_FIELDS = frozenset(
+    {
+        "id",
+        "agent_id",
+        "issue",
+        "intent_id",
+        "role_route",
+        "model",
+        "effort",
+        "generation",
+        "prior_invocation_id",
+    }
+)
+
+
+class _TerminalResumeReceiptProof(NamedTuple):
+    """Resolved owner and intent association for one confirmed resume result."""
+
+    owner_agent_id: str
+    dispatch_intent_id: str
+    evidence_source: str
+
+
+def _safe_diagnostic(detail: object) -> str:
+    """Return one redacted single-line diagnostic fragment."""
+    text = "".join(
+        character if character.isprintable() else " " for character in str(detail)
+    )
+    return " ".join(text.split())[:200]
+
+
+def _ledger_row_type(row: Mapping[str, object]) -> str:
+    """Return the raw event type of one unprojected ledger document."""
+    value = row.get("type", row.get("event_type"))
+    return value if isinstance(value, str) else ""
+
+
+def _confirmed_resume_successor(
+    journal: EffectJournal, entry: Mapping[str, object]
+) -> object:
+    """Return the successor invocation one confirmed resume action named."""
+    try:
+        payload = journal.replay(entry).result
+    except ActionJournalError:
+        return None
+    invocation = payload.get("invocation") if isinstance(payload, Mapping) else None
+    return invocation.get("invocation_id") if isinstance(invocation, Mapping) else None
+
+
 def _absolute_worktree_path(value: object) -> Path | None:
     """Return the resolved absolute worktree path, or None for missing or relative values."""
     if not isinstance(value, str) or not value or not Path(value).is_absolute():
@@ -5617,6 +5709,367 @@ def _host_launch_intent_id(
     if len(intents) != 1:
         return None
     return intents[0]
+
+
+def _terminal_resume_receipt_is_modern(
+    arguments: Mapping[str, object],
+    result: ToolResult,
+    agent: Mapping[str, object],
+    invocation: Mapping[str, object],
+    identity: Mapping[str, object],
+    persisted: Mapping[str, object],
+    persisted_matches: bool,
+) -> bool:
+    """Whether one confirmed resume receipt carries modern producer provenance."""
+    return bool(
+        _terminal_resume_route_is_bound(
+            arguments, result, identity, persisted, persisted_matches
+        )
+        or set(agent) & _MODERN_RESUME_RESPONSE_FIELDS
+        or set(invocation) & _MODERN_RESUME_RESPONSE_FIELDS
+    )
+
+
+def _legacy_resume_projection_error(
+    payload: object,
+    agent: Mapping[str, object],
+    invocation: Mapping[str, object],
+) -> str | None:
+    """Reject anything but the exact historical resume result projection."""
+    if not isinstance(payload, Mapping):
+        return "confirmed resume result is missing or malformed"
+    if set(payload) - _LEGACY_RESUME_RESULT_FIELDS:
+        return "legacy resume result has an unsupported field"
+    if set(agent) - _LEGACY_RESUME_AGENT_FIELDS:
+        return "legacy resume result.agent has an unsupported field"
+    if set(invocation) - _LEGACY_RESUME_INVOCATION_FIELDS:
+        return "legacy resume result.invocation has an unsupported field"
+    return None
+
+
+class _LegacyResumeLineage(NamedTuple):
+    """Actual successor route and the retained record that proves it."""
+
+    runtime: str
+    model: str
+    effort: str
+    source: str
+
+
+def _legacy_resume_lineage(
+    arguments: Mapping[str, object],
+    invocation: Mapping[str, object],
+    owner: BlockedLeafOwner,
+    leaf: LeafTask,
+    persisted: Mapping[str, object],
+    persisted_matches: bool,
+    following_arguments: Mapping[str, object] | None,
+) -> tuple[_LegacyResumeLineage | None, str | None]:
+    """Resolve the historical successor's actual route from retained lineage.
+
+    The owner registry holds only the newest invocation. Before rotation it is
+    the historical successor itself; afterwards the immediately following
+    confirmed successor action retains the predecessor facts this receipt was
+    validated against, and the host ``agent.resumed`` row independently names
+    the same pair. Neither source is rebuilt from the current successor's
+    fields.
+    """
+    prior_invocation_id = arguments.get("expected_invocation_id")
+    prior_generation = arguments.get("prior_generation")
+    if not isinstance(prior_invocation_id, str) or not prior_invocation_id:
+        return None, "legacy resume action has no predecessor invocation"
+    if type(prior_generation) is not int or prior_generation < 1:
+        return None, "legacy resume action has no predecessor generation"
+    generation = prior_generation + 1
+    response_runtime = normalize_runtime_label(invocation.get("runtime"))
+    if response_runtime is None:
+        return None, "legacy resume result has an unsupported runtime label"
+    if persisted_matches:
+        durable_runtime = normalize_runtime_label(persisted.get("runtime"))
+        if durable_runtime is None:
+            return None, "legacy resume invocation has an unsupported runtime label"
+        if response_runtime != durable_runtime:
+            return None, "legacy resume result runtime conflicts with its durable invocation"
+        durable_model = _optional_nonempty_text(persisted.get("model"))
+        durable_effort = _optional_nonempty_text(persisted.get("effort"))
+        if durable_model is None or durable_effort is None:
+            return None, "legacy resume invocation lacks its actual model or effort"
+        if persisted.get("status") not in {"failed", "exited", "killed", "timed_out"}:
+            return None, "legacy resume successor is not terminal"
+        if (
+            persisted.get("prior_invocation_id") != prior_invocation_id
+            or persisted.get("generation") != generation
+            or persisted.get("trigger") != "resume_blocked"
+            or persisted.get("branch") != owner.branch
+            or _absolute_worktree_path(persisted.get("worktree")) != owner.worktree
+            or persisted.get("slice_id") not in {None, leaf.name}
+            or persisted.get("runtime_agent_id") not in {None, owner.agent_name}
+            or persisted.get("pr_number") is not None
+            or persisted.get("head_sha") is not None
+        ):
+            return None, "legacy resume result conflicts with its durable invocation lineage"
+        return (
+            _LegacyResumeLineage(
+                durable_runtime, durable_model, durable_effort, "durable_owner_invocation"
+            ),
+            None,
+        )
+    if not isinstance(following_arguments, Mapping):
+        return None, "legacy resume result lacks its durable invocation lineage"
+    following_runtime = normalize_runtime_label(following_arguments.get("prior_runtime"))
+    durable_model = _optional_nonempty_text(following_arguments.get("prior_model"))
+    durable_effort = _optional_nonempty_text(following_arguments.get("prior_effort"))
+    if (
+        following_arguments.get("expected_invocation_id") != invocation.get("invocation_id")
+        or following_arguments.get("prior_generation") != generation
+        or following_runtime is None
+        or following_runtime != response_runtime
+        or durable_model is None
+        or durable_effort is None
+        or following_arguments.get("expected_branch") != owner.branch
+        or following_arguments.get("expected_worktree") != str(owner.worktree)
+    ):
+        return None, "legacy resume lineage conflicts with the next accepted successor"
+    return (
+        _LegacyResumeLineage(
+            response_runtime,
+            durable_model,
+            durable_effort,
+            "next_confirmed_successor_action",
+        ),
+        None,
+    )
+
+
+def _legacy_resume_lifecycle_payloads(
+    records: Sequence[Mapping[str, object]],
+    *,
+    successor_id: str,
+    owner: BlockedLeafOwner,
+    lineage: _LegacyResumeLineage,
+    generation: int,
+    ledger_run_id: str,
+    controller_run_id: str,
+    prior_invocation_id: str,
+    dispatch_intent_id: str,
+    persisted: Mapping[str, object],
+    persisted_matches: bool,
+) -> str | None:
+    """Return the reason one successor's historical lifecycle trio does not prove it."""
+
+    def rows_naming(event_type: str) -> list[Mapping[str, object]]:
+        selected: list[Mapping[str, object]] = []
+        for record in records:
+            if _ledger_row_type(record) != event_type:
+                continue
+            data = record.get("data")
+            data_invocation = data.get("invocation_id") if isinstance(data, Mapping) else None
+            if successor_id not in {record.get("invocation_id"), data_invocation}:
+                continue
+            selected.append(record)
+        return selected
+
+    if rows_naming("agent.spawned"):
+        return "legacy resume result has a modern launch row"
+    started_rows = rows_naming("agent.invocation.started")
+    resumed_rows = rows_naming("agent.resumed")
+    finished_rows = rows_naming("agent.invocation.finished")
+    if len(started_rows) != 1:
+        return "legacy resume lineage requires exactly one invocation started row"
+    if len(resumed_rows) != 1:
+        return "legacy resume lineage requires exactly one agent.resumed row"
+    if len(finished_rows) != 1:
+        return "legacy resume lineage requires exactly one invocation finished row"
+    started_data = _legacy_resume_lifecycle_data(
+        started_rows[0], owner, lineage.runtime, generation, successor_id, ledger_run_id
+    )
+    if started_data is None:
+        return "legacy resume invocation started row conflicts with its durable lineage"
+    resumed_data = _legacy_resume_lifecycle_data(
+        resumed_rows[0], owner, lineage.runtime, generation, successor_id, ledger_run_id
+    )
+    if resumed_data is None:
+        return "legacy resume agent.resumed row conflicts with its durable lineage"
+    finished_data = _legacy_resume_lifecycle_data(
+        finished_rows[0], owner, lineage.runtime, generation, successor_id, ledger_run_id
+    )
+    if finished_data is None:
+        return "legacy resume invocation finished row conflicts with its durable lineage"
+    if (
+        started_rows[0].get("agent_id") != owner.agent_name
+        or finished_rows[0].get("agent_id") != owner.agent_name
+    ):
+        return "legacy resume invocation lifecycle reporter conflicts with its owner"
+    if resumed_rows[0].get("agent_id") != controller_run_id:
+        return "legacy resume reporter conflicts with its controller run"
+    if (
+        resumed_data.get("child_agent") != owner.agent_name
+        or resumed_data.get("previous_invocation_id") != prior_invocation_id
+        or resumed_data.get("spawn_type") != "resume_blocked"
+        or (
+            resumed_data.get("intent_id") is not None
+            and resumed_data.get("intent_id") != dispatch_intent_id
+        )
+        or resumed_data.get("model") != lineage.model
+        or resumed_data.get("effort") != lineage.effort
+    ):
+        return "legacy resume agent.resumed row conflicts with its confirmed action"
+    if persisted_matches:
+        if (
+            finished_data.get("status") != persisted.get("status")
+            or finished_data.get("exit_code") != persisted.get("exit_code")
+            or finished_data.get("exit_classification")
+            != persisted.get("exit_classification")
+        ):
+            return "legacy resume invocation finished row conflicts with its terminal record"
+    elif (
+        finished_data.get("status") not in {"failed", "exited", "killed", "timed_out"}
+        or not _optional_nonempty_text(finished_data.get("exit_classification"))
+    ):
+        return "legacy resume invocation finished row does not prove a terminal outcome"
+    return None
+
+
+def _legacy_resume_lifecycle_data(
+    row: Mapping[str, object],
+    owner: BlockedLeafOwner,
+    runtime: str,
+    generation: int,
+    invocation_id: str,
+    ledger_run_id: str,
+) -> Mapping[str, object] | None:
+    """Return the payload of one corroborating legacy lifecycle row, or None."""
+    data = row.get("data")
+    if (
+        row.get("run_id") != ledger_run_id
+        or row.get("generation") not in {None, generation}
+        or not isinstance(data, Mapping)
+        or data.get("invocation_id") != invocation_id
+        or data.get("generation") not in {None, generation}
+        or data.get("branch") != owner.branch
+    ):
+        return None
+    recorded_runtime = data.get("runtime")
+    if recorded_runtime is None:
+        recorded_runtime = data.get("agent_type")
+    if recorded_runtime is not None and normalize_runtime_label(recorded_runtime) != runtime:
+        return None
+    return data
+
+
+def _legacy_terminal_resume_receipt(
+    result: ToolResult,
+    agent: Mapping[str, object],
+    invocation: Mapping[str, object],
+    arguments: Mapping[str, object],
+    owner: BlockedLeafOwner,
+    leaf: LeafTask,
+    identity: Mapping[str, object],
+    persisted: Mapping[str, object],
+    persisted_matches: bool,
+    following_arguments: Mapping[str, object] | None,
+    config: TLLoopConfig,
+    store: RunStore,
+    state: RunState,
+) -> tuple[_TerminalResumeReceiptProof | None, str | None]:
+    """Prove one historical resume result from its durable lineage and host rows.
+
+    The historical host wrote no ``agent.spawned`` launch confirmation for a
+    blocked-leaf resume: it wrote ``agent.invocation.started``,
+    ``agent.resumed`` and ``agent.invocation.finished``, and its saved response
+    carried neither an owner nor an intent. This proof is narrow. It requires
+    the exact historical response projection, the durable invocation that names
+    the successor and its immediate predecessor, the owner identity record, and
+    exactly one corroborating host lifecycle trio. The intent association comes
+    from the unique confirmed action whose result names this successor; it is
+    never attributed to a host row that never carried it.
+    """
+    successor_id = invocation.get("invocation_id")
+    if not isinstance(successor_id, str) or not successor_id:
+        return None, "confirmed resume result has no successor invocation"
+    projection_error = _legacy_resume_projection_error(
+        result.result, agent, invocation
+    )
+    if projection_error is not None:
+        return None, projection_error
+    prior_invocation_id = arguments.get("expected_invocation_id")
+    prior_generation = arguments.get("prior_generation")
+    dispatch_intent_id = arguments.get("dispatch_intent_id")
+    if not isinstance(prior_invocation_id, str) or not prior_invocation_id:
+        return None, "legacy resume action has no predecessor invocation"
+    if type(prior_generation) is not int or prior_generation < 1:
+        return None, "legacy resume action has no predecessor generation"
+    if not isinstance(dispatch_intent_id, str) or not dispatch_intent_id:
+        return None, "legacy resume action has no dispatch intent"
+    lineage, lineage_error = _legacy_resume_lineage(
+        arguments,
+        invocation,
+        owner,
+        leaf,
+        persisted,
+        persisted_matches,
+        following_arguments,
+    )
+    if lineage_error is not None or lineage is None:
+        return None, lineage_error
+    if (
+        identity.get("agent_name") != owner.agent_name
+        or identity.get("slice_id") != leaf.name
+        or identity.get("slug") != leaf.name
+        or identity.get("birth_branch") != owner.branch
+        or identity.get("parent_branch") != owner.parent_branch
+        or _absolute_worktree_path(identity.get("working_dir")) != owner.worktree
+    ):
+        return None, "legacy resume result conflicts with its durable owner identity"
+    if persisted_matches and (
+        normalize_runtime_label(identity.get("agent_type")) != lineage.runtime
+        or _optional_nonempty_text(identity.get("model")) != lineage.model
+        or _optional_nonempty_text(identity.get("effort")) != lineage.effort
+    ):
+        return None, "legacy resume result conflicts with its durable owner identity"
+    if config.project_root is None or config.ledger_run_id is None:
+        return None, "legacy resume evidence requires the authoritative ledger"
+    try:
+        reader = LedgerReader(
+            Path(config.project_root) / ".exo" / "ledger" / "segments",
+            run_dir=store.run_dir,
+            ledger_run_id=config.ledger_run_id,
+        )
+        records = reader.lifecycle_records(_LEGACY_RESUME_LIFECYCLE_TYPES)
+    except (LedgerReadError, EnvelopeError, OSError, ValueError):
+        return None, "legacy resume lifecycle evidence is unavailable or malformed"
+    lifecycle_error = _legacy_resume_lifecycle_payloads(
+        records,
+        successor_id=successor_id,
+        owner=owner,
+        lineage=lineage,
+        generation=prior_generation + 1,
+        ledger_run_id=config.ledger_run_id,
+        controller_run_id=state.run_id,
+        prior_invocation_id=prior_invocation_id,
+        dispatch_intent_id=dispatch_intent_id,
+        persisted=persisted,
+        persisted_matches=persisted_matches,
+    )
+    if lifecycle_error is not None:
+        return None, lifecycle_error
+    receipt = _TerminalResumeReceiptProof(
+        owner.agent_name,
+        dispatch_intent_id,
+        f"{lineage.source}+agent.resumed",
+    )
+    LOGGER.info(
+        "resolved legacy resume receipt owner=%s invocation=%s predecessor=%s generation=%d runtime=%s model=%s effort=%s evidence=%s",
+        owner.agent_name,
+        successor_id,
+        prior_invocation_id,
+        prior_generation + 1,
+        lineage.runtime,
+        lineage.model,
+        lineage.effort,
+        receipt.evidence_source,
+    )
+    return receipt, None
 
 
 def _terminal_resume_history_proof(
@@ -5750,6 +6203,7 @@ def _terminal_resume_history_proof(
     identity = identity_document
     latest_confirmed_entry: Mapping[str, object] | None = None
     latest_result: ToolResult | None = None
+    latest_receipt: _TerminalResumeReceiptProof | None = None
     latest_route_match: bool | None = None
     unresolved_latest = False
     checkpointed_index, checkpoint_error = _terminal_resume_checkpointed_index(
@@ -5821,18 +6275,68 @@ def _terminal_resume_history_proof(
         route, route_error = _terminal_resume_result_route(entry, result)
         if route_error is not None:
             return None, route_error
-        validated_route, route_error = _validate_terminal_resume_route_receipts(
-            entry,
+        # A receipt is modern when any modern provenance marker is present:
+        # route-bound action arguments, a role-route receipt, a durable route
+        # record for this exact successor, or any modern response key. Only a
+        # receipt that is positively the historical projection may use the
+        # legacy proof, so stripping modern fields can never opt a record into
+        # it.
+        receipt: _TerminalResumeReceiptProof | None = None
+        validated_route: Mapping[str, object] | None = None
+        if _terminal_resume_receipt_is_modern(
+            arguments,
             result,
-            leaf,
+            agent,
+            invocation,
             identity,
             persisted,
             persisted_matches,
-        )
-        if route_error is not None:
-            return None, route_error
-        if validated_route is not None and route != validated_route:
-            return None, "confirmed resume route receipt conflicts with its accepted action"
+        ):
+            validated_route, route_error = _validate_terminal_resume_route_receipts(
+                entry,
+                result,
+                leaf,
+                identity,
+                persisted,
+                persisted_matches,
+            )
+            if route_error is not None:
+                return None, route_error
+            if validated_route is not None and route != validated_route:
+                return None, "confirmed resume route receipt conflicts with its accepted action"
+        else:
+            competing_claims = sum(
+                1
+                for candidate in entries
+                if candidate.get("status") == "confirmed"
+                and _confirmed_resume_successor(journal, candidate) == successor_id
+            )
+            if competing_claims > 1:
+                return None, "multiple confirmed resume actions claim one successor invocation"
+            following_entry = entries[index + 1] if index + 1 < len(entries) else None
+            following_arguments = (
+                following_entry.get("arguments")
+                if isinstance(following_entry, Mapping)
+                and following_entry.get("status") == "confirmed"
+                else None
+            )
+            receipt, receipt_error = _legacy_terminal_resume_receipt(
+                result,
+                agent,
+                invocation,
+                arguments,
+                owner,
+                leaf,
+                identity,
+                persisted,
+                persisted_matches,
+                following_arguments if isinstance(following_arguments, Mapping) else None,
+                config,
+                store,
+                state,
+            )
+            if receipt_error is not None:
+                return None, receipt_error
         if not _terminal_resume_authorization_matches(entry, state, leaf, current, validated_route):
             return None, "confirmed resume lacks its historical accepted route authorization"
         runtime = invocation.get("runtime") or (
@@ -5865,7 +6369,8 @@ def _terminal_resume_history_proof(
         # the agent.spawned launch row for intent. Never rebuild them from the
         # controller's route receipt or action arguments, which would let a
         # route agree with itself. Only the response key alias for the owner id
-        # is accepted.
+        # is accepted. A supported historical receipt separately proves its
+        # owner and intent association from durable lineage and host rows.
         durable_scope = identity.get("slice_id") or identity.get("slug")
         durable_branch = identity.get("birth_branch")
         response_scope = agent.get("issue")
@@ -5878,22 +6383,47 @@ def _terminal_resume_history_proof(
         )
         evidence_intent = response_intent if response_intent is not None else host_intent
         agent_owner_id = agent.get("id") or agent.get("agent_id")
+        if receipt is not None:
+            # The historical host never recorded an intent_id for this launch.
+            # The receipt proves the action/result/effect join instead, so the
+            # intent is the unique confirmed action's own identity.
+            agent_owner_id = receipt.owner_agent_id
+            evidence_intent = receipt.dispatch_intent_id
+        if not isinstance(successor_id, str):
+            return None, "confirmed resume result has no successor invocation"
+        if invocation.get("trigger") != "resume_blocked":
+            return None, "confirmed resume result is not a blocked-leaf resume"
+        if not isinstance(runtime, str):
+            return None, "confirmed resume result has no supported runtime"
+        if agent_owner_id is None:
+            return None, "confirmed resume result omitted its owner identity"
+        if agent_owner_id != owner.agent_name:
+            return None, "confirmed resume result owner conflicts with the accepted logical owner"
+        if durable_scope != leaf.name:
+            return None, "durable owner scope conflicts with the accepted leaf"
+        if durable_branch != owner.branch:
+            return None, "durable owner branch conflicts with the accepted worktree"
+        if response_scope is not None and response_scope != durable_scope:
+            return None, "confirmed resume result scope conflicts with its durable owner"
         if (
-            not isinstance(successor_id, str)
-            or invocation.get("trigger") != "resume_blocked"
-            or not isinstance(runtime, str)
-            or agent_owner_id != owner.agent_name
-            or durable_scope != leaf.name
-            or durable_branch != owner.branch
-            or (response_scope is not None and response_scope != durable_scope)
-            or (response_intent is not None and host_intent is not None and response_intent != host_intent)
-            or evidence_intent != arguments.get("dispatch_intent_id")
-            or (response_branch is not None and response_branch != durable_branch)
-            or Path(str(agent.get("worktree_path", ""))).resolve() != owner.worktree
-            or (model is not None and not isinstance(model, str))
-            or (effort is not None and not isinstance(effort, str))
+            response_intent is not None
+            and host_intent is not None
+            and response_intent != host_intent
         ):
-            return None, "confirmed resume result conflicts with its owner, scope, or worktree"
+            return None, "confirmed resume result intent conflicts with the host launch row"
+        if evidence_intent is None:
+            return None, "confirmed resume result lacks its modern host intent proof"
+        if evidence_intent != arguments.get("dispatch_intent_id"):
+            return None, "confirmed resume result intent conflicts with its accepted action"
+        if response_branch is not None and response_branch != durable_branch:
+            return None, "confirmed resume result branch conflicts with its durable owner"
+        if Path(str(agent.get("worktree_path", ""))).resolve() != owner.worktree:
+            return None, "confirmed resume result worktree conflicts with the accepted owner"
+        if (model is not None and not isinstance(model, str)) or (
+            effort is not None and not isinstance(effort, str)
+        ):
+            return None, "confirmed resume result route evidence is malformed"
+        latest_receipt = receipt
         requested = (
             arguments.get("desired_agent_type"),
             arguments.get("desired_model"),
@@ -5942,6 +6472,13 @@ def _terminal_resume_history_proof(
         payload = latest_result.result
         result_agent = payload.get("agent") if isinstance(payload, Mapping) else None
         result_invocation = payload.get("invocation") if isinstance(payload, Mapping) else None
+        result_owner_id = (
+            result_agent.get("id") or result_agent.get("agent_id")
+            if isinstance(result_agent, Mapping)
+            else None
+        )
+        if latest_receipt is not None:
+            result_owner_id = latest_receipt.owner_agent_id
         if (
             not isinstance(result_agent, Mapping)
             or not isinstance(result_invocation, Mapping)
@@ -5955,7 +6492,7 @@ def _terminal_resume_history_proof(
                 result_invocation.get("effort") is not None
                 and result_invocation.get("effort") != invocation.get("effort")
             )
-            or (result_agent.get("id") or result_agent.get("agent_id")) != owner.agent_name
+            or result_owner_id != owner.agent_name
             or result_agent.get("branch_name") != owner.branch
             or Path(str(result_agent.get("worktree_path", ""))).resolve() != owner.worktree
         ):
@@ -6486,10 +7023,21 @@ def _terminal_owner_recovery_proof(
             resume_entries=uncheckpointed_entries,
             allow_terminal_resume_history=True,
         )
-    except (BlockedLeafOwnerError, OSError, ValueError) as error:
+    except BlockedLeafOwnerError as error:
         return (
             None,
-            f"terminal owner registry evidence is unavailable or conflicting: {type(error).__name__}",
+            (
+                "terminal owner registry evidence is unavailable or conflicting: "
+                f"{type(error).__name__}: {_safe_diagnostic(error)}"
+            ),
+        )
+    except (OSError, ValueError) as error:
+        return (
+            None,
+            (
+                "terminal owner registry evidence is unavailable or conflicting: "
+                f"{type(error).__name__}"
+            ),
         )
     owner = resolved.owner
     if (
