@@ -189,6 +189,21 @@ the decision is recorded in each directory's continuation.json. A preserved
 invocation keeps its original ID verbatim, while an invocation classified for
 recreation carries an explicit reason for the later spawn path.
 
+A completed workspace-shutdown handoff is scoped by the root run and by an
+already-ended controller lifetime, not by the tmux session name. `init
+--continue` therefore adopts the same run's completed handoff even under a
+`--session` override; both the recorded and adopting session names are retained
+as archive evidence. The handoff is validated before the controller is
+released on both startup paths, so an incomplete, unsafe, foreign, conflicting,
+or still-live handoff fails before ownership is committed. The handoff epoch
+must not be the epoch being started, a pending target epoch, or the epoch of a
+committed controller whose pane is still live; it is not required to equal the
+latest epoch marker, because a later failed `init --continue` may have advanced
+the marker while the handoff still names the earlier stopped lifetime. Archival
+happens only after the controller startup commits, and a remaining archive
+failure leaves the pending target and startup fence intact so the next
+`init --continue` resumes the exact controller pane and archives once.
+
 Optional local Forgejo CI stack:
 ```bash
 cd forgejo

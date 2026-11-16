@@ -17,7 +17,8 @@ use exomonad_core::services::{
         read_controller_target_for_routing, read_invocation, read_invocation_conservatively,
         CapturedCodexTrust, ControllerPaneOwnership, ControllerPaneTarget, InvocationRecord,
         WorkspaceShutdownIntent, WorkspaceShutdownPhase, CONTROLLER_STARTUP_INTENT_RELATIVE_PATH,
-        ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH, WORKSPACE_SHUTDOWN_RELATIVE_PATH,
+        ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH, ROOT_CONTROLLER_PENDING_OWNERSHIP_RELATIVE_PATH,
+        WORKSPACE_SHUTDOWN_RELATIVE_PATH,
     },
     pr_registry::{
         invocation_succession_reaches_current, read_published_heads,
@@ -6321,6 +6322,22 @@ async fn reconcile_interrupted_controller_startup(
     ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
     project_dir: &Path,
 ) -> Result<InterruptedControllerStartup> {
+    reconcile_interrupted_controller_startup_with_archive(
+        ipc,
+        project_dir,
+        filesystem_workspace_shutdown_archive,
+    )
+    .await
+}
+
+async fn reconcile_interrupted_controller_startup_with_archive<A>(
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+    project_dir: &Path,
+    archive: A,
+) -> Result<InterruptedControllerStartup>
+where
+    A: FnOnce(&Path, &ValidatedWorkspaceShutdownHandoff, &str, &str) -> Result<()>,
+{
     let Some(mut intent) = read_controller_startup_intent(project_dir)? else {
         return Ok(InterruptedControllerStartup::None);
     };
@@ -6388,11 +6405,18 @@ async fn reconcile_interrupted_controller_startup(
             root_run_id,
         });
     }
-    if intent.continue_mode {
+    let workspace_shutdown_handoff = if intent.continue_mode {
         let run_id = intent
             .root_run_id
             .clone()
             .context("continued root startup has no accepted RunStore identity")?;
+        let handoff = validate_completed_workspace_shutdown_handoff(
+            ipc,
+            project_dir,
+            &run_id,
+            &intent.controller_epoch,
+        )
+        .await?;
         let pending = target.with_run_id(run_id);
         persist_pending_controller_ownership(project_dir, &pending).await?;
         let released =
@@ -6405,18 +6429,20 @@ async fn reconcile_interrupted_controller_startup(
             intent.phase = ControllerStartupPhase::Released;
             persist_controller_startup_intent(project_dir, &intent)?;
         }
-    }
+        handoff
+    } else {
+        None
+    };
     wait_for_tl_controller_startup(ipc, project_dir, target, &intent.controller_epoch).await?;
-    let final_run_id = read_root_run_id(project_dir)?;
-    let ownership = target.with_run_id(final_run_id);
-    persist_controller_ownership(project_dir, &ownership).await?;
-    if intent.continue_mode {
-        archive_completed_workspace_shutdown(project_dir, &ownership)?;
-    }
-    clear_pending_controller_ownership(project_dir, &intent.controller_epoch).await?;
-    clear_controller_startup_intent(project_dir, &intent.controller_epoch)?;
-    ipc.set_window_remain_on_exit(&target.window_id, false)
-        .await?;
+    commit_controller_startup_handoff(
+        ipc,
+        project_dir,
+        target,
+        &intent.controller_epoch,
+        workspace_shutdown_handoff.as_ref(),
+        archive,
+    )
+    .await?;
     Ok(InterruptedControllerStartup::Resumed)
 }
 
@@ -6479,12 +6505,27 @@ async fn launch_tl_recovery(
     }
     let previous_controller_epoch = read_controller_epoch_state(project_dir)?;
     let controller_epoch = allocate_controller_epoch();
-    let server = ipc.server_identity().await?;
     let root_run_id = if continue_mode {
         Some(read_root_run_id(project_dir)?)
     } else {
         None
     };
+    // The shutdown handoff is validated before the epoch marker, the startup
+    // fence, or the controller pane exist, so a rejected handoff cannot leave a
+    // released controller behind.
+    let workspace_shutdown_handoff = match root_run_id.as_deref() {
+        Some(run_id) if continue_mode => {
+            validate_completed_workspace_shutdown_handoff(
+                ipc,
+                project_dir,
+                run_id,
+                &controller_epoch,
+            )
+            .await?
+        }
+        _ => None,
+    };
+    let server = ipc.server_identity().await?;
     let mut startup_intent = ControllerStartupIntent {
         schema_version: 1,
         controller_epoch: controller_epoch.clone(),
@@ -6564,15 +6605,15 @@ async fn launch_tl_recovery(
     let startup =
         wait_for_tl_controller_startup(ipc, project_dir, &target, &controller_epoch).await;
     if startup.is_ok() {
-        let run_id = read_root_run_id(project_dir)?;
-        let ownership = target.with_run_id(run_id);
-        persist_controller_ownership(project_dir, &ownership).await?;
-        if continue_mode {
-            archive_completed_workspace_shutdown(project_dir, &ownership)?;
-        }
-        clear_pending_controller_ownership(project_dir, &controller_epoch).await?;
-        clear_controller_startup_intent(project_dir, &controller_epoch)?;
-        ipc.set_window_remain_on_exit(&tl_window, false).await?;
+        commit_controller_startup_handoff(
+            ipc,
+            project_dir,
+            &target,
+            &controller_epoch,
+            workspace_shutdown_handoff.as_ref(),
+            filesystem_workspace_shutdown_archive,
+        )
+        .await?;
     }
     startup
 }
@@ -6607,51 +6648,317 @@ async fn reconcile_continue_state_before_controller(
     Ok(())
 }
 
-fn archive_completed_workspace_shutdown(
+const WORKSPACE_SHUTDOWN_HANDOFF_SCOPE_MESSAGE: &str =
+    "workspace shutdown handoff is incomplete or belongs to another root scope";
+const WORKSPACE_SHUTDOWN_ARCHIVE_CONFLICT_MESSAGE: &str =
+    "workspace shutdown archive conflicts with its active intent";
+const WORKSPACE_SHUTDOWN_ARCHIVE_RELATIVE_DIR: &str = ".exo/controller-lifecycle/archive";
+const WORKSPACE_SHUTDOWN_ARCHIVE_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+
+/// A completed workspace-shutdown handoff that has been proven to belong to the
+/// current root run and to describe an earlier controller lifetime. The
+/// retained bytes are exactly what archival moves, so the archived record stays
+/// byte-identical to the intent it replaces and the operation stays idempotent.
+#[derive(Debug)]
+struct ValidatedWorkspaceShutdownHandoff {
+    intent: WorkspaceShutdownIntent,
+    active_path: PathBuf,
+    bytes: Vec<u8>,
+}
+
+fn workspace_shutdown_archive_path(archive_dir: &Path, operation_id: &str) -> PathBuf {
+    archive_dir.join(format!("{operation_id}.json"))
+}
+
+async fn read_optional_controller_ownership(
     project_dir: &Path,
-    current_target: &ControllerPaneOwnership,
-) -> Result<()> {
-    let path = project_dir.join(WORKSPACE_SHUTDOWN_RELATIVE_PATH);
-    let bytes = match std::fs::read(&path) {
+) -> Result<Option<ControllerPaneOwnership>> {
+    match read_controller_ownership(project_dir).await {
+        Ok(ownership) => Ok(Some(ownership)),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error).context("root controller ownership is malformed"),
+    }
+}
+
+async fn read_optional_pending_controller_ownership(
+    project_dir: &Path,
+) -> Result<Option<ControllerPaneOwnership>> {
+    let path = project_dir.join(ROOT_CONTROLLER_PENDING_OWNERSHIP_RELATIVE_PATH);
+    let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
     };
+    let target: ControllerPaneOwnership = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse pending root controller target {}", path.display()))?;
+    target.validate()?;
+    Ok(Some(target))
+}
+
+/// Observe one recorded controller target without consulting the epoch marker.
+/// The caller already knows who owns which epoch; this only answers whether the
+/// exact recorded pane is still live on the exact recorded tmux server
+/// lifetime. A different server lifetime means the recorded pane cannot be live
+/// because numeric window/pane ids can be recycled by a fresh server.
+async fn controller_target_is_live_on_recorded_server(
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+    target: &ControllerPaneOwnership,
+) -> Result<bool> {
+    target.validate()?;
+    if target.tmux_session != ipc.session_name() {
+        return Ok(false);
+    }
+    let server = ipc.server_identity().await?;
+    if server.pid != target.tmux_server_pid || server.start_ticks != target.tmux_server_start_ticks
+    {
+        return Ok(false);
+    }
+    let Some(pane) = ipc
+        .pane_snapshot(&target.tmux_session, &target.window_id, &target.pane_id)
+        .await?
+    else {
+        return Ok(false);
+    };
+    Ok(!pane.dead && pane.pid == target.pane_pid)
+}
+
+/// Prove a durable workspace-shutdown handoff is complete, belongs to the run
+/// this startup is continuing, describes an already-ended controller lifetime,
+/// and can be archived. The tmux session name is recorded evidence, not
+/// identity: a `--session` override must still be able to adopt the same run's
+/// completed handoff.
+///
+/// Epoch scope: the handoff epoch is compared by equality (never by parsing or
+/// ordering) against the epoch this startup is about to release, against any
+/// pending target epoch, and against the epoch of a committed controller target
+/// whose exact pane is still live on its recorded tmux server. It is
+/// deliberately NOT compared with the latest epoch marker: a later failed
+/// `init --continue` may have advanced that marker while the completed handoff
+/// still names the earlier stopped lifetime, and a retry must adopt it. A
+/// committed target that is no longer live is retained historical evidence of a
+/// lifetime that already ended, including the very lifetime this handoff names
+/// after a supported `shutdown --workspace`.
+async fn validate_completed_workspace_shutdown_handoff(
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+    project_dir: &Path,
+    expected_run_id: &str,
+    starting_controller_epoch: &str,
+) -> Result<Option<ValidatedWorkspaceShutdownHandoff>> {
+    let active_path = project_dir.join(WORKSPACE_SHUTDOWN_RELATIVE_PATH);
+    let bytes = match std::fs::read(&active_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("read {}", active_path.display())),
+    };
     let intent: WorkspaceShutdownIntent = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse workspace shutdown intent {}", path.display()))?;
-    if intent.schema_version != 1
-        || intent.phase != WorkspaceShutdownPhase::Complete
-        || intent.operation_id.trim().is_empty()
-        || intent.target.run_id != current_target.run_id
-        || intent.target.tmux_session != current_target.tmux_session
-    {
-        anyhow::bail!("workspace shutdown handoff is incomplete or belongs to another root scope");
-    }
-    if !intent
-        .operation_id
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || character == '-')
-    {
-        anyhow::bail!("workspace shutdown operation ID is unsafe for archival");
-    }
-    let archive_dir = project_dir.join(".exo/controller-lifecycle/archive");
-    std::fs::create_dir_all(&archive_dir)?;
-    let archive = archive_dir.join(format!("{}.json", intent.operation_id));
-    if archive.exists() {
-        let retained = std::fs::read(&archive)?;
-        if retained != bytes {
-            anyhow::bail!("workspace shutdown archive conflicts with its active intent");
+        .with_context(|| format!("parse workspace shutdown intent {}", active_path.display()))?;
+    anyhow::ensure!(
+        intent.schema_version == 1
+            && intent.phase == WorkspaceShutdownPhase::Complete
+            && intent.target.run_id == expected_run_id,
+        WORKSPACE_SHUTDOWN_HANDOFF_SCOPE_MESSAGE
+    );
+    anyhow::ensure!(
+        intent.target.validate().is_ok(),
+        WORKSPACE_SHUTDOWN_HANDOFF_SCOPE_MESSAGE
+    );
+    anyhow::ensure!(
+        !intent.operation_id.trim().is_empty()
+            && intent
+                .operation_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-'),
+        "workspace shutdown operation ID is unsafe for archival"
+    );
+    // A conflicting archive is a validation failure, not a post-release
+    // discovery: the same bytes may already be archived (idempotent) but a
+    // different record under the same operation id can never be adopted.
+    let archive = workspace_shutdown_archive_path(
+        &project_dir.join(WORKSPACE_SHUTDOWN_ARCHIVE_RELATIVE_DIR),
+        &intent.operation_id,
+    );
+    match std::fs::read(&archive) {
+        Ok(retained) => anyhow::ensure!(
+            retained == bytes,
+            WORKSPACE_SHUTDOWN_ARCHIVE_CONFLICT_MESSAGE
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", archive.display()));
         }
-        std::fs::remove_file(&path)?;
+    }
+    // The handoff describes a controller lifetime that already ended. It can
+    // never describe the controller this startup is about to release, and it
+    // can never describe an uncommitted startup target.
+    anyhow::ensure!(
+        intent.target.controller_epoch != starting_controller_epoch,
+        WORKSPACE_SHUTDOWN_HANDOFF_SCOPE_MESSAGE
+    );
+    if let Some(pending) = read_optional_pending_controller_ownership(project_dir).await? {
+        anyhow::ensure!(
+            pending.controller_epoch != intent.target.controller_epoch,
+            WORKSPACE_SHUTDOWN_HANDOFF_SCOPE_MESSAGE
+        );
+    }
+    if let Some(committed) = read_optional_controller_ownership(project_dir).await? {
+        if committed.controller_epoch == intent.target.controller_epoch
+            && controller_target_is_live_on_recorded_server(ipc, &committed).await?
+        {
+            anyhow::bail!(WORKSPACE_SHUTDOWN_HANDOFF_SCOPE_MESSAGE);
+        }
+    }
+    Ok(Some(ValidatedWorkspaceShutdownHandoff {
+        intent,
+        active_path,
+        bytes,
+    }))
+}
+
+/// Adjacent evidence for one archived handoff. It records the adopting session
+/// and controller epoch without touching the archived bytes, so idempotence
+/// keeps comparing the exact retained intent.
+#[derive(Serialize)]
+struct WorkspaceShutdownArchiveEvidence<'a> {
+    schema_version: u32,
+    operation_id: &'a str,
+    run_id: &'a str,
+    recorded_tmux_session: &'a str,
+    adopting_tmux_session: &'a str,
+    recorded_controller_epoch: &'a str,
+    adopting_controller_epoch: &'a str,
+    archived_at: u64,
+}
+
+fn workspace_shutdown_archive_evidence_path(archive_dir: &Path, operation_id: &str) -> PathBuf {
+    archive_dir.join(format!("{operation_id}.evidence.json"))
+}
+
+fn write_workspace_shutdown_archive_evidence(
+    archive_dir: &Path,
+    handoff: &ValidatedWorkspaceShutdownHandoff,
+    adopting_tmux_session: &str,
+    adopting_controller_epoch: &str,
+) -> Result<()> {
+    let path =
+        workspace_shutdown_archive_evidence_path(archive_dir, handoff.intent.operation_id.as_str());
+    if path.exists() {
+        // A previous attempt recorded this archive's adoption evidence; the
+        // archived bytes are what prove identity, so leave it untouched.
+        return Ok(());
+    }
+    let evidence = WorkspaceShutdownArchiveEvidence {
+        schema_version: WORKSPACE_SHUTDOWN_ARCHIVE_EVIDENCE_SCHEMA_VERSION,
+        operation_id: handoff.intent.operation_id.as_str(),
+        run_id: handoff.intent.target.run_id.as_str(),
+        recorded_tmux_session: handoff.intent.target.tmux_session.as_str(),
+        adopting_tmux_session,
+        recorded_controller_epoch: handoff.intent.target.controller_epoch.as_str(),
+        adopting_controller_epoch,
+        archived_at: (current_time_millis() / 1000) as u64,
+    };
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, serde_json::to_vec_pretty(&evidence)?).with_context(|| {
+        format!(
+            "write workspace shutdown archive evidence {}",
+            temporary.display()
+        )
+    })?;
+    std::fs::rename(&temporary, &path).with_context(|| {
+        format!(
+            "record workspace shutdown archive evidence {}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Move one validated, completed handoff into the operation-keyed archive.
+///
+/// The archive is keyed by operation id and the retained bytes must match the
+/// active intent exactly; a conflicting archive still fails. An existing
+/// identical archive only removes the active intent, so a retried archival has
+/// no duplicate effect.
+fn filesystem_workspace_shutdown_archive(
+    project_dir: &Path,
+    handoff: &ValidatedWorkspaceShutdownHandoff,
+    adopting_tmux_session: &str,
+    adopting_controller_epoch: &str,
+) -> Result<()> {
+    let archive_dir = project_dir.join(WORKSPACE_SHUTDOWN_ARCHIVE_RELATIVE_DIR);
+    std::fs::create_dir_all(&archive_dir)?;
+    let archive = workspace_shutdown_archive_path(&archive_dir, &handoff.intent.operation_id);
+    let archive_exists = archive.exists();
+    if archive_exists {
+        // Validation already proved this cannot conflict; keep the check so a
+        // direct caller can never overwrite a different retained record.
+        let retained = std::fs::read(&archive)?;
+        if retained != handoff.bytes {
+            anyhow::bail!(WORKSPACE_SHUTDOWN_ARCHIVE_CONFLICT_MESSAGE);
+        }
+    }
+    write_workspace_shutdown_archive_evidence(
+        &archive_dir,
+        handoff,
+        adopting_tmux_session,
+        adopting_controller_epoch,
+    )?;
+    if archive_exists {
+        std::fs::remove_file(&handoff.active_path)?;
     } else {
-        std::fs::rename(&path, &archive).with_context(|| {
+        std::fs::rename(&handoff.active_path, &archive).with_context(|| {
             format!(
                 "archive completed workspace shutdown intent {}",
-                path.display()
+                handoff.active_path.display()
             )
         })?;
     }
     std::fs::File::open(&archive_dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Finish one controller startup exactly once: commit its ownership, archive a
+/// validated workspace-shutdown handoff, then retire the pending target and
+/// startup fence.
+///
+/// Every error after controller release leaves the pending target and startup
+/// fence intact with the controller pane retained, which is the state
+/// [`reconcile_interrupted_controller_startup`] re-adopts on `init --continue`.
+async fn commit_controller_startup_handoff<A>(
+    ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
+    project_dir: &Path,
+    target: &ControllerPaneTarget,
+    controller_epoch: &str,
+    workspace_shutdown_handoff: Option<&ValidatedWorkspaceShutdownHandoff>,
+    archive: A,
+) -> Result<()>
+where
+    A: FnOnce(&Path, &ValidatedWorkspaceShutdownHandoff, &str, &str) -> Result<()>,
+{
+    let run_id = read_root_run_id(project_dir)?;
+    let ownership = target.with_run_id(run_id);
+    persist_controller_ownership(project_dir, &ownership).await?;
+    if let Some(handoff) = workspace_shutdown_handoff {
+        archive(
+            project_dir,
+            handoff,
+            target.tmux_session.as_str(),
+            controller_epoch,
+        )
+        .with_context(|| {
+            "workspace shutdown handoff could not be archived after the controller committed; \
+             the retained startup fence and pending target stay resumable for init --continue"
+        })?;
+    }
+    clear_pending_controller_ownership(project_dir, controller_epoch).await?;
+    clear_controller_startup_intent(project_dir, controller_epoch)?;
+    ipc.set_window_remain_on_exit(&target.window_id, false)
+        .await?;
     Ok(())
 }
 
@@ -13665,6 +13972,1183 @@ mod tests {
             tl_windows, 1,
             "recovery adopts the exact created target once"
         );
+    }
+
+    struct ControllerStartupHandoffFixture {
+        _socket: TmuxSocketRestore,
+        dir: tempfile::TempDir,
+        ipc: exomonad_core::services::tmux_ipc::TmuxIpc,
+        session: String,
+        target: Option<ControllerPaneTarget>,
+    }
+
+    impl ControllerStartupHandoffFixture {
+        async fn start(
+            tag: &str,
+            controller_epoch: &str,
+            previous_epoch: Option<&str>,
+            run_id: &str,
+        ) -> Self {
+            Self::start_with_command(tag, controller_epoch, previous_epoch, run_id, |_| {
+                "sleep 300".to_owned()
+            })
+            .await
+        }
+
+        async fn start_with_command<F>(
+            tag: &str,
+            controller_epoch: &str,
+            previous_epoch: Option<&str>,
+            run_id: &str,
+            command: F,
+        ) -> Self
+        where
+            F: FnOnce(&Path) -> String,
+        {
+            use exomonad_core::services::tmux_ipc::TmuxIpc;
+
+            let previous_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
+            let socket = format!("exo-shutdown-handoff-{}-{tag}", std::process::id());
+            std::env::set_var("EXOMONAD_TMUX_SOCKET", &socket);
+            let socket_restore = TmuxSocketRestore {
+                socket: socket.clone(),
+                previous: previous_socket,
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let session = format!("exo-shutdown-handoff-{}-{tag}", std::process::id());
+            let status = Command::new("tmux")
+                .args([
+                    "-L",
+                    &socket,
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &session,
+                    "-n",
+                    "root",
+                    "sleep",
+                    "300",
+                ])
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE")
+                .status()
+                .expect("start the isolated controller handoff tmux server");
+            assert!(status.success(), "isolated tmux session starts");
+            let ipc = TmuxIpc::new(&session);
+            let root = dir.path().join(".exo/tl-loop/root");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join("run.json"),
+                format!(r#"{{"run_id":"{run_id}","fsm":{{"phase":"tl_running"}}}}"#),
+            )
+            .unwrap();
+            let mut fixture = Self {
+                _socket: socket_restore,
+                dir,
+                ipc,
+                session,
+                target: None,
+            };
+            let command = command(fixture.project_dir());
+            let target = fixture
+                .begin_controller_attempt(controller_epoch, previous_epoch, run_id, &command)
+                .await;
+            fixture.target = Some(target);
+            fixture
+        }
+
+        fn project_dir(&self) -> &Path {
+            self.dir.path()
+        }
+
+        fn target(&self) -> &ControllerPaneTarget {
+            self.target.as_ref().expect("fixture has an attempt")
+        }
+
+        /// Start one more controller attempt in this fixture's project, tmux
+        /// server and session, exactly as `launch_tl_recovery` would: allocate
+        /// (or accept) the epoch, advance the epoch marker, persist the startup
+        /// fence with the previous marker, then create the gated pane.
+        async fn begin_controller_attempt(
+            &self,
+            controller_epoch: &str,
+            previous_epoch: Option<&str>,
+            run_id: &str,
+            command: &str,
+        ) -> ControllerPaneTarget {
+            let server = self.ipc.server_identity().await.unwrap();
+            let previous_marker = read_controller_epoch_state(self.project_dir()).unwrap();
+            let previous = previous_epoch.map(str::to_owned).or(previous_marker);
+            let target = self.spawn_controller_pane(controller_epoch, command).await;
+            std::fs::write(
+                controller_epoch_path(self.project_dir()),
+                format!("{controller_epoch}\n"),
+            )
+            .unwrap();
+            let intent = ControllerStartupIntent {
+                schema_version: 1,
+                controller_epoch: controller_epoch.to_owned(),
+                previous_controller_epoch: previous,
+                tmux_session: self.session.clone(),
+                tmux_server_pid: server.pid,
+                tmux_server_start_ticks: server.start_ticks,
+                continue_mode: true,
+                root_run_id: Some(run_id.to_owned()),
+                target: Some(target.clone()),
+                phase: ControllerStartupPhase::TargetCreated,
+            };
+            persist_controller_startup_intent(self.project_dir(), &intent).unwrap();
+            persist_pending_controller_ownership(self.project_dir(), &target.with_run_id(run_id))
+                .await
+                .unwrap();
+            target
+        }
+
+        /// Create one extra controller-shaped pane and capture its exact target
+        /// without touching the epoch marker, startup fence or pending record.
+        /// Used to seed a stopped committed target from an earlier attempt.
+        async fn spawn_controller_pane(
+            &self,
+            controller_epoch: &str,
+            command: &str,
+        ) -> ControllerPaneTarget {
+            let created = self
+                .ipc
+                .new_window_with_environment(
+                    "TL",
+                    self.project_dir(),
+                    "/bin/sh",
+                    command,
+                    &[("EXOMONAD_CONTROLLER_EPOCH", controller_epoch)],
+                )
+                .await
+                .unwrap();
+            self.ipc
+                .set_window_remain_on_exit(&created.window_id, true)
+                .await
+                .unwrap();
+            capture_controller_pane_target(
+                &self.ipc,
+                controller_epoch,
+                created.window_id,
+                created.pane_id,
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn kill_controller_pane(&self, target: &ControllerPaneTarget) {
+            self.ipc.kill_pane(&target.pane_id).await.unwrap();
+        }
+
+        async fn controller_pane_is_dead(&self, target: &ControllerPaneTarget) -> bool {
+            match self
+                .ipc
+                .pane_snapshot(&self.session, &target.window_id, &target.pane_id)
+                .await
+                .unwrap()
+            {
+                Some(pane) => pane.dead,
+                None => true,
+            }
+        }
+
+        async fn wait_until_controller_pane_stops(&self, target: &ControllerPaneTarget) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !self.controller_pane_is_dead(target).await {
+                assert!(
+                    Instant::now() < deadline,
+                    "the controller pane must stop when startup does not commit"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        async fn assert_controller_pane_live(&self) {
+            self.assert_target_pane_live(self.target()).await;
+        }
+
+        async fn assert_target_pane_live(&self, target: &ControllerPaneTarget) {
+            let pane = self
+                .ipc
+                .pane_snapshot(&self.session, &target.window_id, &target.pane_id)
+                .await
+                .unwrap()
+                .expect("the retained controller pane is observable");
+            assert!(!pane.dead, "the retained controller pane stays alive");
+            assert_eq!(pane.pid, target.pane_pid);
+        }
+
+        async fn tl_window_count(&self) -> usize {
+            self.ipc
+                .list_windows()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|window| window.window_name == "TL")
+                .count()
+        }
+    }
+
+    fn workspace_shutdown_handoff(
+        operation_id: &str,
+        run_id: &str,
+        controller_epoch: &str,
+        tmux_session: &str,
+    ) -> WorkspaceShutdownIntent {
+        WorkspaceShutdownIntent {
+            schema_version: 1,
+            operation_id: operation_id.to_owned(),
+            phase: WorkspaceShutdownPhase::Complete,
+            requested_at: 1,
+            completed_at: Some(2),
+            target: exomonad_core::services::agent_control::ControllerPaneOwnership {
+                schema_version: 1,
+                controller_epoch: controller_epoch.to_owned(),
+                run_id: run_id.to_owned(),
+                tmux_session: tmux_session.to_owned(),
+                window_id: WindowId::parse("@41").unwrap(),
+                pane_id: PaneId::parse("%41").unwrap(),
+                pane_pid: 4321,
+                pane_start_ticks: 8765,
+                tmux_server_pid: 999,
+                tmux_server_start_ticks: 111,
+            },
+            controllers: Vec::new(),
+            preserved_worker_panes: 0,
+            blocker: None,
+        }
+    }
+
+    fn write_workspace_shutdown_handoff(
+        project_dir: &Path,
+        intent: &WorkspaceShutdownIntent,
+    ) -> Vec<u8> {
+        let path = project_dir.join(WORKSPACE_SHUTDOWN_RELATIVE_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = serde_json::to_vec_pretty(intent).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        bytes
+    }
+
+    fn handoff_archive_path(project_dir: &Path, operation_id: &str) -> PathBuf {
+        project_dir
+            .join(WORKSPACE_SHUTDOWN_ARCHIVE_RELATIVE_DIR)
+            .join(format!("{operation_id}.json"))
+    }
+
+    fn handoff_evidence_path(project_dir: &Path, operation_id: &str) -> PathBuf {
+        project_dir
+            .join(WORKSPACE_SHUTDOWN_ARCHIVE_RELATIVE_DIR)
+            .join(format!("{operation_id}.evidence.json"))
+    }
+
+    fn assert_handoff_evidence(
+        project_dir: &Path,
+        operation_id: &str,
+        recorded_session: &str,
+        adopting_session: &str,
+        run_id: &str,
+        recorded_epoch: &str,
+        adopting_epoch: &str,
+    ) {
+        let path = handoff_evidence_path(project_dir, operation_id);
+        let evidence: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(evidence["schema_version"], 1);
+        assert_eq!(evidence["operation_id"], operation_id);
+        assert_eq!(evidence["run_id"], run_id);
+        assert_eq!(evidence["recorded_tmux_session"], recorded_session);
+        assert_eq!(evidence["adopting_tmux_session"], adopting_session);
+        assert_eq!(evidence["recorded_controller_epoch"], recorded_epoch);
+        assert_eq!(evidence["adopting_controller_epoch"], adopting_epoch);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn completed_workspace_shutdown_handoff_is_archived_in_the_same_session() {
+        let previous = "controller-previous-same";
+        let current = "controller-current-same";
+        let fixture =
+            ControllerStartupHandoffFixture::start("same", current, Some(previous), "root").await;
+        let handoff =
+            workspace_shutdown_handoff("op-same-session", "root", previous, &fixture.session);
+        let active_bytes = write_workspace_shutdown_handoff(fixture.project_dir(), &handoff);
+
+        assert_eq!(
+            reconcile_interrupted_controller_startup(&fixture.ipc, fixture.project_dir())
+                .await
+                .unwrap(),
+            InterruptedControllerStartup::Resumed
+        );
+
+        let archive = handoff_archive_path(fixture.project_dir(), "op-same-session");
+        assert_eq!(
+            std::fs::read(&archive).unwrap(),
+            active_bytes,
+            "the archive stays byte-identical to the completed intent"
+        );
+        assert!(!fixture
+            .project_dir()
+            .join(WORKSPACE_SHUTDOWN_RELATIVE_PATH)
+            .exists());
+        assert_handoff_evidence(
+            fixture.project_dir(),
+            "op-same-session",
+            &fixture.session,
+            &fixture.session,
+            "root",
+            previous,
+            current,
+        );
+        let ownership = read_controller_ownership(fixture.project_dir())
+            .await
+            .unwrap();
+        assert_eq!(ownership.run_id, "root");
+        assert_eq!(ownership.controller_epoch, current);
+        assert!(!fixture
+            .project_dir()
+            .join(exomonad_core::services::agent_control::ROOT_CONTROLLER_PENDING_OWNERSHIP_RELATIVE_PATH)
+            .exists());
+        assert!(read_controller_startup_intent(fixture.project_dir())
+            .unwrap()
+            .is_none());
+        assert_eq!(fixture.tl_window_count().await, 1);
+        fixture.assert_controller_pane_live().await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn completed_workspace_shutdown_handoff_adopts_a_session_override_for_the_same_run() {
+        let previous = "controller-previous-override";
+        let current = "controller-current-override";
+        let fixture =
+            ControllerStartupHandoffFixture::start("override", current, Some(previous), "root")
+                .await;
+        // The supported shutdown recorded the default session; this run was
+        // continued through an explicit --session override.
+        let recorded_session = "workspace";
+        let handoff =
+            workspace_shutdown_handoff("op-session-override", "root", previous, recorded_session);
+        let active_bytes = write_workspace_shutdown_handoff(fixture.project_dir(), &handoff);
+
+        assert_eq!(
+            reconcile_interrupted_controller_startup(&fixture.ipc, fixture.project_dir())
+                .await
+                .unwrap(),
+            InterruptedControllerStartup::Resumed
+        );
+
+        assert_eq!(
+            std::fs::read(handoff_archive_path(
+                fixture.project_dir(),
+                "op-session-override"
+            ))
+            .unwrap(),
+            active_bytes
+        );
+        assert_handoff_evidence(
+            fixture.project_dir(),
+            "op-session-override",
+            recorded_session,
+            &fixture.session,
+            "root",
+            previous,
+            current,
+        );
+        assert!(read_controller_startup_intent(fixture.project_dir())
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn completed_handoff_adopts_its_own_stopped_committed_controller_lifetime() {
+        let shutdown_epoch = "controller-shutdown-own";
+        let current = "controller-current-own";
+        let fixture =
+            ControllerStartupHandoffFixture::start("own", current, Some(shutdown_epoch), "root")
+                .await;
+        // A supported `shutdown --workspace` leaves the stopped lifetime as the
+        // committed ownership record. Its epoch equals the handoff epoch, and
+        // that must stay adoptable because the exact pane has ended.
+        let stopped = fixture
+            .spawn_controller_pane(shutdown_epoch, "sleep 300")
+            .await;
+        fixture.kill_controller_pane(&stopped).await;
+        persist_controller_ownership(fixture.project_dir(), &stopped.with_run_id("root"))
+            .await
+            .unwrap();
+        let handoff =
+            workspace_shutdown_handoff("op-own-stopped", "root", shutdown_epoch, &fixture.session);
+        let active_bytes = write_workspace_shutdown_handoff(fixture.project_dir(), &handoff);
+
+        assert_eq!(
+            reconcile_interrupted_controller_startup(&fixture.ipc, fixture.project_dir())
+                .await
+                .unwrap(),
+            InterruptedControllerStartup::Resumed
+        );
+        assert_eq!(
+            std::fs::read(handoff_archive_path(
+                fixture.project_dir(),
+                "op-own-stopped"
+            ))
+            .unwrap(),
+            active_bytes
+        );
+        let ownership = read_controller_ownership(fixture.project_dir())
+            .await
+            .unwrap();
+        assert_eq!(ownership.controller_epoch, current);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn prior_failed_continue_epoch_does_not_block_the_completed_handoff() {
+        let shutdown_epoch = "controller-shutdown-before-failure";
+        let failed_epoch = "controller-failed-continue";
+        let current = "controller-retry-continue";
+        // A later failed `init --continue` advanced the epoch marker and left a
+        // stopped committed target. The completed handoff still names the
+        // earlier lifetime that the supported shutdown stopped.
+        let fixture = ControllerStartupHandoffFixture::start(
+            "prior-failed",
+            current,
+            Some(failed_epoch),
+            "root",
+        )
+        .await;
+        let failed = fixture
+            .spawn_controller_pane(failed_epoch, "sleep 300")
+            .await;
+        fixture.kill_controller_pane(&failed).await;
+        persist_controller_ownership(fixture.project_dir(), &failed.with_run_id("root"))
+            .await
+            .unwrap();
+        let handoff =
+            workspace_shutdown_handoff("op-prior-failed", "root", shutdown_epoch, &fixture.session);
+        let active_bytes = write_workspace_shutdown_handoff(fixture.project_dir(), &handoff);
+
+        assert_eq!(
+            reconcile_interrupted_controller_startup(&fixture.ipc, fixture.project_dir())
+                .await
+                .unwrap(),
+            InterruptedControllerStartup::Resumed,
+            "a handoff for an ended lifetime must be adopted after a later epoch marker"
+        );
+        assert_eq!(
+            std::fs::read(handoff_archive_path(
+                fixture.project_dir(),
+                "op-prior-failed"
+            ))
+            .unwrap(),
+            active_bytes
+        );
+        assert_handoff_evidence(
+            fixture.project_dir(),
+            "op-prior-failed",
+            &fixture.session,
+            &fixture.session,
+            "root",
+            shutdown_epoch,
+            current,
+        );
+        let ownership = read_controller_ownership(fixture.project_dir())
+            .await
+            .unwrap();
+        assert_eq!(ownership.controller_epoch, current);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn completed_handoff_naming_a_live_committed_controller_fails_before_release() {
+        let handoff_epoch = "controller-live-committed";
+        let current = "controller-current-live-committed";
+        let fixture = ControllerStartupHandoffFixture::start(
+            "live-committed",
+            current,
+            Some(handoff_epoch),
+            "root",
+        )
+        .await;
+        // The committed ownership record still has a live exact pane, so this
+        // epoch is owned by a current controller and cannot be an ended
+        // lifetime named by a completed shutdown handoff.
+        let live = fixture
+            .spawn_controller_pane(handoff_epoch, "sleep 300")
+            .await;
+        persist_controller_ownership(fixture.project_dir(), &live.with_run_id("root"))
+            .await
+            .unwrap();
+        let handoff = workspace_shutdown_handoff(
+            "op-live-committed",
+            "root",
+            handoff_epoch,
+            &fixture.session,
+        );
+        write_workspace_shutdown_handoff(fixture.project_dir(), &handoff);
+
+        let error = reconcile_interrupted_controller_startup(&fixture.ipc, fixture.project_dir())
+            .await
+            .expect_err("a handoff naming a live controller lifetime must fail");
+        assert!(
+            format!("{error:#}").contains(WORKSPACE_SHUTDOWN_HANDOFF_SCOPE_MESSAGE),
+            "unexpected diagnostic: {error:#}"
+        );
+        assert!(
+            !controller_start_release_path(fixture.project_dir(), current).exists(),
+            "the controller must not be released"
+        );
+        let ownership = read_controller_ownership(fixture.project_dir())
+            .await
+            .unwrap();
+        assert_eq!(
+            ownership.controller_epoch, handoff_epoch,
+            "no new ownership is committed by the rejected startup"
+        );
+        assert!(fixture
+            .project_dir()
+            .join(WORKSPACE_SHUTDOWN_RELATIVE_PATH)
+            .exists());
+        assert_handoff_evidence_is_absent(fixture.project_dir(), "op-live-committed");
+        fixture.assert_target_pane_live(&live).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn completed_handoff_naming_the_starting_epoch_fails_before_release() {
+        let previous = "controller-previous-starting";
+        let current = "controller-current-starting";
+        let fixture =
+            ControllerStartupHandoffFixture::start("starting", current, Some(previous), "root")
+                .await;
+        let handoff =
+            workspace_shutdown_handoff("op-starting-epoch", "root", current, &fixture.session);
+        write_workspace_shutdown_handoff(fixture.project_dir(), &handoff);
+
+        let error = reconcile_interrupted_controller_startup(&fixture.ipc, fixture.project_dir())
+            .await
+            .expect_err("a handoff naming the starting epoch must fail");
+        assert!(format!("{error:#}").contains(WORKSPACE_SHUTDOWN_HANDOFF_SCOPE_MESSAGE));
+        assert!(!controller_start_release_path(fixture.project_dir(), current).exists());
+        assert!(!fixture
+            .project_dir()
+            .join(ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH)
+            .exists());
+        assert!(read_controller_startup_intent(fixture.project_dir())
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn conflicting_workspace_shutdown_archive_fails_before_controller_release() {
+        let previous = "controller-previous-conflict";
+        let current = "controller-current-conflict";
+        let fixture =
+            ControllerStartupHandoffFixture::start("conflict", current, Some(previous), "root")
+                .await;
+        let handoff = workspace_shutdown_handoff("op-conflict", "root", previous, &fixture.session);
+        write_workspace_shutdown_handoff(fixture.project_dir(), &handoff);
+        let archive = handoff_archive_path(fixture.project_dir(), "op-conflict");
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        std::fs::write(&archive, b"{\"different\":true}").unwrap();
+
+        let error = reconcile_interrupted_controller_startup(&fixture.ipc, fixture.project_dir())
+            .await
+            .expect_err("a conflicting archive must fail before release");
+        assert!(
+            format!("{error:#}").contains(WORKSPACE_SHUTDOWN_ARCHIVE_CONFLICT_MESSAGE),
+            "unexpected diagnostic: {error:#}"
+        );
+        assert!(
+            !controller_start_release_path(fixture.project_dir(), current).exists(),
+            "the controller must not be released"
+        );
+        assert!(!fixture
+            .project_dir()
+            .join(ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH)
+            .exists());
+        assert!(read_controller_startup_intent(fixture.project_dir())
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            read_controller_epoch_state(fixture.project_dir())
+                .unwrap()
+                .as_deref(),
+            Some(current)
+        );
+        assert!(fixture
+            .project_dir()
+            .join(WORKSPACE_SHUTDOWN_RELATIVE_PATH)
+            .exists());
+        assert_eq!(std::fs::read(&archive).unwrap(), b"{\"different\":true}");
+        fixture.assert_controller_pane_live().await;
+    }
+
+    /// A controller that waits for init's startup commit exactly like
+    /// `tl_loop.loop.startup_handoff`: the startup fence must disappear and the
+    /// final `controller-target.json` ownership must exist for this run/epoch.
+    /// When startup never completes, it gives up on its own and exits.
+    fn controller_that_stops_when_startup_does_not_commit(project_dir: &Path) -> String {
+        let intent = shell_escape::escape(
+            controller_startup_intent_path(project_dir)
+                .display()
+                .to_string()
+                .into(),
+        );
+        let owner = shell_escape::escape(
+            project_dir
+                .join(ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH)
+                .display()
+                .to_string()
+                .into(),
+        );
+        format!(
+            "attempts=0; while [ \"$attempts\" -lt 70 ]; do \
+             if [ ! -f {intent} ] && [ -f {owner} ]; then sleep 300; exit 0; fi; \
+             attempts=$((attempts + 1)); sleep 0.1; done; exit 1"
+        )
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn post_release_archive_failure_then_stopped_pane_retry_archives_the_handoff_once() {
+        let shutdown_epoch = "controller-shutdown-retry";
+        let failed_epoch = "controller-failed-retry";
+        let retry_epoch = "controller-second-retry";
+        let fixture = ControllerStartupHandoffFixture::start_with_command(
+            "retry",
+            failed_epoch,
+            Some(shutdown_epoch),
+            "root",
+            controller_that_stops_when_startup_does_not_commit,
+        )
+        .await;
+        let handoff =
+            workspace_shutdown_handoff("op-retry-once", "root", shutdown_epoch, &fixture.session);
+        let active_bytes = write_workspace_shutdown_handoff(fixture.project_dir(), &handoff);
+
+        let error = reconcile_interrupted_controller_startup_with_archive(
+            &fixture.ipc,
+            fixture.project_dir(),
+            |_: &Path, _: &ValidatedWorkspaceShutdownHandoff, _: &str, _: &str| {
+                Err(anyhow::anyhow!("injected post-release archive failure"))
+            },
+        )
+        .await
+        .expect_err("the injected archive failure must fail the commit");
+        assert!(format!("{error:#}").contains("injected post-release archive failure"));
+        assert!(format!("{error:#}").contains("resumable"));
+        assert!(controller_start_release_path(fixture.project_dir(), failed_epoch).exists());
+        assert_eq!(
+            read_controller_ownership(fixture.project_dir())
+                .await
+                .unwrap()
+                .controller_epoch,
+            failed_epoch
+        );
+        assert!(read_controller_startup_intent(fixture.project_dir())
+            .unwrap()
+            .is_some());
+        assert!(fixture
+            .project_dir()
+            .join(WORKSPACE_SHUTDOWN_RELATIVE_PATH)
+            .exists());
+        assert_handoff_evidence_is_absent(fixture.project_dir(), "op-retry-once");
+
+        // The retained controller waits for the startup fence to disappear and
+        // the exact ownership to commit; because startup never committed it
+        // stops on its own.
+        fixture
+            .wait_until_controller_pane_stops(fixture.target())
+            .await;
+
+        // Next `init --continue`: the stopped-pane recovery commits the stopped
+        // target and clears the fence without archiving the still-active
+        // handoff.
+        assert_eq!(
+            reconcile_interrupted_controller_startup(&fixture.ipc, fixture.project_dir())
+                .await
+                .unwrap(),
+            InterruptedControllerStartup::TargetStopped {
+                original_continue_mode: true,
+                root_run_id: Some("root".to_owned()),
+            }
+        );
+        assert!(fixture
+            .project_dir()
+            .join(WORKSPACE_SHUTDOWN_RELATIVE_PATH)
+            .exists());
+        assert_handoff_evidence_is_absent(fixture.project_dir(), "op-retry-once");
+        assert!(read_controller_startup_intent(fixture.project_dir())
+            .unwrap()
+            .is_none());
+        assert!(!fixture
+            .project_dir()
+            .join(ROOT_CONTROLLER_PENDING_OWNERSHIP_RELATIVE_PATH)
+            .exists());
+
+        // The relaunch creates exactly one new controller epoch; the next
+        // startup must adopt the earlier completed handoff and archive it once.
+        let retry_target = fixture
+            .begin_controller_attempt(retry_epoch, None, "root", "sleep 300")
+            .await;
+        assert_eq!(
+            reconcile_interrupted_controller_startup(&fixture.ipc, fixture.project_dir())
+                .await
+                .unwrap(),
+            InterruptedControllerStartup::Resumed
+        );
+        assert_eq!(
+            std::fs::read(handoff_archive_path(fixture.project_dir(), "op-retry-once")).unwrap(),
+            active_bytes
+        );
+        assert!(!fixture
+            .project_dir()
+            .join(WORKSPACE_SHUTDOWN_RELATIVE_PATH)
+            .exists());
+        assert_handoff_evidence(
+            fixture.project_dir(),
+            "op-retry-once",
+            &fixture.session,
+            &fixture.session,
+            "root",
+            shutdown_epoch,
+            retry_epoch,
+        );
+        let ownership = read_controller_ownership(fixture.project_dir())
+            .await
+            .unwrap();
+        assert_eq!(ownership.controller_epoch, retry_epoch);
+        assert!(read_controller_startup_intent(fixture.project_dir())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            fixture.tl_window_count().await,
+            1,
+            "the retry owns the only TL window"
+        );
+        assert!(
+            fixture.controller_pane_is_dead(fixture.target()).await,
+            "the failed attempt's pane is not revived"
+        );
+        let archived_files = std::fs::read_dir(
+            fixture
+                .project_dir()
+                .join(WORKSPACE_SHUTDOWN_ARCHIVE_RELATIVE_DIR),
+        )
+        .unwrap()
+        .filter_map(Result::ok)
+        .count();
+        assert_eq!(
+            archived_files, 2,
+            "exactly one archived handoff and one evidence record"
+        );
+        fixture.assert_target_pane_live(&retry_target).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn incomplete_workspace_shutdown_handoff_fails_before_controller_release() {
+        let previous = "controller-previous-incomplete";
+        let current = "controller-current-incomplete";
+        let fixture =
+            ControllerStartupHandoffFixture::start("incomplete", current, Some(previous), "root")
+                .await;
+        let mut handoff =
+            workspace_shutdown_handoff("op-incomplete", "root", previous, &fixture.session);
+        handoff.phase = WorkspaceShutdownPhase::Requested;
+        write_workspace_shutdown_handoff(fixture.project_dir(), &handoff);
+
+        let error = reconcile_interrupted_controller_startup(&fixture.ipc, fixture.project_dir())
+            .await
+            .expect_err("a non-complete handoff must fail init");
+        assert!(
+            format!("{error:#}").contains(WORKSPACE_SHUTDOWN_HANDOFF_SCOPE_MESSAGE),
+            "unexpected diagnostic: {error:#}"
+        );
+        assert!(
+            !controller_start_release_path(fixture.project_dir(), current).exists(),
+            "the controller must not be released"
+        );
+        assert!(
+            !fixture
+                .project_dir()
+                .join(ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH)
+                .exists(),
+            "no controller ownership may be committed"
+        );
+        assert_eq!(
+            read_controller_epoch_state(fixture.project_dir())
+                .unwrap()
+                .as_deref(),
+            Some(current),
+            "no epoch beyond the gated recovery state is written"
+        );
+        assert!(read_controller_startup_intent(fixture.project_dir())
+            .unwrap()
+            .is_some());
+        assert_handoff_evidence_is_absent(fixture.project_dir(), "op-incomplete");
+        fixture.assert_controller_pane_live().await;
+    }
+
+    fn assert_handoff_evidence_is_absent(project_dir: &Path, operation_id: &str) {
+        assert!(!handoff_evidence_path(project_dir, operation_id).exists());
+        assert!(!handoff_archive_path(project_dir, operation_id).exists());
+    }
+
+    #[tokio::test]
+    async fn unsupported_workspace_shutdown_handoff_schema_fails_before_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("run.json"),
+            r#"{"run_id":"root","fsm":{"phase":"tl_running"}}"#,
+        )
+        .unwrap();
+        let mut handoff =
+            workspace_shutdown_handoff("op-schema", "root", "controller-old", "workspace");
+        handoff.schema_version = 2;
+        write_workspace_shutdown_handoff(dir.path(), &handoff);
+
+        let ipc = exomonad_core::services::tmux_ipc::TmuxIpc::new("unused-schema");
+        let error = launch_tl_recovery(
+            &ipc,
+            dir.path(),
+            "/bin/sh",
+            Path::new("/tmp/exo-tl-loop"),
+            &Config::default(),
+            None,
+            true,
+        )
+        .await
+        .expect_err("an unsupported handoff must fail before release");
+        assert!(
+            format!("{error:#}").contains(WORKSPACE_SHUTDOWN_HANDOFF_SCOPE_MESSAGE),
+            "unexpected diagnostic: {error:#}"
+        );
+        assert!(!controller_epoch_path(dir.path()).exists());
+        assert!(!controller_startup_intent_path(dir.path()).exists());
+        assert!(!dir
+            .path()
+            .join(exomonad_core::services::agent_control::ROOT_CONTROLLER_PENDING_OWNERSHIP_RELATIVE_PATH)
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn workspace_shutdown_handoff_from_another_run_fails_before_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("run.json"),
+            r#"{"run_id":"root","fsm":{"phase":"tl_running"}}"#,
+        )
+        .unwrap();
+        let handoff = workspace_shutdown_handoff(
+            "op-other-run",
+            "another-run",
+            "controller-old",
+            "workspace",
+        );
+        write_workspace_shutdown_handoff(dir.path(), &handoff);
+
+        let ipc = exomonad_core::services::tmux_ipc::TmuxIpc::new("unused-run");
+        let error = launch_tl_recovery(
+            &ipc,
+            dir.path(),
+            "/bin/sh",
+            Path::new("/tmp/exo-tl-loop"),
+            &Config::default(),
+            None,
+            true,
+        )
+        .await
+        .expect_err("a handoff for another run must fail before release");
+        assert!(format!("{error:#}").contains(WORKSPACE_SHUTDOWN_HANDOFF_SCOPE_MESSAGE));
+        assert!(!controller_epoch_path(dir.path()).exists());
+        assert!(!controller_startup_intent_path(dir.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn unsafe_workspace_shutdown_operation_id_fails_before_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".exo/tl-loop/root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("run.json"),
+            r#"{"run_id":"root","fsm":{"phase":"tl_running"}}"#,
+        )
+        .unwrap();
+        let handoff =
+            workspace_shutdown_handoff("op/with/separators", "root", "controller-old", "workspace");
+        write_workspace_shutdown_handoff(dir.path(), &handoff);
+
+        let ipc = exomonad_core::services::tmux_ipc::TmuxIpc::new("unused-op-id");
+        let error = launch_tl_recovery(
+            &ipc,
+            dir.path(),
+            "/bin/sh",
+            Path::new("/tmp/exo-tl-loop"),
+            &Config::default(),
+            None,
+            true,
+        )
+        .await
+        .expect_err("an unsafe operation id must fail before release");
+        assert!(
+            format!("{error:#}").contains("unsafe for archival"),
+            "unexpected diagnostic: {error:#}"
+        );
+        assert!(!controller_epoch_path(dir.path()).exists());
+        assert!(!controller_startup_intent_path(dir.path()).exists());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn post_release_archive_failure_keeps_the_startup_resumable() {
+        let previous = "controller-previous-resume";
+        let current = "controller-current-resume";
+        let fixture =
+            ControllerStartupHandoffFixture::start("resume", current, Some(previous), "root").await;
+        let handoff = workspace_shutdown_handoff("op-resume", "root", previous, &fixture.session);
+        let active_bytes = write_workspace_shutdown_handoff(fixture.project_dir(), &handoff);
+
+        let error = reconcile_interrupted_controller_startup_with_archive(
+            &fixture.ipc,
+            fixture.project_dir(),
+            |_: &Path, _: &ValidatedWorkspaceShutdownHandoff, _: &str, _: &str| {
+                Err(anyhow::anyhow!("injected post-release archive failure"))
+            },
+        )
+        .await
+        .expect_err("the injected archive failure must fail the commit");
+        assert!(format!("{error:#}").contains("injected post-release archive failure"));
+        assert!(
+            format!("{error:#}").contains("resumable"),
+            "the failure must state the resumable guarantee: {error:#}"
+        );
+
+        // The controller is released and its ownership committed, but the
+        // pending target, startup fence, and exact pane are retained.
+        assert!(controller_start_release_path(fixture.project_dir(), current).exists());
+        assert!(fixture
+            .project_dir()
+            .join(ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH)
+            .exists());
+        assert!(fixture
+            .project_dir()
+            .join(exomonad_core::services::agent_control::ROOT_CONTROLLER_PENDING_OWNERSHIP_RELATIVE_PATH)
+            .exists());
+        assert!(read_controller_startup_intent(fixture.project_dir())
+            .unwrap()
+            .is_some());
+        assert!(fixture
+            .project_dir()
+            .join(WORKSPACE_SHUTDOWN_RELATIVE_PATH)
+            .exists());
+        assert_eq!(
+            std::fs::read(fixture.project_dir().join(WORKSPACE_SHUTDOWN_RELATIVE_PATH)).unwrap(),
+            active_bytes
+        );
+        assert!(!handoff_archive_path(fixture.project_dir(), "op-resume").exists());
+        fixture.assert_controller_pane_live().await;
+
+        // A later `init --continue` re-adopts the exact pane, retries the
+        // archive, and commits without starting a second controller.
+        assert_eq!(
+            reconcile_interrupted_controller_startup(&fixture.ipc, fixture.project_dir())
+                .await
+                .unwrap(),
+            InterruptedControllerStartup::Resumed
+        );
+        assert_eq!(
+            std::fs::read(handoff_archive_path(fixture.project_dir(), "op-resume")).unwrap(),
+            active_bytes
+        );
+        assert!(!fixture
+            .project_dir()
+            .join(WORKSPACE_SHUTDOWN_RELATIVE_PATH)
+            .exists());
+        assert!(read_controller_startup_intent(fixture.project_dir())
+            .unwrap()
+            .is_none());
+        assert_eq!(fixture.tl_window_count().await, 1);
+        fixture.assert_controller_pane_live().await;
+    }
+
+    #[tokio::test]
+    async fn existing_workspace_shutdown_archive_is_idempotent_and_conflicts_still_fail() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path();
+        let ipc = exomonad_core::services::tmux_ipc::TmuxIpc::new("unused-idempotent");
+        let handoff =
+            workspace_shutdown_handoff("op-idempotent", "root", "controller-old", "workspace");
+        let bytes = write_workspace_shutdown_handoff(project_dir, &handoff);
+        let validated = validate_completed_workspace_shutdown_handoff(
+            &ipc,
+            project_dir,
+            "root",
+            "controller-new",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // A previous attempt already archived this exact intent.
+        let archive = handoff_archive_path(project_dir, "op-idempotent");
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        std::fs::write(&archive, &bytes).unwrap();
+        filesystem_workspace_shutdown_archive(
+            project_dir,
+            &validated,
+            "workspace",
+            "controller-new",
+        )
+        .unwrap();
+        assert!(!project_dir.join(WORKSPACE_SHUTDOWN_RELATIVE_PATH).exists());
+        assert_eq!(std::fs::read(&archive).unwrap(), bytes);
+        let evidence_path = handoff_evidence_path(project_dir, "op-idempotent");
+        let first_evidence = std::fs::read(&evidence_path).unwrap();
+        let files = std::fs::read_dir(archive.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 2, "one archive and one evidence record");
+
+        // Re-seeding the active intent and archiving again is a no-op for the
+        // already-present archive and evidence.
+        write_workspace_shutdown_handoff(project_dir, &handoff);
+        let validated_again = validate_completed_workspace_shutdown_handoff(
+            &ipc,
+            project_dir,
+            "root",
+            "controller-new",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        filesystem_workspace_shutdown_archive(
+            project_dir,
+            &validated_again,
+            "workspace",
+            "controller-new",
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&evidence_path).unwrap(), first_evidence);
+        assert_eq!(std::fs::read(&archive).unwrap(), bytes);
+
+        // A different intent that claims the same operation id still conflicts,
+        // and validation now rejects it before any controller side effect.
+        let mut conflicting = handoff.clone();
+        conflicting.completed_at = Some(3);
+        write_workspace_shutdown_handoff(project_dir, &conflicting);
+        let error = validate_completed_workspace_shutdown_handoff(
+            &ipc,
+            project_dir,
+            "root",
+            "controller-new",
+        )
+        .await
+        .expect_err("a conflicting archive must fail");
+        assert!(format!("{error:#}").contains("conflicts with its active intent"));
+        assert_eq!(std::fs::read(&archive).unwrap(), bytes);
+        assert!(project_dir.join(WORKSPACE_SHUTDOWN_RELATIVE_PATH).exists());
+    }
+
+    #[tokio::test]
+    async fn workspace_shutdown_archive_evidence_excludes_unrelated_handoff_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path();
+        let ipc = exomonad_core::services::tmux_ipc::TmuxIpc::new("unused-evidence");
+        let canary = "SECRET-CANARY-e7f3c1";
+        let mut handoff =
+            workspace_shutdown_handoff("op-evidence", "root", "controller-old", "workspace");
+        handoff.blocker = Some(format!("shutdown detail {canary}"));
+        write_workspace_shutdown_handoff(project_dir, &handoff);
+        let validated = validate_completed_workspace_shutdown_handoff(
+            &ipc,
+            project_dir,
+            "root",
+            "controller-new",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        filesystem_workspace_shutdown_archive(
+            project_dir,
+            &validated,
+            "beast-accept",
+            "controller-new",
+        )
+        .unwrap();
+
+        let evidence =
+            std::fs::read_to_string(handoff_evidence_path(project_dir, "op-evidence")).unwrap();
+        assert!(
+            !evidence.contains(canary),
+            "archive evidence must not copy unrelated handoff text: {evidence}"
+        );
+        let evidence: Value = serde_json::from_str(&evidence).unwrap();
+        assert_eq!(evidence["recorded_tmux_session"], "workspace");
+        assert_eq!(evidence["adopting_tmux_session"], "beast-accept");
+        assert_eq!(evidence["run_id"], "root");
+    }
+
+    #[test]
+    fn both_controller_startup_paths_validate_the_handoff_before_release() {
+        let source = include_str!("init.rs");
+        let validation_fn = ["fn validate_completed_workspace", "_shutdown_handoff("].concat();
+        let validation_call = ["validate_completed_workspace", "_shutdown_handoff("].concat();
+        let archive_fn = ["fn filesystem_workspace", "_shutdown_archive("].concat();
+        assert_eq!(
+            source.matches(&validation_fn).count(),
+            1,
+            "both call sites share one validation function"
+        );
+        assert_eq!(
+            source.matches(&archive_fn).count(),
+            1,
+            "both call sites share one archive function"
+        );
+        let signatures = [
+            [
+                "async fn reconcile_interrupted_controller",
+                "_startup_with_archive<A>(",
+            ]
+            .concat(),
+            ["async fn launch_tl", "_recovery("].concat(),
+        ];
+        for signature in signatures {
+            let start = source
+                .find(&signature)
+                .unwrap_or_else(|| panic!("missing {signature}"));
+            let rest = &source[start..];
+            let end = rest
+                .find("\nasync fn ")
+                .into_iter()
+                .chain(rest.find("\nfn "))
+                .min()
+                .unwrap_or(rest.len());
+            let body = &rest[..end];
+            let validate = body
+                .find(&validation_call)
+                .unwrap_or_else(|| panic!("{signature} must validate the handoff"));
+            let release = body
+                .find("release_controller_start(")
+                .unwrap_or_else(|| panic!("{signature} must release the controller"));
+            assert!(
+                validate < release,
+                "{signature} must validate the handoff before releasing the controller"
+            );
+            assert!(
+                body.contains("commit_controller_startup_handoff("),
+                "{signature} must commit through the shared handoff function"
+            );
+        }
     }
 
     struct TmuxSocketRestore {

@@ -91,6 +91,28 @@ target for that epoch, clears both the pending record and the startup fence, and
 returns to the caller so a retry starts from a clean handoff instead of looping
 on the same interrupted startup.
 
+A completed workspace-shutdown handoff (`workspace-shutdown.json`, phase
+`complete`) is scoped by the root `run_id` and its controller epoch, not by the
+tmux session name. `--session <name>` may therefore adopt the same run's
+completed handoff across sessions: the recorded and adopting session names are
+kept in an adjacent archive evidence record while the archived handoff bytes
+stay identical to the retained intent. The handoff is validated before the
+controller is released on both startup paths (the interrupted-startup recovery
+and the fresh `--continue` TL window): schema 1, phase `complete`, a safe
+operation id, the same run, an archive whose existing bytes are identical, and
+an epoch that names a controller lifetime which already ended. That epoch is
+compared against the epoch being started, any pending target epoch, and a
+committed target epoch whose exact pane is still live; it is deliberately not
+required to equal the latest epoch marker, because a later failed
+`init --continue` may have advanced the marker while the handoff still names
+the earlier stopped lifetime. An incomplete, foreign, conflicting, or still-live
+handoff therefore fails init before any ownership commit or release. After a
+successful startup commit the handoff is renamed into
+`.exo/controller-lifecycle/archive/<operation_id>.json`; if that post-release
+archival still fails, the pending target, startup fence, and exact controller
+pane are retained so the next `init --continue` re-adopts the same pane and
+completes the archive instead of leaving an unowned controller.
+
 `exomonad shutdown` stays server-only. `exomonad shutdown --workspace` is the
 explicit control-plane operation: it fences dispatch, quiesces the root and
 shared sub-TL controllers, preserves independent worker panes, writes terminal
