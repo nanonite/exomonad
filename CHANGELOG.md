@@ -42,6 +42,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Remove every redundant cast and `no-any-return` error from `tl_loop/**` in the strict mypy form (#1329)
 
 ### Fixed
+- Continue from a confirmed blocked-leaf resume result written before the host recorded launch confirmations: its omitted owner and launch intent are now proven in memory from the unique confirmed action, the durable successor lineage and the host's started, resumed and finished rows, instead of holding with an owner/scope/worktree conflict; modern receipts with missing provenance are still refused and no historical record is rewritten (#1351)
+- Seed the init-recovery fixture's historical lifecycle rows in the ledger's own segment with every field the server's ledger parser requires, and fail the Docker-free check when a seeded row would not parse (#1351)
 - Let a replay of the same scope handoff wait for its in-flight owner's Git mutation lease (bounded by the Git timeout) and adopt its commit, instead of failing after the two-second conflict window; a different owner still fails at two seconds (#1347)
 - Converge when an exit monitor has already retired a superseded controller invocation before reprovisioning reconciles it, instead of refusing with a spurious lifecycle block; a different invocation or generation still fails closed (#1347)
 - Keep tmux test fixtures' socket paths short and fail with the measured length when a deep TMPDIR would exceed the Unix socket limit (#1347)
