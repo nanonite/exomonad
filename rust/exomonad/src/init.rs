@@ -15753,6 +15753,176 @@ mod tests {
         assert!(error.to_string().contains("Codex model"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewer_opencode_model_in_the_version_table_with_recorded_effort_passes() {
+        let _fixture = lock_opencode_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode v2.0.22", false),
+        );
+
+        validate_fixture(
+            &binary,
+            Duration::from_secs(2),
+            "opencode-go/deepseek-v4.1-flash",
+            Some("high"),
+        )
+        .await
+        .expect("a reviewer model in the committed table with a recorded effort passes");
+        assert!(
+            !marker.exists(),
+            "reviewer validation must use the committed table, not a catalog call"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewer_opencode_unknown_model_names_the_model_and_table_file() {
+        let _fixture = lock_opencode_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode v2.0.22", false),
+        );
+
+        let error = validate_fixture(
+            &binary,
+            Duration::from_secs(2),
+            "opencode-go/reviewer-not-a-model",
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Unknown OpenCode model `opencode-go/reviewer-not-a-model`"));
+        assert!(error.contains("rust/exomonad/data/opencode/v2.0.22.json"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewer_opencode_unrecorded_effort_names_the_model_and_table_file() {
+        let _fixture = lock_opencode_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode v2.0.22", false),
+        );
+
+        let error = validate_fixture(
+            &binary,
+            Duration::from_secs(2),
+            // `opencode-go/beam-free` records `efforts: null`.
+            "opencode-go/beam-free",
+            Some("high"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("does not record effort variants"));
+        assert!(error.contains("opencode-go/beam-free"));
+        assert!(error.contains("rust/exomonad/data/opencode/v2.0.22.json"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewer_opencode_unsupported_effort_lists_the_recorded_variants() {
+        let _fixture = lock_opencode_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode v2.0.22", false),
+        );
+
+        let error = validate_fixture(
+            &binary,
+            Duration::from_secs(2),
+            "opencode-go/deepseek-v4.1-flash",
+            Some("minimal"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Unsupported OpenCode effort `minimal`"));
+        assert!(error.contains("low, high, max"));
+        assert!(error.contains("rust/exomonad/data/opencode/v2.0.22.json"));
+    }
+
+    #[test]
+    fn reviewer_codex_model_without_the_gpt_prefix_is_refused() {
+        let error = validate_codex_model_name("claude-sonnet-4-6")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("Unknown Codex model `claude-sonnet-4-6`"));
+        assert!(error.contains("gpt-"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn changing_the_reviewer_harness_changes_which_validator_runs() {
+        let mut config = Config::default();
+        config.reviewer.agent_type = AgentType::Codex;
+        config.reviewer.model = Some("opencode-go/deepseek-v4.1-flash".to_string());
+
+        let codex_targets =
+            init_model_validation_targets(&config, "medium", "high").expect("targets");
+        let reviewer = codex_targets
+            .iter()
+            .find(|target| target.role == "reviewer")
+            .expect("reviewer is validated");
+        assert_eq!(reviewer.agent_type, AgentType::Codex);
+        let codex_error = validate_harness_model_with(
+            reviewer.agent_type,
+            reviewer.model.as_deref(),
+            Some(&reviewer.effort),
+            Path::new("unused"),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            codex_error.contains("Codex model"),
+            "a Codex reviewer route uses the Codex validator: {codex_error}"
+        );
+
+        config.reviewer.agent_type = AgentType::OpenCode;
+        let opencode_targets =
+            init_model_validation_targets(&config, "medium", "high").expect("targets");
+        let reviewer = opencode_targets
+            .iter()
+            .find(|target| target.role == "reviewer")
+            .expect("reviewer is validated");
+        assert_eq!(reviewer.agent_type, AgentType::OpenCode);
+        assert_eq!(reviewer.effort, "high");
+
+        let _fixture = lock_opencode_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode v2.0.22", false),
+        );
+        validate_harness_model_with(
+            reviewer.agent_type,
+            reviewer.model.as_deref(),
+            Some(&reviewer.effort),
+            &binary,
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("the same model is valid once the reviewer route switches to OpenCode");
+    }
+
     #[test]
     fn test_opencode_tl_model_requires_opencode_root_harness() {
         let error = validate_opencode_model_owner(

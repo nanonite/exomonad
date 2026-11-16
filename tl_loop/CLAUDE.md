@@ -995,7 +995,16 @@ reviewer's, not a model's. A round is one completed reviewer verdict
 (`ReviewVerdictObserved`) or one first CI failure on the reviewed head
 (`CIStatusObserved`); a repeated CI failure for the same head is not a round. No
 repair creates a branch, leaf name, or agent type. This path needs no
-`review_model_choice` and no model.
+`review_model_choice` and no model. A configured reviewer route change is not a
+round event: a verdict already persisted for the same head is neither invalidated
+nor re-requested, a `ReviewerIdentityObserved` replacement updates the reviewer
+identity for the same head, and `review_rounds`/`tl_intervention_attempts` keep
+counting. These are structural pins: `derive_next_action` and `slice_transition`
+take no reviewer-route input, and a structural test fails if one is added. The
+reviewer route is configured, not selected: no `select_agent_type` call uses the
+reviewer role, so there is no reviewer harness/model escalation. Reviewer
+identity attribution after a harness change is a Rust resolver concern
+(`resolve_reviewer_invocation`); the Python state tests do not exercise it.
 
 **Outer loop (roles.tl, only at the ceiling).** When the reconciler reports
 `review_rounds_exhausted`, `_judge_review_stuck` in `loop/driver.py` runs. If

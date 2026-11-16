@@ -505,9 +505,9 @@ The reviewer convergence loop is configured via `.exo/review-policy.toml`. To ov
 | `require_second_reviewer_complexity` | false | Require second reviewer for complex PRs |
 | `complexity_line_threshold` | 500 | Line threshold for complexity-based second review |
 
-**Reviewer identity discipline:** Every reviewer invocation uses the one configured `exomonad-reviewer` Forgejo service account and `forgejo_reviewer_token`; per-invocation Forgejo accounts and logins are not part of this deployment. Authorization proves that the review author is the reviewer-token account rather than the PR-authoring account, then binds the review to the exact PR head and the durable reviewer invocation assigned to that slice. Git identity, branch provenance, and invocation IDs remain distinct internal traceability, and an agent never reviews its own authored PR.
+**Reviewer identity discipline:** Every reviewer invocation uses the one configured `exomonad-reviewer` Forgejo service account and `forgejo_reviewer_token`; per-invocation Forgejo accounts and logins are not part of this deployment. Authorization proves that the review author is the reviewer-token account rather than the PR-authoring account, then binds the review to the exact PR head and the durable reviewer invocation assigned to that slice. Git identity, branch provenance, and invocation IDs remain distinct internal traceability, and an agent never reviews its own authored PR. A configured `[reviewer]` harness change changes the reviewer's internal name and birth branch (`review-pr-N-codex` vs `review-pr-N-opencode`) for the next one-shot spawn. The durable assignment lookup collects every exact-head match and deterministically prefers the live/recent replacement instead of following directory order, so a review submitted after the change is attributed to the replacement reviewer, while the Forgejo account binding, exact-head binding, and owner self-review refusal are unchanged. See [docs/guides/changing-routes-mid-run.md](docs/guides/changing-routes-mid-run.md#reviewer).
 
-**Stuck state:** `tl_loop` counts rounds in durable `SliceState.review_rounds`, across head resets: one per completed reviewer verdict and one per pre-merge CI failure on the reviewed head. Below `reviewer_max_rounds` the worker<->reviewer loop is deterministic and makes no model call. When the count reaches `reviewer_max_rounds` without convergence, the controller makes ONE `roles.tl` judgment with a closed `guide`/`escalate` schema. `guide` dispatches a validated seven-section handoff through `resume_pr` to the same owner with a fresh round budget; `escalate` parks the slice with `review_rounds_exhausted` and opens the named human gate. Interventions per slice are bounded by `roles.tl.escalate_after_attempts`; when they are used up the gate opens without another model call. Each judgment emits `tl.review_stuck_judged` and is charged to `roles.tl.token_budget`. A `roles.tl` model that cannot be resolved, or whose harness binary is not installed, refuses controller startup; a backend failure at judgment time parks the slice as `review_stuck` with the error recorded. The watcher remains an observation source and never owns this control decision.
+**Stuck state:** `tl_loop` counts rounds in durable `SliceState.review_rounds`, across head resets: one per completed reviewer verdict and one per pre-merge CI failure on the reviewed head. Below `reviewer_max_rounds` the worker<->reviewer loop is deterministic and makes no model call. When the count reaches `reviewer_max_rounds` without convergence, the controller makes ONE `roles.tl` judgment with a closed `guide`/`escalate` schema. `guide` dispatches a validated seven-section handoff through `resume_pr` to the same owner with a fresh round budget; `escalate` parks the slice with `review_rounds_exhausted` and opens the named human gate. Interventions per slice are bounded by `roles.tl.escalate_after_attempts`; when they are used up the gate opens without another model call. Each judgment emits `tl.review_stuck_judged` and is charged to `roles.tl.token_budget`. A `roles.tl` model that cannot be resolved, or whose harness binary is not installed, refuses controller startup; a backend failure at judgment time parks the slice as `review_stuck` with the error recorded. The watcher remains an observation source and never owns this control decision. A configured reviewer route change is not a review round, does not reset or double count `review_rounds` or `tl_intervention_attempts`, and does not change the review-stuck ceiling.
 
 ### Notification Vocabulary
 
@@ -1148,9 +1148,16 @@ exact head. Its terminal verdict is persisted before exit; GO waits for
 same-head CI and then uses compare evidence for `merge_pr`, while NO-GO or
 same-head CI failure uses one same-owner `resume_pr` carrying the findings
 verbatim. A head change invalidates
-the prior verdict and queues one reviewer for the new head. Pane liveness never
-authorizes a merge or repair, and no path messages an exited reviewer, rewinds
-the ledger cursor, edits `plan.json`, or creates a sibling owner.
+the prior verdict and queues one reviewer for the new head. A configured
+reviewer route change (`[reviewer]` plus `roles.reviewer.allow`) is not a head
+change: a verdict already persisted for the same head stays valid and is not
+re-run, a mid-flight reviewer keeps its attempt, and the next one-shot spawn uses
+the new route. There is no reviewer harness/model escalation and no per-call
+reviewer harness override; the configured `[reviewer]` route is the base, and
+`escalate_after_attempts` removes only a failed worker harness. Pane liveness
+never authorizes a merge or repair, and no path messages an exited reviewer,
+rewinds the ledger cursor, edits `plan.json`, or creates a sibling owner. See
+[docs/guides/changing-routes-mid-run.md](docs/guides/changing-routes-mid-run.md#reviewer).
 
 ### Depth, waves, and recursion
 

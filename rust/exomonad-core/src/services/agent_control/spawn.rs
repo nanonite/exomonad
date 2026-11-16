@@ -6166,6 +6166,856 @@ mod tests {
         assert!(!agent_dir.join("dispatch_intent.tmp").exists());
     }
 
+    /// A temporary repository, fake harness binaries and an isolated tmux
+    /// server, so a test can drive the production reviewer spawn across a
+    /// configured route change without touching a real harness or session.
+    #[cfg(unix)]
+    struct ReviewerRouteFixture {
+        _temp: tempfile::TempDir,
+        project_dir: PathBuf,
+        branch: String,
+        head_sha: String,
+        argv_log: PathBuf,
+        launch_log: PathBuf,
+        socket: String,
+        session: String,
+        forgejo: wiremock::MockServer,
+        _path_restore: EnvironmentRestore,
+        _shell_restore: EnvironmentRestore,
+        _socket_restore: EnvironmentRestore,
+    }
+
+    #[cfg(unix)]
+    struct EnvironmentRestore {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl EnvironmentRestore {
+        fn set(key: &'static str, value: std::ffi::OsString) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvironmentRestore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl ReviewerRouteFixture {
+        async fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let temp = tempfile::tempdir().expect("temporary reviewer fixture");
+            let project_dir = temp.path().join("checkout");
+            std::fs::create_dir_all(&project_dir).expect("create fixture repository");
+            init_fixture_git_repository(&project_dir).expect("initialize fixture repository");
+            git(&project_dir, &["branch", "-M", "main"]);
+            git(&project_dir, &["config", "user.name", "reviewer fixture"]);
+            git(
+                &project_dir,
+                &["config", "user.email", "reviewer@example.invalid"],
+            );
+            std::fs::write(project_dir.join(".gitignore"), ".exo/\n")
+                .expect("write fixture ignore");
+            std::fs::write(project_dir.join("README.md"), "fixture baseline\n")
+                .expect("write fixture baseline");
+            git(&project_dir, &["add", ".gitignore", "README.md"]);
+            git(&project_dir, &["commit", "--quiet", "-m", "baseline"]);
+            git(
+                &project_dir,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://forgejo.local/acme/repo.git",
+                ],
+            );
+            let branch = "main.feat-codex".to_string();
+            git(&project_dir, &["checkout", "--quiet", "-b", &branch]);
+            std::fs::write(project_dir.join("feature.txt"), "reviewable change\n")
+                .expect("write feature commit");
+            git(&project_dir, &["add", "feature.txt"]);
+            git(&project_dir, &["commit", "--quiet", "-m", "feature head"]);
+            let head_sha = git_output(&project_dir, &["rev-parse", "HEAD"]);
+            git(&project_dir, &["checkout", "--quiet", "main"]);
+
+            let role_context = project_dir.join(".exo/roles/devswarm/context");
+            std::fs::create_dir_all(&role_context).expect("create reviewer role context");
+            std::fs::write(
+                role_context.join("reviewer.md"),
+                "reviewer fixture context\n",
+            )
+            .expect("write reviewer role context");
+
+            let fake_bin = temp.path().join("fake-bin");
+            std::fs::create_dir_all(&fake_bin).expect("create fake harness bin");
+            let argv_log = project_dir.join(".exo/harness-argv.log");
+            let launch_log = project_dir.join(".exo/harness-launches.log");
+            for harness in ["codex", "opencode"] {
+                let script = fake_bin.join(harness);
+                std::fs::write(
+                    &script,
+                    format!(
+                        "#!/bin/sh\nprintf '%s %s\\n' '{}' \"$*\" >> '{}'\nprintf '%s\\n' '{}' >> '{}'\nsleep 30\n",
+                        harness,
+                        argv_log.display(),
+                        harness,
+                        launch_log.display(),
+                    ),
+                )
+                .expect("write fake harness");
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                    .expect("make fake harness executable");
+            }
+
+            let prior_path = std::env::var_os("PATH").unwrap_or_default();
+            let mut shim_path = std::ffi::OsString::from(&fake_bin);
+            shim_path.push(":");
+            shim_path.push(prior_path);
+            let path_restore = EnvironmentRestore::set("PATH", shim_path.clone());
+            let shell_restore =
+                EnvironmentRestore::set("SHELL", std::ffi::OsString::from("/bin/sh"));
+            let socket = format!("exo-reviewer-route-{}", std::process::id());
+            let session = format!("exo-reviewer-route-{}", std::process::id());
+            let socket_restore =
+                EnvironmentRestore::set("EXOMONAD_TMUX_SOCKET", std::ffi::OsString::from(&socket));
+            let created = std::process::Command::new("tmux")
+                .args([
+                    "-L",
+                    &socket,
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &session,
+                    "-n",
+                    "keeper",
+                    "sleep",
+                    "300",
+                ])
+                .status()
+                .expect("start isolated tmux session");
+            assert!(created.success(), "isolated tmux session starts");
+            let path_text = shim_path.to_string_lossy().into_owned();
+            let set_path = std::process::Command::new("tmux")
+                .args(["-L", &socket, "set-environment", "-g", "PATH", &path_text])
+                .status()
+                .expect("set isolated tmux PATH");
+            assert!(
+                set_path.success(),
+                "isolated tmux server receives shim PATH"
+            );
+
+            let forgejo = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("PATCH"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "number": 1,
+                        "title": "fixture PR 1",
+                        "body": "fixture",
+                        "state": "open",
+                        "merged": false,
+                        "html_url": "http://forgejo.local/acme/repo/pulls/1",
+                        "head": {"ref": branch, "sha": head_sha},
+                        "base": {"ref": "main", "sha": "fixture-base-sha"}
+                    }),
+                ))
+                .mount(&forgejo)
+                .await;
+
+            Self {
+                _temp: temp,
+                project_dir,
+                branch,
+                head_sha,
+                argv_log,
+                launch_log,
+                socket,
+                session,
+                forgejo,
+                _path_restore: path_restore,
+                _shell_restore: shell_restore,
+                _socket_restore: socket_restore,
+            }
+        }
+
+        async fn service(
+            &self,
+            agent_type: AgentType,
+            model: &str,
+            effort: &str,
+            sources: crate::services::agent_control::invocation::RouteConfigSources,
+        ) -> AgentControlService<crate::services::Services> {
+            let mut services = crate::services::Services::test();
+            services.project_dir = self.project_dir.clone();
+            services.git_wt = Arc::new(crate::services::git_worktree::GitWorktreeService::new(
+                self.project_dir.clone(),
+            ));
+            services.agent_resolver =
+                Arc::new(crate::services::AgentResolver::load(self.project_dir.clone()).await);
+            services.event_log = Some(Arc::new(
+                crate::services::EventLog::open(self.project_dir.join(".exo/logs"))
+                    .expect("open event log"),
+            ));
+            services.forgejo_client = Some(
+                crate::services::forgejo::ForgejoClient::new(&self.forgejo.uri(), "fixture-token")
+                    .expect("construct fixture Forgejo client"),
+            );
+            AgentControlService::new(Arc::new(services))
+                .with_tmux_session(self.session.clone())
+                .with_birth_branch(
+                    BirthBranch::try_from_str("main").expect("literal main is non-empty"),
+                )
+                .with_reviewer_agent_type(agent_type)
+                .with_reviewer_model(Some(model.to_string()))
+                .with_reviewer_effort(Some(effort.to_string()))
+                .with_reviewer_route_sources(Some(sources))
+        }
+
+        fn pr_entry(&self, head_sha: &str) -> crate::services::pr_registry::PrEntry {
+            crate::services::pr_registry::PrEntry {
+                number: 1,
+                head_branch: self.branch.clone(),
+                base_branch: "main".to_string(),
+                title: "fixture PR 1".to_string(),
+                body: "Authoring-Agent: feat-codex\nAuthoring-Role: dev\nBirth-Branch: main.feat-codex"
+                    .to_string(),
+                author_agent: "feat-codex".to_string(),
+                author_role: "dev".to_string(),
+                created_at: chrono::Utc::now(),
+                state: crate::services::pr_registry::PrState::Open,
+                last_review_at: None,
+                last_head_sha: Some(head_sha.to_string()),
+                approved_at_sha: None,
+                reviewer_agent: None,
+                reviewer_birth_branch: None,
+                rounds: 0,
+                stuck: false,
+                needs_human_review: false,
+                merge_blocked_on_ci: false,
+                chainlink_issue_id: None,
+            }
+        }
+
+        fn caller(&self) -> BirthBranch {
+            BirthBranch::try_from_str("main").expect("literal main is non-empty")
+        }
+
+        /// Commit a new PR head on the review branch and return it.
+        fn new_head(&self, message: &str) -> String {
+            git(&self.project_dir, &["checkout", "--quiet", &self.branch]);
+            std::fs::write(
+                self.project_dir.join(format!("{message}.txt")),
+                format!("{message}\n"),
+            )
+            .expect("write new head commit");
+            git(&self.project_dir, &["add", &format!("{message}.txt")]);
+            git(&self.project_dir, &["commit", "--quiet", "-m", message]);
+            let head = git_output(&self.project_dir, &["rev-parse", "HEAD"]);
+            git(&self.project_dir, &["checkout", "--quiet", "main"]);
+            head
+        }
+
+        fn invocation(&self, agent: &str) -> serde_json::Value {
+            serde_json::from_slice(
+                &std::fs::read(
+                    self.project_dir
+                        .join(".exo/agents")
+                        .join(agent)
+                        .join("invocation.json"),
+                )
+                .expect("reviewer invocation is readable"),
+            )
+            .expect("reviewer invocation is JSON")
+        }
+
+        fn identity(&self, agent: &str) -> serde_json::Value {
+            serde_json::from_slice(
+                &std::fs::read(
+                    self.project_dir
+                        .join(".exo/agents")
+                        .join(agent)
+                        .join("identity.json"),
+                )
+                .expect("reviewer identity is readable"),
+            )
+            .expect("reviewer identity is JSON")
+        }
+
+        fn launches(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.launch_log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        async fn wait_for_launches(&self, expected: usize) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while self.launches().len() < expected && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                self.launches().len(),
+                expected,
+                "expected {expected} harness launches"
+            );
+        }
+
+        fn argv(&self) -> String {
+            std::fs::read_to_string(&self.argv_log).unwrap_or_default()
+        }
+
+        async fn last_pr_body(&self) -> String {
+            self.forgejo
+                .received_requests()
+                .await
+                .expect("wiremock records requests")
+                .iter()
+                .rev()
+                .find(|request| request.method.as_str() == "PATCH")
+                .and_then(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+                .and_then(|body: serde_json::Value| {
+                    body.get("body")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .expect("reviewer assignment PATCH body")
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ReviewerRouteFixture {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &self.socket, "kill-server"])
+                .status();
+        }
+    }
+
+    #[cfg(unix)]
+    fn reviewer_sources(
+        harness: &str,
+        model: &str,
+        effort: &str,
+    ) -> crate::services::agent_control::invocation::RouteConfigSources {
+        crate::services::agent_control::invocation::RouteConfigSources {
+            harness: Some(harness.to_string()),
+            model: Some(model.to_string()),
+            effort: Some(effort.to_string()),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reviewer_route_change_codex_to_opencode_runs_new_route_and_keeps_prior_invocation() {
+        let fixture = ReviewerRouteFixture::new().await;
+        let first_sources = reviewer_sources(
+            "config.toml:reviewer.agent_type",
+            "config.toml:reviewer.model",
+            "config.toml:reviewer.effort_level",
+        );
+        let first_service = fixture
+            .service(
+                AgentType::Codex,
+                "gpt-6.1-sol",
+                "medium",
+                first_sources.clone(),
+            )
+            .await;
+        let pr = fixture.pr_entry(&fixture.head_sha);
+        first_service
+            .spawn_reviewer_for_recovery_with_criteria_named(
+                &pr,
+                &fixture.caller(),
+                "review-pr-1",
+                &[],
+            )
+            .await
+            .expect("configured Codex reviewer spawns");
+        let codex_identity = fixture.identity("review-pr-1-codex");
+        assert_eq!(codex_identity["agent_type"], "codex");
+        let codex_invocation = fixture.invocation("review-pr-1-codex");
+        assert_eq!(codex_invocation["runtime"], "codex");
+        assert_eq!(codex_invocation["model"], "gpt-6.1-sol");
+        assert_eq!(codex_invocation["effort"], "medium");
+        assert_eq!(
+            codex_invocation["config_sources"],
+            serde_json::to_value(&first_sources).unwrap()
+        );
+
+        let next_head = fixture.new_head("next-head");
+        let second_sources = reviewer_sources(
+            "config.toml:reviewer.agent_type",
+            "config.toml:reviewer.model",
+            "config.toml:reviewer.effort_level",
+        );
+        let second_service = fixture
+            .service(
+                AgentType::OpenCode,
+                "deepseek-v4.1-flash",
+                "high",
+                second_sources.clone(),
+            )
+            .await;
+        let next_pr = fixture.pr_entry(&next_head);
+        second_service
+            .spawn_reviewer_for_recovery_with_criteria_named(
+                &next_pr,
+                &fixture.caller(),
+                "review-pr-1-r2",
+                &[],
+            )
+            .await
+            .expect("configured OpenCode reviewer spawns");
+
+        let opencode_invocation = fixture.invocation("review-pr-1-r2-opencode");
+        let opencode_identity = fixture.identity("review-pr-1-r2-opencode");
+        assert_eq!(opencode_invocation["runtime"], "opencode");
+        assert_eq!(opencode_invocation["model"], "deepseek-v4.1-flash");
+        assert_eq!(opencode_invocation["effort"], "high");
+        assert_eq!(opencode_invocation["head_sha"], next_head);
+        assert_eq!(
+            opencode_invocation["config_sources"],
+            serde_json::to_value(&second_sources).unwrap()
+        );
+        assert_eq!(opencode_identity["agent_type"], "opencode");
+        assert_eq!(
+            fixture.invocation("review-pr-1-codex"),
+            codex_invocation,
+            "the previous route's invocation record is not rewritten"
+        );
+        fixture.wait_for_launches(2).await;
+        assert_eq!(fixture.launches(), ["codex", "opencode"]);
+        assert!(fixture.argv().contains("deepseek-v4.1-flash"));
+        assert!(fixture.argv().contains("high"));
+        assert!(
+            !fixture.argv().contains("gpt-6.1-sol")
+                || fixture
+                    .argv()
+                    .lines()
+                    .filter(|line| line.contains("gpt-6.1-sol"))
+                    .count()
+                    == 1
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reviewer_route_change_opencode_to_codex_runs_new_route_and_keeps_prior_invocation() {
+        let fixture = ReviewerRouteFixture::new().await;
+        let first_service = fixture
+            .service(
+                AgentType::OpenCode,
+                "deepseek-v4.1-flash",
+                "high",
+                reviewer_sources(
+                    "config.toml:reviewer.agent_type",
+                    "config.toml:reviewer.model",
+                    "config.toml:reviewer.effort_level",
+                ),
+            )
+            .await;
+        let pr = fixture.pr_entry(&fixture.head_sha);
+        first_service
+            .spawn_reviewer_for_recovery_with_criteria_named(
+                &pr,
+                &fixture.caller(),
+                "review-pr-1",
+                &[],
+            )
+            .await
+            .expect("configured OpenCode reviewer spawns");
+        let opencode_invocation = fixture.invocation("review-pr-1-opencode");
+
+        let next_head = fixture.new_head("next-head");
+        let second_service = fixture
+            .service(
+                AgentType::Codex,
+                "gpt-6.1-sol",
+                "medium",
+                reviewer_sources(
+                    "config.toml:reviewer.agent_type",
+                    "config.toml:reviewer.model",
+                    "config.toml:reviewer.effort_level",
+                ),
+            )
+            .await;
+        let next_pr = fixture.pr_entry(&next_head);
+        second_service
+            .spawn_reviewer_for_recovery_with_criteria_named(
+                &next_pr,
+                &fixture.caller(),
+                "review-pr-1-r2",
+                &[],
+            )
+            .await
+            .expect("configured Codex reviewer spawns");
+
+        let codex_invocation = fixture.invocation("review-pr-1-r2-codex");
+        assert_eq!(codex_invocation["runtime"], "codex");
+        assert_eq!(codex_invocation["model"], "gpt-6.1-sol");
+        assert_eq!(codex_invocation["effort"], "medium");
+        assert_eq!(codex_invocation["head_sha"], next_head);
+        assert_eq!(
+            fixture.invocation("review-pr-1-opencode"),
+            opencode_invocation,
+            "the previous route's invocation record is not rewritten"
+        );
+        fixture.wait_for_launches(2).await;
+        assert_eq!(fixture.launches(), ["opencode", "codex"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reviewer_model_only_change_updates_the_next_invocation_and_keeps_the_prior_lifecycle()
+    {
+        let fixture = ReviewerRouteFixture::new().await;
+        let first_service = fixture
+            .service(
+                AgentType::Codex,
+                "gpt-6.1-sol",
+                "medium",
+                reviewer_sources(
+                    "config.toml:reviewer.agent_type",
+                    "config.toml:reviewer.model",
+                    "config.toml:reviewer.effort_level",
+                ),
+            )
+            .await;
+        let pr = fixture.pr_entry(&fixture.head_sha);
+        first_service
+            .spawn_reviewer_for_recovery_with_criteria_named(
+                &pr,
+                &fixture.caller(),
+                "review-pr-1",
+                &[],
+            )
+            .await
+            .expect("first reviewer spawns");
+        let first_invocation = fixture.invocation("review-pr-1-codex");
+        let first_id = first_invocation["invocation_id"].clone();
+
+        let next_head = fixture.new_head("next-head");
+        let second_service = fixture
+            .service(
+                AgentType::Codex,
+                "gpt-6.1-luna",
+                "medium",
+                reviewer_sources(
+                    "config.toml:reviewer.agent_type",
+                    "config.toml:reviewer.model",
+                    "config.toml:reviewer.effort_level",
+                ),
+            )
+            .await;
+        second_service
+            .spawn_reviewer_for_recovery_with_criteria_named(
+                &fixture.pr_entry(&next_head),
+                &fixture.caller(),
+                "review-pr-1-r2",
+                &[],
+            )
+            .await
+            .expect("second reviewer spawns");
+
+        let second_invocation = fixture.invocation("review-pr-1-r2-codex");
+        assert_eq!(second_invocation["model"], "gpt-6.1-luna");
+        assert_eq!(second_invocation["effort"], "medium");
+        assert_eq!(second_invocation["head_sha"], next_head);
+        assert_ne!(second_invocation["invocation_id"], first_id);
+        let writer =
+            crate::services::immutable_ledger::LedgerWriter::open_project(&fixture.project_dir)
+                .expect("open fixture ledger");
+        let first_id = first_id.as_str().expect("prior invocation id is a string");
+        assert!(
+            writer
+                .read_resolved_events()
+                .expect("read fixture ledger")
+                .iter()
+                .any(|record| format!("{:?}", record.event.data).contains(first_id)),
+            "the prior invocation id remains in durable lifecycle evidence"
+        );
+        fixture.wait_for_launches(2).await;
+        assert_eq!(fixture.launches(), ["codex", "codex"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reviewer_effort_only_change_updates_the_next_invocation() {
+        let fixture = ReviewerRouteFixture::new().await;
+        let first_service = fixture
+            .service(
+                AgentType::Codex,
+                "gpt-6.1-sol",
+                "medium",
+                reviewer_sources(
+                    "config.toml:reviewer.agent_type",
+                    "config.toml:reviewer.model",
+                    "config.toml:reviewer.effort_level",
+                ),
+            )
+            .await;
+        let pr = fixture.pr_entry(&fixture.head_sha);
+        first_service
+            .spawn_reviewer_for_recovery_with_criteria_named(
+                &pr,
+                &fixture.caller(),
+                "review-pr-1",
+                &[],
+            )
+            .await
+            .expect("first reviewer spawns");
+
+        let second_service = fixture
+            .service(
+                AgentType::Codex,
+                "gpt-6.1-sol",
+                "xhigh",
+                reviewer_sources(
+                    "config.toml:reviewer.agent_type",
+                    "config.toml:reviewer.model",
+                    "config.toml:reviewer.effort_level",
+                ),
+            )
+            .await;
+        second_service
+            .spawn_reviewer_for_recovery_with_criteria_named(
+                &fixture.pr_entry(&fixture.head_sha),
+                &fixture.caller(),
+                "review-pr-1-r2",
+                &[],
+            )
+            .await
+            .expect("second reviewer spawns");
+
+        let invocation = fixture.invocation("review-pr-1-r2-codex");
+        assert_eq!(invocation["model"], "gpt-6.1-sol");
+        assert_eq!(invocation["effort"], "xhigh");
+        fixture.wait_for_launches(2).await;
+        assert_eq!(fixture.launches(), ["codex", "codex"]);
+        assert!(fixture.argv().contains("xhigh"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reviewer_harness_change_changes_internal_name_and_birth_branch() {
+        let fixture = ReviewerRouteFixture::new().await;
+        let codex_service = fixture
+            .service(
+                AgentType::Codex,
+                "gpt-6.1-sol",
+                "medium",
+                reviewer_sources(
+                    "config.toml:reviewer.agent_type",
+                    "config.toml:reviewer.model",
+                    "config.toml:reviewer.effort_level",
+                ),
+            )
+            .await;
+        let codex_result = codex_service
+            .spawn_reviewer_for_recovery_with_criteria_named(
+                &fixture.pr_entry(&fixture.head_sha),
+                &fixture.caller(),
+                "review-pr-1",
+                &[],
+            )
+            .await
+            .expect("Codex reviewer spawns");
+        let opencode_service = fixture
+            .service(
+                AgentType::OpenCode,
+                "deepseek-v4.1-flash",
+                "high",
+                reviewer_sources(
+                    "config.toml:reviewer.agent_type",
+                    "config.toml:reviewer.model",
+                    "config.toml:reviewer.effort_level",
+                ),
+            )
+            .await;
+        let opencode_result = opencode_service
+            .spawn_reviewer_for_recovery_with_criteria_named(
+                &fixture.pr_entry(&fixture.head_sha),
+                &fixture.caller(),
+                "review-pr-1",
+                &[],
+            )
+            .await
+            .expect("OpenCode reviewer respawns for the same head");
+
+        assert_eq!(codex_result.agent_name.as_str(), "review-pr-1-codex");
+        assert_eq!(opencode_result.agent_name.as_str(), "review-pr-1-opencode");
+        assert_ne!(codex_result.agent_name, opencode_result.agent_name);
+        let codex_identity = fixture.identity("review-pr-1-codex");
+        let opencode_identity = fixture.identity("review-pr-1-opencode");
+        assert_eq!(codex_identity["birth_branch"], "main.review-pr-1-codex");
+        assert_eq!(
+            opencode_identity["birth_branch"],
+            "main.review-pr-1-opencode"
+        );
+        assert_eq!(
+            fixture.invocation("review-pr-1-codex")["head_sha"],
+            fixture.head_sha
+        );
+        assert_eq!(
+            fixture.invocation("review-pr-1-opencode")["head_sha"],
+            fixture.head_sha
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reviewer_harness_change_opencode_to_codex_changes_internal_name_and_birth_branch() {
+        let fixture = ReviewerRouteFixture::new().await;
+        let opencode_service = fixture
+            .service(
+                AgentType::OpenCode,
+                "deepseek-v4.1-flash",
+                "high",
+                reviewer_sources(
+                    "config.toml:reviewer.agent_type",
+                    "config.toml:reviewer.model",
+                    "config.toml:reviewer.effort_level",
+                ),
+            )
+            .await;
+        let opencode_result = opencode_service
+            .spawn_reviewer_for_recovery_with_criteria_named(
+                &fixture.pr_entry(&fixture.head_sha),
+                &fixture.caller(),
+                "review-pr-1",
+                &[],
+            )
+            .await
+            .expect("OpenCode reviewer spawns");
+        let codex_service = fixture
+            .service(
+                AgentType::Codex,
+                "gpt-6.1-sol",
+                "medium",
+                reviewer_sources(
+                    "config.toml:reviewer.agent_type",
+                    "config.toml:reviewer.model",
+                    "config.toml:reviewer.effort_level",
+                ),
+            )
+            .await;
+        let codex_result = codex_service
+            .spawn_reviewer_for_recovery_with_criteria_named(
+                &fixture.pr_entry(&fixture.head_sha),
+                &fixture.caller(),
+                "review-pr-1",
+                &[],
+            )
+            .await
+            .expect("Codex reviewer respawns for the same head");
+
+        assert_eq!(opencode_result.agent_name.as_str(), "review-pr-1-opencode");
+        assert_eq!(codex_result.agent_name.as_str(), "review-pr-1-codex");
+        assert_ne!(opencode_result.agent_name, codex_result.agent_name);
+        assert_eq!(
+            fixture.identity("review-pr-1-opencode")["birth_branch"],
+            "main.review-pr-1-opencode"
+        );
+        assert_eq!(
+            fixture.identity("review-pr-1-codex")["birth_branch"],
+            "main.review-pr-1-codex"
+        );
+        assert_eq!(
+            fixture.invocation("review-pr-1-opencode")["head_sha"],
+            fixture.head_sha
+        );
+        assert_eq!(
+            fixture.invocation("review-pr-1-codex")["head_sha"],
+            fixture.head_sha
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reviewer_harness_change_rewrites_the_pr_reviewer_assignment_metadata() {
+        let fixture = ReviewerRouteFixture::new().await;
+        let codex_service = fixture
+            .service(
+                AgentType::Codex,
+                "gpt-6.1-sol",
+                "medium",
+                reviewer_sources(
+                    "config.toml:reviewer.agent_type",
+                    "config.toml:reviewer.model",
+                    "config.toml:reviewer.effort_level",
+                ),
+            )
+            .await;
+        codex_service
+            .spawn_reviewer_for_recovery_with_criteria_named(
+                &fixture.pr_entry(&fixture.head_sha),
+                &fixture.caller(),
+                "review-pr-1",
+                &[],
+            )
+            .await
+            .expect("Codex reviewer spawns");
+        let codex_body = fixture.last_pr_body().await;
+        assert!(codex_body.contains("Reviewer-Agent: review-pr-1-codex"));
+        assert!(codex_body.contains("Reviewer-Birth-Branch: main.review-pr-1-codex"));
+
+        let opencode_service = fixture
+            .service(
+                AgentType::OpenCode,
+                "deepseek-v4.1-flash",
+                "high",
+                reviewer_sources(
+                    "config.toml:reviewer.agent_type",
+                    "config.toml:reviewer.model",
+                    "config.toml:reviewer.effort_level",
+                ),
+            )
+            .await;
+        opencode_service
+            .spawn_reviewer_for_recovery_with_criteria_named(
+                &fixture.pr_entry(&fixture.head_sha),
+                &fixture.caller(),
+                "review-pr-1",
+                &[],
+            )
+            .await
+            .expect("OpenCode reviewer respawns for the same head");
+
+        let replacement_body = fixture.last_pr_body().await;
+        assert!(replacement_body.contains("Reviewer-Agent: review-pr-1-opencode"));
+        assert!(replacement_body.contains("Reviewer-Birth-Branch: main.review-pr-1-opencode"));
+        assert!(
+            !replacement_body.contains("Reviewer-Agent: review-pr-1-codex"),
+            "the PR body carries one current reviewer assignment, not two: {replacement_body}"
+        );
+        assert_eq!(
+            replacement_body
+                .lines()
+                .filter(|line| line.starts_with("Reviewer-Agent:"))
+                .count(),
+            1
+        );
+    }
+
     #[test]
     fn test_claude_project_path_encoding() {
         // Claude Code encodes paths via [^a-zA-Z0-9] → '-'

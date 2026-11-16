@@ -93,6 +93,133 @@ fn lifecycle_review_agent(
         })
 }
 
+/// One durable reviewer invocation for an exact PR head.
+///
+/// A reviewer identity is harness-derived (`review-pr-N-codex` versus
+/// `review-pr-N-opencode`), so changing the configured reviewer harness leaves
+/// two matching `Review` invocations for the same PR head: the exited reviewer
+/// on the old route and its replacement. Selection is therefore a decision over
+/// all matching candidates, never "the first directory/file the filesystem
+/// happens to enumerate".
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewerInvocationCandidate {
+    agent_id: String,
+    invocation_id: Option<String>,
+    generation: u64,
+    started_at: u64,
+    live: bool,
+}
+
+/// Select the reviewer invocation that owns an exact PR head.
+///
+/// One rule for every source (agent directories, compatibility event files and
+/// the canonical ledger):
+/// 1. prefer a live (non-terminal) invocation, because that is the reviewer
+///    that can still submit a review;
+/// 2. otherwise prefer the most recently started invocation;
+/// 3. then the greatest invocation generation;
+/// 4. then the lexicographically smallest agent id.
+///
+/// Steps 1-3 follow the reviewer's own lifecycle; step 4 makes the result
+/// independent of directory/file enumeration order when two records tie.
+fn select_reviewer_invocation(candidates: &[ReviewerInvocationCandidate]) -> Option<String> {
+    candidates
+        .iter()
+        .max_by(|left, right| {
+            left.live
+                .cmp(&right.live)
+                .then(left.started_at.cmp(&right.started_at))
+                .then(left.generation.cmp(&right.generation))
+                .then_with(|| right.agent_id.cmp(&left.agent_id))
+        })
+        .map(|candidate| candidate.agent_id.clone())
+}
+
+fn lifecycle_event_seconds(event_time: Option<&str>) -> u64 {
+    event_time
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp().max(0) as u64)
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone)]
+struct ReviewerLifecycleObservation {
+    agent_id: String,
+    invocation_id: Option<String>,
+    generation: u64,
+    started_at: u64,
+    finished: bool,
+}
+
+fn reviewer_observation_from_parts(
+    event_type: &str,
+    agent_id: Option<&str>,
+    data: Option<&serde_json::Value>,
+    event_time: Option<&str>,
+    pr_number: u64,
+    head_sha: &str,
+) -> Option<ReviewerLifecycleObservation> {
+    if !matches!(
+        event_type,
+        "agent.invocation.started" | "agent.invocation.finished"
+    ) {
+        return None;
+    }
+    let agent_id = lifecycle_review_agent(data, agent_id, pr_number, head_sha)?;
+    let data = data?;
+    let invocation_id = data
+        .get("invocation_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned);
+    Some(ReviewerLifecycleObservation {
+        agent_id,
+        invocation_id,
+        generation: data
+            .get("generation")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0),
+        started_at: lifecycle_event_seconds(event_time),
+        finished: event_type == "agent.invocation.finished"
+            || data.get("outcome").and_then(|value| value.as_str()) == Some("finished"),
+    })
+}
+
+/// Fold start/finish observations into one candidate per invocation.
+///
+/// A `started` event alone means live; the matching `finished` event clears
+/// liveness without removing the candidate, so an exited reviewer can still be
+/// selected when it is the only record for the head. Observations may arrive in
+/// any order because files and ledger segments are read in enumeration order.
+fn reviewer_candidates_from_observations(
+    observations: impl IntoIterator<Item = ReviewerLifecycleObservation>,
+) -> Vec<ReviewerInvocationCandidate> {
+    let mut candidates: Vec<ReviewerInvocationCandidate> = Vec::new();
+    for observation in observations {
+        let existing = candidates.iter_mut().find(|candidate| {
+            candidate.agent_id == observation.agent_id
+                && candidate.invocation_id == observation.invocation_id
+        });
+        match existing {
+            Some(candidate) => {
+                candidate.started_at = candidate.started_at.min(observation.started_at);
+                candidate.generation = candidate.generation.max(observation.generation);
+                if observation.finished {
+                    candidate.live = false;
+                }
+            }
+            None => candidates.push(ReviewerInvocationCandidate {
+                agent_id: observation.agent_id,
+                invocation_id: observation.invocation_id,
+                generation: observation.generation,
+                started_at: observation.started_at,
+                live: !observation.finished,
+            }),
+        }
+    }
+    candidates
+}
+
 impl AgentResolver {
     /// Construct an empty resolver (no agents loaded). Useful for tests.
     pub fn empty() -> Self {
@@ -339,6 +466,11 @@ impl AgentResolver {
     /// per-agent directory, so the immutable lifecycle event is the final
     /// fallback. A Forgejo login alone is not an agent authorization: the exact
     /// PR/head-bound `Review` invocation is the assignment proof.
+    ///
+    /// More than one reviewer can match the same PR head after the configured
+    /// reviewer harness changes. Every source is collected and narrowed by
+    /// [`select_reviewer_invocation`], so the answer never depends on
+    /// filesystem enumeration order.
     pub async fn resolve_reviewer_invocation(
         &self,
         pr_number: u64,
@@ -347,6 +479,8 @@ impl AgentResolver {
         if pr_number == 0 || head_sha.trim().is_empty() {
             return None;
         }
+
+        let mut directory_candidates: Vec<ReviewerInvocationCandidate> = Vec::new();
         let agents_dir = self.project_dir.join(".exo/agents");
         if let Ok(mut entries) = tokio::fs::read_dir(agents_dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
@@ -370,6 +504,7 @@ impl AgentResolver {
                 }
                 let agent_id = invocation
                     .runtime_agent_id
+                    .clone()
                     .filter(|value| !value.trim().is_empty())
                     .or_else(|| {
                         entry
@@ -378,12 +513,23 @@ impl AgentResolver {
                             .filter(|value| !value.trim().is_empty())
                             .map(ToOwned::to_owned)
                     });
-                if agent_id.is_some() {
-                    return agent_id;
-                }
+                let Some(agent_id) = agent_id else {
+                    continue;
+                };
+                directory_candidates.push(ReviewerInvocationCandidate {
+                    agent_id,
+                    invocation_id: Some(invocation.invocation_id.clone()),
+                    generation: invocation.generation,
+                    started_at: invocation.started_at,
+                    live: invocation.is_live(),
+                });
             }
         }
+        if let Some(agent_id) = select_reviewer_invocation(&directory_candidates) {
+            return Some(agent_id);
+        }
 
+        let mut event_observations: Vec<ReviewerLifecycleObservation> = Vec::new();
         let events_dir = self.project_dir.join(".exo/events");
         if let Ok(mut entries) = tokio::fs::read_dir(&events_dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
@@ -398,49 +544,51 @@ impl AgentResolver {
                 let Ok(contents) = tokio::fs::read_to_string(entry.path()).await else {
                     continue;
                 };
-                for line in contents.lines().rev() {
+                for line in contents.lines() {
                     let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
                         continue;
                     };
-                    if !matches!(
-                        event.get("type").and_then(|value| value.as_str()),
-                        Some("agent.invocation.started") | Some("agent.invocation.finished")
-                    ) {
-                        continue;
-                    }
-                    if let Some(agent_id) = lifecycle_review_agent(
-                        event.get("data"),
+                    let Some(observation) = reviewer_observation_from_parts(
+                        event
+                            .get("type")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default(),
                         event.get("agent_id").and_then(|value| value.as_str()),
+                        event.get("data"),
+                        event.get("ts").and_then(|value| value.as_str()),
                         pr_number,
                         head_sha,
-                    ) {
-                        return Some(agent_id);
-                    }
+                    ) else {
+                        continue;
+                    };
+                    event_observations.push(observation);
                 }
             }
         }
+        let event_candidates = reviewer_candidates_from_observations(event_observations);
+        if let Some(agent_id) = select_reviewer_invocation(&event_candidates) {
+            return Some(agent_id);
+        }
 
         let event_log = EventLog::open(self.project_dir.join(".exo/events")).ok()?;
-        event_log
+        let ledger_observations = event_log
             .ledger()
             .read_events()
             .ok()?
             .iter()
-            .rev()
-            .filter(|record| {
-                matches!(
-                    record.event.event_type.as_str(),
-                    "agent.invocation.started" | "agent.invocation.finished"
-                )
-            })
-            .find_map(|record| {
-                lifecycle_review_agent(
-                    Some(&record.event.data),
+            .filter_map(|record| {
+                reviewer_observation_from_parts(
+                    &record.event.event_type,
                     record.event.agent_id.as_deref(),
+                    Some(&record.event.data),
+                    Some(&record.event.event_time),
                     pr_number,
                     head_sha,
                 )
             })
+            .collect::<Vec<_>>();
+        let ledger_candidates = reviewer_candidates_from_observations(ledger_observations);
+        select_reviewer_invocation(&ledger_candidates)
     }
 
     /// Return whether an exact PR head has a durable reviewer assignment.
@@ -948,5 +1096,363 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    fn candidate(
+        agent_id: &str,
+        started_at: u64,
+        live: bool,
+        generation: u64,
+    ) -> ReviewerInvocationCandidate {
+        ReviewerInvocationCandidate {
+            agent_id: agent_id.to_string(),
+            invocation_id: Some(format!("invocation-{agent_id}")),
+            generation,
+            started_at,
+            live,
+        }
+    }
+
+    async fn start_reviewer(
+        root: &std::path::Path,
+        agent: &str,
+        runtime: AgentType,
+        pr_number: u64,
+        head_sha: &str,
+    ) -> (PathBuf, String) {
+        let agent_dir = root.join(".exo/agents").join(agent);
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        let record = crate::services::agent_control::start_invocation_with_provenance(
+            &agent_dir,
+            runtime,
+            InvocationTrigger::Review,
+            RoutingInfo::window(crate::services::tmux_ipc::WindowId::parse("@42").unwrap()),
+            Some(pr_number),
+            Some(head_sha.to_string()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        (agent_dir, record.invocation_id)
+    }
+
+    async fn finish_reviewer(agent_dir: &std::path::Path, invocation_id: &str) {
+        crate::services::agent_control::finish_invocation(
+            agent_dir,
+            invocation_id,
+            crate::services::agent_control::InvocationStatus::Exited,
+            Some(0),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Write a reviewer invocation fixture with an explicit start time and
+    /// terminal/live status, so directory-order tests do not depend on the
+    /// second-resolution clock.
+    #[allow(clippy::too_many_arguments)]
+    fn write_reviewer_record(
+        root: &std::path::Path,
+        agent: &str,
+        runtime: AgentType,
+        pr_number: u64,
+        head_sha: &str,
+        invocation_id: &str,
+        started_at: u64,
+        live: bool,
+    ) {
+        let agent_dir = root.join(".exo/agents").join(agent);
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let mut invocation = serde_json::json!({
+            "invocation_id": invocation_id,
+            "runtime": runtime.suffix(),
+            "trigger": "review",
+            "routing": {"window_id": null, "pane_id": null, "parent_tab": null},
+            "started_at": started_at,
+            "status": if live { "running" } else { "exited" },
+            "pr_number": pr_number,
+            "head_sha": head_sha,
+            "generation": 1,
+            "runtime_agent_id": agent,
+        });
+        if !live {
+            invocation["ended_at"] = serde_json::json!(started_at + 1);
+            invocation["exit_code"] = serde_json::json!(0);
+        }
+        std::fs::write(
+            agent_dir.join("invocation.json"),
+            serde_json::to_vec(&invocation).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn removal_order_permutations(
+        first: ReviewerInvocationCandidate,
+        second: ReviewerInvocationCandidate,
+    ) -> Vec<Vec<ReviewerInvocationCandidate>> {
+        vec![vec![first.clone(), second.clone()], vec![second, first]]
+    }
+
+    #[test]
+    fn reviewer_harness_change_selects_the_replacement_in_both_candidate_orders() {
+        let old_codex = candidate("review-pr-7-codex", 10, false, 1);
+        let new_opencode = candidate("review-pr-7-opencode", 20, false, 1);
+        for order in removal_order_permutations(old_codex.clone(), new_opencode.clone()) {
+            assert_eq!(
+                select_reviewer_invocation(&order).as_deref(),
+                Some("review-pr-7-opencode"),
+                "the replacement reviewer must win regardless of collection order: {order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reviewer_harness_change_selects_the_replacement_in_both_directions() {
+        let old_opencode = candidate("review-pr-7-opencode", 10, false, 1);
+        let new_codex = candidate("review-pr-7-codex", 20, false, 1);
+        for order in removal_order_permutations(old_opencode.clone(), new_codex.clone()) {
+            assert_eq!(
+                select_reviewer_invocation(&order).as_deref(),
+                Some("review-pr-7-codex"),
+                "OpenCode->Codex must resolve to the Codex replacement: {order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_old_reviewer_outranks_a_newer_terminal_reviewer() {
+        // Rule: liveness first. A reviewer that can still submit the exact-head
+        // review owns the head, even when a replacement attempt started later
+        // and already exited.
+        let live_old = candidate("review-pr-7-codex", 10, true, 1);
+        let newer_terminal = candidate("review-pr-7-opencode", 20, false, 2);
+        for order in removal_order_permutations(live_old.clone(), newer_terminal.clone()) {
+            assert_eq!(
+                select_reviewer_invocation(&order).as_deref(),
+                Some("review-pr-7-codex"),
+                "{order:?}"
+            );
+        }
+
+        // Without liveness the newest start wins.
+        let terminal_old = candidate("review-pr-7-codex", 10, false, 1);
+        assert_eq!(
+            select_reviewer_invocation(&[terminal_old, newer_terminal]).as_deref(),
+            Some("review-pr-7-opencode")
+        );
+    }
+
+    #[test]
+    fn equal_ties_are_broken_by_agent_id_not_collection_order() {
+        let codex = candidate("review-pr-7-codex", 10, false, 1);
+        let opencode = candidate("review-pr-7-opencode", 10, false, 1);
+        for order in removal_order_permutations(codex.clone(), opencode.clone()) {
+            assert_eq!(
+                select_reviewer_invocation(&order).as_deref(),
+                Some("review-pr-7-codex"),
+                "ties resolve to the lexicographically smallest agent id: {order:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewer_harness_change_resolves_the_replacement_directory_in_both_creation_orders() {
+        for replacement_first in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            if replacement_first {
+                write_reviewer_record(
+                    root,
+                    "review-pr-7-opencode",
+                    AgentType::OpenCode,
+                    7,
+                    "head-7",
+                    "invocation-opencode",
+                    20,
+                    false,
+                );
+                write_reviewer_record(
+                    root,
+                    "review-pr-7-codex",
+                    AgentType::Codex,
+                    7,
+                    "head-7",
+                    "invocation-codex",
+                    10,
+                    false,
+                );
+            } else {
+                write_reviewer_record(
+                    root,
+                    "review-pr-7-codex",
+                    AgentType::Codex,
+                    7,
+                    "head-7",
+                    "invocation-codex",
+                    10,
+                    false,
+                );
+                write_reviewer_record(
+                    root,
+                    "review-pr-7-opencode",
+                    AgentType::OpenCode,
+                    7,
+                    "head-7",
+                    "invocation-opencode",
+                    20,
+                    false,
+                );
+            }
+            let resolver = AgentResolver::load(root.to_path_buf()).await;
+            assert_eq!(
+                resolver
+                    .resolve_reviewer_invocation(7, "head-7")
+                    .await
+                    .as_deref(),
+                Some("review-pr-7-opencode"),
+                "replacement_first={replacement_first}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reviewer_harness_change_opencode_to_codex_resolves_the_replacement_directory_in_both_creation_orders(
+    ) {
+        for replacement_first in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            let write_replacement = |root: &std::path::Path| {
+                write_reviewer_record(
+                    root,
+                    "review-pr-7-codex",
+                    AgentType::Codex,
+                    7,
+                    "head-7",
+                    "invocation-codex-new",
+                    30,
+                    false,
+                );
+            };
+            let write_previous = |root: &std::path::Path| {
+                write_reviewer_record(
+                    root,
+                    "review-pr-7-opencode",
+                    AgentType::OpenCode,
+                    7,
+                    "head-7",
+                    "invocation-opencode-old",
+                    10,
+                    false,
+                );
+            };
+            if replacement_first {
+                write_replacement(root);
+                write_previous(root);
+            } else {
+                write_previous(root);
+                write_replacement(root);
+            }
+            let resolver = AgentResolver::load(root.to_path_buf()).await;
+            assert_eq!(
+                resolver
+                    .resolve_reviewer_invocation(7, "head-7")
+                    .await
+                    .as_deref(),
+                Some("review-pr-7-codex"),
+                "replacement_first={replacement_first}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_event_file_and_ledger_sources_select_the_same_reviewer() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (old_dir, old_invocation) =
+            start_reviewer(root, "review-pr-7-codex", AgentType::Codex, 7, "head-7").await;
+        finish_reviewer(&old_dir, &old_invocation).await;
+        let (_new_dir, _new_invocation) = start_reviewer(
+            root,
+            "review-pr-7-opencode",
+            AgentType::OpenCode,
+            7,
+            "head-7",
+        )
+        .await;
+
+        let resolver = AgentResolver::load(root.to_path_buf()).await;
+        let from_directories = resolver.resolve_reviewer_invocation(7, "head-7").await;
+        assert_eq!(from_directories.as_deref(), Some("review-pr-7-opencode"));
+
+        // Remove the per-agent invocation records: the compatibility event
+        // files must choose the same live replacement even though the exited
+        // old reviewer's events remain.
+        std::fs::remove_dir_all(root.join(".exo/agents")).unwrap();
+        let resolver = AgentResolver::load(root.to_path_buf()).await;
+        let from_event_files = resolver.resolve_reviewer_invocation(7, "head-7").await;
+        assert_eq!(from_event_files, from_directories);
+
+        // Remove the compatibility files too: the canonical ledger is the only
+        // remaining source and must still choose the same reviewer.
+        for entry in std::fs::read_dir(root.join(".exo/events")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let resolver = AgentResolver::load(root.to_path_buf()).await;
+        let from_ledger = resolver.resolve_reviewer_invocation(7, "head-7").await;
+        assert_eq!(from_ledger, from_directories);
+    }
+
+    #[tokio::test]
+    async fn another_head_or_another_pull_request_is_never_selected() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let (other_pr_dir, other_pr_invocation) =
+            start_reviewer(root, "review-pr-8-codex", AgentType::Codex, 8, "head-7").await;
+        finish_reviewer(&other_pr_dir, &other_pr_invocation).await;
+        let (other_head_dir, other_head_invocation) =
+            start_reviewer(root, "review-pr-7-codex", AgentType::Codex, 7, "head-other").await;
+        finish_reviewer(&other_head_dir, &other_head_invocation).await;
+
+        let resolver = AgentResolver::load(root.to_path_buf()).await;
+        assert_eq!(
+            resolver.resolve_reviewer_invocation(7, "head-7").await,
+            None
+        );
+        assert_eq!(
+            resolver.resolve_reviewer_invocation(8, "head-8").await,
+            None
+        );
+        assert!(!resolver.has_reviewer_invocation(7, "head-7").await);
+
+        // The event-file and ledger fallbacks apply the same PR/head filter.
+        std::fs::remove_dir_all(root.join(".exo/agents")).unwrap();
+        let resolver = AgentResolver::load(root.to_path_buf()).await;
+        assert_eq!(
+            resolver.resolve_reviewer_invocation(7, "head-7").await,
+            None
+        );
+        assert_eq!(
+            resolver.resolve_reviewer_invocation(8, "head-8").await,
+            None
+        );
+        for entry in std::fs::read_dir(root.join(".exo/events")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let resolver = AgentResolver::load(root.to_path_buf()).await;
+        assert_eq!(
+            resolver.resolve_reviewer_invocation(7, "head-7").await,
+            None
+        );
+        assert_eq!(
+            resolver.resolve_reviewer_invocation(8, "head-8").await,
+            None
+        );
     }
 }

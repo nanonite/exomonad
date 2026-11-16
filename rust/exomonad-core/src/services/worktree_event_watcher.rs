@@ -5565,6 +5565,336 @@ mod tests {
         assert!(state.reviewer_attempt.is_none());
     }
 
+    fn write_reviewer_invocation(
+        project_dir: &std::path::Path,
+        agent: &str,
+        runtime: AgentType,
+        status: &str,
+        head_sha: &str,
+        invocation_id: &str,
+    ) {
+        let agent_dir = project_dir.join(".exo/agents").join(agent);
+        std::fs::create_dir_all(&agent_dir).expect("create reviewer agent directory");
+        let mut invocation = serde_json::json!({
+            "invocation_id": invocation_id,
+            "runtime": runtime.suffix(),
+            "trigger": "review",
+            "routing": {"window_id": null, "pane_id": null, "parent_tab": null},
+            "started_at": 1,
+            "status": status,
+            "pr_number": 1,
+            "head_sha": head_sha,
+            "generation": 1,
+            "runtime_agent_id": agent,
+        });
+        if status != "running" {
+            invocation["ended_at"] = serde_json::json!(2);
+            invocation["exit_code"] = serde_json::json!(0);
+        }
+        std::fs::write(
+            agent_dir.join("invocation.json"),
+            serde_json::to_vec(&invocation).expect("serialize reviewer invocation"),
+        )
+        .expect("write reviewer invocation");
+    }
+
+    fn reviewer_attempt(agent: &str, head_sha: &str, invocation_id: &str) -> ReviewerAttempt {
+        ReviewerAttempt {
+            pr_number: 1,
+            head_sha: head_sha.to_string(),
+            round: 1,
+            attempt_id: "attempt-1".to_string(),
+            phase: ReviewerAttemptPhase::Running,
+            invocation_id: Some(invocation_id.to_string()),
+            reviewer_agent: Some(agent.to_string()),
+            routing: None,
+            claimed_at: chrono::Utc::now(),
+            started_at: Some(chrono::Utc::now()),
+            finished_at: None,
+            failure: None,
+        }
+    }
+
+    #[test]
+    fn test_reviewer_attempt_is_current_is_bound_to_the_attempt_head_and_id() {
+        let branch = BranchName::try_from_str("main.feat-codex").unwrap();
+        let mut state = WatchState::new(&branch, AgentType::Codex, "head-1", CIStatus::Unknown, 0);
+        state.reviewer_attempt = Some(reviewer_attempt(
+            "review-pr-1-codex",
+            "head-1",
+            "invocation-1",
+        ));
+
+        assert!(reviewer_attempt_is_current(
+            &state,
+            1,
+            "head-1",
+            "attempt-1"
+        ));
+        assert!(
+            !reviewer_attempt_is_current(&state, 1, "head-2", "attempt-1"),
+            "a reviewer attempt for another exact head is not current"
+        );
+        assert!(
+            !reviewer_attempt_is_current(&state, 2, "head-1", "attempt-1"),
+            "a reviewer attempt for another PR is not current"
+        );
+        assert!(
+            !reviewer_attempt_is_current(&state, 1, "head-1", "attempt-2"),
+            "a replaced attempt is not current"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_reviewer_attempt_marks_exited_old_route_reviewer_failed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().to_path_buf();
+        write_reviewer_invocation(
+            &project_dir,
+            "review-pr-1-codex",
+            AgentType::Codex,
+            "exited",
+            "head-1",
+            "invocation-old",
+        );
+        let old_invocation =
+            std::fs::read(project_dir.join(".exo/agents/review-pr-1-codex/invocation.json"))
+                .unwrap();
+
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.clone();
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+        let attempt = reviewer_attempt("review-pr-1-codex", "head-1", "invocation-old");
+        let mut persisted = WatcherStateFile::default();
+        persisted.prs.insert(
+            1,
+            WatcherPrState {
+                last_head_sha: Some("head-1".to_string()),
+                reviewer_attempt: Some(attempt.clone()),
+                ..Default::default()
+            },
+        );
+        watcher.write_watcher_state(&persisted).await.unwrap();
+        let branch = BranchName::try_from_str("main.feat-codex").unwrap();
+        let mut runtime =
+            WatchState::new(&branch, AgentType::Codex, "head-1", CIStatus::Unknown, 0);
+        runtime.reviewer_attempt = Some(attempt);
+        runtime.reviewer_spawned = true;
+        watcher.state.prs.lock().await.insert(1, runtime);
+
+        watcher.reconcile_reviewer_attempts().await.unwrap();
+
+        let persisted = watcher.read_watcher_state().await.unwrap();
+        let failed = persisted
+            .prs
+            .get(&1)
+            .unwrap()
+            .reviewer_attempt
+            .as_ref()
+            .unwrap();
+        assert_eq!(failed.phase, ReviewerAttemptPhase::Failed);
+        assert_eq!(failed.head_sha, "head-1");
+        assert_eq!(failed.attempt_id, "attempt-1");
+        assert_eq!(
+            std::fs::read(project_dir.join(".exo/agents/review-pr-1-codex/invocation.json"))
+                .unwrap(),
+            old_invocation,
+            "reconciliation classifies the attempt; it does not rewrite the old invocation"
+        );
+        let runtime = watcher.state.prs.lock().await;
+        let runtime = runtime.get(&1).unwrap();
+        assert_eq!(
+            runtime.reviewer_attempt.as_ref().unwrap().phase,
+            ReviewerAttemptPhase::Failed
+        );
+        assert!(!runtime.reviewer_spawned);
+
+        // A replacement reviewer under the new configured route is bound to the
+        // same exact head and makes the head reviewable again.
+        write_reviewer_invocation(
+            &project_dir,
+            "review-pr-1-opencode",
+            AgentType::OpenCode,
+            "running",
+            "head-1",
+            "invocation-new",
+        );
+        let resolver = Arc::new(crate::services::AgentResolver::load(project_dir.clone()).await);
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.clone();
+        services.agent_resolver = resolver;
+        let replacement = WorktreeEventWatcher::new(Arc::new(services));
+        assert!(
+            replacement
+                .ctx
+                .agent_resolver()
+                .has_reviewer_invocation(1, "head-1")
+                .await,
+            "the replacement reviewer identity satisfies the exact-head assignment query"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_route_change_does_not_duplicate_or_kill_a_midflight_reviewer() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().to_path_buf();
+        write_reviewer_invocation(
+            &project_dir,
+            "review-pr-1-codex",
+            AgentType::Codex,
+            "running",
+            "head-1",
+            "invocation-live",
+        );
+        let invocation_before =
+            std::fs::read(project_dir.join(".exo/agents/review-pr-1-codex/invocation.json"))
+                .unwrap();
+        // A replacement reviewer directory for the same exact head already
+        // exists (the harness-change two-directory situation). The live attempt
+        // must still be neither duplicated nor killed, and the replacement must
+        // not steal the in-flight attempt.
+        write_reviewer_invocation(
+            &project_dir,
+            "review-pr-1-opencode",
+            AgentType::OpenCode,
+            "running",
+            "head-1",
+            "invocation-replacement",
+        );
+
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.clone();
+        services.agent_resolver =
+            Arc::new(crate::services::AgentResolver::load(project_dir.clone()).await);
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+        let attempt = reviewer_attempt("review-pr-1-codex", "head-1", "invocation-live");
+        let mut persisted = WatcherStateFile::default();
+        persisted.prs.insert(
+            1,
+            WatcherPrState {
+                last_head_sha: Some("head-1".to_string()),
+                reviewer_attempt: Some(attempt.clone()),
+                ..Default::default()
+            },
+        );
+        watcher.write_watcher_state(&persisted).await.unwrap();
+        let branch = BranchName::try_from_str("main.feat-codex").unwrap();
+        let mut runtime =
+            WatchState::new(&branch, AgentType::Codex, "head-1", CIStatus::Unknown, 0);
+        runtime.reviewer_attempt = Some(attempt);
+        runtime.reviewer_spawned = true;
+        watcher.state.prs.lock().await.insert(1, runtime);
+
+        // The operator changes the reviewer route in config.toml; the watcher
+        // observes the same PR/head again on the next poll.
+        let mut observation = test_observation("head-1");
+        observation.review_state = ForgejoReviewState::PendingReview;
+        watcher
+            .process_observations(
+                &test_registry(test_pr_entry()),
+                &HashMap::from([(1u64, observation)]),
+            )
+            .await
+            .unwrap();
+
+        {
+            let runtime = watcher.state.prs.lock().await;
+            let runtime = runtime.get(&1).unwrap();
+            let attempt = runtime
+                .reviewer_attempt
+                .as_ref()
+                .expect("mid-flight reviewer attempt survives the route change");
+            assert_eq!(attempt.phase, ReviewerAttemptPhase::Running);
+            assert_eq!(attempt.invocation_id.as_deref(), Some("invocation-live"));
+            assert_eq!(attempt.head_sha, "head-1");
+            assert!(
+                runtime.reviewer_spawned,
+                "the live reviewer is not orphaned by the route change"
+            );
+        }
+        let persisted = watcher.read_watcher_state().await.unwrap();
+        assert_eq!(
+            persisted
+                .prs
+                .get(&1)
+                .unwrap()
+                .reviewer_attempt
+                .as_ref()
+                .unwrap()
+                .phase,
+            ReviewerAttemptPhase::Running
+        );
+        assert_eq!(
+            std::fs::read(project_dir.join(".exo/agents/review-pr-1-codex/invocation.json"))
+                .unwrap(),
+            invocation_before,
+            "the route change neither replaces nor finalizes a mid-flight reviewer"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_author_after_a_reviewer_harness_change_resolves_the_replacement() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().to_path_buf();
+        write_reviewer_invocation(
+            &project_dir,
+            "review-pr-1-codex",
+            AgentType::Codex,
+            "exited",
+            "head-1",
+            "invocation-old",
+        );
+        write_reviewer_invocation(
+            &project_dir,
+            "review-pr-1-opencode",
+            AgentType::OpenCode,
+            "running",
+            "head-1",
+            "invocation-replacement",
+        );
+
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.clone();
+        services.agent_resolver =
+            Arc::new(crate::services::AgentResolver::load(project_dir.clone()).await);
+        let watcher = WorktreeEventWatcher::new(Arc::new(services));
+
+        assert_eq!(
+            watcher
+                .resolve_review_author(
+                    1,
+                    "head-1",
+                    Some("reviewer-bot"),
+                    Some("reviewer-bot"),
+                    None
+                )
+                .await
+                .as_deref(),
+            Some("review-pr-1-opencode"),
+            "a review submitted after the harness change belongs to the replacement reviewer"
+        );
+        assert_eq!(
+            watcher
+                .resolve_review_author(
+                    1,
+                    "head-1",
+                    Some("reviewer-bot"),
+                    Some("reviewer-bot"),
+                    Some("review-pr-1-opencode"),
+                )
+                .await,
+            None,
+            "the owner self-review refusal survives the identity change"
+        );
+        assert_eq!(
+            watcher
+                .resolve_review_author(1, "head-1", Some("author-bot"), Some("reviewer-bot"), None)
+                .await,
+            None,
+            "a login other than the configured reviewer account is never attributed"
+        );
+    }
+
     #[test]
     fn canonical_watcher_event_data_preserves_stable_owner_and_pr() {
         let data = canonical_watcher_event_data(

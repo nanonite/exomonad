@@ -9990,6 +9990,191 @@ mod tests {
         assert!(!reviewer_window_matches_pr("issue-7-codex", 7));
     }
 
+    /// The reviewer route is operator configuration, never a caller request.
+    ///
+    /// `spawn_reviewer` is the only reviewer-spawn surface exposed to a TL or
+    /// the WASM guest, and `restart_review` only resets a cycle. If a harness,
+    /// model, effort or agent-type field is ever added to either request, this
+    /// test fails so the change must go through the configured-route guard
+    /// instead of becoming an unguarded per-call override.
+    #[test]
+    fn reviewer_effect_requests_cannot_override_the_configured_route() {
+        let proto = include_str!("../../../../proto/effects/agent.proto");
+        let spawn_reviewer = proto
+            .split("message SpawnReviewerRequest {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("SpawnReviewerRequest is declared");
+        let restart_review = proto
+            .split("message RestartReviewRequest {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("RestartReviewRequest is declared");
+        for (name, block) in [
+            ("SpawnReviewerRequest", spawn_reviewer),
+            ("RestartReviewRequest", restart_review),
+        ] {
+            for forbidden in ["harness", "model", "effort", "agent_type"] {
+                assert!(
+                    !block.contains(forbidden),
+                    "{name} must not carry a `{forbidden}` override: {block}"
+                );
+            }
+        }
+
+        let haskell = include_str!(
+            "../../../../haskell/wasm-guest/src/ExoMonad/Guest/Tools/SpawnReviewer.hs"
+        );
+        let args = haskell
+            .split("data SpawnReviewerArgs = SpawnReviewerArgs")
+            .nth(1)
+            .and_then(|rest| rest.split("deriving").next())
+            .expect("SpawnReviewerArgs is declared");
+        for forbidden in ["Harness", "Model", "Effort", "AgentType"] {
+            assert!(
+                !args.contains(forbidden),
+                "the spawn_reviewer tool arguments must not carry a {forbidden} override: {args}"
+            );
+        }
+
+        let effects = include_str!("../../../../tl_loop/client/effects.py");
+        let reviewer_call = effects
+            .split("def spawn_reviewer(")
+            .nth(1)
+            .and_then(|rest| rest.split("return self._call").next())
+            .expect("the Python effect client declares spawn_reviewer");
+        for forbidden in ["harness", "model", "effort", "agent_type"] {
+            assert!(
+                !reviewer_call.contains(forbidden),
+                "the tl_loop spawn_reviewer effect must not carry a {forbidden} override: {reviewer_call}"
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_review_fixture(
+        project_dir: &std::path::Path,
+        agent: &str,
+        runtime: &str,
+        status: &str,
+        pr_number: u64,
+        head_sha: &str,
+        invocation_id: &str,
+        started_at: u64,
+    ) {
+        let agent_dir = project_dir.join(".exo/agents").join(agent);
+        std::fs::create_dir_all(&agent_dir).expect("create reviewer agent directory");
+        let mut invocation = serde_json::json!({
+            "invocation_id": invocation_id,
+            "runtime": runtime,
+            "trigger": "review",
+            "routing": {"window_id": null, "pane_id": null, "parent_tab": null},
+            "started_at": started_at,
+            "status": status,
+            "pr_number": pr_number,
+            "head_sha": head_sha,
+            "generation": 1,
+            "runtime_agent_id": agent,
+        });
+        if status != "running" {
+            invocation["ended_at"] = serde_json::json!(started_at + 1);
+            invocation["exit_code"] = serde_json::json!(0);
+        }
+        std::fs::write(
+            agent_dir.join("invocation.json"),
+            serde_json::to_vec(&invocation).expect("serialize reviewer invocation"),
+        )
+        .expect("write reviewer invocation");
+    }
+
+    /// A review submitted after the operator changes the reviewer harness must
+    /// be attributed to the replacement reviewer, and the owner self-review
+    /// refusal must survive the identity change.
+    #[tokio::test]
+    async fn durable_review_author_after_a_reviewer_harness_change_is_the_replacement() {
+        let temp = tempfile::tempdir().expect("temporary reviewer state");
+        let project_dir = temp.path().to_path_buf();
+        write_review_fixture(
+            &project_dir,
+            "review-pr-7-codex",
+            "codex",
+            "exited",
+            7,
+            "head-7",
+            "invocation-old",
+            10,
+        );
+        write_review_fixture(
+            &project_dir,
+            "review-pr-7-opencode",
+            "opencode",
+            "running",
+            7,
+            "head-7",
+            "invocation-replacement",
+            20,
+        );
+
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.clone();
+        services.agent_resolver =
+            Arc::new(crate::services::AgentResolver::load(project_dir.clone()).await);
+
+        assert_eq!(
+            resolve_durable_review_author(
+                &services,
+                7,
+                "head-7",
+                Some("reviewer-bot"),
+                Some("reviewer-bot"),
+                None,
+            )
+            .await
+            .as_deref(),
+            Some("review-pr-7-opencode"),
+            "the durable author lookup follows the replacement reviewer identity"
+        );
+        assert_eq!(
+            resolve_durable_review_author(
+                &services,
+                7,
+                "head-7",
+                Some("reviewer-bot"),
+                Some("reviewer-bot"),
+                Some("review-pr-7-opencode"),
+            )
+            .await,
+            None,
+            "the owner self-review refusal survives the identity change"
+        );
+        assert_eq!(
+            resolve_durable_review_author(
+                &services,
+                7,
+                "head-7",
+                Some("author-bot"),
+                Some("reviewer-bot"),
+                None,
+            )
+            .await,
+            None,
+            "a login other than the configured reviewer account is never attributed"
+        );
+        assert_eq!(
+            resolve_durable_review_author(
+                &services,
+                8,
+                "head-7",
+                Some("reviewer-bot"),
+                Some("reviewer-bot"),
+                None,
+            )
+            .await,
+            None,
+            "another pull request is never attributed"
+        );
+    }
+
     #[test]
     #[cfg(test)]
     fn cleanup_prs_for_leaf_matches_issue_and_leaf_identity() {

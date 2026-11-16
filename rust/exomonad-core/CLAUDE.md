@@ -470,7 +470,11 @@ the `RouteValueSource` for each resolved route field separately (`harness`,
 records without these fields decode with an empty build and absent provenance;
 they are never rewritten merely by reading. Starting resume_pr or a
 SHA-scoped reviewer replaces only this record and records the exact current
-tmux window/pane. Finishing must supply the invocation ID (or matching
+tmux window/pane. A reviewer respawned under a changed harness is a different
+reviewer internal identity and writes its own agent directory, so the prior
+route's record is left untouched; a same-harness reviewer attempt replaces its
+own record and the prior invocation ID survives in durable lifecycle evidence.
+Finishing must supply the invocation ID (or matching
 routing) and cannot change a newer record. Missing or malformed records are
 legacy metadata: status and cleanup paths log the condition and avoid
 destructive reconciliation. A finished invocation is dormant ownership; an
@@ -503,6 +507,27 @@ configured cross-runtime change therefore does not require
 `EXOMONAD_ALLOW_HARNESS_SWITCH`. An explicit request outside both sources still
 emits `[STUCK: harness-switch]`/`agent.stuck` and is approved only by that flag.
 See [docs/guides/changing-routes-mid-run.md](../../../docs/guides/changing-routes-mid-run.md).
+
+The reviewer is the same rule with a role-specific route. Reviewer spawns read
+`configured_runtime_route("reviewer")` (`[reviewer]` in `config.toml`); they do
+not pass through the worker harness-switch guard because there is no caller
+harness argument to guard. A configured reviewer harness/model/effort change
+therefore applies at the next one-shot reviewer spawn. Because the reviewer
+identity embeds the harness, a harness change produces a new internal name and
+birth branch for the same PR/head and rewrites the PR body's reviewer
+assignment; the old route's invocation record is not rewritten. Two `Review`
+invocations can then match the same PR/head, so `resolve_reviewer_invocation`
+selects one with a single pure rule over all candidates (live first, then most
+recently started, then highest generation, then smallest agent id) instead of
+returning whichever directory the filesystem listed first. The watcher's
+`resolve_review_author` and the handler's `resolve_durable_review_author` both
+use that rule, so Forgejo review attribution after a harness change follows the
+replacement reviewer. The watcher's dedup/reconciliation is keyed by
+PR/head/attempt and is unaffected by the route change. No reviewer harness/model
+escalation exists: the selector's `escalate_after_attempts` is never invoked for
+the reviewer role. The `roles.reviewer.allow` list is part of the shared
+configured-route definition and should be kept in step with `[reviewer]`; see
+[docs/guides/changing-routes-mid-run.md](../../../docs/guides/changing-routes-mid-run.md#reviewer).
 
 ### Ordered sub-TL invocation provisioning
 
