@@ -155,23 +155,35 @@ effort_level = "medium"
 local config > global config > medium default. OpenCode receives effort as a
 model-aware `--variant`; Shoal logs that effort is ignored.
 
-**OpenCode catalog capability probe:** `init` catalog-validates exactly the
-roles it validated before the probe existed: an OpenCode worker route and the
-reviewer (through the harness-aware validator for its configured harness). TL
-routes are resolved and logged but not catalog-validated, and a non-OpenCode
-worker route is not catalog-validated; `validate_opencode_model_owner` remains a
-separate field-owner check. For OpenCode the probe runs `opencode --version` and
-`opencode models --help` under a short `OPENCODE_PROBE_TIMEOUT` (10s), then runs
-`opencode models --verbose` only when the help output lists `--verbose`. On a CLI
-that does not accept the flag (v2.0.22 accepts only `--standalone`/`--server`) it
-validates the exact `provider/model` line from plain `opencode models` and warns
-that an effort variant could not be checked. The catalog listing itself uses the
-longer `OPENCODE_CATALOG_TIMEOUT` (60s) because `opencode models` may contact a
-background server on a cold start. Unknown model IDs still fail in both modes. A
-missing binary, a bounded timeout, non-UTF8 output, and a non-zero plain `models`
-exit are distinct fail-closed errors that name the command and bound. There is
+**OpenCode model validation:** `init` validates exactly the roles it validated
+before the probe existed: an OpenCode worker route and the reviewer (through the
+harness-aware validator for its configured harness). TL routes are resolved and
+logged but not model-validated, and a non-OpenCode worker route is not
+model-validated; `validate_opencode_model_owner` remains a separate field-owner
+check. For OpenCode, `init` runs exactly one subprocess — `opencode --version`
+under `OPENCODE_PROBE_TIMEOUT` (10s) — and then validates the model and effort
+against the committed static table for that version
+(`rust/exomonad/data/opencode/<version>.json`, embedded through
+`EMBEDDED_OPENCODE_TABLES`). No live catalog command and no network request is
+made; the catalog is never discovered at runtime. A missing binary,
+a `--version` timeout, a non-zero exit, non-UTF8 output, and output without a
+recognizable version are distinct fail-closed errors that name the command and
+bound. An unknown model fails naming the model, the version, and the table file;
+a requested effort that the table does not record (`null`), that the model does
+not support (`[]`), or that is not in the model's list is a hard error naming
+the supported efforts — there is no pass-through and no warning. An unknown
+harness version fails naming the detected version, the known versions, and the
+table entry a new version needs; there is no nearest-version fallback. There is
 no bypass flag or silent skip, and no ETXTBSY retry loop in production; test
 fixtures create their executable atomically instead.
+
+**Adding an OpenCode harness version:** commit
+`rust/exomonad/data/opencode/<version>.json` (schema_version 1, harness
+`opencode`, `version` equal to the file key, and `models` mapping each
+`provider/model` to `{"efforts": [...] | null}`), register it in
+`EMBEDDED_OPENCODE_TABLES`, and add the test that pins the new table. No code
+branch is added per version, and `exomonad models` lists the new table
+automatically under `# opencode <version>`.
 
 **Bootstrap:** `exomonad new` auto-creates `.exo/config.toml` (empty, all defaults) and `.gitignore` entries if missing.
 

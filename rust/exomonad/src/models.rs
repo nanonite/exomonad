@@ -1,10 +1,10 @@
+use crate::opencode_models;
 use anyhow::{bail, Context, Result};
-use std::process::Stdio;
 
 pub async fn run(harness: Option<String>, provider: Option<String>) -> Result<()> {
     match harness.as_deref() {
         None => run_all(provider).await,
-        Some("opencode") => run_opencode(provider).await,
+        Some("opencode") => run_opencode(provider),
         Some("claude") => run_claude(),
         Some("codex") => run_codex(),
         Some(other) => {
@@ -13,22 +13,38 @@ pub async fn run(harness: Option<String>, provider: Option<String>) -> Result<()
     }
 }
 
-async fn run_opencode(provider: Option<String>) -> Result<()> {
-    let mut cmd = tokio::process::Command::new("opencode");
-    cmd.arg("models");
-    if let Some(p) = provider {
-        cmd.arg(p);
+/// The OpenCode model listing printed by `exomonad models`.
+///
+/// One `# opencode <version>` header per committed table, followed by that
+/// table's model ids. The committed table is the only source: no `opencode`
+/// subprocess runs, so the listing cannot disagree with what init validates.
+pub fn opencode_model_listing(provider: Option<&str>) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    for table in opencode_models::tables()? {
+        lines.push(format!("# opencode {}", table.version));
+        for id in table.models.keys() {
+            if let Some(provider) = provider {
+                let matches_provider =
+                    id.split_once('/').map(|(prefix, _)| prefix) == Some(provider);
+                if !matches_provider {
+                    continue;
+                }
+            }
+            lines.push(id.clone());
+        }
     }
-    let status = cmd
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .await
-        .context("Failed to spawn `opencode models` — is opencode on PATH?")?;
-    if !status.success() {
-        bail!("`opencode models` exited {status}");
+    Ok(lines)
+}
+
+fn print_opencode_listing(provider: Option<&str>) -> Result<()> {
+    for line in opencode_model_listing(provider)? {
+        println!("{line}");
     }
     Ok(())
+}
+
+fn run_opencode(provider: Option<String>) -> Result<()> {
+    print_opencode_listing(provider.as_deref())
 }
 
 fn run_claude() -> Result<()> {
@@ -113,10 +129,7 @@ fn parse_codex_catalog(json: &[u8]) -> Result<Vec<String>> {
 }
 
 async fn run_all(provider: Option<String>) -> Result<()> {
-    println!("# opencode");
-    if let Err(error) = run_opencode(provider).await {
-        println!("opencode: unavailable ({error:#})");
-    }
+    print_opencode_listing(provider.as_deref())?;
     println!();
     println!("# claude");
     run_claude()?;
@@ -129,6 +142,99 @@ async fn run_all(provider: Option<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn opencode_listing_matches_the_table_for_every_committed_version() {
+        let lines = opencode_model_listing(None).unwrap();
+        let mut headers = Vec::new();
+        let mut listed = BTreeSet::new();
+        for line in &lines {
+            match line.strip_prefix("# opencode ") {
+                Some(version) => headers.push(version.to_string()),
+                None => {
+                    listed.insert(line.clone());
+                }
+            }
+        }
+
+        let tables = opencode_models::tables().unwrap();
+        let expected = tables
+            .iter()
+            .flat_map(|table| table.models.keys().cloned())
+            .collect::<BTreeSet<_>>();
+        let expected_headers = tables
+            .iter()
+            .map(|table| table.version.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(listed, expected);
+        assert_eq!(headers, expected_headers);
+    }
+
+    #[test]
+    fn opencode_listing_filters_by_provider() {
+        let lines = opencode_model_listing(Some("opencode-go")).unwrap();
+        assert!(lines
+            .iter()
+            .any(|line| line == "opencode-go/deepseek-v4.1-flash"));
+        assert!(lines
+            .iter()
+            .all(|line| { line.starts_with("# opencode ") || line.starts_with("opencode-go/") }));
+        assert!(!lines.iter().any(|line| line.starts_with("opencode/")));
+    }
+
+    #[test]
+    fn opencode_listing_keeps_a_header_when_the_provider_has_no_models() {
+        let lines = opencode_model_listing(Some("no-such-provider")).unwrap();
+        assert!(lines.iter().all(|line| line.starts_with("# opencode ")));
+        assert_eq!(lines.len(), opencode_models::tables().unwrap().len());
+    }
+
+    #[test]
+    fn opencode_listing_has_no_duplicate_ids_across_tables() {
+        let lines = opencode_model_listing(None).unwrap();
+        let ids = lines
+            .iter()
+            .filter(|line| !line.starts_with("# "))
+            .collect::<Vec<_>>();
+        let unique = ids.iter().copied().collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), unique.len());
+    }
+
+    #[test]
+    fn opencode_listing_orders_ids_within_each_table() {
+        let lines = opencode_model_listing(None).unwrap();
+        let mut current = Vec::new();
+        let mut per_table = Vec::new();
+        for line in &lines {
+            if line.starts_with("# opencode ") {
+                if !current.is_empty() {
+                    per_table.push(std::mem::take(&mut current));
+                }
+            } else {
+                current.push(line.clone());
+            }
+        }
+        if !current.is_empty() {
+            per_table.push(current);
+        }
+        assert!(!per_table.is_empty());
+        for ids in per_table {
+            assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+    }
+
+    #[test]
+    fn opencode_provider_filter_matches_a_whole_provider_segment() {
+        let lines = opencode_model_listing(Some("opencode")).unwrap();
+        let ids = lines
+            .iter()
+            .filter(|line| !line.starts_with("# "))
+            .collect::<Vec<_>>();
+        assert!(!ids.is_empty());
+        assert!(ids.iter().all(|id| id.starts_with("opencode/")));
+        assert!(!ids.iter().any(|id| id.starts_with("opencode-go/")));
+    }
 
     #[test]
     fn parse_codex_catalog_prefers_display_name_when_distinct() {

@@ -1,57 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# OpenCode capability probe fixtures. The installed v2.0.22 accepts only
-# --standalone/--server on `models`, so its help text deliberately omits
-# --verbose and init validates the plain provider/model listing.
+# OpenCode fixture. `init` validates models against its committed static table
+# for this version and runs only `opencode --version`; the shim therefore answers
+# nothing else.
 if [[ "${1:-}" == "--version" ]]; then
     printf 'opencode v2.0.22\n'
-    exit 0
-fi
-
-if [[ "${1:-}" == "models" && "${2:-}" == "--help" ]]; then
-    cat <<'HELP'
-DESCRIPTION
-  List all available models
-
-USAGE
-  opencode models [flags]
-
-FLAGS
-  --standalone       Run with a private server instead of the background service
-  --server string    Connect to a server URL instead of the background service
-HELP
-    exit 0
-fi
-
-if [[ "${1:-}" == "models" && -z "${2:-}" ]]; then
-    printf 'opencode-go/deepseek-v4.1-flash\nopencode-go/deepseek-v4.1-pro\n'
-    exit 0
-fi
-
-if [[ "${1:-}" == "models" && "${2:-}" == "--verbose" ]]; then
-    # Match the catalog format the production parser accepts: a model label
-    # followed by one pretty-printed JSON record. The record id omits the
-    # provider; providerID supplies the qualified catalog key.
-    cat <<'JSON'
-opencode-go/deepseek-v4.1-flash
-{
-  "id": "deepseek-v4.1-flash",
-  "providerID": "opencode-go",
-  "variants": {
-    "high": {},
-    "xhigh": {}
-  }
-}
-opencode-go/deepseek-v4.1-pro
-{
-  "id": "deepseek-v4.1-pro",
-  "providerID": "opencode-go",
-  "variants": {
-    "high": {}
-  }
-}
-JSON
     exit 0
 fi
 

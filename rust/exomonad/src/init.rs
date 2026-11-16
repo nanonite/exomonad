@@ -1,4 +1,4 @@
-use crate::{clean, uds_client};
+use crate::{clean, opencode_models, uds_client};
 use anyhow::{Context, Result};
 use exomonad::config::{
     Config, EffortLevel, ResolvedEffort, REVIEWER_EFFORT_ENV, REVIEWER_MAX_ROUNDS_ENV,
@@ -4523,86 +4523,11 @@ fn validate_claude_model(model: &str) -> Result<()> {
     Ok(())
 }
 
-type OpencodeModelCatalog = std::collections::HashMap<String, std::collections::BTreeSet<String>>;
-
-/// Upper bound for the cheap capability probe (`--version`, `models --help`).
+/// Upper bound for the one subprocess `init` runs for OpenCode validation.
 ///
-/// These commands answer from local state; a hung CLI must fail `init` with a
-/// named timeout instead of blocking controller startup forever.
+/// `opencode --version` answers from local state; a hung CLI must fail `init`
+/// with a named timeout instead of blocking controller startup forever.
 const OPENCODE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Upper bound for the catalog listing itself.
-///
-/// `opencode models` may start or contact a background server, which can take
-/// much longer than `--version` on a cold start. The bound is deliberately
-/// generous so a slow but healthy catalog is not mistaken for a hung one.
-const OPENCODE_CATALOG_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// One OpenCode catalog observation plus the capability mode it proved.
-struct OpencodeCatalogProbe {
-    version: String,
-    verbose: bool,
-    catalog: OpencodeModelCatalog,
-}
-
-fn parse_opencode_model_catalog(text: &str) -> OpencodeModelCatalog {
-    let mut catalog = std::collections::HashMap::new();
-    let mut json = String::new();
-    let mut label = None;
-
-    for line in text.lines() {
-        if json.is_empty() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('{') {
-                json.push_str(trimmed);
-            } else if !trimmed.is_empty() {
-                label = Some(trimmed.to_string());
-            }
-            continue;
-        }
-
-        json.push('\n');
-        json.push_str(line);
-        let Ok(value) = serde_json::from_str::<Value>(&json) else {
-            continue;
-        };
-        let Some(object) = value.as_object() else {
-            json.clear();
-            label = None;
-            continue;
-        };
-        let id = object
-            .get("id")
-            .and_then(Value::as_str)
-            .or(label.as_deref());
-        let provider = object.get("providerID").and_then(Value::as_str);
-        let variants: std::collections::BTreeSet<String> = object
-            .get("variants")
-            .and_then(Value::as_object)
-            .map(|variants| variants.keys().cloned().collect())
-            .unwrap_or_default();
-        if let Some(id) = id {
-            catalog.insert(id.to_string(), variants.clone());
-            if let Some(provider) = provider {
-                catalog.insert(format!("{provider}/{id}"), variants);
-            }
-        }
-        json.clear();
-        label = None;
-    }
-
-    catalog
-}
-
-/// Parse the plain `opencode models` projection: one exact `provider/model`
-/// identifier per line. Comment and blank lines are not model identifiers.
-fn parse_plain_opencode_model_catalog(text: &str) -> OpencodeModelCatalog {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(|line| (line.to_string(), std::collections::BTreeSet::new()))
-        .collect()
-}
 
 fn opencode_command_label(binary: &Path, args: &[&str]) -> String {
     let mut label = binary.display().to_string();
@@ -4641,117 +4566,53 @@ fn opencode_stdout_text(output: &std::process::Output, label: &str) -> Result<St
         .with_context(|| format!("`{label}` produced non-UTF8 output"))
 }
 
-/// Probe the installed OpenCode CLI for the catalog capability it supports.
+/// Detect the installed OpenCode harness version.
 ///
-/// `opencode models --verbose` is not universal: v2.0.22 only accepts
-/// `--standalone` and `--server`. The version and `models --help` output decide
-/// which catalog command to run, so an unknown flag can never turn the catalog
-/// check into a hard failure.
-async fn probe_opencode_catalog(
-    binary: &Path,
-    probe_timeout: Duration,
-    catalog_timeout: Duration,
-) -> Result<OpencodeCatalogProbe> {
-    let version_args = ["--version"];
-    let version_label = opencode_command_label(binary, &version_args);
-    let version_output = run_opencode_command(binary, &version_args, probe_timeout).await?;
-    if !version_output.status.success() {
+/// This is the only subprocess `init` runs for OpenCode validation. The model
+/// and effort verdict comes from the committed table for the detected version,
+/// never from a live catalog listing.
+async fn detect_opencode_version(binary: &Path, probe_timeout: Duration) -> Result<String> {
+    let args = ["--version"];
+    let label = opencode_command_label(binary, &args);
+    let output = run_opencode_command(binary, &args, probe_timeout).await?;
+    if !output.status.success() {
         anyhow::bail!(
-            "`{version_label}` exited {}: {}",
-            version_output.status,
-            String::from_utf8_lossy(&version_output.stderr).trim()
+            "`{label}` exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let version = opencode_stdout_text(&version_output, &version_label)?
-        .trim()
-        .to_string();
-
-    let help_args = ["models", "--help"];
-    let help_label = opencode_command_label(binary, &help_args);
-    let help_output = run_opencode_command(binary, &help_args, probe_timeout).await?;
-    let verbose = if help_output.status.success() {
-        opencode_stdout_text(&help_output, &help_label)?
-            .lines()
-            .any(|line| line.contains("--verbose"))
-    } else {
-        warn!(
-            command = %help_label,
-            status = %help_output.status,
-            "OpenCode `models --help` failed; validating against the plain model list"
-        );
-        false
-    };
-
-    let model_args: &[&str] = if verbose {
-        &["models", "--verbose"]
-    } else {
-        &["models"]
-    };
-    let models_label = opencode_command_label(binary, model_args);
+    let text = opencode_stdout_text(&output, &label)?;
+    let version = opencode_models::parse_version_token(&text).ok_or_else(|| {
+        anyhow::anyhow!(
+            "`{label}` produced no recognisable OpenCode version (expected output like \
+             `opencode v2.0.22`): {:?}",
+            text.trim()
+        )
+    })?;
     info!(
-        binary = %binary.display(),
         version = %version,
-        mode = if verbose { "verbose" } else { "plain" },
-        "Probed OpenCode model catalog capability"
+        "Detected the OpenCode harness version; validating models against the committed static table"
     );
-    let models_output = run_opencode_command(binary, model_args, catalog_timeout).await?;
-    if !models_output.status.success() {
-        anyhow::bail!(
-            "`{models_label}` exited {}: {}",
-            models_output.status,
-            String::from_utf8_lossy(&models_output.stderr).trim()
-        );
-    }
-    let text = opencode_stdout_text(&models_output, &models_label)?;
-    let catalog = if verbose {
-        parse_opencode_model_catalog(&text)
-    } else {
-        parse_plain_opencode_model_catalog(&text)
-    };
-    Ok(OpencodeCatalogProbe {
-        version,
-        verbose,
-        catalog,
-    })
+    Ok(version)
 }
 
 async fn validate_opencode_model_with(
     binary: &Path,
     probe_timeout: Duration,
-    catalog_timeout: Duration,
     model: &str,
     effort: Option<&str>,
 ) -> Result<()> {
-    let probe = probe_opencode_catalog(binary, probe_timeout, catalog_timeout).await?;
-    let Some(variants) = probe.catalog.get(model) else {
+    let version = detect_opencode_version(binary, probe_timeout).await?;
+    let Some(table) = opencode_models::table_for_version(&version)? else {
+        let known = opencode_models::known_versions()?.join(", ");
         anyhow::bail!(
-            "Unknown opencode model `{model}` for {} (`{}` mode). Run `exomonad models` to see the list.",
-            probe.version,
-            if probe.verbose { "verbose" } else { "plain" }
+            "OpenCode harness version `{version}` has no committed model table. Known versions: \
+             {known}. Add `{}`, register it in EMBEDDED_OPENCODE_TABLES, and add a test.",
+            opencode_models::table_path(&version)
         );
     };
-    if let Some(effort) = effort.filter(|value| !value.is_empty()) {
-        if probe.verbose {
-            if !variants.contains(effort) {
-                let supported = if variants.is_empty() {
-                    "none".to_string()
-                } else {
-                    variants.iter().cloned().collect::<Vec<_>>().join(", ")
-                };
-                anyhow::bail!(
-                    "Unsupported OpenCode effort `{effort}` for model `{model}`. Supported variants: {supported}. Correct with the role-specific effort flag."
-                );
-            }
-        } else {
-            warn!(
-                model = %model,
-                effort = %effort,
-                version = %probe.version,
-                "OpenCode does not accept `models --verbose`; the requested effort variant could not be validated and is passed through unchanged"
-            );
-        }
-    }
-    Ok(())
+    opencode_models::validate_model(table, model, effort)
 }
 
 fn validate_codex_model_name(model: &str) -> Result<()> {
@@ -4845,7 +4706,6 @@ async fn validate_harness_model_with(
     effort: Option<&str>,
     opencode_binary: &Path,
     opencode_probe_timeout: Duration,
-    opencode_catalog_timeout: Duration,
 ) -> Result<()> {
     let Some(model) = model else {
         return Ok(());
@@ -4855,14 +4715,8 @@ async fn validate_harness_model_with(
         AgentType::Claude => validate_claude_model(model),
         AgentType::Codex => validate_codex_model(model, effort).await,
         AgentType::OpenCode => {
-            validate_opencode_model_with(
-                opencode_binary,
-                opencode_probe_timeout,
-                opencode_catalog_timeout,
-                model,
-                effort,
-            )
-            .await
+            validate_opencode_model_with(opencode_binary, opencode_probe_timeout, model, effort)
+                .await
         }
         AgentType::Shoal | AgentType::Process => Ok(()),
     }
@@ -4879,7 +4733,6 @@ async fn validate_harness_model(
         effort,
         Path::new("opencode"),
         OPENCODE_PROBE_TIMEOUT,
-        OPENCODE_CATALOG_TIMEOUT,
     )
     .await
 }
@@ -16022,14 +15875,11 @@ mod tests {
     async fn validate_fixture(
         binary: &Path,
         probe_timeout: Duration,
-        catalog_timeout: Duration,
         model: &str,
         effort: Option<&str>,
     ) -> anyhow::Result<()> {
         for attempt in 0..20 {
-            let result =
-                validate_opencode_model_with(binary, probe_timeout, catalog_timeout, model, effort)
-                    .await;
+            let result = validate_opencode_model_with(binary, probe_timeout, model, effort).await;
             if attempt == 19 || !result.as_ref().err().is_some_and(is_text_file_busy) {
                 return result;
             }
@@ -16038,152 +15888,94 @@ mod tests {
         unreachable!("the bounded retry loop always returns")
     }
 
+    /// A fake `opencode` that answers only `--version`.
+    ///
+    /// Every other invocation writes `marker` and exits non-zero, so a test can
+    /// prove init never asked the CLI for a catalog. When `empty_models` is
+    /// set, `models` prints nothing and exits zero: the old probe would have
+    /// seen an empty catalog instead of the table.
     #[cfg(unix)]
-    async fn probe_fixture(
-        binary: &Path,
-        probe_timeout: Duration,
-        catalog_timeout: Duration,
-    ) -> anyhow::Result<OpencodeCatalogProbe> {
-        for attempt in 0..20 {
-            let result = probe_opencode_catalog(binary, probe_timeout, catalog_timeout).await;
-            if attempt == 19 || !result.as_ref().err().is_some_and(is_text_file_busy) {
-                return result;
+    fn opencode_version_only_shim(
+        marker: &Path,
+        version_output: &str,
+        empty_models: bool,
+    ) -> String {
+        let models = if empty_models {
+            format!("  models) : > '{}' ; exit 0 ;;\n", marker.display())
+        } else {
+            format!("  models) : > '{}' ; exit 1 ;;\n", marker.display())
+        };
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) printf '%s\\n' '{version_output}' ;;\n{models}  *) : > '{}' ; exit 64 ;;\nesac\n",
+            marker.display()
+        )
+    }
+
+    #[cfg(unix)]
+    async fn assert_known_models_validate_fifty_times(binary: &Path, marker: &Path) {
+        let cases = [
+            ("opencode-go/deepseek-v4.1-flash", None),
+            ("opencode-go/deepseek-v4.1-flash", Some("high")),
+            ("opencode-go/glm-5.3-flash", None),
+            ("opencode-go/glm-5.3-flash", Some("high")),
+        ];
+        for run in 0..50 {
+            for (model, effort) in cases {
+                validate_fixture(binary, Duration::from_secs(2), model, effort)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "run {run} rejected known model `{model}` effort {effort:?}: {error:#}"
+                        )
+                    });
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        unreachable!("the bounded retry loop always returns")
-    }
-
-    #[test]
-    fn opencode_catalog_bounds_are_distinct_and_generous() {
-        assert!(OPENCODE_PROBE_TIMEOUT < OPENCODE_CATALOG_TIMEOUT);
-        assert!(OPENCODE_CATALOG_TIMEOUT >= Duration::from_secs(60));
-    }
-
-    #[cfg(unix)]
-    const PLAIN_OPENCODE_SHIM: &str = r#"#!/bin/sh
-case "$1" in
-  --version) echo "opencode v2.0.22" ;;
-  models)
-    if [ "$2" = "--help" ]; then
-      printf 'USAGE\n  opencode models [flags]\n\nFLAGS\n  --standalone       Run with a private server\n  --server string    Connect to a server URL\n'
-      exit 0
-    fi
-    printf 'opencode-go/deepseek-v4-flash\nopencode-go/deepseek-v4-pro\n'
-    ;;
-  *) exit 64 ;;
-esac
-"#;
-
-    #[cfg(unix)]
-    const VERBOSE_OPENCODE_SHIM: &str = r#"#!/bin/sh
-case "$1" in
-  --version) echo "opencode v1.9.0" ;;
-  models)
-    if [ "$2" = "--help" ]; then
-      printf 'USAGE\n  opencode models [flags]\n\nFLAGS\n  --verbose          Include variants\n  --standalone       Run with a private server\n'
-      exit 0
-    fi
-    if [ "$2" = "--verbose" ]; then
-      printf 'opencode-go/deepseek-v4-pro\n{\n  "id": "deepseek-v4-pro",\n  "providerID": "opencode-go",\n  "variants": {\n    "high": {},\n    "max": {}\n  }\n}\n'
-      exit 0
-    fi
-    printf 'opencode-go/deepseek-v4-pro\n'
-    ;;
-  *) exit 64 ;;
-esac
-"#;
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn opencode_plain_catalog_validates_v2_0_22_model_without_verbose() {
-        let _fixture = lock_opencode_fixture().await;
-        let directory = tempfile::tempdir().unwrap();
-        let binary = write_opencode_shim(directory.path(), PLAIN_OPENCODE_SHIM);
-
-        validate_fixture(
-            &binary,
-            Duration::from_secs(2),
-            Duration::from_secs(10),
-            "opencode-go/deepseek-v4-flash",
-            Some("max"),
-        )
-        .await
-        .expect("plain catalog validates the model and degrades the effort check");
+        assert!(
+            !marker.exists(),
+            "init invoked `opencode` for something other than `--version`"
+        );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn opencode_probe_reports_plain_mode_for_v2_0_22() {
+    async fn opencode_table_validates_known_models_deterministically_fifty_times() {
         let _fixture = lock_opencode_fixture().await;
         let directory = tempfile::tempdir().unwrap();
-        let binary = write_opencode_shim(directory.path(), PLAIN_OPENCODE_SHIM);
-        let probe = probe_fixture(&binary, Duration::from_secs(2), Duration::from_secs(10))
-            .await
-            .unwrap();
-        assert!(!probe.verbose);
-        assert_eq!(probe.version, "opencode v2.0.22");
-        assert!(probe.catalog.contains_key("opencode-go/deepseek-v4-flash"));
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode v2.0.22", false),
+        );
+        assert_known_models_validate_fifty_times(&binary, &marker).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn opencode_verbose_catalog_uses_variant_data() {
+    async fn opencode_table_does_not_depend_on_models_output() {
         let _fixture = lock_opencode_fixture().await;
         let directory = tempfile::tempdir().unwrap();
-        let binary = write_opencode_shim(directory.path(), VERBOSE_OPENCODE_SHIM);
-        let probe = probe_fixture(&binary, Duration::from_secs(2), Duration::from_secs(10))
-            .await
-            .unwrap();
-        assert!(probe.verbose);
-        assert!(probe
-            .catalog
-            .get("opencode-go/deepseek-v4-pro")
-            .is_some_and(|variants| variants.contains("max")));
-
-        validate_fixture(
-            &binary,
-            Duration::from_secs(2),
-            Duration::from_secs(10),
-            "opencode-go/deepseek-v4-pro",
-            Some("max"),
-        )
-        .await
-        .unwrap();
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode v2.0.22", true),
+        );
+        assert_known_models_validate_fifty_times(&binary, &marker).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn opencode_verbose_catalog_rejects_unsupported_effort() {
+    async fn opencode_unknown_model_names_model_version_and_table_file() {
         let _fixture = lock_opencode_fixture().await;
         let directory = tempfile::tempdir().unwrap();
-        let binary = write_opencode_shim(directory.path(), VERBOSE_OPENCODE_SHIM);
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode v2.0.22", false),
+        );
 
         let error = validate_fixture(
             &binary,
             Duration::from_secs(2),
-            Duration::from_secs(10),
-            "opencode-go/deepseek-v4-pro",
-            Some("medium"),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("Unsupported OpenCode effort `medium`"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn opencode_unknown_model_fails_in_plain_mode() {
-        let _fixture = lock_opencode_fixture().await;
-        let directory = tempfile::tempdir().unwrap();
-        let binary = write_opencode_shim(directory.path(), PLAIN_OPENCODE_SHIM);
-
-        let error = validate_fixture(
-            &binary,
-            Duration::from_secs(2),
-            Duration::from_secs(10),
             "opencode-go/not-a-model",
             None,
         )
@@ -16191,30 +15983,65 @@ esac
         .unwrap_err()
         .to_string();
 
-        assert!(error.contains("Unknown opencode model `opencode-go/not-a-model`"));
-        assert!(error.contains("plain"));
+        assert!(error.contains("Unknown OpenCode model `opencode-go/not-a-model`"));
+        assert!(error.contains("v2.0.22"));
+        assert!(error.contains("rust/exomonad/data/opencode/v2.0.22.json"));
+        assert!(
+            !marker.exists(),
+            "an unknown model must not trigger a catalog call"
+        );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn opencode_unknown_model_fails_in_verbose_mode() {
+    async fn opencode_unknown_harness_version_names_the_known_versions() {
         let _fixture = lock_opencode_fixture().await;
         let directory = tempfile::tempdir().unwrap();
-        let binary = write_opencode_shim(directory.path(), VERBOSE_OPENCODE_SHIM);
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode v9.9.9", false),
+        );
 
         let error = validate_fixture(
             &binary,
             Duration::from_secs(2),
-            Duration::from_secs(10),
-            "opencode-go/not-a-model",
+            "opencode-go/deepseek-v4.1-flash",
             None,
         )
         .await
         .unwrap_err()
         .to_string();
 
-        assert!(error.contains("Unknown opencode model `opencode-go/not-a-model`"));
-        assert!(error.contains("verbose"));
+        assert!(error.contains("`v9.9.9`"));
+        assert!(error.contains("Known versions: v2.0.22"));
+        assert!(error.contains("EMBEDDED_OPENCODE_TABLES"));
+        assert!(error.contains("rust/exomonad/data/opencode/v9.9.9.json"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_unparseable_version_output_is_a_distinct_error() {
+        let _fixture = lock_opencode_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode unknown-build", false),
+        );
+
+        let error = validate_fixture(
+            &binary,
+            Duration::from_secs(2),
+            "opencode-go/deepseek-v4.1-flash",
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("no recognisable OpenCode version"));
+        assert!(error.contains("--version"));
     }
 
     #[cfg(unix)]
@@ -16227,8 +16054,7 @@ esac
         let error = validate_fixture(
             &missing,
             Duration::from_secs(2),
-            Duration::from_secs(10),
-            "opencode-go/deepseek-v4-flash",
+            "opencode-go/deepseek-v4.1-flash",
             None,
         )
         .await
@@ -16242,19 +16068,18 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn opencode_catalog_timeout_is_a_distinct_bounded_error() {
+    async fn opencode_version_timeout_is_a_distinct_bounded_error() {
         let _fixture = lock_opencode_fixture().await;
         let directory = tempfile::tempdir().unwrap();
         let binary = write_opencode_shim(
             directory.path(),
-            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'opencode v2.0.22' ;;\n  *) sleep 5 ;;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\n  --version) sleep 5 ;;\n  *) exit 64 ;;\nesac\n",
         );
 
         let error = validate_fixture(
             &binary,
             Duration::from_millis(50),
-            Duration::from_millis(500),
-            "opencode-go/deepseek-v4-flash",
+            "opencode-go/deepseek-v4.1-flash",
             None,
         )
         .await
@@ -16262,26 +16087,25 @@ esac
         .to_string();
 
         assert!(error.contains("timed out"));
-        assert!(error.contains("models --help"));
+        assert!(error.contains("--version"));
         // The message names the bound that fired, not just the command.
         assert!(error.contains("0.1s"), "unexpected error: {error}");
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn opencode_non_utf8_catalog_output_is_a_distinct_error() {
+    async fn opencode_non_utf8_version_output_is_a_distinct_error() {
         let _fixture = lock_opencode_fixture().await;
         let directory = tempfile::tempdir().unwrap();
         let binary = write_opencode_shim(
             directory.path(),
-            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'opencode v2.0.22' ;;\n  models)\n    if [ \"$2\" = \"--help\" ]; then printf 'FLAGS\\n  --standalone\\n'; exit 0; fi\n    printf '\\377\\376\\n'\n    ;;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\n  --version) printf '\\377\\376\\n' ;;\n  *) exit 64 ;;\nesac\n",
         );
 
         let error = validate_fixture(
             &binary,
             Duration::from_secs(2),
-            Duration::from_secs(10),
-            "opencode-go/deepseek-v4-flash",
+            "opencode-go/deepseek-v4.1-flash",
             None,
         )
         .await
@@ -16289,32 +16113,225 @@ esac
         .to_string();
 
         assert!(error.contains("non-UTF8"));
-        assert!(error.contains("opencode models"));
+        assert!(error.contains("--version"));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn opencode_plain_models_nonzero_exit_is_a_distinct_error() {
+    async fn opencode_version_nonzero_exit_is_a_distinct_error() {
         let _fixture = lock_opencode_fixture().await;
         let directory = tempfile::tempdir().unwrap();
         let binary = write_opencode_shim(
             directory.path(),
-            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'opencode v2.0.22' ;;\n  models)\n    if [ \"$2\" = \"--help\" ]; then printf 'FLAGS\\n  --standalone\\n'; exit 0; fi\n    echo 'catalog refused' >&2\n    exit 3\n    ;;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'version refused' >&2; exit 3 ;;\n  *) exit 64 ;;\nesac\n",
         );
 
         let error = validate_fixture(
             &binary,
             Duration::from_secs(2),
-            Duration::from_secs(10),
-            "opencode-go/deepseek-v4-flash",
+            "opencode-go/deepseek-v4.1-flash",
             None,
         )
         .await
         .unwrap_err()
         .to_string();
 
-        assert!(error.contains("models` exited"));
-        assert!(error.contains("catalog refused"));
+        assert!(error.contains("--version` exited"));
+        assert!(error.contains("version refused"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_unsupported_effort_lists_the_supported_ones() {
+        let _fixture = lock_opencode_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode v2.0.22", false),
+        );
+
+        let error = validate_fixture(
+            &binary,
+            Duration::from_secs(2),
+            "opencode-go/deepseek-v4.1-flash",
+            Some("minimal"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Unsupported OpenCode effort `minimal`"));
+        assert!(error.contains("low, high, max"));
+        assert!(error.contains("rust/exomonad/data/opencode/v2.0.22.json"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_model_with_no_effort_variants_refuses_the_effort() {
+        let _fixture = lock_opencode_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode v2.0.22", false),
+        );
+
+        let error = validate_fixture(
+            &binary,
+            Duration::from_secs(2),
+            "opencode-go/kimi-k2.7-code",
+            Some("high"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("records no effort variants"));
+        assert!(error.contains("opencode-go/kimi-k2.7-code"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_unrecorded_efforts_refuse_the_effort() {
+        let _fixture = lock_opencode_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode v2.0.22", false),
+        );
+
+        let error = validate_fixture(
+            &binary,
+            Duration::from_secs(2),
+            "opencode-go/beam-free",
+            Some("high"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("does not record effort variants"));
+        assert!(error.contains("models[\"opencode-go/beam-free\"].efforts"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_supported_effort_passes_without_a_warning() {
+        let _fixture = lock_opencode_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode v2.0.22", false),
+        );
+
+        validate_fixture(
+            &binary,
+            Duration::from_secs(2),
+            "opencode-go/glm-5.3-flash",
+            Some("high"),
+        )
+        .await
+        .expect("a recorded effort passes");
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_route_reaches_the_same_table_validator_as_the_dispatcher() {
+        let _fixture = lock_opencode_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode v2.0.22", false),
+        );
+
+        let direct = validate_fixture(
+            &binary,
+            Duration::from_secs(2),
+            "opencode-go/not-a-model",
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        let dispatched = validate_harness_model_with(
+            AgentType::OpenCode,
+            Some("opencode-go/not-a-model"),
+            None,
+            &binary,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(direct, dispatched);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn opencode_table_registry_resolves_the_committed_version() {
+        let table = opencode_models::table_for_version("v2.0.22")
+            .expect("the registry parses")
+            .expect("v2.0.22 is committed");
+        assert_eq!(table.version, "v2.0.22");
+        assert!(table.model("opencode-go/deepseek-v4.1-flash").is_some());
+    }
+
+    #[test]
+    fn opencode_table_registry_rejects_unknown_versions_without_a_fallback() {
+        assert!(opencode_models::table_for_version("v9.9.9")
+            .expect("the registry parses")
+            .is_none());
+        assert!(opencode_models::known_versions()
+            .expect("the registry parses")
+            .contains(&"v2.0.22"));
+    }
+
+    #[test]
+    fn every_role_route_reaches_the_one_harness_validator() {
+        let source = include_str!("init.rs");
+        let tests_module = source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("init.rs keeps its tests in one module");
+        let production = &source[..tests_module];
+
+        // The OpenCode table validator is defined once and reached only through
+        // the harness dispatcher; every role target uses that dispatcher.
+        assert_eq!(
+            production.matches("validate_opencode_model_with(").count(),
+            2
+        );
+        assert_eq!(
+            production.matches("validate_harness_model_with(").count(),
+            2
+        );
+        assert_eq!(production.matches("validate_harness_model(").count(), 2);
+        let init_call = production
+            .find("for target in init_model_validation_targets")
+            .expect("init validates the resolved role targets");
+        assert!(production[init_call..].contains("validate_harness_model("));
+        assert!(production.contains("fn validate_opencode_model_owner("));
+
+        // The removed probe identifiers are assembled from fragments so this
+        // regression guard does not itself reintroduce the names it bans.
+        let removed = [
+            ["probe_opencode", "_catalog"].concat(),
+            ["parse_opencode_model", "_catalog"].concat(),
+            ["parse_plain_opencode_model", "_catalog"].concat(),
+            ["OPENCODE_CATALOG", "_TIMEOUT"].concat(),
+            ["models --", "verbose"].concat(),
+        ];
+        for removed in removed {
+            assert!(
+                !production.contains(&removed),
+                "the removed dynamic catalog probe symbol `{removed}` must not remain"
+            );
+        }
     }
 
     #[test]
@@ -17438,17 +17455,6 @@ esac
             .to_string()
             .contains("initial_prompt must be a JSON WorkPlan"));
     }
-    #[test]
-    fn parses_opencode_verbose_catalog_variants() {
-        let catalog = parse_opencode_model_catalog(
-            "opencode-go/deepseek-v4-pro\n{\n  \"id\": \"deepseek-v4-pro\",\n  \"providerID\": \"opencode-go\",\n  \"variants\": {\n    \"high\": {},\n    \"max\": {}\n  }\n}\n",
-        );
-
-        assert!(catalog["opencode-go/deepseek-v4-pro"].contains("high"));
-        assert!(catalog["opencode-go/deepseek-v4-pro"].contains("max"));
-        assert!(!catalog["opencode-go/deepseek-v4-pro"].contains("medium"));
-    }
-
     #[test]
     fn embedded_archive_contains_expected_source() {
         let marker = std::env::var("EXOMONAD_TL_LOOP_EXPECT_MARKER").unwrap_or_default();

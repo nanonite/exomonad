@@ -29,6 +29,7 @@ mod logs;
 mod mcp_stdio;
 mod models;
 mod new;
+mod opencode_models;
 mod plan;
 mod revert;
 mod serve;

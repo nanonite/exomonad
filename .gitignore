@@ -147,6 +147,10 @@ opencode-notes.md
 OPENCODE_NOTES.md
 opencode-*.md
 
+# Committed OpenCode harness model tables and fixtures, not runtime state.
+!rust/exomonad/data/opencode/
+!rust/exomonad/data/opencode/**
+
 
 .lolearn
 .codex
