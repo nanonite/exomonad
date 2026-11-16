@@ -62,6 +62,7 @@ from tl_loop.loop.driver import (
     AGGREGATE_PUBLICATION_GATE_PREFIX,
     DISPATCH_ALREADY_CONFIRMED,
     DISPATCH_CORRELATED,
+    DISPATCH_EPOCH_MISMATCH,
     DISPATCH_HISTORICAL_AUDIT,
     DISPATCH_INTEGRITY_CONFLICT,
     INTEGRATION_FAILURE_GATE_NAME,
@@ -28367,6 +28368,220 @@ def test_legacy_resume_receipt_records_its_evidence_source(
     )
 
 
+def test_legacy_resume_receipt_resolves_missing_model_effort_from_current_configuration(
+    tmp_path: Path,
+) -> None:
+    """A historical generation without route provenance is evidence, not a constraint."""
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path,
+        persisted_overrides={"model": None, "effort": None},
+    )
+
+    proof, reason = fixture.proof()
+
+    assert proof is not None, reason
+    assert proof.historical_route_gaps == (
+        "legacy resume invocation does not record model or effort",
+    )
+    authorization = _required_mapping(
+        proof.route_authorization, "configured route authorization"
+    )
+    # The successor generation is the currently configured route, not the
+    # historical model the old generation never recorded.
+    assert authorization["model"] == "gpt-6-luna"
+    assert authorization["effort"] == "xhigh"
+    assert proof.resume.desired_model == "gpt-6-luna"
+    assert proof.resume.desired_effort == "xhigh"
+
+
+def test_legacy_resume_route_gap_is_persisted_as_recovery_evidence(
+    tmp_path: Path,
+) -> None:
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path,
+        persisted_overrides={"model": None, "effort": None},
+    )
+    proof, reason = fixture.proof()
+    assert proof is not None, reason
+    before = fixture.snapshot()
+
+    state = driver_module._persist_terminal_route_authorization(
+        proof, fixture.store.load(), fixture.store
+    )
+
+    recovery = state.slices[fixture.plan.leaves[0].name].recovery
+    assert recovery is not None
+    assert recovery.evidence["historical_route_evidence_gaps"] == [
+        "legacy resume invocation does not record model or effort"
+    ]
+    # Persisting the evidence gap never rewrites the historical journal,
+    # identity, invocation, dispatch intent, or ledger rows.
+    after = fixture.snapshot()
+    assert after["journal"] == before["journal"]
+    assert after["identity"] == before["identity"]
+    assert after["invocation"] == before["invocation"]
+    assert after["dispatch_intent"] == before["dispatch_intent"]
+    assert after["ledger"] == before["ledger"]
+
+
+def test_legacy_resume_route_gap_resolution_is_idempotent(tmp_path: Path) -> None:
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path,
+        persisted_overrides={"model": None, "effort": None},
+    )
+    proof, reason = fixture.proof()
+    assert proof is not None, reason
+    snapshot = fixture.snapshot()
+    first = driver_module._persist_terminal_route_authorization(
+        proof, fixture.store.load(), fixture.store
+    )
+    proof_again, reason = driver_module._terminal_owner_recovery_proof(
+        fixture.plan, first, fixture.config, fixture.store
+    )
+    assert proof_again is not None, reason
+    second = driver_module._persist_terminal_route_authorization(
+        proof_again, first, fixture.store
+    )
+    assert second.slices[fixture.plan.leaves[0].name] == first.slices[
+        fixture.plan.leaves[0].name
+    ]
+    assert fixture.snapshot()["journal"] == snapshot["journal"]
+    assert fixture.snapshot()["invocation"] == snapshot["invocation"]
+
+
+def test_resume_with_changed_configured_model_records_old_and_new_route(
+    tmp_path: Path,
+) -> None:
+    fixture = _seed_legacy_terminal_resume(tmp_path)
+
+    proof, reason = fixture.proof()
+
+    assert proof is not None, reason
+    authorization = _required_mapping(
+        proof.route_authorization, "configured route authorization"
+    )
+    assert authorization["prior_model"] == "gpt-6.1-sol"
+    assert authorization["prior_effort"] == "xhigh"
+    assert authorization["model"] == "gpt-6-luna"
+    assert authorization["effort"] == "xhigh"
+    assert authorization["prior_invocation_id"] == fixture.successor_id
+    assert authorization["source"] == "accepted_operator_role_configuration"
+
+
+@pytest.mark.parametrize("field_name", ("model", "effort"))
+def test_modern_resume_receipt_still_refuses_missing_identity_route_field(
+    tmp_path: Path, field_name: str
+) -> None:
+    """A modern generation may not explain away a field its own record omits."""
+    fixture = _seed_legacy_terminal_resume(tmp_path)
+    _record_modern_successor_for_legacy_history(fixture)
+    identity_path = fixture.owner_dir / "identity.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    assert identity.get(field_name) is not None
+    identity.pop(field_name)
+    identity_path.write_text(json.dumps(identity, sort_keys=True), encoding="utf-8")
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason == "terminal owner runtime and model records disagree"
+
+
+def test_modern_lineage_without_route_fields_is_refused(tmp_path: Path) -> None:
+    """Only a proven legacy gap may omit model/effort from its comparisons."""
+    fixture = _seed_legacy_terminal_resume(tmp_path)
+    proof, reason = fixture.proof()
+    assert proof is not None, reason
+    lineage = driver_module._LegacyResumeLineage(
+        "codex", None, None, "durable_owner_invocation", None
+    )
+    arguments = _required_mapping(fixture.arguments, "resume arguments")
+    common = {
+        "records": fixture.ledger_rows,
+        "successor_id": fixture.successor_id,
+        "owner": proof.resume.owner,
+        "generation": 2,
+        "ledger_run_id": fixture.config.ledger_run_id,
+        "controller_run_id": fixture.store.run_id,
+        "prior_invocation_id": fixture.original_id,
+        "dispatch_intent_id": arguments["dispatch_intent_id"],
+        "persisted": fixture.persisted,
+        "persisted_matches": True,
+    }
+
+    assert driver_module._legacy_resume_lifecycle_payloads(
+        lineage=lineage, **common
+    ) == "legacy resume agent.resumed row conflicts with its confirmed action"
+
+    proven_gap = driver_module._LegacyResumeLineage(
+        "codex",
+        None,
+        None,
+        "durable_owner_invocation",
+        "legacy resume invocation does not record model or effort",
+    )
+    assert (
+        driver_module._legacy_resume_lifecycle_payloads(
+            lineage=proven_gap, **common
+        )
+        is None
+    )
+
+
+def test_a_stale_controller_epoch_is_still_rejected(
+    tmp_path: Path,
+) -> None:
+    """A predecessor controller epoch can never confirm this controller's dispatch.
+
+    The leaf-resume receipt proof does not carry a controller epoch (see the
+    evidence README); the live epoch guard is the dispatch-confirmation path,
+    which is what this regression pins.
+    """
+    run_id = "epoch-regression-run"
+    plan = WorkPlan.from_mapping(
+        {"leaves": [{"name": "leaf-a", "task": "task", "chainlink_issue_id": None}]}
+    )
+    create(
+        run_id,
+        {
+            "controller_epoch": "epoch-current",
+            "slices": _initial_slices(plan, TLLoopConfig(), tmp_path, run_id),
+        },
+        root_dir=tmp_path,
+    )
+    state = RunStore(run_id, tmp_path).load()
+    current = replace(
+        state.slices["leaf-a"],
+        status=SliceStatus.DISPATCHING,
+        attempts=1,
+        dispatch_intent_id=_dispatch_intent(run_id, "leaf-a"),
+        dispatch_generation=3,
+    )
+    state = replace(state, slices={"leaf-a": current})
+    base = _canonical_event(
+        1,
+        "agent.spawned",
+        "leaf-a",
+        run_id,
+        intent_id=current.dispatch_intent_id,
+    )
+    stale = replace(
+        base,
+        data={**base.data, "controller_epoch": "epoch-predecessor", "dispatch_generation": 3},
+    )
+
+    correlation = correlate_dispatch_event(state, stale)
+
+    assert correlation.classification == DISPATCH_HISTORICAL_AUDIT
+    assert correlation.reason == DISPATCH_EPOCH_MISMATCH
+    assert (
+        driver_module._spawn_confirmation_refusal(
+            state.slices, stale, controller_epoch=state.controller_epoch
+        )
+        == DISPATCH_EPOCH_MISMATCH
+    )
+
+
 def _record_modern_successor_for_legacy_history(
     fixture: _LegacyResumeFixture,
     *,
@@ -28817,6 +29032,65 @@ def test_legacy_resume_receipt_refuses_wrong_owner_coordinates_or_effects(
     assert proof is None
     assert observed is not None
     assert reason_fragment in observed
+
+
+def test_legacy_resume_receipt_still_refuses_a_foreign_owner(tmp_path: Path) -> None:
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path, persisted_overrides={"runtime_agent_id": "foreign-owner"}
+    )
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason is not None
+
+
+def test_legacy_resume_receipt_still_refuses_a_foreign_scope(tmp_path: Path) -> None:
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path, identity_overrides={"slice_id": "foreign-scope"}
+    )
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason is not None
+
+
+def test_legacy_resume_receipt_still_refuses_a_foreign_worktree(tmp_path: Path) -> None:
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path,
+        persisted_overrides={"worktree": "/tmp/foreign-worktree"},
+    )
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason is not None
+
+
+def test_legacy_resume_receipt_still_refuses_a_foreign_predecessor(tmp_path: Path) -> None:
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path,
+        persisted_overrides={"prior_invocation_id": "foreign-predecessor"},
+    )
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason is not None
+
+
+def test_legacy_resume_receipt_still_refuses_a_foreign_process_identity(
+    tmp_path: Path,
+) -> None:
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path, identity_overrides={"agent_name": "foreign-process"}
+    )
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason is not None
 
 
 @pytest.mark.parametrize(

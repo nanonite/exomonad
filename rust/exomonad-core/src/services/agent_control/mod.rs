@@ -38,8 +38,9 @@ pub use invocation::{
     start_invocation_with_provenance_and_context,
     start_invocation_with_provenance_and_context_and_mode, InvocationExitContext,
     InvocationFinishResult, InvocationIdentityContext, InvocationMetadata, InvocationMode,
-    InvocationRecord, InvocationStatus, InvocationTrigger, RecoveryAuthorization,
-    RecoveryInvocationLineage, RoleRouteProvenance, INVOCATION_FILENAME,
+    InvocationRecord, InvocationStatus, InvocationTrigger, LaunchCommandSource,
+    RecoveryAuthorization, RecoveryInvocationLineage, RoleRouteProvenance, RouteConfigSources,
+    INVOCATION_FILENAME,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1329,6 +1330,10 @@ pub struct AgentControlService<C> {
     pub(crate) spawn_agent_model: Option<String>,
     /// Effort inherited by spawned TLs, leaves, workers, and companions.
     pub(crate) spawn_agent_effort: Option<String>,
+    /// Compile-time build identity of this server process.
+    pub(crate) build_identity: String,
+    /// Provenance of each resolved worker route field (`cli`, `local_config`, ...).
+    pub(crate) spawn_route_sources: Option<RouteConfigSources>,
     /// WASM name for role context resolution (default: "devswarm").
     pub(crate) wasm_name: String,
     /// Pre-serialized extra MCP servers to include in spawned agent configs.
@@ -1341,6 +1346,8 @@ pub struct AgentControlService<C> {
     pub(crate) reviewer_model: Option<String>,
     /// Effort used by automatically spawned reviewers.
     pub(crate) reviewer_effort: Option<String>,
+    /// Provenance of each resolved reviewer route field.
+    pub(crate) reviewer_route_sources: Option<RouteConfigSources>,
     /// Context file paths injected into the reviewer's task (e.g. CLAUDE.md, reviewer rules).
     pub(crate) reviewer_context: Vec<String>,
     /// Role-routing configuration accepted by this server process.
@@ -1385,12 +1392,15 @@ impl<
             spawn_agent_type: AgentType::default(),
             spawn_agent_model: None,
             spawn_agent_effort: None,
+            build_identity: invocation::BUILD_IDENTITY.to_string(),
+            spawn_route_sources: None,
             wasm_name: "devswarm".to_string(),
             extra_mcp_servers: HashMap::new(),
             openrouter_api_key: None,
             reviewer_agent_type: AgentType::Claude,
             reviewer_model: None,
             reviewer_effort: None,
+            reviewer_route_sources: None,
             reviewer_context: vec![],
             role_route_configuration_fingerprint: None,
             forgejo_spawn_env: None,
@@ -1461,9 +1471,40 @@ impl<
         self
     }
 
+    /// Set the compile-time build identity stamped into every invocation.
+    pub fn with_build_identity(mut self, build_identity: impl Into<String>) -> Self {
+        self.build_identity = build_identity.into();
+        self
+    }
+
+    /// Set the provenance of each resolved worker route field.
+    pub fn with_spawn_route_sources(mut self, sources: Option<RouteConfigSources>) -> Self {
+        self.spawn_route_sources = sources;
+        self
+    }
+
+    /// Set the provenance of the configured worker model.
+    pub fn with_spawn_agent_model_source(mut self, source: Option<String>) -> Self {
+        self.spawn_route_sources
+            .get_or_insert_with(RouteConfigSources::default)
+            .model = source;
+        self
+    }
+
     /// Get the configured model for spawned OpenCode workers, if any.
     pub fn spawn_agent_model(&self) -> Option<&str> {
         self.spawn_agent_model.as_deref()
+    }
+
+    fn config_sources_for_invocation(
+        &self,
+        trigger: InvocationTrigger,
+    ) -> Option<RouteConfigSources> {
+        if trigger == InvocationTrigger::Review {
+            self.reviewer_route_sources.clone()
+        } else {
+            self.spawn_route_sources.clone()
+        }
     }
 
     /// Set the effort inherited by spawned agents and companions.
@@ -1543,6 +1584,20 @@ impl<
     /// Set the model for the reviewer agent.
     pub fn with_reviewer_model(mut self, model: Option<String>) -> Self {
         self.reviewer_model = model;
+        self
+    }
+
+    /// Set the provenance of each resolved reviewer route field.
+    pub fn with_reviewer_route_sources(mut self, sources: Option<RouteConfigSources>) -> Self {
+        self.reviewer_route_sources = sources;
+        self
+    }
+
+    /// Set the provenance of the configured reviewer model.
+    pub fn with_reviewer_model_source(mut self, source: Option<String>) -> Self {
+        self.reviewer_route_sources
+            .get_or_insert_with(RouteConfigSources::default)
+            .model = source;
         self
     }
 
@@ -1687,6 +1742,10 @@ impl<
             routing,
             identity,
             InvocationMetadata {
+                launch_command: None,
+                launch_command_source: None,
+                config_sources: None,
+                build: None,
                 runtime,
                 trigger: InvocationTrigger::Spawn,
                 pr_number: None,
@@ -1718,6 +1777,37 @@ impl<
             .join(".exo/agents")
             .join(agent_name.as_str());
         fs::create_dir_all(&agent_config_dir).await?;
+        let mut metadata = metadata;
+        if metadata.config_sources.is_none() {
+            metadata.config_sources = self.config_sources_for_invocation(metadata.trigger);
+        }
+        if metadata.build.is_none() {
+            metadata.build = Some(self.build_identity.clone());
+        }
+        if metadata.launch_command.is_none() {
+            // The resolved agent command and flags, with no environment values
+            // and no prompt text. Spawn paths that already built the exact
+            // shell command supply a redacted version of it instead. The
+            // reconstruction is labelled as such, never presented as the argv
+            // that actually launched the process.
+            metadata.launch_command = Some(Self::build_agent_command_with_effort(
+                metadata.runtime,
+                None,
+                None,
+                &HashMap::new(),
+                &agent_config_dir,
+                None,
+                self.yolo,
+                metadata.model.as_deref(),
+                metadata.effort.as_deref(),
+                metadata.mode,
+            ));
+            metadata.launch_command_source = Some(LaunchCommandSource::Reconstructed);
+        } else if metadata.launch_command_source.is_none() {
+            return Err(anyhow!(
+                "refusing to persist a launch command without its source marker"
+            ));
+        }
         if !routing.has_delivery_target() {
             return Err(anyhow!(
                 "refusing to finalize spawn for {} without routing target",
@@ -1880,6 +1970,10 @@ impl<
                 metadata.expected_live_invocation_id.as_deref(),
                 metadata.role_route,
                 metadata.controller_epoch,
+                metadata.launch_command,
+                metadata.launch_command_source,
+                metadata.config_sources,
+                metadata.build,
             )
             .await?;
         for adoption in adoptions {
@@ -2721,6 +2815,73 @@ mod tests {
             "65"
         );
         assert!(agent_dir.join(LAST_ACTIVITY_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn finalize_spawn_persists_the_injected_build_and_route_sources() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_dir = temp_dir.path().to_path_buf();
+        let git_wt = Arc::new(crate::services::git_worktree::GitWorktreeService::new(
+            project_dir.clone(),
+        ));
+        let mut services = crate::services::Services::test();
+        services.project_dir = project_dir.clone();
+        services.git_wt = git_wt;
+        services.agent_resolver = Arc::new(AgentResolver::load(project_dir.clone()).await);
+        let service = AgentControlService::new(Arc::new(services))
+            .with_build_identity("commit-injected-1352")
+            .with_spawn_route_sources(Some(RouteConfigSources {
+                harness: Some("cli".to_string()),
+                model: Some("local_config".to_string()),
+                effort: Some("default".to_string()),
+            }));
+
+        let agent_name =
+            AgentName::try_from_str("issue-1352-build-identity-codex").expect("agent name");
+        let parent_branch = BirthBranch::try_from_str("main").expect("birth branch");
+        let identity = AgentIdentityRecord {
+            agent_name: agent_name.clone(),
+            slug: Slug::try_from_str("issue-1352-build-identity").expect("slug"),
+            agent_type: AgentType::Codex,
+            birth_branch: parent_branch.clone(),
+            parent_branch,
+            working_dir: PathBuf::from("."),
+            display_name: AgentType::Codex.tab_display_name("issue-1352-build-identity"),
+            topology: Topology::SharedDir,
+            model: Some("gpt-6-luna".to_string()),
+            effort: Some("xhigh".to_string()),
+            role_route: None,
+            ledger_owned: false,
+            slice_id: None,
+        };
+        let pane_id = tmux_ipc::PaneId::parse("%1352").unwrap();
+        let agent_dir = service
+            .finalize_spawn(
+                &agent_name,
+                RoutingInfo::pane(pane_id, "TL"),
+                Some(identity),
+            )
+            .await
+            .unwrap();
+
+        let record: InvocationRecord = serde_json::from_slice(
+            &tokio::fs::read(agent_dir.join(INVOCATION_FILENAME))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        // The server's injected commit is persisted verbatim; the core crate's
+        // own compile-time fallback never overwrites it.
+        assert_eq!(record.build, "commit-injected-1352");
+        assert_eq!(
+            record.launch_command_source,
+            Some(LaunchCommandSource::Reconstructed)
+        );
+        let sources = record.config_sources.expect("worker route sources");
+        assert_eq!(sources.harness.as_deref(), Some("cli"));
+        assert_eq!(sources.model.as_deref(), Some("local_config"));
+        assert_eq!(sources.effort.as_deref(), Some("default"));
+        assert!(record.launch_command.is_some());
     }
 
     #[test]

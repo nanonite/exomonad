@@ -16,6 +16,116 @@ use uuid::Uuid;
 
 pub const INVOCATION_FILENAME: &str = "invocation.json";
 
+/// Compile-time identity of the runtime that wrote this invocation record.
+///
+/// The workspace build script stamps `EXOMONAD_BUILD_GIT_COMMIT` for the
+/// `exomonad` package. `exomonad-core` does not receive that package-private
+/// rustc env, so a missing stamp is the explicit string `unknown`; it is never
+/// an invented crate-version label. The `exomonad` server injects the real
+/// commit with [`AgentControlService::with_build_identity`] so every durable
+/// record names the build that wrote it.
+///
+/// [`AgentControlService::with_build_identity`]: super::AgentControlService::with_build_identity
+pub const BUILD_IDENTITY: &str = match option_env!("EXOMONAD_BUILD_GIT_COMMIT") {
+    Some(commit) => commit,
+    None => "unknown",
+};
+
+/// The literal persisted beside a launch command: was it the exact command or
+/// a reconstruction from the resolver?
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchCommandSource {
+    /// Captured from the command that actually launched the process.
+    Actual,
+    /// Rebuilt from the resolved route when no actual command was available.
+    Reconstructed,
+}
+
+/// Source of each field of the resolved route.
+///
+/// `harness`, `model`, and `effort` each cite their own `RouteValueSource`
+/// (`cli`, `local_config`, `project_config`, `environment`, `policy`,
+/// `default`, ...). One field's provenance never stands in for another's.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteConfigSources {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// Names whose values are credentials and must never reach a persisted record.
+const SENSITIVE_NAME_MARKERS: &[&str] = &[
+    "KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "AUTH",
+];
+
+/// Flags whose following argv entry is a credential value.
+const SENSITIVE_VALUE_FLAGS: &[&str] = &[
+    "--api-key",
+    "--token",
+    "--access-token",
+    "--auth-token",
+    "--password",
+    "--secret",
+    "--credential",
+    "--key",
+];
+
+fn looks_like_credential_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    SENSITIVE_NAME_MARKERS
+        .iter()
+        .any(|marker| upper.contains(marker))
+}
+
+/// Render a launch command with every environment value and credential flag
+/// value redacted.
+///
+/// Environment values may carry API keys, tokens, or forge credentials; argv
+/// flags may carry the same secret directly. Only the keys, flag names, and
+/// non-secret arguments remain in the durable record.
+pub(crate) fn redacted_launch_command(
+    full_command: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> String {
+    let mut redacted = full_command.to_string();
+    for value in env_vars.values().filter(|value| !value.is_empty()) {
+        let escaped = shell_escape::escape(value.as_str().into()).to_string();
+        if escaped != "''" {
+            redacted = redacted.replace(&escaped, "<redacted>");
+        }
+    }
+    let mut redact_next = false;
+    let tokens = redacted
+        .split(' ')
+        .map(|token| {
+            if redact_next {
+                redact_next = false;
+                return "<redacted>".to_string();
+            }
+            if let Some((name, _)) = token.split_once('=') {
+                if looks_like_credential_name(name) {
+                    return format!("{name}=<redacted>");
+                }
+            }
+            if SENSITIVE_VALUE_FLAGS.iter().any(|flag| token == *flag) {
+                redact_next = true;
+            }
+            token.to_string()
+        })
+        .collect::<Vec<_>>();
+    tokens.join(" ")
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InvocationTrigger {
@@ -106,6 +216,14 @@ pub struct InvocationMetadata {
     pub mode: InvocationMode,
     pub role_route: Option<RoleRouteProvenance>,
     pub controller_epoch: Option<String>,
+    /// Redacted launch command/argv/flags for this process attempt.
+    pub launch_command: Option<String>,
+    /// Whether `launch_command` is the actual command or a reconstruction.
+    pub launch_command_source: Option<LaunchCommandSource>,
+    /// Per-field provenance of the resolved route.
+    pub config_sources: Option<RouteConfigSources>,
+    /// Build identity injected by the server process that wrote the record.
+    pub build: Option<String>,
 }
 
 /// Accepted controller route persisted with the invocation that used it.
@@ -226,6 +344,18 @@ pub struct InvocationRecord {
     pub stderr_tail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_route: Option<RoleRouteProvenance>,
+    /// Compile-time runtime build that wrote this generation.
+    #[serde(default)]
+    pub build: String,
+    /// Launch command, argv, and flags with environment values redacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_command: Option<String>,
+    /// Whether the launch command was captured or reconstructed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_command_source: Option<LaunchCommandSource>,
+    /// Provenance of each resolved route field for this attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_sources: Option<RouteConfigSources>,
 }
 
 impl InvocationRecord {
@@ -733,6 +863,10 @@ async fn start_invocation_with_context(
         exit_classification: None,
         stderr_tail: None,
         role_route: None,
+        build: BUILD_IDENTITY.to_string(),
+        launch_command: None,
+        launch_command_source: None,
+        config_sources: None,
         prior_invocation_id: None,
         recovery_round: 0,
         authorization_source: None,
@@ -867,6 +1001,10 @@ pub async fn start_invocation_with_provenance_and_context_and_mode_with_id(
         None,
         None,
         None,
+        None,
+        None,
+        None,
+        None,
     )
     .await
 }
@@ -888,6 +1026,10 @@ pub async fn start_invocation_with_provenance_and_context_and_mode_with_id_guard
     expected_live_invocation_id: Option<&str>,
     role_route: Option<RoleRouteProvenance>,
     controller_epoch: Option<String>,
+    launch_command: Option<String>,
+    launch_command_source: Option<LaunchCommandSource>,
+    config_sources: Option<RouteConfigSources>,
+    build: Option<String>,
 ) -> Result<InvocationRecord> {
     if invocation_id.trim().is_empty() {
         return Err(anyhow::anyhow!("invocation ID must not be empty"));
@@ -985,6 +1127,10 @@ pub async fn start_invocation_with_provenance_and_context_and_mode_with_id_guard
         exit_classification: None,
         stderr_tail: None,
         role_route,
+        build: build.unwrap_or_else(|| BUILD_IDENTITY.to_string()),
+        launch_command,
+        launch_command_source,
+        config_sources,
     };
     write_atomic(agent_dir, &record).await?;
     #[cfg(test)]
@@ -1820,5 +1966,241 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn invocation_record_persists_build_launch_command_and_config_source() {
+        let dir = tempdir().expect("tempdir");
+        let launch = "OPENROUTER_API_KEY=<redacted> opencode run --standalone --model opencode-go/deepseek-v4-flash#max";
+        let record = start_invocation_with_provenance_and_context_and_mode_with_id_guarded(
+            dir.path(),
+            AgentType::OpenCode,
+            InvocationTrigger::Spawn,
+            routing(),
+            None,
+            None,
+            Some("opencode-go/deepseek-v4-flash".to_string()),
+            Some("max".to_string()),
+            None,
+            None,
+            InvocationMode::OneShot,
+            "invocation-1352".to_string(),
+            None,
+            None,
+            None,
+            Some(launch.to_string()),
+            Some(LaunchCommandSource::Actual),
+            Some(RouteConfigSources {
+                harness: Some("cli".to_string()),
+                model: Some("local_config".to_string()),
+                effort: Some("default".to_string()),
+            }),
+            Some("commit-injected-by-server".to_string()),
+        )
+        .await
+        .expect("start invocation");
+
+        assert_eq!(record.build, "commit-injected-by-server");
+        assert_eq!(record.launch_command.as_deref(), Some(launch));
+        assert_eq!(
+            record.launch_command_source,
+            Some(LaunchCommandSource::Actual)
+        );
+        let sources = record.config_sources.as_ref().expect("route sources");
+        assert_eq!(sources.harness.as_deref(), Some("cli"));
+        assert_eq!(sources.model.as_deref(), Some("local_config"));
+        assert_eq!(sources.effort.as_deref(), Some("default"));
+        assert_eq!(
+            record.model.as_deref(),
+            Some("opencode-go/deepseek-v4-flash")
+        );
+        assert_eq!(record.effort.as_deref(), Some("max"));
+
+        let persisted = read_invocation(dir.path())
+            .await
+            .expect("read invocation")
+            .expect("record exists");
+        assert_eq!(persisted, record);
+        let document: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(dir.path().join(INVOCATION_FILENAME))
+                .await
+                .unwrap(),
+        )
+        .expect("invocation JSON");
+        assert_eq!(document["build"], "commit-injected-by-server");
+        assert_eq!(document["launch_command_source"], "actual");
+        assert_eq!(document["config_sources"]["harness"], "cli");
+        assert_eq!(document["config_sources"]["model"], "local_config");
+        assert_eq!(document["config_sources"]["effort"], "default");
+        assert!(document["launch_command"]
+            .as_str()
+            .is_some_and(|command| command.contains("--model")));
+    }
+
+    #[test]
+    fn redacted_launch_command_removes_credential_flag_values_without_env() {
+        let command = "codex --api-key canary-secret-1352-do-not-persist --cd /work";
+        let redacted = redacted_launch_command(command, &std::collections::HashMap::new());
+        assert!(!redacted.contains("canary-secret-1352-do-not-persist"));
+        assert!(redacted.contains("--api-key <redacted>"));
+        assert!(redacted.contains("--cd /work"));
+    }
+
+    #[test]
+    fn redacted_launch_command_removes_environment_secret_values() {
+        let mut env = std::collections::HashMap::new();
+        env.insert(
+            "OPENROUTER_API_KEY".to_string(),
+            "canary-secret-1352-do-not-persist".to_string(),
+        );
+        env.insert("EXOMONAD_PARENT_AGENT".to_string(), "root".to_string());
+        let command = "OPENROUTER_API_KEY=canary-secret-1352-do-not-persist EXOMONAD_PARENT_AGENT=root opencode run --standalone --model opencode-go/deepseek-v4-flash";
+
+        let redacted = redacted_launch_command(command, &env);
+
+        assert!(!redacted.contains("canary-secret-1352-do-not-persist"));
+        assert!(redacted.contains("OPENROUTER_API_KEY=<redacted>"));
+        assert!(redacted.contains("opencode run --standalone"));
+        assert!(redacted.contains("--model"));
+    }
+
+    #[tokio::test]
+    async fn persisted_invocation_record_never_contains_a_canary_secret() {
+        let dir = tempdir().expect("tempdir");
+        let secret = "canary-secret-1352-do-not-persist";
+        let mut env = std::collections::HashMap::new();
+        env.insert("OPENROUTER_API_KEY".to_string(), secret.to_string());
+        let full_command = format!(
+            "OPENROUTER_API_KEY={secret} codex --dangerously-bypass-approvals-and-sandbox --cd /work"
+        );
+        let launch = redacted_launch_command(&full_command, &env);
+        start_invocation_with_provenance_and_context_and_mode_with_id_guarded(
+            dir.path(),
+            AgentType::Codex,
+            InvocationTrigger::Spawn,
+            routing(),
+            None,
+            None,
+            Some("gpt-6-luna".to_string()),
+            Some("high".to_string()),
+            None,
+            None,
+            InvocationMode::OneShot,
+            "invocation-canary".to_string(),
+            None,
+            None,
+            None,
+            Some(launch),
+            Some(LaunchCommandSource::Actual),
+            None,
+            None,
+        )
+        .await
+        .expect("start invocation");
+
+        let bytes = tokio::fs::read(dir.path().join(INVOCATION_FILENAME))
+            .await
+            .unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains(secret));
+        assert!(text.contains("<redacted>"));
+        assert!(text.contains("gpt-6-luna"));
+    }
+
+    #[tokio::test]
+    async fn persisted_record_and_ledger_never_contain_a_flag_value_canary_secret() {
+        let root = tempdir().expect("tempdir");
+        let agent_dir = root.path().join(".exo/agents/canary");
+        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
+        let secret = "canary-secret-1352-flag-value";
+        let full_command =
+            format!("codex --api-key {secret} --dangerously-bypass-approvals-and-sandbox");
+        let launch = redacted_launch_command(&full_command, &std::collections::HashMap::new());
+        start_invocation_with_provenance_and_context_and_mode_with_id_guarded(
+            &agent_dir,
+            AgentType::Codex,
+            InvocationTrigger::Spawn,
+            routing(),
+            None,
+            None,
+            Some("gpt-6-luna".to_string()),
+            Some("high".to_string()),
+            None,
+            None,
+            InvocationMode::OneShot,
+            "invocation-flag-canary".to_string(),
+            None,
+            None,
+            None,
+            Some(launch),
+            Some(LaunchCommandSource::Actual),
+            None,
+            Some("commit-canary".to_string()),
+        )
+        .await
+        .expect("start invocation");
+
+        for entry in walk_files(root.path()) {
+            let bytes = std::fs::read(&entry).expect("read persisted file");
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(
+                !text.contains(secret),
+                "secret reached persisted file {}",
+                entry.display()
+            );
+        }
+        let record = read_invocation(&agent_dir)
+            .await
+            .expect("read invocation")
+            .expect("record exists");
+        assert!(record
+            .launch_command
+            .as_deref()
+            .is_some_and(|command| command.contains("--api-key <redacted>")));
+    }
+
+    fn walk_files(root: &Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(&directory).expect("read directory") {
+                let entry = entry.expect("directory entry");
+                let path = entry.path();
+                if entry.file_type().expect("file type").is_dir() {
+                    pending.push(path);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files
+    }
+
+    #[tokio::test]
+    async fn legacy_invocation_without_launch_provenance_still_decodes() {
+        let dir = tempdir().expect("tempdir");
+        tokio::fs::write(
+            dir.path().join(INVOCATION_FILENAME),
+            serde_json::json!({
+                "invocation_id": "legacy-1352",
+                "runtime": "codex",
+                "trigger": "spawn",
+                "routing": {"window_id": "@42"},
+                "started_at": 1,
+                "status": "running"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let record = read_invocation(dir.path())
+            .await
+            .expect("read invocation")
+            .expect("record exists");
+        assert!(record.build.is_empty());
+        assert!(record.launch_command.is_none());
+        assert!(record.launch_command_source.is_none());
+        assert!(record.config_sources.is_none());
     }
 }

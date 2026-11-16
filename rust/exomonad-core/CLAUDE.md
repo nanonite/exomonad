@@ -448,7 +448,23 @@ runtime, trigger, routing, started_at, and status are required. ended_at,
 exit_code, pr_number, head_sha, model, and effort are optional. model and
 effort describe the current process attempt; identity.json retains the
 owner's original model and effort so a resume cannot erase historical
-provenance. Starting resume_pr or a
+provenance.
+
+Every invocation also records its launch provenance. `build` is the build
+identity the writing server injected through
+`AgentControlService::with_build_identity` (the `exomonad` crate passes
+`env!("EXOMONAD_BUILD_GIT_COMMIT")`). `exomonad-core` on its own has no such
+package-private env, so its fallback is the explicit string `unknown`, never an
+invented crate-version stamp. `launch_command` is the resolved agent command,
+argv, and flags with every environment value and every credential flag value
+redacted to `<redacted>`; `launch_command_source` says whether that text was the
+`actual` captured command or a `reconstructed` rendering from the resolved
+route, so evidence is never presented as an argv that did not launch. A launch
+command is never persisted without its source marker. `config_sources` records
+the `RouteValueSource` for each resolved route field separately (`harness`,
+`model`, `effort`); one field's provenance never stands in for another's. Legacy
+records without these fields decode with an empty build and absent provenance;
+they are never rewritten merely by reading. Starting resume_pr or a
 SHA-scoped reviewer replaces only this record and records the exact current
 tmux window/pane. Finishing must supply the invocation ID (or matching
 routing) and cannot change a newer record. Missing or malformed records are
@@ -459,6 +475,22 @@ issue-owned worktree. Spawned-child memory records and structured
 agent.spawned/agent.resumed events carry the same bounded model, effort,
 topology, branch, and spawn-type provenance. Prompts and secrets are never
 copied into these provenance fields.
+
+### Configured-route transitions at resume
+
+Resume/continuation treats the currently configured harness/model/effort as the
+route for the successor generation. The historical invocation's route is stored,
+shown, and diffed as evidence, never used as a constraint. When the configured
+route differs, `resume_pr` and `resume_blocked_leaf` record one
+`configured_runtime_route_transition` row through
+`configured_route_transition_id`/`record_configured_route_transition`, carrying
+the operation, scope, prior invocation ID and generation, from/to harness, model,
+and effort, and the worktree fingerprint. The successor's invocation record then
+carries the new route. A change of model, effort, or harness is a routing
+transition; it is never reported as an owner, scope, or worktree conflict. Owner,
+scope, worktree, predecessor-invocation, epoch, and process-identity checks are
+unchanged, and a cross-runtime change still passes the harness-switch/human
+approval guard.
 
 ### Ordered sub-TL invocation provisioning
 

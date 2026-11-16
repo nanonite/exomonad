@@ -6486,6 +6486,10 @@ mod tests {
             .await
             .expect("persist successor routing owner");
         let invocation = InvocationRecord {
+            build: crate::services::agent_control::invocation::BUILD_IDENTITY.to_string(),
+            launch_command: None,
+            launch_command_source: None,
+            config_sources: None,
             invocation_id: CURRENT.to_string(),
             runtime: ServiceAgentType::Codex,
             trigger: InvocationTrigger::ResumePr,
@@ -6519,6 +6523,10 @@ mod tests {
         )
         .expect("persist live successor invocation");
         let prior = InvocationRecord {
+            build: crate::services::agent_control::invocation::BUILD_IDENTITY.to_string(),
+            launch_command: None,
+            launch_command_source: None,
+            config_sources: None,
             invocation_id: PRIOR.to_string(),
             runtime: ServiceAgentType::OpenCode,
             trigger: InvocationTrigger::Spawn,
@@ -8114,6 +8122,10 @@ mod tests {
             slice_id: Some("issue-814-substitution-model-kani".to_string()),
         };
         let invocation = InvocationRecord {
+            build: crate::services::agent_control::invocation::BUILD_IDENTITY.to_string(),
+            launch_command: None,
+            launch_command_source: None,
+            config_sources: None,
             invocation_id: "resumed-invocation".to_string(),
             runtime: ServiceAgentType::Codex,
             trigger: InvocationTrigger::ResumeBlocked,
@@ -8384,6 +8396,10 @@ mod tests {
     #[test]
     fn repeated_resume_requires_a_new_invocation_generation() {
         let current = InvocationRecord {
+            build: crate::services::agent_control::invocation::BUILD_IDENTITY.to_string(),
+            launch_command: None,
+            launch_command_source: None,
+            config_sources: None,
             invocation_id: "invocation-2".to_string(),
             runtime: ServiceAgentType::Codex,
             trigger: InvocationTrigger::ResumePr,
@@ -8414,10 +8430,18 @@ mod tests {
             authorization_source: None,
         };
         let same_generation = InvocationRecord {
+            build: crate::services::agent_control::invocation::BUILD_IDENTITY.to_string(),
+            launch_command: None,
+            launch_command_source: None,
+            config_sources: None,
             invocation_id: current.invocation_id.clone(),
             ..current.clone()
         };
         let previous = InvocationRecord {
+            build: crate::services::agent_control::invocation::BUILD_IDENTITY.to_string(),
+            launch_command: None,
+            launch_command_source: None,
+            config_sources: None,
             invocation_id: "invocation-1".to_string(),
             ..current.clone()
         };
@@ -8445,6 +8469,10 @@ mod tests {
             slice_id: Some("issue-814".to_string()),
         };
         let invocation = InvocationRecord {
+            build: crate::services::agent_control::invocation::BUILD_IDENTITY.to_string(),
+            launch_command: None,
+            launch_command_source: None,
+            config_sources: None,
             invocation_id: "old-invocation".to_string(),
             runtime: ServiceAgentType::OpenCode,
             trigger: InvocationTrigger::Spawn,

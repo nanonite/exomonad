@@ -2021,12 +2021,27 @@ Run `exomonad recompile` first to build it.",
     )?;
     agent_control = agent_control.with_spawn_agent_type(worker_route.agent_type);
     agent_control = agent_control.with_spawn_agent_model(worker_route.model.clone());
+    agent_control = agent_control.with_spawn_route_sources(Some(
+        exomonad_core::services::agent_control::RouteConfigSources {
+            harness: Some(worker_route.agent_type_source.as_str().to_string()),
+            model: Some(worker_route.model_source.as_str().to_string()),
+            effort: Some(worker_route.effort.source.to_string()),
+        },
+    ));
     agent_control =
         agent_control.with_spawn_agent_effort(Some(worker_route.effort.level.to_string()));
     agent_control =
         agent_control.with_reviewer_effort(Some(reviewer_route.effort.level.to_string()));
     agent_control = agent_control.with_reviewer_agent_type(reviewer_route.agent_type);
     agent_control = agent_control.with_reviewer_model(reviewer_route.model.clone());
+    agent_control = agent_control.with_reviewer_route_sources(Some(
+        exomonad_core::services::agent_control::RouteConfigSources {
+            harness: Some(reviewer_route.agent_type_source.as_str().to_string()),
+            model: Some(reviewer_route.model_source.as_str().to_string()),
+            effort: Some(reviewer_route.effort.source.to_string()),
+        },
+    ));
+    agent_control = agent_control.with_build_identity(env!("EXOMONAD_BUILD_GIT_COMMIT"));
     agent_control = agent_control.with_reviewer_context(config.reviewer.context.clone());
     agent_control = agent_control
         .with_extra_mcp_servers(serialize_extra_mcp_servers(&config.extra_mcp_servers));

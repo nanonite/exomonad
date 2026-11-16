@@ -674,6 +674,10 @@ mod tests {
     #[test]
     fn invocation_telemetry_is_structured_and_delivery_is_non_authoritative() {
         let record = InvocationRecord {
+            build: crate::services::agent_control::invocation::BUILD_IDENTITY.to_string(),
+            launch_command: None,
+            launch_command_source: None,
+            config_sources: None,
             invocation_id: "inv-1".to_string(),
             runtime: AgentType::Codex,
             trigger: InvocationTrigger::Review,
@@ -728,6 +732,10 @@ mod tests {
         let agent_dir = root.path().join(".exo/agents/codex");
         fs::create_dir_all(&agent_dir).expect("agent dir");
         let record = InvocationRecord {
+            build: crate::services::agent_control::invocation::BUILD_IDENTITY.to_string(),
+            launch_command: None,
+            launch_command_source: None,
+            config_sources: None,
             invocation_id: "inv-1".to_string(),
             runtime: AgentType::Codex,
             trigger: InvocationTrigger::Spawn,

@@ -5047,6 +5047,7 @@ class _TerminalOwnerRecoveryProof(NamedTuple):
     route_authorization: Mapping[str, object]
     successor_adoption_authorization: Mapping[str, object] | None = None
     route_authorization_supersedes_digest: str | None = None
+    historical_route_gaps: tuple[str, ...] = ()
 
 
 class _TerminalResumeHistory(NamedTuple):
@@ -5058,6 +5059,9 @@ class _TerminalResumeHistory(NamedTuple):
     latest_route_matches_request: bool | None
     unresolved_latest: bool
     current_dispatch_invocation_generation: int
+    # Historical receipts whose route could not be recovered from their own
+    # record. They are evidence gaps, not route conflicts.
+    route_gaps: tuple[str, ...] = ()
 
 
 class _TerminalOwnerLedgerProof(NamedTuple):
@@ -5553,6 +5557,7 @@ class _TerminalResumeReceiptProof(NamedTuple):
     owner_agent_id: str
     dispatch_intent_id: str
     evidence_source: str
+    route_gap: str | None = None
 
 
 def _safe_diagnostic(detail: object) -> str:
@@ -5748,12 +5753,18 @@ def _legacy_resume_projection_error(
 
 
 class _LegacyResumeLineage(NamedTuple):
-    """Actual successor route and the retained record that proves it."""
+    """Actual successor route and the retained record that proves it.
+
+    ``model``/``effort`` are ``None`` when the historical record predates route
+    provenance. That is evidence of a gap, never a reason to reject the receipt:
+    the successor generation's route comes from the currently configured route.
+    """
 
     runtime: str
-    model: str
-    effort: str
+    model: str | None
+    effort: str | None
     source: str
+    route_gap: str | None = None
 
 
 def _legacy_resume_lineage(
@@ -5792,8 +5803,15 @@ def _legacy_resume_lineage(
             return None, "legacy resume result runtime conflicts with its durable invocation"
         durable_model = _optional_nonempty_text(persisted.get("model"))
         durable_effort = _optional_nonempty_text(persisted.get("effort"))
-        if durable_model is None or durable_effort is None:
-            return None, "legacy resume invocation lacks its actual model or effort"
+        # A historical invocation written before route provenance existed is
+        # route evidence with a recorded gap. The next generation is dispatched
+        # from the currently configured route, so the gap never blocks the
+        # receipt and never rewrites the durable record.
+        route_gap = (
+            "legacy resume invocation does not record model or effort"
+            if durable_model is None or durable_effort is None
+            else None
+        )
         if persisted.get("status") not in {"failed", "exited", "killed", "timed_out"}:
             return None, "legacy resume successor is not terminal"
         if (
@@ -5810,7 +5828,11 @@ def _legacy_resume_lineage(
             return None, "legacy resume result conflicts with its durable invocation lineage"
         return (
             _LegacyResumeLineage(
-                durable_runtime, durable_model, durable_effort, "durable_owner_invocation"
+                durable_runtime,
+                durable_model,
+                durable_effort,
+                "durable_owner_invocation",
+                route_gap,
             ),
             None,
         )
@@ -5819,13 +5841,16 @@ def _legacy_resume_lineage(
     following_runtime = normalize_runtime_label(following_arguments.get("prior_runtime"))
     durable_model = _optional_nonempty_text(following_arguments.get("prior_model"))
     durable_effort = _optional_nonempty_text(following_arguments.get("prior_effort"))
+    route_gap = (
+        "next confirmed successor action does not record the prior model or effort"
+        if durable_model is None or durable_effort is None
+        else None
+    )
     if (
         following_arguments.get("expected_invocation_id") != invocation.get("invocation_id")
         or following_arguments.get("prior_generation") != generation
         or following_runtime is None
         or following_runtime != response_runtime
-        or durable_model is None
-        or durable_effort is None
         or following_arguments.get("expected_branch") != owner.branch
         or following_arguments.get("expected_worktree") != str(owner.worktree)
     ):
@@ -5836,9 +5861,26 @@ def _legacy_resume_lineage(
             durable_model,
             durable_effort,
             "next_confirmed_successor_action",
+            route_gap,
         ),
         None,
     )
+
+
+def _legacy_route_agrees(
+    observed: object,
+    expected: object,
+    route_gap: str | None,
+) -> bool:
+    """Compare one historical route field under a positively proven gap.
+
+    Only a generation whose receipt proved a legacy route gap may omit the
+    field. A record that carries a value still has to match exactly, and a
+    modern lineage (``route_gap`` is ``None``) keeps HEAD's exact comparison.
+    """
+    if route_gap is not None and expected is None:
+        return True
+    return observed == expected
 
 
 def _legacy_resume_lifecycle_payloads(
@@ -5910,8 +5952,12 @@ def _legacy_resume_lifecycle_payloads(
             resumed_data.get("intent_id") is not None
             and resumed_data.get("intent_id") != dispatch_intent_id
         )
-        or resumed_data.get("model") != lineage.model
-        or resumed_data.get("effort") != lineage.effort
+        or not _legacy_route_agrees(
+            resumed_data.get("model"), lineage.model, lineage.route_gap
+        )
+        or not _legacy_route_agrees(
+            resumed_data.get("effort"), lineage.effort, lineage.route_gap
+        )
     ):
         return "legacy resume agent.resumed row conflicts with its confirmed action"
     if persisted_matches:
@@ -6023,8 +6069,16 @@ def _legacy_terminal_resume_receipt(
         return None, "legacy resume result conflicts with its durable owner identity"
     if persisted_matches and (
         normalize_runtime_label(identity.get("agent_type")) != lineage.runtime
-        or _optional_nonempty_text(identity.get("model")) != lineage.model
-        or _optional_nonempty_text(identity.get("effort")) != lineage.effort
+        or not _legacy_route_agrees(
+            _optional_nonempty_text(identity.get("model")),
+            lineage.model,
+            lineage.route_gap,
+        )
+        or not _legacy_route_agrees(
+            _optional_nonempty_text(identity.get("effort")),
+            lineage.effort,
+            lineage.route_gap,
+        )
     ):
         return None, "legacy resume result conflicts with its durable owner identity"
     if config.project_root is None or config.ledger_run_id is None:
@@ -6057,9 +6111,10 @@ def _legacy_terminal_resume_receipt(
         owner.agent_name,
         dispatch_intent_id,
         f"{lineage.source}+agent.resumed",
+        lineage.route_gap,
     )
     LOGGER.info(
-        "resolved legacy resume receipt owner=%s invocation=%s predecessor=%s generation=%d runtime=%s model=%s effort=%s evidence=%s",
+        "resolved legacy resume receipt owner=%s invocation=%s predecessor=%s generation=%d runtime=%s model=%s effort=%s evidence=%s route_gap=%s",
         owner.agent_name,
         successor_id,
         prior_invocation_id,
@@ -6068,6 +6123,7 @@ def _legacy_terminal_resume_receipt(
         lineage.model,
         lineage.effort,
         receipt.evidence_source,
+        lineage.route_gap or "none",
     )
     return receipt, None
 
@@ -6204,6 +6260,7 @@ def _terminal_resume_history_proof(
     latest_confirmed_entry: Mapping[str, object] | None = None
     latest_result: ToolResult | None = None
     latest_receipt: _TerminalResumeReceiptProof | None = None
+    receipt_route_gaps: list[str] = []
     latest_route_match: bool | None = None
     unresolved_latest = False
     checkpointed_index, checkpoint_error = _terminal_resume_checkpointed_index(
@@ -6424,6 +6481,12 @@ def _terminal_resume_history_proof(
         ):
             return None, "confirmed resume result route evidence is malformed"
         latest_receipt = receipt
+        if (
+            receipt is not None
+            and receipt.route_gap is not None
+            and receipt.route_gap not in receipt_route_gaps
+        ):
+            receipt_route_gaps.append(receipt.route_gap)
         requested = (
             arguments.get("desired_agent_type"),
             arguments.get("desired_model"),
@@ -6459,13 +6522,26 @@ def _terminal_resume_history_proof(
         return None, "resume history has no checkpoint binding for the current dispatch"
     if checkpointed_index is not None and checkpointed_index >= len(entries):
         return None, "checkpointed resume history boundary is invalid"
+    # Route fields a generation's own record never recorded can only be
+    # excused when that same generation's receipt positively proved a legacy
+    # route gap. A modern record keeps HEAD's exact comparisons: a missing
+    # field is a disagreement, never a wildcard.
+    current_receipt_route_gap = (
+        latest_receipt is not None and latest_receipt.route_gap is not None
+    )
+
+    def _optional_route_agrees(left: object, right: object) -> bool:
+        if current_receipt_route_gap:
+            return left is None or right is None or left == right
+        return left == right
+
     if (
         identity.get("agent_type") != invocation.get("runtime")
-        or identity.get("model") != invocation.get("model")
-        or identity.get("effort") != invocation.get("effort")
+        or not _optional_route_agrees(identity.get("model"), invocation.get("model"))
+        or not _optional_route_agrees(identity.get("effort"), invocation.get("effort"))
         or owner.runtime != invocation.get("runtime")
-        or owner.model != invocation.get("model")
-        or owner.effort != invocation.get("effort")
+        or not _optional_route_agrees(owner.model, invocation.get("model"))
+        or not _optional_route_agrees(owner.effort, invocation.get("effort"))
     ):
         return None, "terminal owner runtime and model records disagree"
     if latest_result is not None and latest_confirmed_entry is not None:
@@ -6554,6 +6630,7 @@ def _terminal_resume_history_proof(
             latest_route_match,
             unresolved_latest,
             dispatch_generation,
+            tuple(receipt_route_gaps),
         ),
         None,
     )
@@ -7551,6 +7628,7 @@ def _terminal_owner_recovery_proof(
             route_authorization,
             successor_adoption_authorization,
             route_authorization_supersedes_digest,
+            resume_history.route_gaps,
         ),
         None,
     )
@@ -8240,6 +8318,11 @@ def _persist_terminal_route_authorization(
     else:
         evidence["configured_route_authorization"] = dict(terminal.route_authorization)
         changed = True
+    if terminal.historical_route_gaps:
+        gaps = list(terminal.historical_route_gaps)
+        if evidence.get("historical_route_evidence_gaps") != gaps:
+            evidence["historical_route_evidence_gaps"] = gaps
+            changed = True
     adoption = terminal.successor_adoption_authorization
     if adoption is not None:
         existing_adoption = evidence.get("confirmed_successor_adoption_authorization")

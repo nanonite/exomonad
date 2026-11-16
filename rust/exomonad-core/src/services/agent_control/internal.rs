@@ -912,6 +912,10 @@ impl<
             routing,
             Some(durable_identity.clone()),
             InvocationMetadata {
+                launch_command: None,
+                launch_command_source: None,
+                config_sources: None,
+                build: None,
                 runtime: durable_identity.agent_type,
                 trigger: invocation_plan.trigger,
                 pr_number: invocation_plan.pr_number,
@@ -1997,7 +2001,7 @@ impl<
         model_override: Option<&str>,
         effort_override: Option<&str>,
         use_role_defaults: bool,
-    ) -> Result<super::tmux_ipc::PaneId> {
+    ) -> Result<(super::tmux_ipc::PaneId, String)> {
         let _dispatch = self
             .acquire_dispatch_permit("start a worker in a tmux pane")
             .await?;
@@ -2088,7 +2092,7 @@ impl<
         }
 
         info!(name, pane_id = %pane_id, "Successfully created tmux pane");
-        Ok(pane_id)
+        Ok((pane_id, full_command))
     }
 
     /// Write MCP config for the agent directory.

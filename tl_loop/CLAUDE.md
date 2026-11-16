@@ -331,10 +331,32 @@ emitted. The proof logs its evidence source
 (`durable_owner_invocation+agent.resumed` or
 `next_confirmed_successor_action+agent.resumed`).
 
+A historical receipt whose own record does not carry model/effort is a route
+evidence gap, not a route conflict. `_legacy_resume_lineage` returns an optional
+model/effort plus `route_gap`; the same-generation `agent.resumed` row and owner
+identity checks apply only to the fields the record actually claims. The
+receipt then resolves, records the gap as `historical_route_evidence_gaps` in the
+human recovery evidence, and dispatches the next generation from the currently
+accepted configured route. Journals, receipts, identity, invocation, dispatch
+intent, and ledger rows are never rewritten, and replaying the same resolution is
+idempotent. The relaxation is scoped: only a generation whose receipt positively
+proved `route_gap` may omit a route field. Every modern record keeps the exact
+HEAD comparisons, so removing model/effort from a modern identity, owner, or
+lineage is refused ("terminal owner runtime and model records disagree")
+instead of being treated as a wildcard. The leaf-resume receipt proof itself
+carries no controller epoch; the live epoch guard is the dispatch-confirmation
+path (`correlate_dispatch_event` / `_spawn_confirmation_refusal`, refusing with
+`controller_epoch_mismatch`) and Rust `verify_controller_epoch`, and both stay
+exact.
+
 After the historical successor is proven terminal, the controller leaves its
 recorded request and actual route unchanged and dispatches exactly one new
 successor from the currently accepted configured route, linked to the proven
-invocation. Diagnostics distinguish an omitted owner, an explicit owner
+invocation. The successor's route may therefore differ from the predecessor's;
+`_terminal_route_authorization_record` records both the prior and desired route,
+and a changed configuration supersedes the previous authorization with the
+`confirmed_terminal_successor_reconciled_to_current_route` transition rather than
+rejecting the resume. Diagnostics distinguish an omitted owner, an explicit owner
 conflict, missing lineage, an ambiguous action, and missing modern
 provenance, and are redacted to a single printable line.
 

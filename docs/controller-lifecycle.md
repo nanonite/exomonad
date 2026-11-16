@@ -44,7 +44,18 @@ following confirmed action, and the exact
 `agent.invocation.started`/`agent.resumed`/`agent.invocation.finished` trio,
 and it holds when any `agent.spawned` row names that successor. It never
 synthesizes a launch row or rewrites the saved response, and the modern
-adoption above is unchanged.
+adoption above is unchanged. A historical generation that predates route
+provenance is resolved as an evidence gap: the gap is recorded in the recovery
+evidence and the next generation is dispatched from the currently configured
+harness/model/effort, never from the missing history. The successor records the
+new route, and a changed configuration is a routing transition rather than an
+owner/scope/worktree conflict. The relaxation is limited to a generation whose
+receipt carries a positively proven legacy route gap; a modern record still has
+to match its own route fields exactly. The leaf-resume receipt proof has no
+controller-epoch field; epoch/process identity is enforced on the controller
+ownership path (`verify_controller_epoch`) and on dispatch confirmation, where a
+row from a predecessor epoch is retained as historical audit and can never
+confirm the current controller's dispatch.
 
 The implementation does not remove worktrees, branches, receipts, journals,
 publication evidence, or gates. A server-only restart does not terminate agent

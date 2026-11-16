@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Record the exomonad build commit, the redacted launch command (marked actual or reconstructed) and the source of each resolved harness, model and effort in every invocation record, with credential flag values and environment values never persisted (#1352)
 - Prove the controller restart sequence in one disposable actual-init run with `E2E_COMPOSED_RESTART=1` (#1288)
 - Run the TL-loop strict typecheck ratchet in CI from the pinned dev extra (#1326)
 - Gate TL-loop strict type checking behind a shrink-only ratchet baseline (#1323)
@@ -42,6 +43,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Remove every redundant cast and `no-any-return` error from `tl_loop/**` in the strict mypy form (#1329)
 
 ### Fixed
+- Probe the installed OpenCode CLI's `models` capability during init instead of hardcoding `models --verbose`: an OpenCode without that flag validates the model against the plain list and warns that the effort variant could not be checked, an unknown model still fails, and a missing binary, a timeout, non-UTF8 output and a failing `models` command each fail with a distinct error (#1352)
+- Resolve a legacy blocked-leaf resume receipt whose invocation records no model or effort from the currently configured route and record the gap as recovery evidence, while owner, scope, worktree, predecessor and process identity checks and the exact comparisons for modern records stay unchanged (#1352)
 - Continue from a confirmed blocked-leaf resume result written before the host recorded launch confirmations: its omitted owner and launch intent are now proven in memory from the unique confirmed action, the durable successor lineage and the host's started, resumed and finished rows, instead of holding with an owner/scope/worktree conflict; modern receipts with missing provenance are still refused and no historical record is rewritten (#1351)
 - Seed the init-recovery fixture's historical lifecycle rows in the ledger's own segment with every field the server's ledger parser requires, and fail the Docker-free check when a seeded row would not parse (#1351)
 - Let a replay of the same scope handoff wait for its in-flight owner's Git mutation lease (bounded by the Git timeout) and adopt its commit, instead of failing after the two-second conflict window; a different owner still fails at two seconds (#1347)

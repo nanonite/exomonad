@@ -1405,6 +1405,50 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::sync::Arc;
 
+    /// A predecessor controller epoch must never authorize the current
+    /// controller's run, pane, or process identity.
+    #[tokio::test]
+    async fn controller_epoch_mismatch_still_rejects_ownership_evidence() {
+        let project = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir_all(project.path().join(".exo/tl-loop/root"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            project.path().join(".exo/tl-loop/root.controller-epoch"),
+            "epoch-current\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            project.path().join(".exo/tl-loop/root/run.json"),
+            r#"{"run_id":"run-1"}"#,
+        )
+        .await
+        .unwrap();
+        let target = ControllerPaneOwnership {
+            schema_version: 1,
+            controller_epoch: "epoch-predecessor".to_string(),
+            run_id: "run-1".to_string(),
+            tmux_session: "session".to_string(),
+            window_id: WindowId::parse("@1").unwrap(),
+            pane_id: PaneId::parse("%1").unwrap(),
+            pane_pid: 1,
+            pane_start_ticks: 1,
+            tmux_server_pid: 1,
+            tmux_server_start_ticks: 1,
+        };
+
+        let error = verify_controller_epoch(project.path(), &target)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("root controller epoch changed"),
+            "unexpected error: {error}"
+        );
+    }
+
     struct IsolatedTmux {
         socket: String,
         session: String,

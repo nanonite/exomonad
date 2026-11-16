@@ -133,6 +133,24 @@ effort_level = "medium"
 local config > global config > medium default. OpenCode receives effort as a
 model-aware `--variant`; Shoal logs that effort is ignored.
 
+**OpenCode catalog capability probe:** `init` catalog-validates exactly the
+roles it validated before the probe existed: an OpenCode worker route and the
+reviewer (through the harness-aware validator for its configured harness). TL
+routes are resolved and logged but not catalog-validated, and a non-OpenCode
+worker route is not catalog-validated; `validate_opencode_model_owner` remains a
+separate field-owner check. For OpenCode the probe runs `opencode --version` and
+`opencode models --help` under a short `OPENCODE_PROBE_TIMEOUT` (10s), then runs
+`opencode models --verbose` only when the help output lists `--verbose`. On a CLI
+that does not accept the flag (v2.0.22 accepts only `--standalone`/`--server`) it
+validates the exact `provider/model` line from plain `opencode models` and warns
+that an effort variant could not be checked. The catalog listing itself uses the
+longer `OPENCODE_CATALOG_TIMEOUT` (60s) because `opencode models` may contact a
+background server on a cold start. Unknown model IDs still fail in both modes. A
+missing binary, a bounded timeout, non-UTF8 output, and a non-zero plain `models`
+exit are distinct fail-closed errors that name the command and bound. There is
+no bypass flag or silent skip, and no ETXTBSY retry loop in production; test
+fixtures create their executable atomically instead.
+
 **Bootstrap:** `exomonad new` auto-creates `.exo/config.toml` (empty, all defaults) and `.gitignore` entries if missing.
 
 **Multi-remote projects:** `exomonad init --set-git-remote <name>` pins which

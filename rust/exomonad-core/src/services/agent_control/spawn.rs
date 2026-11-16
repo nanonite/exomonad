@@ -2181,12 +2181,12 @@ impl<
 
             // Workers are panes in the parent's tab — pane_id is the stable identifier.
             // Prompt goes through a temp file to avoid shell quoting issues.
-            let pane_id = self.new_tmux_pane(
+            let (pane_id, full_command) = self.new_tmux_pane(
                 &display_name,
                 &worker_cwd,
                 agent_type,
                 Some(&options.prompt),
-                env_vars,
+                env_vars.clone(),
                 Some(&caller_tab),
                 Some(&options.claude_flags),
                 model.as_deref(),
@@ -2195,6 +2195,8 @@ impl<
             )
               .await?;
               let pane_id_string = pane_id.as_str().to_string();
+              let launch_command =
+                  super::invocation::redacted_launch_command(&full_command, &env_vars);
 
               // Store pane_id for message delivery and cleanup
               let routing = RoutingInfo::pane(pane_id, &caller_tab);
@@ -2226,6 +2228,10 @@ impl<
                 routing,
                 Some(identity_record),
                 super::InvocationMetadata {
+                    launch_command: Some(launch_command),
+                    launch_command_source: Some(super::LaunchCommandSource::Actual),
+                    config_sources: None,
+                    build: None,
                     runtime: agent_type,
                     trigger: super::InvocationTrigger::Spawn,
                     pr_number: None,
@@ -2601,6 +2607,10 @@ impl<
                 routing,
                 Some(identity_record),
                 InvocationMetadata {
+                    launch_command: None,
+                    launch_command_source: None,
+                    config_sources: None,
+                    build: None,
                     runtime: agent_type,
                     trigger,
                     pr_number: options.invocation_pr_number,
@@ -3097,12 +3107,14 @@ impl<
                     &env_vars,
                     &worktree_path,
                 );
-                self.new_tmux_window_with_command(&display_name, &worktree_path, &full_command)
-                    .await
+                let window_id = self
+                    .new_tmux_window_with_command(&display_name, &worktree_path, &full_command)
+                    .await?;
+                Ok::<_, anyhow::Error>((window_id, full_command))
             }
             .await;
-            let window_id = match launch_result {
-                Ok(wid) => wid,
+            let (window_id, full_command) = match launch_result {
+                Ok(launched) => launched,
                 Err(e) => {
                     warn!(name = %identity.slug(), error = %e, "tmux window creation failed, rolling back");
                     if !agent_config_preexisting {
@@ -3178,6 +3190,13 @@ impl<
                 routing,
                 Some(identity_record),
                   InvocationMetadata {
+                      launch_command: Some(super::invocation::redacted_launch_command(
+                          &full_command,
+                          &env_vars,
+                      )),
+                      launch_command_source: Some(super::LaunchCommandSource::Actual),
+                      config_sources: None,
+                      build: None,
                       runtime: agent_type,
                       trigger,
                       pr_number: options.invocation_pr_number,
