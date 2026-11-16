@@ -150,6 +150,7 @@ from tl_loop.ordered import (
 from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmResponse
 from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
+from tl_loop.select.harness import parse_harness_identifier
 from tl_loop.select.model import ModelCatalog
 from tl_loop.select.policy import validate_policy
 from tl_loop.state.plan_manifest import ManifestNode, PlanManifest, build_plan_manifest
@@ -21599,12 +21600,17 @@ def _seed_terminal_provider_failure_leaf(
     prior_runtime: str = "opencode",
     prior_model: str = "opencode-go/deepseek-v4.1-flash",
     prior_effort: str = "high",
+    selected_harness: str = "codex/gpt-6-luna",
+    selected_model: str | None = "gpt-6-luna",
+    selected_effort: str = "xhigh",
     controller_invocation_id: str = "accepted-kani-controller-invocation",
     reference_requirements: tuple[ReferenceVerificationRequirement, ...] = (),
     omit_initial_spawn_effort: bool = False,
     legacy_spawn_result: bool = False,
 ) -> tuple[WorkPlan, TLLoopConfig, RunStore, Path, str, str]:
     """Build the retained accepted-launch / terminal-provider-failure shape."""
+    selected_route = parse_harness_identifier(selected_harness)
+    selected_catalog_model = selected_model or selected_route.model or "model-default"
     run_id = "substitution-model-kani-stage"
     ledger_run_id = "9ed1de9e-b0ff-4205-bed2-5f4538009254"
     slice_id = "issue-814-substitution-model-kani"
@@ -21642,17 +21648,24 @@ def _seed_terminal_provider_failure_leaf(
         }
     )
     role = {
-        "allow": ["codex/gpt-6-luna"],
-        "cost_rank": {"codex/gpt-6-luna": 1},
+        "allow": [selected_harness],
+        "cost_rank": {selected_harness: 1},
         "token_budget": 120000,
-        "per_harness_budget": {"codex/gpt-6-luna": 80000},
+        "per_harness_budget": {selected_harness: 80000},
         "escalate_after_attempts": 1,
     }
     policy = validate_policy(
         {"roles": {"tl": dict(role), "worker": dict(role), "reviewer": dict(role)}}
     )
     catalog = ModelCatalog.from_payload(
-        {"models": [{"harness": "codex", "model_id": "gpt-6-luna"}]}
+        {
+            "models": [
+                {
+                    "harness": selected_route.agent_type,
+                    "model_id": selected_catalog_model,
+                }
+            ]
+        }
     )
     parent_config = TLLoopConfig(
         active=True,
@@ -21665,10 +21678,10 @@ def _seed_terminal_provider_failure_leaf(
         repository_identity=RepositoryIdentity("https://forge.example.test/test/repository.git"),
         ledger_run_id=ledger_run_id,
         policy=policy,
-        capabilities=CapabilityMap({"codex/gpt-6-luna": Difficulty.STANDARD}),
+        capabilities=CapabilityMap({selected_harness: Difficulty.STANDARD}),
         catalog=catalog,
-        requested_model="gpt-6-luna",
-        worker_effort_level="xhigh",
+        requested_model=selected_model,
+        worker_effort_level=selected_effort,
         role_route_configuration_fingerprint="sha256:v1:" + "2" * 64,
         agent_id="root",
         max_events=1,
@@ -27958,6 +27971,12 @@ def _legacy_resume_row(
 def _seed_legacy_terminal_resume(
     tmp_path: Path,
     *,
+    prior_runtime: str = "opencode",
+    prior_model: str = "opencode-go/deepseek-v4.1-flash",
+    prior_effort: str = "high",
+    selected_harness: str = "codex/gpt-6-luna",
+    selected_model: str | None = "gpt-6-luna",
+    selected_effort: str = "xhigh",
     agent_overrides: Mapping[str, object] | None = None,
     invocation_overrides: Mapping[str, object] | None = None,
     identity_overrides: Mapping[str, object] | None = None,
@@ -27983,7 +28002,15 @@ def _seed_legacy_terminal_resume(
     """
     plan, config, store, owner_dir, owner_name, original_id = (
         _seed_terminal_provider_failure_leaf(
-            tmp_path, legacy_spawn_result=True, omit_initial_spawn_effort=True
+            tmp_path,
+            prior_runtime=prior_runtime,
+            prior_model=prior_model,
+            prior_effort=prior_effort,
+            selected_harness=selected_harness,
+            selected_model=selected_model,
+            selected_effort=selected_effort,
+            legacy_spawn_result=True,
+            omit_initial_spawn_effort=True,
         )
     )
     initial_proof, initial_reason = driver_module._terminal_owner_recovery_proof(
@@ -28466,6 +28493,195 @@ def test_resume_with_changed_configured_model_records_old_and_new_route(
     assert authorization["effort"] == "xhigh"
     assert authorization["prior_invocation_id"] == fixture.successor_id
     assert authorization["source"] == "accepted_operator_role_configuration"
+
+
+def test_resume_with_changed_configured_harness_dispatches_one_opencode_successor(
+    tmp_path: Path,
+) -> None:
+    """A configured Codex -> OpenCode change is a route transition, not a refusal."""
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path,
+        prior_runtime="codex",
+        prior_model="gpt-6.1-sol",
+        prior_effort="xhigh",
+        selected_harness="opencode/deepseek-v4.1-flash",
+        selected_model="deepseek-v4.1-flash",
+        selected_effort="high",
+    )
+    proof, reason = fixture.proof()
+    assert proof is not None, reason
+    authorization = _required_mapping(
+        proof.route_authorization, "configured route authorization"
+    )
+    assert authorization["prior_runtime"] == "codex"
+    assert authorization["agent_type"] == "opencode"
+    assert authorization["harness"] == "opencode/deepseek-v4.1-flash"
+    assert authorization["model"] == "deepseek-v4.1-flash"
+    assert authorization["effort"] == "high"
+    assert authorization["prior_invocation_id"] == fixture.successor_id
+    assert proof.resume.desired_harness == "opencode/deepseek-v4.1-flash"
+    assert proof.resume.desired_agent_type == "opencode"
+    assert proof.resume.desired_model == "deepseek-v4.1-flash"
+    assert proof.resume.desired_effort == "high"
+
+    transport = RepeatedTransitionTransport(
+        owner_dir=fixture.owner_dir,
+        owner_name=fixture.owner_name,
+        slice_id=fixture.plan.leaves[0].name,
+    )
+    journal = EffectJournal(
+        fixture.store.run_id, fixture.store.run_dir / "action-journal.json"
+    )
+    state = driver_module._resume_terminal_owner_failure(
+        fixture.plan,
+        fixture.store.load(),
+        fixture.config,
+        EffectClient(transport),
+        fixture.store,
+        journal,
+    )
+
+    assert len(transport.successors) == 1
+    launched = transport.successors[0]
+    assert launched["runtime"] == "opencode"
+    assert launched["model"] == "deepseek-v4.1-flash"
+    assert launched["effort"] == "high"
+    assert launched["prior_invocation_id"] == fixture.successor_id
+    leaf = state.slices[fixture.plan.leaves[0].name]
+    assert leaf.dispatch_invocation_id == launched["invocation_id"]
+    assert leaf.agent_type == "opencode"
+    assert leaf.dispatch_effort == "high"
+    entries = journal.entries_for(
+        "resume_blocked_leaf", fixture.plan.leaves[0].name
+    )
+    assert [entry["status"] for entry in entries] == ["confirmed", "confirmed"]
+    arguments = _required_mapping(entries[-1]["arguments"], "arguments")
+    assert arguments["prior_runtime"] == "codex"
+    assert arguments["desired_harness"] == "opencode/deepseek-v4.1-flash"
+    assert arguments["desired_agent_type"] == "opencode"
+    assert arguments["desired_model"] == "deepseek-v4.1-flash"
+    assert arguments["desired_effort"] == "high"
+    assert all(
+        charge.harness != "opencode/deepseek-v4.1-flash"
+        for charge in state.budgets.charges
+    ), "a same-attempt resume is not a new dispatch reservation"
+
+    replayed = driver_module._resume_terminal_owner_failure(
+        fixture.plan,
+        state,
+        fixture.config,
+        EffectClient(transport),
+        fixture.store,
+        journal,
+    )
+    assert len(transport.successors) == 1, "replay adds no second successor launch"
+    replay_entries = journal.entries_for(
+        "resume_blocked_leaf", fixture.plan.leaves[0].name
+    )
+    assert replay_entries == entries, "replay adds no second journal action"
+    assert replayed.slices[fixture.plan.leaves[0].name] == state.slices[
+        fixture.plan.leaves[0].name
+    ]
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("owner", "scope", "worktree", "predecessor"),
+)
+def test_harness_change_does_not_weaken_identity_bindings(
+    tmp_path: Path, field: str
+) -> None:
+    """The route change is accepted only while every identity field still matches."""
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path,
+        prior_runtime="codex",
+        prior_model="gpt-6.1-sol",
+        prior_effort="xhigh",
+        selected_harness="opencode/deepseek-v4.1-flash",
+        selected_model="deepseek-v4.1-flash",
+        selected_effort="high",
+    )
+    proof, reason = fixture.proof()
+    assert proof is not None, reason
+
+    leaf_id = fixture.plan.leaves[0].name
+    if field == "owner":
+        state = fixture.store.load()
+        current = state.slices[leaf_id]
+        assert current.recovery is not None
+        fixture.store.checkpoint(
+            state.fsm,
+            {
+                **state.slices,
+                leaf_id: replace(
+                    current,
+                    recovery=replace(
+                        current.recovery, owner_agent_id="foreign-owner"
+                    ),
+                ),
+            },
+            state.budgets,
+            state.events.last_consumed_offset,
+            plan_manifest=state.plan_manifest,
+        )
+    elif field == "scope":
+        identity_path = fixture.owner_dir / "identity.json"
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+        identity["slice_id"] = "foreign-slice"
+        identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    elif field == "worktree":
+        invocation_path = fixture.owner_dir / "invocation.json"
+        invocation = json.loads(invocation_path.read_text(encoding="utf-8"))
+        invocation["worktree"] = "/foreign/worktree"
+        invocation_path.write_text(json.dumps(invocation), encoding="utf-8")
+    else:
+        journal_path = fixture.store.run_dir / "action-journal.json"
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        for entry in journal:
+            if entry.get("operation") == "resume_blocked_leaf":
+                entry["arguments"]["expected_invocation_id"] = "foreign-predecessor"
+        journal_path.write_text(json.dumps(journal), encoding="utf-8")
+
+    conflicted, conflict_reason = fixture.proof()
+    assert conflicted is None, f"{field} mismatch must still refuse the changed-harness resume"
+    assert conflict_reason is not None
+
+
+def test_a_stale_controller_epoch_still_refuses_a_changed_harness_dispatch(
+    tmp_path: Path,
+) -> None:
+    """A route change never substitutes for the controller epoch."""
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path,
+        prior_runtime="codex",
+        prior_model="gpt-6.1-sol",
+        prior_effort="xhigh",
+        selected_harness="opencode/deepseek-v4.1-flash",
+        selected_model="deepseek-v4.1-flash",
+        selected_effort="high",
+    )
+    state = fixture.store.load()
+    leaf_id = fixture.plan.leaves[0].name
+    base = _canonical_event(
+        1,
+        "agent.spawned",
+        leaf_id,
+        fixture.store.run_id,
+        intent_id=state.slices[leaf_id].dispatch_intent_id,
+    )
+    stale = replace(
+        base,
+        data={
+            **base.data,
+            "controller_epoch": "epoch-predecessor",
+            "dispatch_generation": state.slices[leaf_id].dispatch_generation,
+        },
+    )
+
+    correlation = correlate_dispatch_event(state, stale)
+
+    assert correlation.classification == DISPATCH_HISTORICAL_AUDIT
+    assert correlation.reason == DISPATCH_EPOCH_MISMATCH
 
 
 @pytest.mark.parametrize("field_name", ("model", "effort"))

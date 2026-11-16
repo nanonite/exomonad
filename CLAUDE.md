@@ -397,6 +397,13 @@ resolved level as its model `--variant`; Codex receives the resolved level as
 `model_reasoning_effort` in its rendered config, while Shoal alone logs that effort is
 ignored because it has no stable effort interface.
 
+Changing a role's harness, model, or effort mid-run is supported as a routing
+transition: the successor generation runs the currently configured route and the
+old route is retained as evidence. A configured harness is the role route from
+`config.toml` plus the role's `allow` list in `.exo/harness_policy.toml`; anything
+outside both still requires explicit human approval. See
+[docs/guides/changing-routes-mid-run.md](docs/guides/changing-routes-mid-run.md).
+
 **TL-loop harness policy:** `.exo/harness_policy.toml` is the required human-authored
 allowlist and budget boundary for the programmatic controller. It must contain exactly
 `roles.tl`, `roles.worker`, and `roles.reviewer`. Each role declares `allow` (ordered

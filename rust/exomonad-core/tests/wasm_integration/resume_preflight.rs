@@ -4,6 +4,7 @@ use super::{
 };
 use async_trait::async_trait;
 use exomonad_core::services::agent_control::AgentControlService;
+use exomonad_core::services::agent_control::AgentType as ServiceAgentType;
 use exomonad_core::services::event_log::EventLog;
 use exomonad_core::services::forgejo::ForgejoClient;
 use exomonad_core::services::immutable_ledger::LedgerWriter;
@@ -788,6 +789,471 @@ async fn compiled_resume_pr_preserves_typed_dirty_refusal_after_owner_and_head_c
     );
     assert_eq!(agent_directory_names(&project), [owner.name.as_str()]);
     assert_no_spawn_or_resume_event(&events);
+}
+
+struct ConfiguredResumePrEvidence {
+    output: Value,
+    replay: Value,
+    launches: usize,
+    prior_invocation_id: String,
+    invocation: Value,
+    identity: Value,
+    events: Vec<Value>,
+}
+
+struct DumbHttpRemote {
+    child: std::process::Child,
+}
+
+impl Drop for DumbHttpRemote {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_dumb_http_remote(root: &Path, repository: &str) -> (String, DumbHttpRemote) {
+    use std::net::{TcpListener, TcpStream};
+    use std::process::Stdio;
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve fixture HTTP port");
+    let port = listener.local_addr().expect("reserved address").port();
+    drop(listener);
+    let child = Command::new("python3")
+        .args([
+            "-m",
+            "http.server",
+            &port.to_string(),
+            "--bind",
+            "127.0.0.1",
+            "--directory",
+            root.to_str().expect("HTTP root is UTF-8"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start fixture dumb HTTP remote");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fixture dumb HTTP remote did not start"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    (
+        format!("http://127.0.0.1:{port}/{repository}"),
+        DumbHttpRemote { child },
+    )
+}
+
+async fn resume_pr_across_configured_harness(
+    prior: ServiceAgentType,
+    desired: ServiceAgentType,
+) -> ConfiguredResumePrEvidence {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (owner_name, desired_model, desired_effort) = match prior {
+        ServiceAgentType::Codex => ("issue-814-codex", "deepseek-v4.1-flash", "high"),
+        ServiceAgentType::OpenCode => ("issue-814-opencode", "gpt-6-luna", "xhigh"),
+        other => panic!("unsupported configured-resume fixture harness {other:?}"),
+    };
+    assert_ne!(
+        prior, desired,
+        "the fixture must change the configured harness"
+    );
+
+    let temp = tempfile::tempdir().expect("temporary configured-resume fixture");
+    let project = temp.path().join("checkout");
+    let remote_root = temp.path().join("remote-root");
+    let remote = remote_root.join("acme").join("repo.git");
+    std::fs::create_dir_all(remote.parent().expect("remote parent")).expect("create remote parent");
+    let owner_branch = format!("main.{owner_name}");
+    let (worktree, head_sha) =
+        initialize_resume_repository_with_pr(&project, &remote, owner_name, &owner_branch);
+    run_git(&remote, &["update-server-info"]);
+    let (origin_url, _http_remote) = start_dumb_http_remote(&remote_root, "acme/repo.git");
+    run_git(&project, &["remote", "set-url", "origin", &origin_url]);
+    run_git(&project, &["config", "exomonad.remote", "origin"]);
+    let owner = match prior {
+        ServiceAgentType::OpenCode => {
+            let issue_id = create_open_chainlink_issue(&project);
+            seed_terminal_opencode_owner(
+                &project,
+                owner_name,
+                &owner_branch,
+                &worktree,
+                "issue-814",
+                issue_id,
+            )
+        }
+        _ => seed_dormant_owner(
+            &project,
+            owner_name,
+            &owner_branch,
+            &worktree,
+            "issue-814",
+            None,
+        ),
+    };
+    let prior_invocation: Value =
+        serde_json::from_slice(&owner.invocation_bytes).expect("prior invocation is JSON");
+    let prior_invocation_id = prior_invocation["invocation_id"]
+        .as_str()
+        .expect("prior invocation id")
+        .to_string();
+    std::fs::create_dir_all(project.join(".exo")).expect("create Exo directory");
+    EventLog::open(project.join(".exo/logs"))
+        .expect("open event log for prior lifecycle")
+        .append(
+            "agent.invocation.finished",
+            &owner.name,
+            &json!({"invocation_id": prior_invocation_id, "status": "exited"}),
+        )
+        .expect("retain terminal prior lifecycle record");
+    std::fs::write(
+        project.join(".exo/published-heads.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 2,
+            "heads": [{
+                "pr_number": 46,
+                "head_branch": owner_branch,
+                "base_branch": "main",
+                "head_sha": head_sha,
+                "author_agent": owner.name,
+                "author_role": "dev",
+                "provenance": "ledger_owned",
+                "slice_id": owner.slice_id,
+                "invocation_id": prior_invocation_id,
+                "invocation_trigger": "spawn",
+                "invocation_runtime": prior.suffix()
+            }]
+        }))
+        .expect("serialize prior publication history"),
+    )
+    .expect("write prior publication history");
+
+    let fake_bin = temp.path().join("fake-bin");
+    std::fs::create_dir_all(&fake_bin).expect("create fake harness bin");
+    let launch_log = project.join(".exo/harness-launches.log");
+    for harness in ["codex", "opencode"] {
+        let script = fake_bin.join(harness);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nsleep 30\n",
+                launch_log.display()
+            ),
+        )
+        .expect("write fake harness");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake harness executable");
+    }
+
+    let prior_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut shim_path = std::ffi::OsString::from(&fake_bin);
+    shim_path.push(":");
+    shim_path.push(prior_path);
+    let _path_restore = EnvironmentRestore::set("PATH", shim_path.clone());
+    let socket = format!("exo-configured-resume-{}-{owner_name}", std::process::id());
+    let session = format!("exo-configured-resume-{}-{owner_name}", std::process::id());
+    let _socket_restore =
+        EnvironmentRestore::set("EXOMONAD_TMUX_SOCKET", std::ffi::OsString::from(&socket));
+    let created = Command::new("tmux")
+        .args([
+            "-L",
+            &socket,
+            "new-session",
+            "-d",
+            "-s",
+            &session,
+            "-n",
+            "TL",
+            "sleep",
+            "300",
+        ])
+        .status()
+        .expect("start isolated tmux session");
+    assert!(created.success(), "isolated tmux session starts");
+    let path_text = shim_path.to_string_lossy().into_owned();
+    let set_path = Command::new("tmux")
+        .args(["-L", &socket, "set-environment", "-g", "PATH", &path_text])
+        .status()
+        .expect("set isolated tmux PATH");
+    assert!(
+        set_path.success(),
+        "isolated tmux server receives shim PATH"
+    );
+
+    let forgejo = MockServer::start().await;
+    mount_resume_pr_observations(&forgejo, 46, &owner_branch, &head_sha).await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/repos/acme/repo/pulls"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "number": 46,
+            "title": "fixture PR 46",
+            "body": "temporary integration fixture",
+            "state": "open",
+            "merged": false,
+            "html_url": "http://forgejo.local/acme/repo/pulls/46",
+            "head": {"ref": owner_branch, "sha": head_sha},
+            "base": {"ref": "main", "sha": "fixture-base-sha"}
+        }])))
+        .mount(&forgejo)
+        .await;
+    let mut services =
+        super::Services::benchmark(project.clone()).expect("construct production services");
+    services.forgejo_client = Some(
+        ForgejoClient::new(&forgejo.uri(), "test-only-token")
+            .expect("construct isolated Forgejo client"),
+    );
+    services.agent_resolver =
+        std::sync::Arc::new(exomonad_core::services::AgentResolver::load(project.clone()).await);
+    services.event_log = Some(std::sync::Arc::new(
+        EventLog::open(project.join(".exo/logs")).expect("open event log"),
+    ));
+    let services = std::sync::Arc::new(services);
+    let service = std::sync::Arc::new(
+        AgentControlService::new(services.clone())
+            .with_tmux_session(session)
+            .with_birth_branch(exomonad_core::BirthBranch::try_from_str("main").expect("main"))
+            .with_spawn_agent_type(desired)
+            .with_spawn_agent_model(Some(desired_model.to_string()))
+            .with_spawn_agent_effort(Some(desired_effort.to_string())),
+    );
+    let handler = AgentHandler::new(service, services);
+    let runtime = build_wasm_runtime_with_agent_handler(&project, handler).await;
+    let request = json!({
+        "pr_number": 46,
+        "expected_head_sha": head_sha,
+        "task": "Resume the existing owner after review"
+    });
+
+    let output = call_tool(&runtime, "tl", "resume_pr", request.clone()).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::fs::read_to_string(&launch_log)
+        .map(|contents| contents.lines().count() < 1)
+        .unwrap_or(true)
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let invocation: Value = serde_json::from_slice(
+        &std::fs::read(owner.invocation_path.clone()).expect("read successor invocation"),
+    )
+    .expect("successor invocation is JSON");
+    let identity: Value = serde_json::from_slice(
+        &std::fs::read(
+            project
+                .join(".exo/agents")
+                .join(owner_name)
+                .join("identity.json"),
+        )
+        .expect("read successor identity"),
+    )
+    .expect("successor identity is JSON");
+
+    // The production resume lineage already adopted and recorded this
+    // publication. Replay must adopt the live successor, not spawn again.
+    let replay = call_tool(&runtime, "tl", "resume_pr", request).await;
+    let launches = std::fs::read_to_string(&launch_log)
+        .map(|contents| contents.lines().count())
+        .unwrap_or_default();
+    let events = read_project_events(&project);
+    let _ = Command::new("tmux")
+        .args(["-L", &socket, "kill-server"])
+        .status();
+
+    ConfiguredResumePrEvidence {
+        output,
+        replay,
+        launches,
+        prior_invocation_id,
+        invocation,
+        identity,
+        events,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn configured_codex_to_opencode_resume_pr_records_a_routing_transition() {
+    let evidence =
+        resume_pr_across_configured_harness(ServiceAgentType::Codex, ServiceAgentType::OpenCode)
+            .await;
+
+    assert_eq!(
+        evidence.output["success"], true,
+        "configured Codex to OpenCode resume succeeds: {:#}",
+        evidence.output
+    );
+    assert_eq!(
+        evidence.replay["success"], false,
+        "a live successor is an explicit replay failure, not a fresh resume: {:#}",
+        evidence.replay
+    );
+    assert!(
+        evidence.replay["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already-running"),
+        "replay reports the already-running contract: {:#}",
+        evidence.replay
+    );
+    assert_eq!(
+        evidence.launches,
+        evidence.launches.max(1),
+        "the fixture harness ran"
+    );
+    let starts = evidence
+        .events
+        .iter()
+        .filter(|event| {
+            event["event_type"] == "agent.invocation.started"
+                && event["data"]["invocation_id"] == evidence.invocation["invocation_id"]
+        })
+        .count();
+    let resumed = evidence
+        .events
+        .iter()
+        .filter(|event| event["event_type"] == "agent.resumed")
+        .count();
+    assert_eq!(starts, 1, "replay adds no second invocation start");
+    assert_eq!(resumed, 1, "replay adds no second agent.resumed row");
+    assert_eq!(evidence.invocation["runtime"], "opencode");
+    assert_eq!(evidence.invocation["model"], "deepseek-v4.1-flash");
+    assert_eq!(evidence.invocation["effort"], "high");
+    assert_eq!(
+        evidence.invocation["prior_invocation_id"],
+        evidence.prior_invocation_id
+    );
+    assert_eq!(evidence.invocation["generation"], 2);
+    assert_eq!(evidence.identity["agent_type"], "opencode");
+    assert_eq!(evidence.identity["model"], "deepseek-v4.1-flash");
+    assert_eq!(evidence.identity["effort"], "high");
+
+    let transitions = evidence
+        .events
+        .iter()
+        .filter(|event| event["event_type"] == "agent.harness_switch")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        transitions.len(),
+        1,
+        "one configured-route transition is recorded"
+    );
+    let transition = &transitions[0]["data"];
+    assert_eq!(transition["operation"], "resume_pr");
+    assert_eq!(transition["from_harness"], "codex");
+    assert_eq!(transition["to_harness"], "opencode");
+    assert_eq!(transition["to_model"], "deepseek-v4.1-flash");
+    assert_eq!(transition["to_effort"], "high");
+    assert_eq!(
+        transition["prior_invocation_id"],
+        evidence.prior_invocation_id
+    );
+    assert_eq!(transition["scope"], "issue-814");
+    assert_eq!(transition["pr_number"], 46);
+    assert_eq!(transition["head_sha"], evidence.invocation["head_sha"]);
+    assert_eq!(
+        transition["authorization_source"],
+        "accepted_operator_role_configuration"
+    );
+    assert!(transition["transition_id"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("runtime-route:")));
+    assert!(transition["worktree_fingerprint"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("sha256:")));
+    assert!(
+        !evidence
+            .events
+            .iter()
+            .any(|event| event["event_type"] == "agent.stuck"),
+        "a configured route change is not reported as stuck guidance"
+    );
+    let resumed = evidence
+        .events
+        .iter()
+        .find(|event| event["event_type"] == "agent.resumed")
+        .expect("resume records one agent.resumed row");
+    assert_eq!(resumed["data"]["agent_type"], "opencode");
+    assert_eq!(resumed["data"]["model"], "deepseek-v4.1-flash");
+    assert_eq!(resumed["data"]["effort"], "high");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn configured_opencode_to_codex_resume_pr_records_a_routing_transition() {
+    let evidence =
+        resume_pr_across_configured_harness(ServiceAgentType::OpenCode, ServiceAgentType::Codex)
+            .await;
+
+    assert_eq!(
+        evidence.output["success"], true,
+        "configured OpenCode to Codex resume succeeds: {:#}",
+        evidence.output
+    );
+    assert_eq!(
+        evidence.replay["success"], false,
+        "a live successor is an explicit replay failure, not a fresh resume: {:#}",
+        evidence.replay
+    );
+    assert!(
+        evidence.replay["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already-running"),
+        "replay reports the already-running contract: {:#}",
+        evidence.replay
+    );
+    assert_eq!(
+        evidence.launches,
+        evidence.launches.max(1),
+        "the fixture harness ran"
+    );
+    let starts = evidence
+        .events
+        .iter()
+        .filter(|event| {
+            event["event_type"] == "agent.invocation.started"
+                && event["data"]["invocation_id"] == evidence.invocation["invocation_id"]
+        })
+        .count();
+    let resumed = evidence
+        .events
+        .iter()
+        .filter(|event| event["event_type"] == "agent.resumed")
+        .count();
+    assert_eq!(starts, 1, "replay adds no second invocation start");
+    assert_eq!(resumed, 1, "replay adds no second agent.resumed row");
+    assert_eq!(evidence.invocation["runtime"], "codex");
+    assert_eq!(evidence.invocation["model"], "gpt-6-luna");
+    assert_eq!(evidence.invocation["effort"], "xhigh");
+    assert_eq!(
+        evidence.invocation["prior_invocation_id"],
+        evidence.prior_invocation_id
+    );
+    assert_eq!(evidence.invocation["generation"], 2);
+    assert_eq!(evidence.identity["agent_type"], "codex");
+    assert_eq!(evidence.identity["model"], "gpt-6-luna");
+    assert_eq!(evidence.identity["effort"], "xhigh");
+
+    let transitions = evidence
+        .events
+        .iter()
+        .filter(|event| event["event_type"] == "agent.harness_switch")
+        .collect::<Vec<_>>();
+    assert_eq!(transitions.len(), 1);
+    let transition = &transitions[0]["data"];
+    assert_eq!(transition["from_harness"], "opencode");
+    assert_eq!(transition["to_harness"], "codex");
+    assert_eq!(transition["to_model"], "gpt-6-luna");
+    assert_eq!(transition["to_effort"], "xhigh");
+    assert_eq!(
+        transition["prior_invocation_id"],
+        evidence.prior_invocation_id
+    );
 }
 
 fn initialize_resume_repository(

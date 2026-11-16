@@ -921,6 +921,44 @@ guessing. Catalog entries carry no vendor-specific model table in
 `tl_loop/select/` — the score/cost fields are seeded offline by the operator,
 the same way `harness_policy.toml` and `harness_capability.toml` are authored.
 
+## Dispatch route resolution seam
+
+A slice's harness, model, and effort are resolved in one seam, not at individual
+dispatch sites:
+
+- harness: `select_agent_type` over the role allowlist, capability map,
+  difficulty, and role/per-harness budgets (narrowed by an optional plan
+  request);
+- model: `select_model` or `select_model_for_difficulty` through
+  `_selected_spawn_model` (explicit `requested_model` wins over the catalog
+  tier, which wins over the harness-pinned model);
+- effort and provenance: `_dispatch_route_fields` binds
+  `config.worker_effort_level` and the configuration/policy/manifest
+  fingerprints.
+
+Only three dispatch paths call these helpers: `_prepare_spawn` (fresh and
+pre-execution retry), `_recovered_spawn_choice` with
+`_confirmed_spawn_route_state_fields` (recovered dispatch), and
+`_terminal_owner_recovery_proof` with `_route_fields_for_blocked_resume`
+(terminal-owner and blocked-leaf recovery). `tl_loop/tests/test_route_seam.py`
+is a structural test over every call site; a new resolution site fails it.
+
+The route is recorded in two places: the dispatch/action journal arguments
+(`harness`, `agent_type`, `model`, `effort`, `route_*_fingerprint`, the prior
+route, and the route-authorization digest) and the durable host record
+(invocation `runtime`/`model`/`effort`, the owner identity, and the
+`agent.harness_switch` transition row for a resume). The guard and the selector
+share the same definition of a configured harness: the resolved `config.toml`
+role route plus the role's `.exo/harness_policy.toml` allowlist, pinned by
+`rust/exomonad-core/tests/fixtures/harness_policy_agreement.{toml,json}`.
+See [docs/guides/changing-routes-mid-run.md](../docs/guides/changing-routes-mid-run.md).
+
+Per-slice route *prescription* is not implemented. It would extend the closed
+slice schema and manifest digest, constrain `select_agent_type` to an allowed
+prescription, and teach `_dispatch_route_fields`, `resume_pr`, and
+`resume_blocked_leaf` to treat a prescribed allowlisted route as configured.
+The guard itself would not need a new rule.
+
 ## FSM parity fixture
 
 `tl_loop/fsm/` is a pure port of `.exo/roles/devswarm/TLPhase.hs`. The golden

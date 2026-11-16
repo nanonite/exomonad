@@ -446,9 +446,13 @@ identity, not a second workflow owner and not a stacked-PR abstraction.
 
 runtime, trigger, routing, started_at, and status are required. ended_at,
 exit_code, pr_number, head_sha, model, and effort are optional. model and
-effort describe the current process attempt; identity.json retains the
-owner's original model and effort so a resume cannot erase historical
-provenance.
+effort describe the current process attempt. identity.json holds the owner's
+current route: a controller-routed spawn and a resume of a named owner both
+write the route they run with, so a configured route change updates it. The
+prior route survives in the `configured_runtime_route_transition` row and the
+prior invocation's lifecycle rows; a re-spawn with no routed or named owner
+keeps the identity record's existing model and effort. See
+[docs/guides/changing-routes-mid-run.md](../../docs/guides/changing-routes-mid-run.md).
 
 Every invocation also records its launch provenance. `build` is the build
 identity the writing server injected through
@@ -489,8 +493,16 @@ and effort, and the worktree fingerprint. The successor's invocation record then
 carries the new route. A change of model, effort, or harness is a routing
 transition; it is never reported as an owner, scope, or worktree conflict. Owner,
 scope, worktree, predecessor-invocation, epoch, and process-identity checks are
-unchanged, and a cross-runtime change still passes the harness-switch/human
-approval guard.
+unchanged.
+
+A cross-runtime change is configured when it comes from `config.toml`'s resolved
+role route or from the role's `allow` list in `.exo/harness_policy.toml`; both
+sources are consulted by `crate::services::harness_policy` and are pinned to the
+Python selector by `tests/fixtures/harness_policy_agreement.{toml,json}`. A
+configured cross-runtime change therefore does not require
+`EXOMONAD_ALLOW_HARNESS_SWITCH`. An explicit request outside both sources still
+emits `[STUCK: harness-switch]`/`agent.stuck` and is approved only by that flag.
+See [docs/guides/changing-routes-mid-run.md](../../../docs/guides/changing-routes-mid-run.md).
 
 ### Ordered sub-TL invocation provisioning
 
@@ -571,12 +583,16 @@ retain the publication-backed continuation classification.
 ### Harness selection guardrail
 
 A coding spawn inherits the configured worker harness. Retrying or calling
-resume_pr stays on that harness and the existing owner identity. An explicit
-cross-harness request is rejected with agent.stuck guidance unless the human
-has set EXOMONAD_ALLOW_HARNESS_SWITCH=1; approved switches are audited with
-from/to harness, reason, policy source, model, and effort. No-op, no-commit, or
-no-PR failure handoffs also emit bounded agent.stuck guidance for the parent
-to steer or escalate.
+resume_pr stays on that harness and the existing owner identity. The configured
+harness is the resolved role route from `config.toml`, extended by the role's
+`allow` list in `.exo/harness_policy.toml`; a harness named by either source is
+a configured route and needs no approval. An explicit cross-harness request
+outside both sources is rejected with agent.stuck guidance unless the human has
+set EXOMONAD_ALLOW_HARNESS_SWITCH=1; approved switches are audited with from/to
+harness, reason, policy source, model, and effort. See
+[docs/guides/changing-routes-mid-run.md](../../docs/guides/changing-routes-mid-run.md).
+No-op, no-commit, or no-PR failure handoffs also emit bounded agent.stuck
+guidance for the parent to steer or escalate.
 
 ### One-shot coding invocations
 

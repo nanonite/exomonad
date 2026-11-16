@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -182,6 +183,69 @@ def _choice(*, cost: int, budget: int | None = None) -> HarnessChoice:
         role_budget=limit,
         harness_budget=limit,
     )
+
+
+def test_harness_change_charges_the_new_harness_and_keeps_the_old_spend() -> None:
+    """A continuation on another harness charges that harness, not the old one."""
+    codex = _choice(cost=10)
+    opencode = HarnessChoice(
+        harness="opencode/deepseek-v4.1-flash",
+        reason="test",
+        difficulty=Difficulty.TRIVIAL,
+        matched_rule="focused_slice",
+        estimated_cost=20,
+        candidate_set=("opencode/deepseek-v4.1-flash",),
+        role="worker",
+        role_budget=1000,
+        harness_budget=50,
+    )
+
+    first = charge_spawn({}, codex, _slice())
+    first_spent = reconcile(first, "slice-a", 7)
+    assert cast(dict[str, int], first_spent["harness_spent"]) == {"codex/gpt-luna": 7}
+    assert "codex/gpt-luna" not in cast(dict[str, int], first_spent["harness_reserved"])
+
+    continuation = charge_spawn(
+        first_spent, opencode, replace(_slice(), attempts=1)
+    )
+    assert cast(dict[str, int], continuation["harness_spent"]) == {"codex/gpt-luna": 7}
+    assert cast(dict[str, int], continuation["harness_reserved"]) == {
+        "opencode/deepseek-v4.1-flash": 20
+    }
+    charges = cast(list[dict[str, object]], continuation["charges"])
+    assert charges[-1]["harness"] == "opencode/deepseek-v4.1-flash"
+
+    second_spent = reconcile(continuation, "slice-a", 4)
+    assert cast(dict[str, int], second_spent["harness_spent"]) == {
+        "codex/gpt-luna": 7,
+        "opencode/deepseek-v4.1-flash": 4,
+    }
+    assert cast(dict[str, int], second_spent["harness_reserved"]) == {}
+    assert second_spent["tokens"] == 11
+
+
+def test_harness_budget_is_charged_to_the_harness_that_actually_runs() -> None:
+    codex = _choice(cost=10, budget=10)
+    opencode = HarnessChoice(
+        harness="opencode/deepseek-v4.1-flash",
+        reason="test",
+        difficulty=Difficulty.TRIVIAL,
+        matched_rule="focused_slice",
+        estimated_cost=25,
+        candidate_set=("opencode/deepseek-v4.1-flash",),
+        role="worker",
+        role_budget=1000,
+        harness_budget=20,
+    )
+    first_spent = reconcile(charge_spawn({}, codex, _slice()), "slice-a", 10)
+
+    with pytest.raises(BudgetCeilingExceeded):
+        charge_spawn(first_spent, opencode, replace(_slice(), attempts=1))
+
+    affordable = replace(opencode, estimated_cost=20)
+    charged = charge_spawn(first_spent, affordable, replace(_slice(), attempts=1))
+    assert charged["harness_spent"] == {"codex/gpt-luna": 10}
+    assert charged["harness_reserved"] == {"opencode/deepseek-v4.1-flash": 20}
 
 
 def _slice() -> SliceState:

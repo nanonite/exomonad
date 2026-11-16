@@ -1310,7 +1310,8 @@ impl<
         self.enforce_harness_switch_policy(
             ctx,
             "spawn",
-            self.service.default_spawn_agent_type(),
+            self.service
+                .configured_harness_for_role("tl", effective_agent_type),
             requested_agent_type,
             effective_agent_type,
             self.service
@@ -1349,7 +1350,7 @@ impl<
         self.enforce_harness_switch_policy(
             ctx,
             "spawn_batch",
-            self.service.default_spawn_agent_type(),
+            self.service.configured_harness_for_role("tl", agent_type),
             requested_agent_type,
             agent_type,
             self.service.effective_model_for(agent_type, "tl", None),
@@ -1429,7 +1430,8 @@ impl<
         self.enforce_harness_switch_policy(
             ctx,
             "spawn_worker",
-            default_type,
+            self.service
+                .configured_harness_for_role("worker", effective_agent_type),
             requested_agent_type,
             effective_agent_type,
             model.clone(),
@@ -1641,7 +1643,8 @@ impl<
         self.enforce_harness_switch_policy(
             ctx,
             "spawn_subtree",
-            default_type,
+            self.service
+                .configured_harness_for_role(role_name, effective_agent_type),
             requested_agent_type,
             effective_agent_type,
             model.clone(),
@@ -2636,10 +2639,16 @@ impl<
                 self.service.effective_effort_for("dev", None),
             ),
         };
+        let harness_role = role_route
+            .as_ref()
+            .map(|route| route.role.clone())
+            .or_else(|| requested_role.clone())
+            .unwrap_or_else(|| "dev".to_string());
         self.enforce_harness_switch_policy(
             ctx,
             "spawn_leaf_subtree",
-            default_type,
+            self.service
+                .configured_harness_for_role(&harness_role, effective_agent_type),
             requested_agent_type,
             effective_agent_type,
             model.clone(),
@@ -8580,6 +8589,593 @@ mod tests {
         .is_err());
     }
 
+    struct ConfiguredResumeFixture {
+        _temp: tempfile::TempDir,
+        _forgejo: wiremock::MockServer,
+        _http_remote: DumbHttpRemote,
+        project: PathBuf,
+        owner_dir: PathBuf,
+        slice: String,
+        head_sha: String,
+        prior_invocation_id: String,
+        launch_log: PathBuf,
+        handler: AgentHandler<crate::services::Services>,
+        context: crate::effects::EffectContext,
+        tmux_socket: String,
+        previous_tmux_socket: Option<std::ffi::OsString>,
+        previous_path: std::ffi::OsString,
+    }
+
+    impl Drop for ConfiguredResumeFixture {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("tmux")
+                .args(["-L", &self.tmux_socket, "kill-server"])
+                .status();
+            if let Some(socket) = self.previous_tmux_socket.take() {
+                std::env::set_var("EXOMONAD_TMUX_SOCKET", socket);
+            } else {
+                std::env::remove_var("EXOMONAD_TMUX_SOCKET");
+            }
+            std::env::set_var("PATH", &self.previous_path);
+        }
+    }
+
+    struct DumbHttpRemote {
+        child: std::process::Child,
+    }
+
+    impl Drop for DumbHttpRemote {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn fixture_git(directory: &std::path::Path, arguments: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(arguments)
+            .current_dir(directory)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .expect("run fixture Git command");
+        assert!(
+            output.status.success(),
+            "Git {arguments:?} failed in {}: {}",
+            directory.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn start_dumb_http_remote(
+        root: &std::path::Path,
+        repository: &str,
+    ) -> (String, DumbHttpRemote) {
+        use std::net::{TcpListener, TcpStream};
+        use std::process::Stdio;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("reserve fixture HTTP port");
+        let port = listener.local_addr().expect("reserved address").port();
+        drop(listener);
+        let child = std::process::Command::new("python3")
+            .args([
+                "-m",
+                "http.server",
+                &port.to_string(),
+                "--bind",
+                "127.0.0.1",
+                "--directory",
+                root.to_str().expect("HTTP root is UTF-8"),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start fixture dumb HTTP remote");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture dumb HTTP remote did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        (
+            format!("http://127.0.0.1:{port}/{repository}"),
+            DumbHttpRemote { child },
+        )
+    }
+
+    fn ledger_rows(project: &std::path::Path) -> Vec<serde_json::Value> {
+        crate::services::immutable_ledger::LedgerWriter::open_project(project)
+            .expect("open project ledger")
+            .read_resolved_events()
+            .expect("read project ledger")
+            .into_iter()
+            .map(|record| {
+                serde_json::json!({
+                    "event_type": record.event.event_type,
+                    "agent_id": record.event.agent_id,
+                    "data": record.event.data
+                })
+            })
+            .collect()
+    }
+
+    async fn configured_resume_pr_fixture(
+        prior: ServiceAgentType,
+        desired: ServiceAgentType,
+    ) -> ConfiguredResumeFixture {
+        use std::os::unix::fs::PermissionsExt;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (owner_name, desired_model, desired_effort) = match prior {
+            ServiceAgentType::Codex => ("issue-814-codex", "deepseek-v4.1-flash", "high"),
+            ServiceAgentType::OpenCode => ("issue-814-opencode", "gpt-6-luna", "xhigh"),
+            other => panic!("unsupported configured-resume fixture harness {other:?}"),
+        };
+        assert_ne!(prior, desired);
+        const PR_NUMBER: u64 = 46;
+        const SLICE: &str = "issue-814";
+        let temp = tempfile::tempdir().expect("temporary configured-resume fixture");
+        let project = temp.path().join("repo");
+        let remote_root = temp.path().join("remote-root");
+        let remote = remote_root.join("acme").join("repo.git");
+        std::fs::create_dir_all(remote.parent().expect("remote parent"))
+            .expect("create remote parent");
+        std::fs::create_dir_all(&project).expect("create project");
+        fixture_git(&project, &["init", "--quiet", "--initial-branch=main"]);
+        fixture_git(
+            &project,
+            &["config", "user.name", "Configured resume fixture"],
+        );
+        fixture_git(
+            &project,
+            &["config", "user.email", "configured-resume@example.invalid"],
+        );
+        std::fs::write(project.join(".gitignore"), ".exo/\n").expect("write ignore rules");
+        std::fs::write(project.join("README.md"), "configured resume fixture\n")
+            .expect("write fixture readme");
+        fixture_git(&project, &["add", ".gitignore", "README.md"]);
+        fixture_git(&project, &["commit", "--quiet", "-m", "fixture baseline"]);
+        fixture_git(
+            &project,
+            &[
+                "init",
+                "--bare",
+                "--quiet",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        fixture_git(
+            &project,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://forgejo.local/acme/repo.git",
+            ],
+        );
+        fixture_git(
+            &project,
+            &[
+                "remote",
+                "add",
+                "fixture",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        fixture_git(&project, &["push", "fixture", "main"]);
+
+        let branch = format!("main.{owner_name}");
+        let worktree = project.join(".exo/worktrees").join(owner_name);
+        std::fs::create_dir_all(worktree.parent().expect("worktree parent"))
+            .expect("create worktree parent");
+        fixture_git(
+            &project,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                &branch,
+                worktree.to_str().expect("worktree path"),
+            ],
+        );
+        std::fs::write(worktree.join("review-fix.txt"), "published owner change\n")
+            .expect("write PR commit");
+        fixture_git(&worktree, &["add", "review-fix.txt"]);
+        fixture_git(&worktree, &["commit", "--quiet", "-m", "owner PR head"]);
+        let head_sha = {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&worktree)
+                .output()
+                .expect("read fixture head");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        fixture_git(&project, &["push", "fixture", &branch]);
+        fixture_git(&remote, &["update-server-info"]);
+        let (origin_url, http_remote) = start_dumb_http_remote(&remote_root, "acme/repo.git");
+        fixture_git(&project, &["remote", "set-url", "origin", &origin_url]);
+        fixture_git(&project, &["config", "exomonad.remote", "origin"]);
+
+        let prior_invocation_id = match prior {
+            ServiceAgentType::OpenCode => "opencode-invocation-1",
+            _ => "parked-invocation-1",
+        };
+        let owner_dir = project.join(".exo/agents").join(owner_name);
+        std::fs::create_dir_all(&owner_dir).expect("create owner directory");
+        std::fs::write(
+            owner_dir.join("identity.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agent_name": owner_name,
+                "slug": SLICE,
+                "agent_type": prior.suffix(),
+                "birth_branch": branch,
+                "parent_branch": "main",
+                "working_dir": worktree,
+                "display_name": format!("🤖 {owner_name}"),
+                "topology": "worktree_per_agent",
+                "ledger_owned": true,
+                "slice_id": SLICE
+            }))
+            .expect("serialize prior identity"),
+        )
+        .expect("write prior identity");
+        std::fs::write(
+            owner_dir.join("invocation.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "invocation_id": prior_invocation_id,
+                "runtime": prior.suffix(),
+                "trigger": "spawn",
+                "mode": "one_shot",
+                "routing": { "window_id": null, "pane_id": null, "parent_tab": null },
+                "started_at": 1,
+                "ended_at": 2,
+                "status": "exited",
+                "exit_code": 1,
+                "generation": 1,
+                "slice_id": SLICE,
+                "branch": branch,
+                "worktree": worktree
+            }))
+            .expect("serialize prior invocation"),
+        )
+        .expect("write prior invocation");
+        std::fs::create_dir_all(project.join(".exo")).expect("create Exo directory");
+        crate::services::EventLog::open(project.join(".exo/logs"))
+            .expect("open event log")
+            .append(
+                "agent.invocation.finished",
+                owner_name,
+                &serde_json::json!({
+                    "invocation_id": prior_invocation_id,
+                    "status": "exited"
+                }),
+            )
+            .expect("retain terminal prior lifecycle");
+        std::fs::write(
+            project.join(".exo/published-heads.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 2,
+                "heads": [{
+                    "pr_number": PR_NUMBER,
+                    "head_branch": branch,
+                    "base_branch": "main",
+                    "head_sha": head_sha,
+                    "author_agent": owner_name,
+                    "author_role": "dev",
+                    "provenance": "ledger_owned",
+                    "slice_id": SLICE,
+                    "invocation_id": prior_invocation_id,
+                    "invocation_trigger": "spawn",
+                    "invocation_runtime": prior.suffix()
+                }]
+            }))
+            .expect("serialize prior publication"),
+        )
+        .expect("write prior publication");
+
+        let fake_bin = temp.path().join("fake-bin");
+        std::fs::create_dir_all(&fake_bin).expect("create fake harness bin");
+        let launch_log = project.join(".exo/harness-launches.log");
+        for harness in ["codex", "opencode"] {
+            let script = fake_bin.join(harness);
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nsleep 30\n",
+                    launch_log.display()
+                ),
+            )
+            .expect("write fake harness");
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("make fake harness executable");
+        }
+        let previous_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut shim_path = std::ffi::OsString::from(&fake_bin);
+        shim_path.push(":");
+        shim_path.push(&previous_path);
+        std::env::set_var("PATH", shim_path);
+        let tmux_socket = format!("exo-configured-resume-{}-{owner_name}", std::process::id());
+        let previous_tmux_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
+        std::env::set_var("EXOMONAD_TMUX_SOCKET", &tmux_socket);
+        let session_name = format!("exo-configured-resume-{}-{owner_name}", std::process::id());
+        let session = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_socket,
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-n",
+                "TL",
+                "sleep",
+                "300",
+            ])
+            .status()
+            .expect("start isolated tmux session");
+        assert!(session.success(), "isolated tmux session starts");
+        let path_text = std::env::var_os("PATH")
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let set_path = std::process::Command::new("tmux")
+            .args([
+                "-L",
+                &tmux_socket,
+                "set-environment",
+                "-g",
+                "PATH",
+                &path_text,
+            ])
+            .status()
+            .expect("set isolated tmux PATH");
+        assert!(
+            set_path.success(),
+            "isolated tmux server receives shim PATH"
+        );
+
+        let forgejo = MockServer::start().await;
+        let pr_body = serde_json::json!({
+            "number": PR_NUMBER,
+            "title": "Configured route resume",
+            "body": "",
+            "state": "open",
+            "merged": false,
+            "html_url": "http://forgejo.local/acme/repo/pulls/46",
+            "head": { "ref": branch, "sha": head_sha },
+            "base": { "ref": "main", "sha": "fixture-base-sha" }
+        });
+        for route in [
+            format!("/api/v1/repos/acme/repo/pulls/{PR_NUMBER}"),
+            "/api/v1/repos/acme/repo/pulls".to_string(),
+        ] {
+            let is_list = route.ends_with("/pulls");
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(if is_list {
+                    serde_json::json!([pr_body.clone()])
+                } else {
+                    pr_body.clone()
+                }))
+                .mount(&forgejo)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/v1/repos/acme/repo/pulls/{PR_NUMBER}/reviews"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&forgejo)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/v1/repos/acme/repo/commits/{head_sha}/status"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "state": "pending",
+                "statuses": []
+            })))
+            .mount(&forgejo)
+            .await;
+
+        let mut services =
+            crate::services::Services::benchmark(project.clone()).expect("construct services");
+        services.forgejo_client = Some(
+            crate::services::forgejo::ForgejoClient::new(&forgejo.uri(), "fixture-token")
+                .expect("construct isolated Forgejo client"),
+        );
+        services.agent_resolver =
+            Arc::new(crate::services::AgentResolver::load(project.clone()).await);
+        services.event_log = Some(Arc::new(
+            crate::services::EventLog::open(project.join(".exo/logs")).expect("open event log"),
+        ));
+        let services = Arc::new(services);
+        let service = Arc::new(
+            AgentControlService::new(services.clone())
+                .with_tmux_session(session_name)
+                .with_birth_branch(BirthBranch::try_from_str("main").expect("main branch"))
+                .with_spawn_agent_type(desired)
+                .with_spawn_agent_model(Some(desired_model.to_string()))
+                .with_spawn_agent_effort(Some(desired_effort.to_string())),
+        );
+        let handler = AgentHandler::new(service, services);
+        let context = crate::effects::EffectContext {
+            agent_name: AgentName::try_from_str("root-controller").expect("controller name"),
+            birth_branch: BirthBranch::try_from_str("main").expect("main branch"),
+            working_dir: project.clone(),
+        };
+        ConfiguredResumeFixture {
+            _temp: temp,
+            _forgejo: forgejo,
+            _http_remote: http_remote,
+            project,
+            owner_dir,
+            slice: SLICE.to_string(),
+            head_sha,
+            prior_invocation_id: prior_invocation_id.to_string(),
+            launch_log,
+            handler,
+            context,
+            tmux_socket,
+            previous_tmux_socket,
+            previous_path,
+        }
+    }
+
+    impl ConfiguredResumeFixture {
+        fn request(&self) -> SpawnLeafSubtreeRequest {
+            SpawnLeafSubtreeRequest {
+                task: "Resume the existing owner after review".to_string(),
+                resume_pr_number: 46,
+                expected_head_sha: self.head_sha.clone(),
+                ..Default::default()
+            }
+        }
+    }
+
+    async fn run_configured_resume_pr(
+        prior: ServiceAgentType,
+        desired: ServiceAgentType,
+    ) -> (
+        ConfiguredResumeFixture,
+        SpawnLeafSubtreeResponse,
+        SpawnLeafSubtreeResponse,
+    ) {
+        let fixture = configured_resume_pr_fixture(prior, desired).await;
+        let first = fixture
+            .handler
+            .spawn_leaf_subtree(fixture.request(), &fixture.context)
+            .await
+            .expect("configured resume succeeds through the handler");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::fs::read_to_string(&fixture.launch_log)
+            .map(|contents| contents.lines().count() < 1)
+            .unwrap_or(true)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let replay = fixture
+            .handler
+            .spawn_leaf_subtree(fixture.request(), &fixture.context)
+            .await
+            .expect("a live successor is adopted on replay");
+        (fixture, first, replay)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn configured_codex_to_opencode_resume_pr_records_a_routing_transition() {
+        let (fixture, _first, replay) =
+            run_configured_resume_pr(ServiceAgentType::Codex, ServiceAgentType::OpenCode).await;
+        let invocation: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.owner_dir.join("invocation.json"))
+                .expect("read successor invocation"),
+        )
+        .expect("successor invocation is JSON");
+        let identity: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.owner_dir.join("identity.json"))
+                .expect("read successor identity"),
+        )
+        .expect("successor identity is JSON");
+        let launches = std::fs::read_to_string(&fixture.launch_log)
+            .map(|contents| contents.lines().count())
+            .unwrap_or_default();
+        let events = ledger_rows(&fixture.project);
+        let transitions: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|event| event["event_type"] == "agent.harness_switch")
+            .collect();
+        let starts = events
+            .iter()
+            .filter(|event| {
+                event["event_type"] == "agent.invocation.started"
+                    && event["data"]["invocation_id"] == invocation["invocation_id"]
+            })
+            .count();
+        let resumed = events
+            .iter()
+            .filter(|event| event["event_type"] == "agent.resumed")
+            .count();
+
+        assert!(fixture.launch_log.exists(), "the fake harness ran");
+        assert_eq!(invocation["runtime"], "opencode");
+        assert_eq!(invocation["model"], "deepseek-v4.1-flash");
+        assert_eq!(invocation["effort"], "high");
+        assert_eq!(
+            invocation["prior_invocation_id"],
+            fixture.prior_invocation_id
+        );
+        assert_eq!(invocation["generation"], 2);
+        assert_eq!(identity["agent_type"], "opencode");
+        assert_eq!(identity["model"], "deepseek-v4.1-flash");
+        assert_eq!(identity["effort"], "high");
+        assert_eq!(replay.invocation.expect("replay handoff").fresh, false);
+        assert_eq!(transitions.len(), 1, "one transition row");
+        assert_eq!(starts, 1, "one invocation start");
+        assert_eq!(resumed, 1, "one agent.resumed row");
+        assert_eq!(launches, launches.max(1), "the fake harness ran");
+        let transition = &transitions[0]["data"];
+        assert_eq!(transition["operation"], "resume_pr");
+        assert_eq!(transition["from_harness"], "codex");
+        assert_eq!(transition["to_harness"], "opencode");
+        assert_eq!(transition["to_model"], "deepseek-v4.1-flash");
+        assert_eq!(transition["to_effort"], "high");
+        assert_eq!(transition["scope"], fixture.slice);
+        assert_eq!(transition["pr_number"], 46);
+        assert_eq!(transition["head_sha"], fixture.head_sha);
+        assert_eq!(
+            transition["authorization_source"],
+            "accepted_operator_role_configuration"
+        );
+        assert!(transition["transition_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("runtime-route:")));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn configured_opencode_to_codex_resume_pr_records_a_routing_transition() {
+        let (fixture, _first, _replay) =
+            run_configured_resume_pr(ServiceAgentType::OpenCode, ServiceAgentType::Codex).await;
+        let invocation: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.owner_dir.join("invocation.json"))
+                .expect("read successor invocation"),
+        )
+        .expect("successor invocation is JSON");
+        let launches = std::fs::read_to_string(&fixture.launch_log)
+            .map(|contents| contents.lines().count())
+            .unwrap_or_default();
+        let events = ledger_rows(&fixture.project);
+        let transitions: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|event| event["event_type"] == "agent.harness_switch")
+            .collect();
+
+        assert!(fixture.launch_log.exists(), "the fake harness ran");
+        assert_eq!(invocation["runtime"], "codex");
+        assert_eq!(invocation["model"], "gpt-6-luna");
+        assert_eq!(invocation["effort"], "xhigh");
+        assert_eq!(
+            invocation["prior_invocation_id"],
+            fixture.prior_invocation_id
+        );
+        assert_eq!(invocation["generation"], 2);
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(launches, launches.max(1), "the fake harness ran");
+        let transition = &transitions[0]["data"];
+        assert_eq!(transition["from_harness"], "opencode");
+        assert_eq!(transition["to_harness"], "codex");
+        assert_eq!(transition["to_model"], "gpt-6-luna");
+        assert_eq!(transition["to_effort"], "xhigh");
+        assert_eq!(transition["scope"], fixture.slice);
+        assert_eq!(transition["head_sha"], fixture.head_sha);
+    }
+
     #[test]
     fn unspecified_agent_type_uses_configured_spawn_default() {
         assert_eq!(
@@ -8636,6 +9232,188 @@ mod tests {
         .expect_err("unapproved cross-harness switch must be blocked");
         assert!(error.contains("[STUCK: harness-switch]"));
         assert!(error.contains(HARNESS_SWITCH_APPROVAL_ENV));
+    }
+
+    #[test]
+    fn explicit_unconfigured_cross_harness_request_uses_only_the_approval_seam() {
+        let refused = harness_switch_decision(
+            ServiceAgentType::Codex,
+            AgentType::Claude,
+            ServiceAgentType::Claude,
+            false,
+        )
+        .expect_err("an unconfigured harness is still refused without approval");
+        assert!(refused.contains("[STUCK: harness-switch]"));
+
+        let approved = harness_switch_decision(
+            ServiceAgentType::Codex,
+            AgentType::Claude,
+            ServiceAgentType::Claude,
+            true,
+        )
+        .expect("the operator approval seam authorizes the explicit request");
+        assert_eq!(approved, Some(HARNESS_SWITCH_APPROVAL_ENV));
+    }
+
+    fn policy_route_handler(project: &std::path::Path) -> AgentHandler<crate::services::Services> {
+        let mut services = crate::services::Services::test();
+        services.project_dir = project.to_path_buf();
+        services.event_log = Some(Arc::new(
+            crate::services::EventLog::open(project.join(".exo/logs")).expect("open event log"),
+        ));
+        let services = Arc::new(services);
+        let blocked_base = project
+            .parent()
+            .expect("policy project has a parent")
+            .join("blocked-worktree-base");
+        std::fs::write(&blocked_base, "blocks worktree creation").expect("write worktree blocker");
+        let service = Arc::new(
+            AgentControlService::new(services.clone())
+                .with_spawn_agent_type(ServiceAgentType::Codex)
+                .with_spawn_agent_model(Some("gpt-6.1-sol".to_string()))
+                .with_spawn_agent_effort(Some("medium".to_string()))
+                .with_worktree_base(blocked_base),
+        );
+        AgentHandler::new(service, services)
+    }
+
+    fn policy_text(worker_allow: &str) -> String {
+        format!(
+            "[roles.tl]\nallow = [\"codex/gpt-5.6-luna\"]\ncost_rank = {{ \"codex/gpt-5.6-luna\" = 1 }}\ntoken_budget = 120000\nescalate_after_attempts = 1\n\n[roles.worker]\nallow = [{worker_allow}]\ncost_rank = {{ \"codex/gpt-5.6-luna\" = 1, \"opencode/deepseek-v4.1-flash\" = 2 }}\ntoken_budget = 120000\nescalate_after_attempts = 1\n\n[roles.reviewer]\nallow = [\"codex/gpt-5.6-luna\"]\ncost_rank = {{ \"codex/gpt-5.6-luna\" = 1 }}\ntoken_budget = 60000\nescalate_after_attempts = 1\n"
+        )
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn allowlisted_worker_harness_is_not_refused_as_a_cross_harness_switch() {
+        let temp = tempfile::tempdir().expect("temporary policy project");
+        let project = temp.path();
+        exomonad_test_support::init_fixture_git_repository(project)
+            .expect("initialize fixture repository");
+        std::fs::create_dir_all(project.join(".exo")).expect("create Exo directory");
+        std::fs::write(
+            project.join(".exo/harness_policy.toml"),
+            policy_text("\"codex/gpt-5.6-luna\", \"opencode/deepseek-v4.1-flash\""),
+        )
+        .expect("write operator harness policy");
+        let handler = policy_route_handler(project);
+        let context = crate::effects::EffectContext {
+            agent_name: AgentName::try_from_str("root-controller").expect("controller name"),
+            birth_branch: BirthBranch::try_from_str("main").expect("main branch"),
+            working_dir: project.to_path_buf(),
+        };
+
+        let refused = handler
+            .spawn_leaf_subtree(
+                SpawnLeafSubtreeRequest {
+                    task: "Run the policy-selected OpenCode leaf".to_string(),
+                    branch_name: "policy-route-leaf".to_string(),
+                    agent_type: AgentType::Opencode.into(),
+                    model: "opencode/deepseek-v4.1-flash".to_string(),
+                    intent_id: "policy-route-intent".to_string(),
+                    ..Default::default()
+                },
+                &context,
+            )
+            .await
+            .expect_err("the blocked worktree base stops the fixture after the guard");
+
+        assert!(
+            !refused.to_string().contains("[STUCK: harness-switch]"),
+            "an operator-allowlisted harness must be a configured route, not an explicit switch: {refused}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unlisted_worker_harness_is_still_refused_with_stuck_guidance() {
+        let temp = tempfile::tempdir().expect("temporary policy project");
+        let project = temp.path();
+        exomonad_test_support::init_fixture_git_repository(project)
+            .expect("initialize fixture repository");
+        std::fs::create_dir_all(project.join(".exo")).expect("create Exo directory");
+        std::fs::write(
+            project.join(".exo/harness_policy.toml"),
+            policy_text("\"codex/gpt-5.6-luna\""),
+        )
+        .expect("write operator harness policy");
+        let handler = policy_route_handler(project);
+        let context = crate::effects::EffectContext {
+            agent_name: AgentName::try_from_str("root-controller").expect("controller name"),
+            birth_branch: BirthBranch::try_from_str("main").expect("main branch"),
+            working_dir: project.to_path_buf(),
+        };
+
+        let refused = handler
+            .spawn_leaf_subtree(
+                SpawnLeafSubtreeRequest {
+                    task: "Request a harness the operator did not allow".to_string(),
+                    branch_name: "unlisted-route-leaf".to_string(),
+                    agent_type: AgentType::Opencode.into(),
+                    model: "opencode/deepseek-v4.1-flash".to_string(),
+                    intent_id: "unlisted-route-intent".to_string(),
+                    ..Default::default()
+                },
+                &context,
+            )
+            .await
+            .expect_err("an unlisted harness remains an explicit cross-harness request");
+
+        assert!(
+            refused.to_string().contains("[STUCK: harness-switch]"),
+            "unconfigured request must retain the human-approval refusal: {refused}"
+        );
+        assert!(refused.to_string().contains(HARNESS_SWITCH_APPROVAL_ENV));
+        let events = ledger_rows(project);
+        let stuck: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|event| event["event_type"] == "agent.stuck")
+            .collect();
+        assert_eq!(stuck.len(), 1, "one durable stuck row is recorded");
+        assert_eq!(stuck[0]["data"]["kind"], "harness_switch_disallowed");
+        assert_eq!(stuck[0]["data"]["requested_harness"], "opencode");
+        assert_eq!(stuck[0]["data"]["guidance_required"], true);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn reviewer_allowlist_does_not_authorize_a_worker_harness() {
+        let temp = tempfile::tempdir().expect("temporary policy project");
+        let project = temp.path();
+        exomonad_test_support::init_fixture_git_repository(project)
+            .expect("initialize fixture repository");
+        std::fs::create_dir_all(project.join(".exo")).expect("create Exo directory");
+        let policy = policy_text("\"codex/gpt-5.6-luna\"").replace(
+            "[roles.reviewer]\nallow = [\"codex/gpt-5.6-luna\"]",
+            "[roles.reviewer]\nallow = [\"claude/sonnet\"]",
+        );
+        std::fs::write(project.join(".exo/harness_policy.toml"), policy)
+            .expect("write role-scoped harness policy");
+        let handler = policy_route_handler(project);
+        let context = crate::effects::EffectContext {
+            agent_name: AgentName::try_from_str("root-controller").expect("controller name"),
+            birth_branch: BirthBranch::try_from_str("main").expect("main branch"),
+            working_dir: project.to_path_buf(),
+        };
+
+        let refused = handler
+            .spawn_leaf_subtree(
+                SpawnLeafSubtreeRequest {
+                    task: "A worker cannot borrow the reviewer allowlist".to_string(),
+                    branch_name: "role-scoped-leaf".to_string(),
+                    agent_type: AgentType::Claude.into(),
+                    intent_id: "role-scoped-intent".to_string(),
+                    ..Default::default()
+                },
+                &context,
+            )
+            .await
+            .expect_err("the allowlist is scoped to the dispatch role");
+
+        assert!(
+            refused.to_string().contains("[STUCK: harness-switch]"),
+            "a harness allowlisted only for the reviewer is not configured for the worker: {refused}"
+        );
     }
 
     #[test]

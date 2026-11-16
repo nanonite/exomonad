@@ -22,6 +22,7 @@ from typing import Protocol, cast
 from tl_loop.client.effects import EffectClient, ToolResult
 from tl_loop.fsm.phase import TLPhase
 from tl_loop.loop.observability import emit_controller_event
+from tl_loop.select.harness import canonical_agent_type
 from tl_loop.select.ledger import LedgerInput
 from tl_loop.state.schema import BudgetLedger, ParkCause, SliceState, SliceStatus
 from tl_loop.state.serialization import dumps as dumps_json
@@ -368,7 +369,15 @@ def authorize_harness_switch(
         "effort": effort,
     }
     source_env = os.environ if env is None else env
-    allowed = to_harness in allow or source_env.get("EXOMONAD_ALLOW_HARNESS_SWITCH") == "1"
+    approved_harnesses = frozenset(
+        agent_type
+        for identifier in allow
+        if (agent_type := canonical_agent_type(identifier)) is not None
+    )
+    allowed = (
+        canonical_agent_type(to_harness) in approved_harnesses
+        or source_env.get("EXOMONAD_ALLOW_HARNESS_SWITCH") == "1"
+    )
     return HarnessSwitchDecision(
         allowed=allowed,
         from_harness=from_harness,

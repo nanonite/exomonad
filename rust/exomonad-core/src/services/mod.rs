@@ -33,6 +33,7 @@ pub mod guidance_adapters;
 pub mod guidance_queue;
 pub mod guidance_replay;
 pub mod guidance_shadow;
+pub mod harness_policy;
 pub mod immutable_ledger;
 pub mod inbox_store;
 pub mod inbox_watcher;

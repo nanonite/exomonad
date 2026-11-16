@@ -12,6 +12,8 @@ mod internal;
 pub mod invocation;
 mod spawn;
 
+use super::harness_policy::{policy_role, HarnessPolicyAllowlist};
+
 pub use codex_lifecycle::{
     capture_codex_agent_trust, capture_codex_trust_for_disposal, codex_generated_config_path,
     codex_role_instructions, has_generated_codex_config, provision_codex_agent,
@@ -1352,6 +1354,8 @@ pub struct AgentControlService<C> {
     pub(crate) reviewer_context: Vec<String>,
     /// Role-routing configuration accepted by this server process.
     pub(crate) role_route_configuration_fingerprint: Option<String>,
+    /// Harnesses the operator allowlisted for controller-dispatched roles.
+    pub(crate) harness_policy: HarnessPolicyAllowlist,
     /// Forgejo environment sourced from loaded config, overriding stale parent process env.
     pub(crate) forgejo_spawn_env: Option<ForgejoSpawnEnv>,
 }
@@ -1374,6 +1378,7 @@ impl<
     /// Create a new agent control service.
     pub fn new(ctx: Arc<C>) -> Self {
         let worktree_base = ctx.project_dir().join(".exo/worktrees");
+        let harness_policy = load_harness_policy(ctx.project_dir());
         Self {
             ctx,
             worktree_base,
@@ -1403,6 +1408,7 @@ impl<
             reviewer_route_sources: None,
             reviewer_context: vec![],
             role_route_configuration_fingerprint: None,
+            harness_policy,
             forgejo_spawn_env: None,
         }
     }
@@ -1463,6 +1469,32 @@ impl<
     /// Get the configured default agent type for spawned workers/teammates.
     pub fn default_spawn_agent_type(&self) -> AgentType {
         self.spawn_agent_type
+    }
+
+    /// Return the harness the operator configured for this role.
+    ///
+    /// The configured `config.toml` route is authoritative; the harness policy
+    /// allowlist may additionally name other harnesses the operator approved
+    /// for the role. A route outside both is not configured and must pass the
+    /// explicit human-approval seam instead.
+    pub(crate) fn configured_harness_for_role(
+        &self,
+        role: &str,
+        requested: AgentType,
+    ) -> AgentType {
+        let role = policy_role(role);
+        let configured = if role == Some("reviewer") {
+            self.reviewer_agent_type
+        } else {
+            self.spawn_agent_type
+        };
+        if requested == configured
+            || role.is_some_and(|role| self.harness_policy.allows(role, requested))
+        {
+            requested
+        } else {
+            configured
+        }
     }
 
     /// Set the model for spawned OpenCode workers.
@@ -2523,6 +2555,27 @@ pub(crate) fn issue_id_from_agent_name(slug: &str) -> Option<u64> {
     }
 }
 
+/// Load the operator harness allowlist from the project configuration.
+///
+/// A missing policy keeps the `config.toml` route as the only configured
+/// harness. A malformed policy is logged and ignored rather than widening any
+/// route: the guard still refuses a harness that neither source names.
+fn load_harness_policy(project_dir: &std::path::Path) -> HarnessPolicyAllowlist {
+    let path = project_dir.join(".exo/harness_policy.toml");
+    match HarnessPolicyAllowlist::load(&path) {
+        Ok(Some(policy)) => policy,
+        Ok(None) => HarnessPolicyAllowlist::default(),
+        Err(error) => {
+            warn!(
+                path = %path.display(),
+                error = %error,
+                "harness policy is unreadable; only the configured route is authorized"
+            );
+            HarnessPolicyAllowlist::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Legacy helpers used only by tests for issue-driven agent dir name parsing.
@@ -2921,6 +2974,44 @@ mod tests {
                 .effective_model_for(AgentType::OpenCode, "dev", Some("   "))
                 .as_deref(),
             Some("config-default-model")
+        );
+    }
+
+    #[test]
+    fn worker_harness_change_does_not_change_the_reviewer_route() {
+        let services = crate::services::Services::test();
+        let service = AgentControlService::new(Arc::new(services))
+            .with_spawn_agent_type(AgentType::OpenCode)
+            .with_spawn_agent_model(Some("deepseek-v4.1-flash".to_string()))
+            .with_spawn_agent_effort(Some("high".to_string()))
+            .with_reviewer_agent_type(AgentType::Codex)
+            .with_reviewer_model(Some("gpt-6.1-sol".to_string()))
+            .with_reviewer_effort(Some("medium".to_string()));
+
+        assert_eq!(
+            service.configured_runtime_route("dev"),
+            ConfiguredRuntimeRoute {
+                agent_type: AgentType::OpenCode,
+                model: Some("deepseek-v4.1-flash".to_string()),
+                effort: Some("high".to_string()),
+            }
+        );
+        assert_eq!(
+            service.configured_runtime_route("reviewer"),
+            ConfiguredRuntimeRoute {
+                agent_type: AgentType::Codex,
+                model: Some("gpt-6.1-sol".to_string()),
+                effort: Some("medium".to_string()),
+            }
+        );
+        // The worker route is configured; the reviewer route is not borrowed.
+        assert_eq!(
+            service.configured_harness_for_role("worker", AgentType::OpenCode),
+            AgentType::OpenCode
+        );
+        assert_eq!(
+            service.configured_harness_for_role("reviewer", AgentType::OpenCode),
+            AgentType::Codex
         );
     }
 

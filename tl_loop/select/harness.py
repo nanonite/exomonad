@@ -23,6 +23,22 @@ def normalize_runtime_label(value: object) -> str | None:
     return _RUNTIME_LABELS.get(value) if isinstance(value, str) else None
 
 
+def canonical_agent_type(value: str) -> str | None:
+    """Return the agent type of a harness or ``harness/model`` identifier.
+
+    This is the single Python-side spelling used by the selector, the policy
+    loader, and the explicit-switch guard. ``None`` means the value is not a
+    supported harness identity.
+    """
+    normalized = normalize_runtime_label(value)
+    if normalized is not None:
+        return normalized
+    try:
+        return parse_harness_identifier(value).agent_type
+    except ValueError:
+        return None
+
+
 @dataclass(frozen=True)
 class HarnessRoute:
     """The runtime agent type and optional model selected by policy."""
