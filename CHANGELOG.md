@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Prove offline that a worker harness change keeps one reviewer, the exact-head verdict, CI handling, owner attribution and counters, and that the harness policy is read once at start, and document which source needs which restart (#1393)
 - Charge the role and per-harness budget for a `resume_pr` or `resume_blocked_leaf` continuation on the harness it runs on, refusing one over a ceiling with a budget-exhausted park (#1391)
 - Record the exomonad build commit, the redacted launch command (marked actual or reconstructed) and the source of each resolved harness, model and effort in every invocation record, with credential flag values and environment values never persisted (#1352)
 - Prove the controller restart sequence in one disposable actual-init run with `E2E_COMPOSED_RESTART=1` (#1288)

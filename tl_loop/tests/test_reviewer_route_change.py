@@ -35,6 +35,7 @@ from tl_loop.state.schema import (
     Verdict,
 )
 from tl_loop.state.slice_transition import (
+    CIStatusObserved,
     HeadChanged,
     ReviewerIdentityObserved,
     ReviewVerdictObserved,
@@ -237,6 +238,84 @@ def test_review_stuck_still_fires_at_the_ceiling_independent_of_configuration() 
 
     assert decision == InternalTransition("parked", "review_rounds_exhausted")
     assert exhausted.review_rounds == 2
+
+
+def test_worker_harness_change_keeps_the_same_head_verdict_and_merge() -> None:
+    """The worker's route is not a reviewer or verdict input.
+
+    This is the worker-side counterpart of the reviewer-route test above: a
+    configured Codex -> OpenCode transition changes only the worker route
+    fields, while the exact reviewed head, its verdict, and the single reviewer
+    attempt stay bound to that head.
+    """
+    state = _approved_state(Verdict.GO)
+    route_changed = replace(
+        state,
+        agent_type="opencode",
+        model="deepseek-v4.1-flash",
+        resolved_harness="opencode/deepseek-v4.1-flash",
+        dispatch_agent_id="owner-invocation-opencode",
+    )
+
+    decision = derive_next_action(route_changed, reviewer_max_rounds=5)
+
+    assert isinstance(decision, ExternalIntent)
+    assert decision.operation == "merge"
+    assert decision.arguments == {"pr_number": PR, "head_sha": HEAD}
+    assert route_changed.reviewed_head == HEAD
+    assert route_changed.verdict is Verdict.GO
+    assert route_changed.reviewer_attempt == {HEAD: 1}
+    assert route_changed.reviewer_agent_id == "review-pr-43-codex"
+
+
+def test_worker_harness_change_does_not_reset_or_double_count_worker_counters() -> None:
+    """A configured worker route change is not an attempt or a review round."""
+    state = replace(
+        _slice(review_rounds=2, intervention_attempts=1),
+        attempts=3,
+        agent_type="codex",
+        model="gpt-6.1-sol",
+    )
+    route_changed = replace(
+        state,
+        agent_type="opencode",
+        model="deepseek-v4.1-flash",
+        resolved_harness="opencode/deepseek-v4.1-flash",
+    )
+    assert route_changed.review_rounds == 2
+    assert route_changed.tl_intervention_attempts == 1
+    assert route_changed.attempts == 3
+
+    reviewed = slice_transition(route_changed, _verdict_event())
+    assert reviewed.review_rounds == 3, "one verdict after the route change is one round"
+    assert reviewed.tl_intervention_attempts == 1
+    assert reviewed.attempts == 3
+
+    failed = slice_transition(
+        reviewed,
+        CIStatusObserved(
+            head_sha=HEAD,
+            status="failure",
+            observed_at="2026-08-27T00:00:01Z",
+        ),
+    )
+    assert failed.review_rounds == 4, "one same-head CI failure is one round"
+    assert failed.tl_intervention_attempts == 1
+    assert failed.attempts == 3
+    assert failed.agent_type == "opencode"
+    assert failed.model == "deepseek-v4.1-flash"
+
+    replayed = slice_transition(
+        failed,
+        CIStatusObserved(
+            head_sha=HEAD,
+            status="failure",
+            observed_at="2026-08-27T00:00:02Z",
+        ),
+    )
+    assert replayed.review_rounds == 4, "a replayed observation must not double count"
+    assert replayed.tl_intervention_attempts == 1
+    assert replayed.attempts == 3
 
 
 def test_verdict_from_a_replacement_reviewer_identity_is_accepted_for_the_same_head() -> None:

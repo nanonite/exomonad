@@ -72,9 +72,9 @@ Python controller does not read it, and `roles.tl.allow` is validated by
 
 | Goal | Change | Restart? | Approval flag? |
 |------|--------|----------|---------------|
-| configured model change | `worker_model` (or `[opencode] worker_model`) in `.exo/config.toml` | yes, the server and controller read it at startup | no |
-| configured effort change | `worker_effort_level` in `.exo/config.toml` | yes | no |
-| configured harness change (Codex -> OpenCode or back) | `spawn_agent_type` in `.exo/config.toml` **and** add the harness to `[roles.worker].allow` in `.exo/harness_policy.toml` (plus `cost_rank`, optional `per_harness_budget`) | yes | no |
+| configured model change | `worker_model` (or `[opencode] worker_model`) in `.exo/config.toml` | yes, restart the server and start a new controller invocation | no |
+| configured effort change | `worker_effort_level` in `.exo/config.toml` | yes, restart the server and start a new controller invocation | no |
+| configured harness change (Codex -> OpenCode or back) | `spawn_agent_type` in `.exo/config.toml` **and** add the harness to `[roles.worker].allow` in `.exo/harness_policy.toml` (plus `cost_rank`, optional `per_harness_budget`) | yes, restart the server and start a new controller invocation | no |
 | explicit non-configured harness request | do not edit config; the child asked for a harness outside both sources | no | only `EXOMONAD_ALLOW_HARNESS_SWITCH=1`, audited |
 | policy-escalated switch after NO-GO | add the replacement harness to the same role's `allow`; the selector removes the failed harness after `escalate_after_attempts` | yes | no |
 | reviewer harness/model/effort change | `[reviewer]` in `.exo/config.toml` **and** the matching `roles.reviewer.allow` in `.exo/harness_policy.toml` (see [Reviewer](#reviewer)) | yes | no |
@@ -85,6 +85,35 @@ configured route the allowlist does not authorize. Changing only
 cannot select a harness absent from `allow`, and init rejects the
 disagreement. Change both sources together; init catches a mismatch before the
 controller starts.
+
+## When each source is read
+
+The three configuration sources have different read boundaries. "Restart" means
+both the `exomonad serve` server process and the tl_loop controller invocation;
+`exomonad init --continue` is that new controller invocation and re-runs its
+startup loads.
+
+| Source | Read by | Read boundary | Mid-run edit |
+|--------|---------|---------------|--------------|
+| `.exo/config.toml` | `exomonad serve` (worker/reviewer routes, model, effort, server settings) and `exomonad init` (resolves the same role routes and passes them to the controller); the controller's preflight re-reads it at startup for validation | process startup | no effect on the running server or controller; restart both |
+| `.exo/harness_policy.toml` | Rust `AgentControlService::new` (`load_harness_policy`) for the spawn guard and init; tl_loop `tl_run` (`load_policy`) for selection, budgets, and the `roles.tl` judgment model | server start and controller start | no effect until both restart |
+| `.exo/review-policy.toml` | tl_loop `_review_policy_for_state` / `load_reviewer_policy_snapshot` for `reviewer_max_rounds`; `load_freshness_window` at controller-loop and pre-merge boundaries | `reviewer_max_rounds` is resolved once and then persisted in the run checkpoint; the freshness window is read at controller start and at the relevant gate | `reviewer_max_rounds` does not change mid-run and a restart continues from the persisted snapshot, so a new run is required to change it; the freshness window is re-read at its next gate, and a restart guarantees it |
+
+The proof for the two policy files is
+`harness_policy_is_read_once_at_service_start_and_a_restart_reloads_it`
+(Rust) and `test_controller_start_policy_snapshot_survives_a_mid_run_edit`
+(tl_loop). Both edit the file after the startup read and show that the running
+guard/controller keeps its snapshot while a fresh load observes the edit.
+
+**What the operator must restart.** A configured worker or reviewer harness,
+model, or effort change edits `.exo/config.toml` and, for a harness change, the
+role's `allow` list in `.exo/harness_policy.toml`. Restart `exomonad serve` and
+start a new controller invocation (`exomonad init --continue`); the old server
+and controller keep their startup snapshots. A `review-policy.toml`
+`reviewer_max_rounds` change needs a new run, not a restart, because the first
+resolved ceiling is persisted in the checkpoint; a `review_freshness_window_secs`
+change is re-read from the file at the next gate, so a controller restart is
+the reliable boundary.
 
 ## Guard, record, log, and budget audit
 
@@ -122,6 +151,13 @@ rejects a genuinely invalid run.
 | `escalate_after_attempts` | slice attempts + verdict decide when a harness leaves rotation | PASS; a configured change does not reset the counter, and a NO-GO on harness A selects another allowlisted harness | `test_no_go_escalates_only_after_attempt_threshold`, H4 test |
 | role budget / `per_harness_budget` | a dispatch reserves against the role and the selected harness; a same-slice `resume_pr`/`resume_blocked_leaf` continuation reserves again, on the route it actually runs | PASS for a new dispatch attempt: harness B is charged and harness A's spend is kept. PASS for a continuation: the resume-time route is charged (harness B), A's earlier spend is untouched, and the same ledger reconcile settles it | `test_harness_change_charges_the_new_harness_and_keeps_the_old_spend`, `test_harness_budget_is_charged_to_the_harness_that_actually_runs`, `test_configured_harness_switch_blocked_resume_charges_the_new_harness`, `test_review_repair_continuation_charges_the_configured_new_harness` |
 | owner / scope / worktree / predecessor / epoch | exact identity binding | REFUSE on mismatch; the route change never relaxes them | `test_harness_change_does_not_weaken_identity_bindings`, `test_a_stale_controller_epoch_still_refuses_a_changed_harness_dispatch`, `test_a_stale_controller_epoch_is_still_rejected` |
+| worker harness change / reviewer dedup (A1) | the reviewer assignment and the watcher's exact-head `has_reviewer_invocation` dedup are keyed by the reviewer's own `Review` invocation for the PR/head | PASS; a configured Codex -> OpenCode change to the worker owner keeps one reviewer, one attempt, and the persisted verdict for the exact head | `reviewer_assignment_does_not_depend_on_the_worker_harness`, `test_worker_harness_change_keeps_the_same_head_verdict_and_merge` |
+| same-head CI after a worker harness change (A2) | CI observations bind to the exact head; success permits merge, failure sends one same-owner `resume_pr` | PASS; the route change does not retarget the owner or require a new reviewer | `test_worker_harness_change_keeps_the_same_head_verdict_and_merge`, `test_worker_harness_change_sends_one_same_owner_repair_on_ci_failure` |
+| watcher PR/owner attribution after a worker harness change (A3) | publication author, owner agent directory, and invocation generation | PASS; the successor stays in the same issue-owned directory, generation 2 runs the new harness, and no second owner appears | `configured_worker_route_change_keeps_one_publication_owner_and_generation` |
+| worker route change and counters (A4) | `review_rounds`, `tl_intervention_attempts`, `escalate_after_attempts`, `slice.attempts` | PASS; the route change itself resets and double counts nothing, one verdict/CI failure adds one round, one confirmed repair adds one attempt, and the policy `escalate_after_attempts` threshold is unchanged | `test_worker_harness_change_does_not_reset_or_double_count_worker_counters`, `test_no_go_escalates_only_after_attempt_threshold` |
+| harness policy read once at server start (B1) | Rust `AgentControlService::new` snapshots `.exo/harness_policy.toml`; `configured_harness_for_role` reads that snapshot | PASS; a mid-run edit has no effect on the running guard, and a fresh construction (server restart) reloads | `harness_policy_is_read_once_at_service_start_and_a_restart_reloads_it` |
+| controller policy read at controller start (B2) | `tl_run` resolves `cfg.policy or load_policy()` once before `run_tl_loop`; every slice uses that captured policy | PASS; a mid-run edit does not change the running controller's selection, and a fresh load observes it | `test_controller_start_policy_snapshot_survives_a_mid_run_edit` |
+| restart statements for each source (B3) | `.exo/config.toml`, `.exo/harness_policy.toml`, `.exo/review-policy.toml` read boundaries | PASS; the tables above and [When each source is read](#when-each-source-is-read) match the code paths named there; `reviewer_max_rounds` is checkpoint-pinned while the freshness window is re-read | this guide, `harness_policy_is_read_once_at_service_start_and_a_restart_reloads_it`, `test_controller_start_policy_snapshot_survives_a_mid_run_edit` |
 
 Budget note: a fresh dispatch reserves one charge with
 `apply_spawn_and_charge`/`charge_spawn` against the role and the selected
@@ -220,10 +256,10 @@ the `spawn_reviewer` effect) reads `configured_runtime_route("reviewer")` from
 
 | Goal | Change | Restart? | Approval flag? |
 |------|--------|----------|---------------|
-| reviewer harness | `[reviewer].agent_type` in `.exo/config.toml` **and** add the harness to `[roles.reviewer].allow` in `.exo/harness_policy.toml` | yes, the server/controller read `[reviewer]` at startup | no |
-| reviewer model | `[reviewer].model` (or the reviewer model selected by `exomonad init --reviewer-model`) | yes | no |
-| reviewer effort | `[reviewer].effort_level` (or `exomonad init --reviewer-effort`) | yes | no |
-| reviewer must stay on an allowlisted harness | keep `[roles.reviewer].allow` consistent with `[reviewer].agent_type` | yes | no |
+| reviewer harness | `[reviewer].agent_type` in `.exo/config.toml` **and** add the harness to `[roles.reviewer].allow` in `.exo/harness_policy.toml` | yes, restart the server and start a new controller invocation | no |
+| reviewer model | `[reviewer].model` (or the reviewer model selected by `exomonad init --reviewer-model`) | yes, restart the server and start a new controller invocation | no |
+| reviewer effort | `[reviewer].effort_level` (or `exomonad init --reviewer-effort`) | yes, restart the server and start a new controller invocation | no |
+| reviewer must stay on an allowlisted harness | keep `[roles.reviewer].allow` consistent with `[reviewer].agent_type` | yes, restart the server and start a new controller invocation | no |
 
 The reviewer spawn itself is driven by `[reviewer]`; `roles.reviewer.allow` is
 part of the single "configured route" definition shared with the harness-switch

@@ -431,7 +431,9 @@ creates a permissive default or widens these boundaries. The Rust definition in
 `rust/exomonad-core/src/services/harness_policy.rs` is shared by the spawn guard
 and init, and is pinned to `tl_loop` by
 `rust/exomonad-core/tests/fixtures/harness_policy_agreement.{toml,json}` and
-`tl_loop/tests/test_harness_policy_agreement.py`.
+`tl_loop/tests/test_harness_policy_agreement.py`. The Rust server reads the file
+once in `AgentControlService::new`, and the controller reads it once at controller
+start (`tl_run`); an edit while both are running has no effect until both restart.
 
 `roles.tl.token_budget` covers model-authored plan proposals and review-stuck
 judgments across controller restarts. Their observed token usage is added to
@@ -521,7 +523,7 @@ The flag *moves* the file to the first unused `.codex/config.toml.exomonad-stale
 
 ### Review Policy
 
-The reviewer convergence loop is configured via `.exo/review-policy.toml`. To override only the running session without rewriting that file, use `exomonad init --reviewer-max-rounds 5` (and `--recreate` when replacing an existing session). The precedence is init override, then policy file, then built-in defaults.
+The reviewer convergence loop is configured via `.exo/review-policy.toml`. To override only the running session without rewriting that file, use `exomonad init --reviewer-max-rounds 5` (and `--recreate` when replacing an existing session). The precedence is init override, then policy file, then built-in defaults. `reviewer_max_rounds` is resolved once and persisted in the run checkpoint: an edit mid-run does not apply, and a restart continues from the persisted value, so changing it requires a new run. `review_freshness_window_secs` is re-read from the file at the controller's gate boundaries; a controller restart is the reliable boundary for that field.
 
 | Setting | Default | Description |
 |---------|---------|-------------|

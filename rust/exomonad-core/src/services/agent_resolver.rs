@@ -1455,4 +1455,86 @@ mod tests {
             None
         );
     }
+
+    /// A configured worker route change keeps the same owner directory and
+    /// increments its invocation generation. Reviewer assignment, and the
+    /// watcher's exact-head dedup, are keyed by the reviewer's own `Review`
+    /// invocation for the PR/head; the worker's harness is not an input.
+    #[tokio::test]
+    async fn reviewer_assignment_does_not_depend_on_the_worker_harness() {
+        fn write_worker_owner(
+            root: &std::path::Path,
+            agent: &str,
+            runtime: AgentType,
+            generation: u64,
+        ) {
+            let owner_dir = root.join(".exo/agents").join(agent);
+            std::fs::create_dir_all(&owner_dir).unwrap();
+            let branch = "main.issue-7-codex";
+            std::fs::write(
+                owner_dir.join("identity.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "agent_name": agent,
+                    "slug": "issue-7",
+                    "agent_type": runtime.suffix(),
+                    "birth_branch": branch,
+                    "parent_branch": "main",
+                    "working_dir": root.join(".exo/worktrees").join(agent),
+                    "display_name": format!("🤖 {agent}"),
+                    "topology": "worktree_per_agent",
+                    "ledger_owned": true,
+                    "slice_id": "issue-7",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                owner_dir.join("invocation.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "invocation_id": format!("{agent}-invocation-{generation}"),
+                    "runtime": runtime.suffix(),
+                    "trigger": "spawn",
+                    "mode": "one_shot",
+                    "routing": {"window_id": null, "pane_id": null, "parent_tab": null},
+                    "started_at": generation,
+                    "ended_at": generation + 1,
+                    "status": "exited",
+                    "exit_code": 0,
+                    "generation": generation,
+                    "slice_id": "issue-7",
+                    "branch": branch,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        write_worker_owner(root, "issue-7-codex", AgentType::Codex, 1);
+        let (reviewer_dir, reviewer_invocation) =
+            start_reviewer(root, "review-pr-7-codex", AgentType::Codex, 7, "head-7").await;
+        finish_reviewer(&reviewer_dir, &reviewer_invocation).await;
+
+        let resolver = AgentResolver::load(root.to_path_buf()).await;
+        assert_eq!(
+            resolver.resolve_reviewer_invocation(7, "head-7").await,
+            Some("review-pr-7-codex".to_string())
+        );
+        assert!(resolver.has_reviewer_invocation(7, "head-7").await);
+
+        // The #1353 configured Codex -> OpenCode resume keeps the issue-owned
+        // directory and records the successor runtime at generation 2.
+        write_worker_owner(root, "issue-7-codex", AgentType::OpenCode, 2);
+        let resolver = AgentResolver::load(root.to_path_buf()).await;
+        assert_eq!(
+            resolver.resolve_reviewer_invocation(7, "head-7").await,
+            Some("review-pr-7-codex".to_string()),
+            "the exact-head reviewer assignment is independent of the worker harness"
+        );
+        assert!(
+            resolver.has_reviewer_invocation(7, "head-7").await,
+            "the watcher dedup still sees one reviewer for the exact head"
+        );
+    }
 }

@@ -9176,6 +9176,87 @@ mod tests {
         assert_eq!(transition["head_sha"], fixture.head_sha);
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn configured_worker_route_change_keeps_one_publication_owner_and_generation() {
+        let (fixture, _first, _replay) =
+            run_configured_resume_pr(ServiceAgentType::Codex, ServiceAgentType::OpenCode).await;
+
+        let heads = read_published_heads(&fixture.project)
+            .await
+            .expect("read publication registry after the route change");
+        let publication = heads
+            .iter()
+            .find(|head| head.pr_number == 46)
+            .expect("the exact PR stays published");
+        assert_eq!(
+            publication.author_agent.as_deref(),
+            Some("issue-814-codex"),
+            "the successor runs in the same issue-owned directory, so the watcher still attributes one owner"
+        );
+        assert!(
+            heads
+                .iter()
+                .all(|head| head.author_agent.as_deref() != Some("issue-814-opencode")),
+            "the new harness is not a second owner"
+        );
+        assert_eq!(
+            crate::services::pr_registry::publication_owner_matches(
+                publication,
+                Some("issue-814-codex")
+            )
+            .expect("the watcher's owner match resolves the live owner"),
+            "issue-814-codex"
+        );
+
+        let invocation: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.owner_dir.join("invocation.json"))
+                .expect("read successor invocation"),
+        )
+        .expect("successor invocation is JSON");
+        assert_eq!(invocation["generation"], 2);
+        assert_eq!(invocation["runtime"], "opencode");
+
+        let resolver = crate::services::AgentResolver::load(fixture.project.clone()).await;
+        let owner_name =
+            AgentName::try_from_str("issue-814-codex").expect("fixture owner name is valid");
+        let identity = resolver
+            .get(&owner_name)
+            .await
+            .expect("the live owner resolves from its identity record");
+        assert_eq!(identity.agent_name.as_str(), "issue-814-codex");
+        assert_eq!(identity.agent_type, ServiceAgentType::OpenCode);
+
+        let mut slice_owners = Vec::new();
+        for entry in
+            std::fs::read_dir(fixture.project.join(".exo/agents")).expect("read agent directories")
+        {
+            let path = entry.expect("read agent directory").path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Ok(contents) = std::fs::read_to_string(path.join("identity.json")) else {
+                continue;
+            };
+            let Ok(identity) = serde_json::from_str::<serde_json::Value>(&contents) else {
+                continue;
+            };
+            if identity["slice_id"] == "issue-814" {
+                slice_owners.push(
+                    identity["agent_name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+        assert_eq!(
+            slice_owners,
+            vec!["issue-814-codex".to_string()],
+            "the successor must not appear as a second owner of the slice"
+        );
+    }
+
     #[test]
     fn unspecified_agent_type_uses_configured_spawn_default() {
         assert_eq!(
@@ -9373,6 +9454,77 @@ mod tests {
         assert_eq!(stuck[0]["data"]["kind"], "harness_switch_disallowed");
         assert_eq!(stuck[0]["data"]["requested_harness"], "opencode");
         assert_eq!(stuck[0]["data"]["guidance_required"], true);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn harness_policy_is_read_once_at_service_start_and_a_restart_reloads_it() {
+        let temp = tempfile::tempdir().expect("temporary policy project");
+        let project = temp.path();
+        exomonad_test_support::init_fixture_git_repository(project)
+            .expect("initialize fixture repository");
+        std::fs::create_dir_all(project.join(".exo")).expect("create Exo directory");
+        std::fs::write(
+            project.join(".exo/harness_policy.toml"),
+            policy_text("\"codex/gpt-5.6-luna\", \"opencode/deepseek-v4.1-flash\""),
+        )
+        .expect("write the startup policy");
+        let handler = policy_route_handler(project);
+        let context = crate::effects::EffectContext {
+            agent_name: AgentName::try_from_str("root-controller").expect("controller name"),
+            birth_branch: BirthBranch::try_from_str("main").expect("main branch"),
+            working_dir: project.to_path_buf(),
+        };
+
+        // Edit after the server-equivalent construction. The running guard keeps
+        // the policy snapshot it loaded at start.
+        std::fs::write(
+            project.join(".exo/harness_policy.toml"),
+            policy_text("\"codex/gpt-5.6-luna\""),
+        )
+        .expect("narrow the policy while the guard is running");
+        let still_allowed = handler
+            .spawn_leaf_subtree(
+                SpawnLeafSubtreeRequest {
+                    task: "The startup snapshot still allows OpenCode".to_string(),
+                    branch_name: "startup-policy-leaf".to_string(),
+                    agent_type: AgentType::Opencode.into(),
+                    model: "opencode/deepseek-v4.1-flash".to_string(),
+                    intent_id: "startup-policy-intent".to_string(),
+                    ..Default::default()
+                },
+                &context,
+            )
+            .await
+            .expect_err("the blocked worktree base stops the fixture after the guard");
+        assert!(
+            !still_allowed
+                .to_string()
+                .contains("[STUCK: harness-switch]"),
+            "a mid-run policy edit must not reach the already-running guard: {still_allowed}"
+        );
+
+        // A fresh construction is the server restart boundary; it reads the
+        // edited file and refuses the no-longer-allowlisted harness.
+        let restarted = policy_route_handler(project);
+        let refused = restarted
+            .spawn_leaf_subtree(
+                SpawnLeafSubtreeRequest {
+                    task: "A restarted guard reads the edited policy".to_string(),
+                    branch_name: "restart-policy-leaf".to_string(),
+                    agent_type: AgentType::Opencode.into(),
+                    model: "opencode/deepseek-v4.1-flash".to_string(),
+                    intent_id: "restart-policy-intent".to_string(),
+                    ..Default::default()
+                },
+                &context,
+            )
+            .await
+            .expect_err("the blocked worktree base stops the fixture after the guard");
+        assert!(
+            refused.to_string().contains("[STUCK: harness-switch]"),
+            "a server restart must reload the operator policy: {refused}"
+        );
     }
 
     #[tokio::test]

@@ -983,6 +983,16 @@ checked there: `root_agent_type` is legacy and the controller resolves its own
 `roles.tl` route at startup.
 See [docs/guides/changing-routes-mid-run.md](../docs/guides/changing-routes-mid-run.md).
 
+The controller reads `.exo/harness_policy.toml` once at controller start
+(`tl_run` resolves `cfg.policy or load_policy()` before `run_tl_loop`). Every
+dispatch uses that captured policy, so editing the file mid-run does not change
+a running controller's selection; a new controller invocation (`--continue`) is
+the reload boundary. The reviewer-route tests in
+`tl_loop/tests/test_reviewer_route_change.py` apply the same rule to the worker
+route: a configured worker harness change keeps the exact-head verdict, the
+single reviewer attempt, the same owner/publication, and the counters, and only
+the next dispatch uses the new route.
+
 Per-slice route *prescription* is not implemented. It would extend the closed
 slice schema and manifest digest, constrain `select_agent_type` to an allowed
 prescription, and teach `_dispatch_route_fields`, `resume_pr`, and

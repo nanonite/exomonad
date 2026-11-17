@@ -617,7 +617,10 @@ harness is the resolved role route from `config.toml`, extended by the role's
 a configured route and needs no approval. An explicit cross-harness request
 outside both sources is rejected with agent.stuck guidance unless the human has
 set EXOMONAD_ALLOW_HARNESS_SWITCH=1; approved switches are audited with from/to
-harness, reason, policy source, model, and effort. See
+harness, reason, policy source, model, and effort. `AgentControlService::new`
+reads the allowlist once when `exomonad serve` builds the service;
+`configured_harness_for_role` consults that snapshot, so editing the file while
+the server runs has no effect until a restart. See
 [docs/guides/changing-routes-mid-run.md](../../docs/guides/changing-routes-mid-run.md).
 No-op, no-commit, or no-PR failure handoffs also emit bounded agent.stuck
 guidance for the parent to steer or escalate.

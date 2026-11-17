@@ -6546,6 +6546,64 @@ def test_ci_failure_after_review_binds_head_then_still_repairs(tmp_path: Path) -
     ]
 
 
+def test_worker_harness_change_sends_one_same_owner_repair_on_ci_failure(
+    tmp_path: Path,
+) -> None:
+    """A same-head CI failure after a configured worker route change repairs once.
+
+    The slice keeps its owner invocation and attempts; only the worker route
+    fields change (Codex -> OpenCode). The controller sends one ``resume_pr`` to
+    that same owner for the exact reviewed head.
+    """
+    transport = ReviewRepairTransport()
+    store = _review_store(tmp_path, verdict=Verdict.GO)
+    state = store.load()
+    route_changed = replace(
+        state.slices["leaf-a"],
+        agent_type="opencode",
+        model="deepseek-v4.1-flash",
+        resolved_harness="opencode/deepseek-v4.1-flash",
+        dispatch_agent_id="leaf-a-owner-invocation",
+        attempts=1,
+    )
+    state = store.checkpoint(
+        TLPlanning(),
+        {**state.slices, "leaf-a": route_changed},
+        state.budgets,
+        0,
+    )
+
+    _route_ci_event(
+        store,
+        state,
+        TLPlanning(),
+        _ci_failure_event(),
+        1,
+        TLLoopConfig(
+            active=True,
+            review_policy_path=(
+                Path(__file__).resolve().parents[2] / ".exo/review-policy.toml"
+            ),
+        ),
+        EffectClient(transport),
+        [],
+    )
+
+    restored = store.load().slices["leaf-a"]
+    assert restored.status is SliceStatus.REPAIRING
+    assert restored.agent_type == "opencode"
+    assert restored.model == "deepseek-v4.1-flash"
+    assert restored.dispatch_agent_id == "leaf-a-owner-invocation"
+    assert restored.attempts == 2, "one confirmed repair is one attempt, not zero or two"
+    assert restored.repair_attempts == 1
+    assert restored.review_rounds == 1
+    assert _effect_names(transport) == ["watcher_pr_state", "resume_pr"]
+
+    resume = next(arguments for name, arguments in transport.calls if name == "resume_pr")
+    assert resume["pr_number"] == 42
+    assert resume["expected_head_sha"] == "head-a"
+
+
 def _review_choice(backend: ReviewBackend) -> RlmModelChoice:
     return RlmModelChoice(
         model_id="test-model",
@@ -10019,6 +10077,112 @@ def _json_strings(*values: str) -> list[JsonValue]:
     result: list[JsonValue] = []
     result.extend(values)
     return result
+
+
+def _startup_policy(worker_harness: str) -> str:
+    role = (
+        f'allow = ["{worker_harness}"]\n'
+        f'cost_rank = {{ "{worker_harness}" = 1 }}\n'
+        "token_budget = 120000\n"
+        "escalate_after_attempts = 1\n"
+    )
+    return (
+        "[roles.tl]\n"
+        + role
+        + "\n[roles.worker]\n"
+        + role
+        + "\n[roles.reviewer]\n"
+        + role
+    )
+
+
+def test_controller_start_policy_snapshot_survives_a_mid_run_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``tl_run`` loads the harness policy once, at controller start.
+
+    The loader rewrites the file immediately after the startup read, modeling an
+    operator edit just after ``exomonad init``. The running controller must keep
+    selecting from the startup snapshot; a fresh load (the controller restart /
+    ``--continue`` boundary) must observe the edit.
+    """
+    from tl_loop.select.agent_type import SelectionLedger, select_agent_type
+    from tl_loop.select.policy import load_policy as real_load_policy
+
+    project = tmp_path / "project"
+    (project / ".exo").mkdir(parents=True)
+    policy_path = project / ".exo" / "harness_policy.toml"
+    policy_path.write_text(_startup_policy("codex/gpt-luna"), encoding="utf-8")
+    capabilities = CapabilityMap(
+        {
+            "codex/gpt-luna": Difficulty.STANDARD,
+            "opencode/deepseek-v4.1-flash": Difficulty.STANDARD,
+        }
+    )
+    monkeypatch.chdir(project)
+
+    real_load = real_load_policy
+    startup_loads: list[object] = []
+
+    def load_then_edit(
+        path: str | Path = Path(".exo/harness_policy.toml"),
+    ) -> HarnessPolicy:
+        policy = real_load(path)
+        startup_loads.append(policy)
+        policy_path.write_text(
+            _startup_policy("opencode/deepseek-v4.1-flash"), encoding="utf-8"
+        )
+        return policy
+
+    monkeypatch.setattr(driver_module, "load_policy", load_then_edit)
+
+    transport = RecordingTransport()
+    run_id = "policy-snapshot-run"
+    config = replace(
+        _config(),
+        source=SyntheticQueue(_lifecycle_events(run_id)),
+        effects=EffectClient(transport),
+        run_id=run_id,
+        root_dir=tmp_path,
+        capabilities=capabilities,
+    )
+    tl_run({"run_id": run_id, "plan": _plan()}, config, BudgetLedger(0, 0))
+
+    assert len(startup_loads) == 1, "the controller reads the policy exactly once at start"
+    spawns = [
+        arguments
+        for name, arguments in transport.calls
+        if name in {"spawn_worker", "spawn_leaf"}
+    ]
+    assert spawns
+    assert {arguments["agent_type"] for arguments in spawns} == {"codex"}, (
+        "a mid-run edit must not change the already-running controller's selection"
+    )
+
+    restarted_policy = real_load(policy_path)
+    fresh_slice = SliceState(
+        id="fresh",
+        status=SliceStatus.PENDING,
+        paths=("src/fresh.py",),
+        depends_on=(),
+        base_ref="main",
+        test_plan=("pytest",),
+        agent_type=None,
+        model=None,
+        branch=None,
+        worktree=None,
+        pr_number=None,
+        reviewed_head=None,
+        attempts=0,
+        verdict=None,
+    )
+    choice = select_agent_type(
+        fresh_slice, "worker", SelectionLedger(), restarted_policy, capabilities
+    )
+    assert choice is not None
+    assert choice.harness == "opencode/deepseek-v4.1-flash", (
+        "a fresh controller load observes the edited policy"
+    )
 
 
 def test_tl_run_integrates_selection_model_and_atomic_charge(tmp_path: Path) -> None:
