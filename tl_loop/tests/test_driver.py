@@ -152,7 +152,7 @@ from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
 from tl_loop.select.harness import parse_harness_identifier
 from tl_loop.select.model import ModelCatalog
-from tl_loop.select.policy import validate_policy
+from tl_loop.select.policy import HarnessPolicy, validate_policy
 from tl_loop.state.plan_manifest import ManifestNode, PlanManifest, build_plan_manifest
 from tl_loop.state.schema import OrderedStageState
 from tl_loop.state.store import CheckpointConflict
@@ -172,6 +172,7 @@ from tl_loop.state.schema import (
     ActionKind,
     ActionPhase,
     ActionState,
+    BudgetCharge,
     BudgetLedger,
     DurableReviewEvidence,
     EventCursor,
@@ -28561,10 +28562,14 @@ def test_resume_with_changed_configured_harness_dispatches_one_opencode_successo
     assert arguments["desired_agent_type"] == "opencode"
     assert arguments["desired_model"] == "deepseek-v4.1-flash"
     assert arguments["desired_effort"] == "high"
-    assert all(
-        charge.harness != "opencode/deepseek-v4.1-flash"
+    continuation = [
+        charge
         for charge in state.budgets.charges
-    ), "a same-attempt resume is not a new dispatch reservation"
+        if charge.slice_id == fixture.plan.leaves[0].name
+        and charge.continuation is not None
+    ]
+    assert len(continuation) == 1, "the same-attempt resume is charged once"
+    assert continuation[0].harness == "opencode/deepseek-v4.1-flash"
 
     replayed = driver_module._resume_terminal_owner_failure(
         fixture.plan,
@@ -28582,6 +28587,581 @@ def test_resume_with_changed_configured_harness_dispatches_one_opencode_successo
     assert replayed.slices[fixture.plan.leaves[0].name] == state.slices[
         fixture.plan.leaves[0].name
     ]
+
+
+OPENCODE_CONTINUATION_HARNESS = "opencode/deepseek-v4.1-flash"
+CODEX_CONTINUATION_HARNESS = "codex/gpt-6.1-sol"
+
+
+def _continuation_policy(
+    harness: str,
+    *,
+    role_budget: int = 120000,
+    harness_budget: int = 80000,
+) -> HarnessPolicy:
+    role = {
+        "allow": [harness],
+        "cost_rank": {harness: 1},
+        "token_budget": role_budget,
+        "per_harness_budget": {harness: harness_budget},
+        "escalate_after_attempts": 1,
+    }
+    return validate_policy({"roles": {"tl": dict(role), "worker": dict(role), "reviewer": dict(role)}})
+
+
+def _seed_codex_continuation_spend(
+    store: RunStore, *, slice_id: str, harness: str, spent: int = 7
+) -> RunState:
+    """Persist the earlier dispatch spend that a continuation must not rewrite."""
+    state = store.load()
+    ledger = BudgetLedger(
+        tokens=spent,
+        wall_seconds=0,
+        role_spent={"worker": spent},
+        harness_spent={harness: spent},
+        charges=(
+            BudgetCharge(
+                slice_id=slice_id,
+                attempt=state.slices[slice_id].attempts,
+                role="worker",
+                harness=harness,
+                estimated_tokens=spent,
+                actual=spent,
+                delta_tokens=0,
+                warning=False,
+                reconciled=True,
+            ),
+        ),
+    )
+    return store.checkpoint(
+        state.fsm, state.slices, ledger, state.events.last_consumed_offset
+    )
+
+
+def _continuation_charges(state: RunState, slice_id: str) -> list[BudgetCharge]:
+    return [
+        charge
+        for charge in state.budgets.charges
+        if charge.slice_id == slice_id and charge.continuation is not None
+    ]
+
+
+def _continuation_estimate(
+    state: RunState, config: TLLoopConfig, slice_id: str, harness: str
+) -> int:
+    from tl_loop.select.agent_type import continuation_choice
+
+    assert config.policy is not None
+    return continuation_choice(
+        state.slices[slice_id], config.role, config.policy, harness
+    ).estimated_cost
+
+
+class _ContinuationIssueTransport(RepeatedTransitionTransport):
+    """Record every effect and answer the human-gate issue creation."""
+
+    def call_tool(
+        self, role: str, name: str, tool_name: str, arguments: JsonObject
+    ) -> JsonObject:
+        if tool_name == "chainlink_issue_create":
+            self.calls.append((tool_name, arguments))
+            return {"success": True, "result": {"issue_id": 1011}}
+        return super().call_tool(role, name, tool_name, arguments)
+
+
+def test_configured_harness_switch_blocked_resume_charges_the_new_harness(
+    tmp_path: Path,
+) -> None:
+    """A Codex -> OpenCode continuation reserves the OpenCode ceiling, not Codex's."""
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path,
+        prior_runtime="codex",
+        prior_model="gpt-6.1-sol",
+        prior_effort="xhigh",
+        selected_harness=OPENCODE_CONTINUATION_HARNESS,
+        selected_model="deepseek-v4.1-flash",
+        selected_effort="high",
+    )
+    slice_id = fixture.plan.leaves[0].name
+    seeded = _seed_codex_continuation_spend(
+        fixture.store, slice_id=slice_id, harness=CODEX_CONTINUATION_HARNESS
+    )
+    expected = _continuation_estimate(
+        seeded, fixture.config, slice_id, OPENCODE_CONTINUATION_HARNESS
+    )
+    transport = RepeatedTransitionTransport(
+        owner_dir=fixture.owner_dir, owner_name=fixture.owner_name, slice_id=slice_id
+    )
+    journal = EffectJournal(fixture.store.run_id, fixture.store.run_dir / "action-journal.json")
+
+    state = driver_module._resume_terminal_owner_failure(
+        fixture.plan,
+        seeded,
+        fixture.config,
+        EffectClient(transport),
+        fixture.store,
+        journal,
+    )
+
+    assert len(transport.successors) == 1
+    charges = _continuation_charges(state, slice_id)
+    assert len(charges) == 1
+    charge = charges[0]
+    assert charge.harness == OPENCODE_CONTINUATION_HARNESS
+    assert charge.role == "worker"
+    assert charge.attempt == seeded.slices[slice_id].attempts + 1
+    assert charge.estimated_tokens == expected
+    assert charge.reconciled is True
+    assert charge.actual == "unknown"
+    assert charge.warning is True
+    # The earlier Codex spend is untouched and the role ceiling sees both.
+    assert state.budgets.harness_spent[CODEX_CONTINUATION_HARNESS] == 7
+    assert state.budgets.harness_spent[OPENCODE_CONTINUATION_HARNESS] == expected
+    assert state.budgets.role_spent["worker"] == 7 + expected
+    assert state.budgets.harness_reserved == {}
+    assert state.budgets.role_reserved == {}
+
+
+class _RejectingResumeTransport(RepeatedTransitionTransport):
+    """Reject the blocked-leaf resume without launching a successor."""
+
+    def call_tool(
+        self, role: str, name: str, tool_name: str, arguments: JsonObject
+    ) -> JsonObject:
+        if tool_name != "resume_blocked_leaf":
+            return super().call_tool(role, name, tool_name, arguments)
+        self.calls.append((tool_name, arguments))
+        return {"success": False, "error": "resume rejected before running"}
+
+
+def test_rejected_blocked_resume_releases_the_continuation_reservation(
+    tmp_path: Path,
+) -> None:
+    """A resume the host refuses before running leaves no reserved or spent charge."""
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path,
+        prior_runtime="codex",
+        prior_model="gpt-6.1-sol",
+        prior_effort="xhigh",
+        selected_harness=OPENCODE_CONTINUATION_HARNESS,
+        selected_model="deepseek-v4.1-flash",
+        selected_effort="high",
+    )
+    slice_id = fixture.plan.leaves[0].name
+    seeded = _seed_codex_continuation_spend(
+        fixture.store, slice_id=slice_id, harness=CODEX_CONTINUATION_HARNESS
+    )
+    transport = _RejectingResumeTransport(
+        owner_dir=fixture.owner_dir, owner_name=fixture.owner_name, slice_id=slice_id
+    )
+    journal = EffectJournal(fixture.store.run_id, fixture.store.run_dir / "action-journal.json")
+
+    state = driver_module._resume_terminal_owner_failure(
+        fixture.plan,
+        seeded,
+        fixture.config,
+        EffectClient(transport),
+        fixture.store,
+        journal,
+    )
+
+    assert not transport.successors
+    assert state.budgets.harness_reserved == {}
+    assert state.budgets.role_reserved == {}
+    assert {k: v for k, v in state.budgets.harness_spent.items() if v} == dict(
+        seeded.budgets.harness_spent
+    )
+    assert dict(state.budgets.role_spent) == dict(seeded.budgets.role_spent)
+    assert all(charge.reconciled for charge in _continuation_charges(state, slice_id))
+
+
+def test_configured_harness_switch_blocked_resume_over_the_ceiling_parks(
+    tmp_path: Path,
+) -> None:
+    """The continuation is refused before the effect and parked for a human."""
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path,
+        prior_runtime="codex",
+        prior_model="gpt-6.1-sol",
+        prior_effort="xhigh",
+        selected_harness=OPENCODE_CONTINUATION_HARNESS,
+        selected_model="deepseek-v4.1-flash",
+        selected_effort="high",
+    )
+    slice_id = fixture.plan.leaves[0].name
+    seeded = _seed_codex_continuation_spend(
+        fixture.store, slice_id=slice_id, harness=CODEX_CONTINUATION_HARNESS
+    )
+    config = replace(
+        fixture.config,
+        policy=_continuation_policy(OPENCODE_CONTINUATION_HARNESS, harness_budget=10),
+    )
+    transport = _ContinuationIssueTransport(
+        owner_dir=fixture.owner_dir, owner_name=fixture.owner_name, slice_id=slice_id
+    )
+    journal = EffectJournal(fixture.store.run_id, fixture.store.run_dir / "action-journal.json")
+
+    state = driver_module._resume_terminal_owner_failure(
+        fixture.plan,
+        seeded,
+        config,
+        EffectClient(transport),
+        fixture.store,
+        journal,
+    )
+
+    assert transport.successors == []
+    assert not any(name == "resume_blocked_leaf" for name, _ in transport.calls)
+    assert not _continuation_charges(state, slice_id)
+    leaf = state.slices[slice_id]
+    assert leaf.status is SliceStatus.PARKED
+    assert leaf.park_cause is ParkCause.BUDGET_EXHAUSTED
+    assert leaf.park_issue_id == 1011
+    assert leaf.park_audit is not None
+    assert "budget" in str(leaf.park_audit["reason"])
+    assert any(name == "chainlink_issue_create" for name, _ in transport.calls)
+    assert state.budgets.harness_spent == {CODEX_CONTINUATION_HARNESS: 7}
+    assert state.budgets.role_spent == {"worker": 7}
+    assert state.budgets.harness_reserved == {}
+
+
+def _review_continuation_plan() -> WorkPlan:
+    return WorkPlan.from_mapping(
+        {
+            "leaves": [
+                {
+                    "name": "leaf-a",
+                    "task": "implement the requested change",
+                    "chainlink_issue_id": None,
+                    "boundary": ["src/leaf.py"],
+                    "verify": ["just tl-loop-test"],
+                    "done_criteria": ["the failure path is covered"],
+                }
+            ]
+        }
+    )
+
+
+def _review_continuation_backend() -> ReviewBackend:
+    return ReviewBackend(
+        [
+            RlmResponse(
+                {
+                    "verdict": "NO-GO",
+                    "reviewed_head": "head-a",
+                    "reasons": [
+                        {
+                            "severity": "blocking",
+                            "file": "src/leaf.py",
+                            "line": 8,
+                            "claim": "The failure path is unhandled",
+                        }
+                    ],
+                    "blocking_count": 1,
+                }
+            )
+        ]
+    )
+
+
+def _review_continuation_config(policy: object) -> TLLoopConfig:
+    return TLLoopConfig(
+        active=True,
+        review_model_choice=_review_choice(_review_continuation_backend()),
+        review_policy_path=Path(".exo/review-policy.toml"),
+        policy=cast(Any, policy),
+        capabilities=CapabilityMap({OPENCODE_CONTINUATION_HARNESS: Difficulty.TRIVIAL}),
+        role="worker",
+    )
+
+
+def _seed_review_codex_spend(store: RunStore) -> RunStore:
+    _seed_codex_continuation_spend(
+        store, slice_id="leaf-a", harness="codex/test-model"
+    )
+    return store
+
+
+class _ReviewContinuationTransport(ReviewRepairTransport):
+    """Record every effect and answer the human-gate issue lookup/creation."""
+
+    def call_tool(
+        self, role: str, name: str, tool_name: str, arguments: JsonObject
+    ) -> JsonObject:
+        if tool_name == "chainlink_issue_list":
+            self.calls.append((tool_name, arguments))
+            return {"success": True, "result": []}
+        if tool_name == "chainlink_issue_create":
+            self.calls.append((tool_name, arguments))
+            return {"success": True, "result": {"issue_id": 2022}}
+        return super().call_tool(role, name, tool_name, arguments)
+
+
+def test_review_repair_continuation_charges_the_configured_new_harness(
+    tmp_path: Path,
+) -> None:
+    """A same-slice resume_pr continuation is charged to the configured route."""
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    config = _review_continuation_config(
+        _continuation_policy(OPENCODE_CONTINUATION_HARNESS)
+    )
+    transport = ReviewRepairTransport()
+    expected = _continuation_estimate(store.load(), config, "leaf-a", OPENCODE_CONTINUATION_HARNESS)
+
+    state = driver_module._route_review_event(
+        _review_continuation_plan(),
+        store,
+        store.load(),
+        TLPlanning(),
+        _review_event(),
+        1,
+        config,
+        EffectClient(transport),
+        [],
+    )
+
+    assert [name for name, _ in transport.calls if name == "resume_pr"] == ["resume_pr"]
+    charges = _continuation_charges(state, "leaf-a")
+    assert len(charges) == 1
+    charge = charges[0]
+    assert charge.harness == OPENCODE_CONTINUATION_HARNESS
+    assert charge.attempt == 1
+    assert charge.estimated_tokens == expected
+    assert charge.reconciled is True
+    assert state.budgets.harness_spent["codex/test-model"] == 7
+    assert state.budgets.harness_spent[OPENCODE_CONTINUATION_HARNESS] == expected
+    assert state.budgets.role_spent["worker"] == 7 + expected
+    assert state.budgets.harness_reserved == {}
+
+
+def test_review_repair_continuation_over_the_ceiling_parks_without_a_resume(
+    tmp_path: Path,
+) -> None:
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    config = _review_continuation_config(
+        _continuation_policy(OPENCODE_CONTINUATION_HARNESS, harness_budget=10)
+    )
+    transport = _ReviewContinuationTransport()
+
+    state = driver_module._route_review_event(
+        _review_continuation_plan(),
+        store,
+        store.load(),
+        TLPlanning(),
+        _review_event(),
+        1,
+        config,
+        EffectClient(transport),
+        [],
+    )
+
+    assert not any(name == "resume_pr" for name, _ in transport.calls)
+    assert not _continuation_charges(state, "leaf-a")
+    leaf = state.slices["leaf-a"]
+    assert leaf.status is SliceStatus.PARKED
+    assert leaf.park_cause is ParkCause.BUDGET_EXHAUSTED
+    assert leaf.park_issue_id == 2022
+    assert leaf.park_audit is not None
+    assert "budget" in str(leaf.park_audit["reason"])
+    assert any(name == "chainlink_issue_create" for name, _ in transport.calls)
+    assert state.budgets.harness_spent == {"codex/test-model": 7}
+    assert state.budgets.role_spent == {"worker": 7}
+    assert state.budgets.harness_reserved == {}
+
+
+def test_replayed_blocked_resume_does_not_double_charge_or_reissue(
+    tmp_path: Path,
+) -> None:
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path,
+        prior_runtime="codex",
+        prior_model="gpt-6.1-sol",
+        prior_effort="xhigh",
+        selected_harness=OPENCODE_CONTINUATION_HARNESS,
+        selected_model="deepseek-v4.1-flash",
+        selected_effort="high",
+    )
+    slice_id = fixture.plan.leaves[0].name
+    seeded = _seed_codex_continuation_spend(
+        fixture.store, slice_id=slice_id, harness=CODEX_CONTINUATION_HARNESS
+    )
+    transport = RepeatedTransitionTransport(
+        owner_dir=fixture.owner_dir, owner_name=fixture.owner_name, slice_id=slice_id
+    )
+    journal = EffectJournal(fixture.store.run_id, fixture.store.run_dir / "action-journal.json")
+
+    first = driver_module._resume_terminal_owner_failure(
+        fixture.plan,
+        seeded,
+        fixture.config,
+        EffectClient(transport),
+        fixture.store,
+        journal,
+    )
+    settled = _continuation_charges(first, slice_id)
+    assert len(settled) == 1
+    journal_entries = journal.entries_for("resume_blocked_leaf", slice_id)
+
+    replayed = driver_module._resume_terminal_owner_failure(
+        fixture.plan,
+        first,
+        fixture.config,
+        EffectClient(transport),
+        fixture.store,
+        journal,
+    )
+
+    assert len(transport.successors) == 1, "replay adds no successor launch"
+    assert _continuation_charges(replayed, slice_id) == settled
+    assert replayed.budgets.harness_spent == first.budgets.harness_spent
+    assert replayed.budgets.role_spent == first.budgets.role_spent
+    assert journal.entries_for("resume_blocked_leaf", slice_id) == journal_entries
+
+
+def test_replayed_review_repair_does_not_double_charge_or_reissue(
+    tmp_path: Path,
+) -> None:
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    config = _review_continuation_config(
+        _continuation_policy(OPENCODE_CONTINUATION_HARNESS)
+    )
+    transport = ReviewRepairTransport()
+    journal = EffectJournal("review-run", store.run_dir / "action-journal.json")
+
+    def repair_with(
+        pr: Mapping[str, object],
+        live: EffectClient,
+        dispatch: Callable[[JsonObject], object],
+    ) -> object:
+        return dispatch(
+            {
+                "pr_number": cast(JsonValue, pr["pr_number"]),
+                "expected_head_sha": "head-a",
+                "task": "fix the failure path",
+            }
+        )
+
+    first = driver_module._route_repair(
+        store,
+        store.load(),
+        TLPlanning(),
+        1,
+        "leaf-a",
+        config,
+        EffectClient(transport),
+        journal,
+        repair_with,
+    )
+    settled = _continuation_charges(first, "leaf-a")
+    assert len(settled) == 1
+
+    replayed = driver_module._route_repair(
+        store,
+        store.load(),
+        TLPlanning(),
+        1,
+        "leaf-a",
+        config,
+        EffectClient(transport),
+        journal,
+        repair_with,
+    )
+
+    assert [name for name, _ in transport.calls if name == "resume_pr"] == ["resume_pr"]
+    assert _continuation_charges(replayed, "leaf-a") == settled
+    assert replayed.budgets.harness_spent == first.budgets.harness_spent
+    assert replayed.budgets.harness_reserved == {}
+
+
+def test_refused_review_repair_releases_the_continuation_reservation(
+    tmp_path: Path,
+) -> None:
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    config = _review_continuation_config(
+        _continuation_policy(OPENCODE_CONTINUATION_HARNESS)
+    )
+    expected = _continuation_estimate(store.load(), config, "leaf-a", OPENCODE_CONTINUATION_HARNESS)
+
+    class RefusingResumeTransport(ReviewRepairTransport):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
+            if tool_name == "resume_pr":
+                self.calls.append((tool_name, arguments))
+                return {"success": False, "error": "host refused the resume"}
+            return super().call_tool(role, name, tool_name, arguments)
+
+    transport = RefusingResumeTransport()
+
+    state = driver_module._route_review_event(
+        _review_continuation_plan(),
+        store,
+        store.load(),
+        TLPlanning(),
+        _review_event(),
+        1,
+        config,
+        EffectClient(transport),
+        [],
+    )
+
+    assert [name for name, _ in transport.calls if name == "resume_pr"] == ["resume_pr"]
+    charges = _continuation_charges(state, "leaf-a")
+    assert len(charges) == 1
+    charge = charges[0]
+    assert charge.reconciled is True
+    assert charge.actual == 0
+    assert charge.delta_tokens == -expected
+    assert state.budgets.harness_reserved == {}
+    assert state.budgets.role_reserved == {}
+    assert state.budgets.harness_spent.get(OPENCODE_CONTINUATION_HARNESS, 0) == 0
+    assert state.budgets.harness_spent["codex/test-model"] == 7
+    assert state.slices["leaf-a"].park_cause is ParkCause.REVIEW_STUCK
+    assert not any(name == "resume_blocked_leaf" for name, _ in transport.calls)
+
+
+def test_charged_continuation_keeps_attempts_review_rounds_and_interventions(
+    tmp_path: Path,
+) -> None:
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    config = _review_continuation_config(
+        _continuation_policy(OPENCODE_CONTINUATION_HARNESS)
+    )
+    transport = ReviewRepairTransport()
+    journal = EffectJournal("review-run", store.run_dir / "action-journal.json")
+    before = store.load().slices["leaf-a"]
+
+    def repair_with(
+        pr: Mapping[str, object],
+        live: EffectClient,
+        dispatch: Callable[[JsonObject], object],
+    ) -> object:
+        return dispatch(
+            {
+                "pr_number": cast(JsonValue, pr["pr_number"]),
+                "expected_head_sha": "head-a",
+                "task": "fix the failure path",
+            }
+        )
+
+    state = driver_module._route_repair(
+        store,
+        store.load(),
+        TLPlanning(),
+        1,
+        "leaf-a",
+        config,
+        EffectClient(transport),
+        journal,
+        repair_with,
+    )
+
+    assert _continuation_charges(state, "leaf-a")
+    after = state.slices["leaf-a"]
+    assert after.attempts == before.attempts
+    assert after.review_rounds == before.review_rounds
+    assert after.tl_intervention_attempts == before.tl_intervention_attempts
+    assert after.repair_attempts == 0
 
 
 @pytest.mark.parametrize(

@@ -853,6 +853,7 @@ CHARGE_KEYS = frozenset(
         "delta_tokens",
         "warning",
         "reconciled",
+        "continuation",
     }
 )
 GATE_KEYS = frozenset({"name", "status"})
@@ -981,6 +982,10 @@ class BudgetCharge:
     delta_tokens: int | None
     warning: bool
     reconciled: bool
+    #: Stable identity of the same-slice continuation this charge reserved, or
+    #: None for a dispatch charge. It keeps a replayed continuation from being
+    #: charged twice without changing the slice attempt counters.
+    continuation: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2535,7 +2540,7 @@ def _charges(value: object, path: str, errors: list[tuple[str, str]]) -> None:
     if not isinstance(value, list):
         errors.append((f"{path}.charges", "must be an array"))
         return
-    seen: set[tuple[str, int]] = set()
+    seen: set[tuple[str, int, str | None]] = set()
     for index, raw_charge in enumerate(value):
         charge_path = f"{path}.charges[{index}]"
         charge = _object(raw_charge, charge_path, CHARGE_KEYS, errors)
@@ -2556,12 +2561,27 @@ def _charges(value: object, path: str, errors: list[tuple[str, str]]) -> None:
             errors.append((f"{charge_path}.delta_tokens", "must be null or an integer"))
         _boolean(charge, "warning", charge_path, errors)
         _boolean(charge, "reconciled", charge_path, errors)
+        continuation = charge.get("continuation")
+        if continuation is not None and (
+            not isinstance(continuation, str) or not continuation
+        ):
+            errors.append(
+                (f"{charge_path}.continuation", "must be a non-empty string or null")
+            )
         slice_id = charge.get("slice_id")
         attempt = charge.get("attempt")
         if isinstance(slice_id, str) and type(attempt) is int:
-            identity = (slice_id, attempt)
+            # A continuation extends an attempt, so the charge identity is the
+            # slice, the attempt, and the continuation it reserved.
+            identity = (
+                slice_id,
+                attempt,
+                continuation if isinstance(continuation, str) and continuation else None,
+            )
             if identity in seen:
-                errors.append((f"{charge_path}", "duplicate slice_id and attempt"))
+                errors.append(
+                    (f"{charge_path}", "duplicate slice_id, attempt, and continuation")
+                )
             seen.add(identity)
 
 

@@ -408,7 +408,9 @@ def _attempt_charge(
 ) -> BudgetCharge:
     matches = [
         charge for charge in ledger.charges
-        if charge.slice_id == target.id and charge.attempt == charge_attempt
+        if charge.slice_id == target.id
+        and charge.attempt == charge_attempt
+        and charge.continuation is None
     ]
     if len(matches) != 1:
         raise TaskBudgetResetError("expected exactly one budget charge for the requested charge attempt")

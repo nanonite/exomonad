@@ -37,19 +37,71 @@ def charge_spawn(
     ledger: LedgerInput, choice: HarnessChoice, slice: SliceState
 ) -> dict[str, object]:
     """Reserve one selected spawn without performing I/O or mutating the input."""
+    return _reserve(
+        ledger,
+        choice,
+        slice_id=slice.id,
+        attempt=slice.attempts + 1,
+        continuation=None,
+    )
+
+
+def charge_continuation(
+    ledger: LedgerInput,
+    choice: HarnessChoice,
+    slice: SliceState,
+    continuation_id: str,
+    *,
+    attempt: int | None = None,
+) -> dict[str, object]:
+    """Reserve one same-slice continuation on the route it will actually run.
+
+    A ``resume_pr`` or ``resume_blocked_leaf`` continuation extends a slice
+    attempt with a new invocation. It names the continuation it charges so a
+    replayed continuation is not charged twice, and it is otherwise the same
+    reservation, ceiling check, and charge record a dispatch uses. The earlier
+    dispatch's spend is never rewritten.
+    """
+    selected = slice.attempts if attempt is None else _integer(attempt, "attempt")
+    if selected < 1 or selected not in {slice.attempts, slice.attempts + 1}:
+        raise LedgerError(
+            "a continuation attempt must be the slice attempt it extends or its successor"
+        )
+    return _reserve(
+        ledger,
+        choice,
+        slice_id=slice.id,
+        attempt=selected,
+        continuation=_non_empty(continuation_id, "continuation_id"),
+    )
+
+
+def _reserve(
+    ledger: LedgerInput,
+    choice: HarnessChoice,
+    *,
+    slice_id: str,
+    attempt: int,
+    continuation: str | None,
+) -> dict[str, object]:
     estimated = _non_negative(choice.estimated_cost, "choice.estimated_cost")
     if estimated == 0:
         raise LedgerError("choice.estimated_cost must be positive")
     role = _non_empty(choice.role, "choice.role")
     harness = _non_empty(choice.harness, "choice.harness")
-    attempt = slice.attempts + 1
+    slice_id = _non_empty(slice_id, "slice.id")
     result = _document(ledger)
     charges = _charges(result)
     if any(
-        item["slice_id"] == slice.id and item["attempt"] == attempt
+        item["slice_id"] == slice_id
+        and item["attempt"] == attempt
+        and _charge_continuation(item) == continuation
         for item in charges
     ):
-        raise DuplicateCharge(f"slice {slice.id!r} attempt {attempt} is already charged")
+        label = "continuation" if continuation is not None else "attempt"
+        raise DuplicateCharge(
+            f"slice {slice_id!r} attempt {attempt} {label} is already charged"
+        )
 
     role_spent = _counter(result, "role_spent")
     harness_spent = _counter(result, "harness_spent")
@@ -71,40 +123,72 @@ def charge_spawn(
     result["harness_spent"] = harness_spent
     result["role_reserved"] = role_reserved
     result["harness_reserved"] = harness_reserved
-    charges.append(
-        {
-            "slice_id": slice.id,
-            "attempt": attempt,
-            "role": role,
-            "harness": harness,
-            "estimated_tokens": estimated,
-            "actual": UNKNOWN_ACTUAL,
-            "delta_tokens": None,
-            "warning": False,
-            "reconciled": False,
-        }
-    )
+    charge: dict[str, object] = {
+        "slice_id": slice_id,
+        "attempt": attempt,
+        "role": role,
+        "harness": harness,
+        "estimated_tokens": estimated,
+        "actual": UNKNOWN_ACTUAL,
+        "delta_tokens": None,
+        "warning": False,
+        "reconciled": False,
+    }
+    if continuation is not None:
+        charge["continuation"] = continuation
+    charges.append(charge)
     result["charges"] = charges
     return result
 
 
+def find_continuation_charge(
+    ledger: BudgetLedger, slice_id: str, continuation_id: str
+) -> BudgetCharge | None:
+    """Return the charge recorded for one continuation, if it was reserved."""
+    slice_id = _non_empty(slice_id, "slice_id")
+    continuation_id = _non_empty(continuation_id, "continuation_id")
+    matches = [
+        charge
+        for charge in ledger.charges
+        if charge.slice_id == slice_id and charge.continuation == continuation_id
+    ]
+    if len(matches) > 1:
+        raise LedgerError(
+            f"slice {slice_id!r} continuation {continuation_id!r} is charged more than once"
+        )
+    return matches[0] if matches else None
+
+
+
 def reconcile(
-    ledger: LedgerInput, slice_id: str, actual_tokens: int | None
+    ledger: LedgerInput,
+    slice_id: str,
+    actual_tokens: int | None,
+    *,
+    continuation: str | None = None,
 ) -> dict[str, object]:
     """Move a reservation to spend and record the measured usage delta.
 
     None means no authoritative usage was available. The estimate is then
     conservatively applied to the ceilings while the charge records
     actual="unknown" and a warning.
+
+    ``continuation`` names the continuation charge to reconcile. Without it the
+    pending dispatch charge for the slice is reconciled, so a pending
+    continuation can never be consumed by the dispatch settlement.
     """
     slice_id = _non_empty(slice_id, "slice_id")
+    selected_continuation = (
+        None if continuation is None else _non_empty(continuation, "continuation")
+    )
     if actual_tokens is not None:
         actual_tokens = _non_negative(actual_tokens, "actual_tokens")
     result = _document(ledger)
     charges = _charges(result)
-    charge_index = _pending_charge_index(charges, slice_id)
+    charge_index = _pending_charge_index(charges, slice_id, selected_continuation)
     if charge_index is None:
-        raise ChargeNotFound(f"no pending charge exists for slice {slice_id!r}")
+        label = "continuation" if selected_continuation is not None else "dispatch"
+        raise ChargeNotFound(f"no pending {label} charge exists for slice {slice_id!r}")
     charge = charges[charge_index]
     estimate = _non_negative(charge["estimated_tokens"], "charge.estimated_tokens")
     role = _non_empty(cast(str, charge["role"]), "charge.role")
@@ -186,6 +270,74 @@ def apply_spawn_and_charge(
     return apply(run_dir, mutate, lock_timeout=lock_timeout, hooks=hooks)
 
 
+def apply_continuation_and_charge(
+    run_dir: str | Path,
+    choice: HarnessChoice,
+    slice: SliceState,
+    continuation_id: str,
+    record_continuation: SpawnRecorder,
+    *,
+    attempt: int | None = None,
+    lock_timeout: float = 5.0,
+    hooks: WriteHooks | None = None,
+) -> Document:
+    """Record a continuation and its reservation in one state-writer apply call."""
+    if not callable(record_continuation):
+        raise TypeError("record_continuation must be callable")
+
+    def mutate(document: Document) -> Document:
+        updated = record_continuation(document)
+        if not isinstance(updated, dict):
+            raise TypeError("record_continuation must return an object")
+        updated["budgets"] = {
+            "ledger": charge_continuation(
+                _document_mapping(updated, "continuation"),
+                choice,
+                slice,
+                continuation_id,
+                attempt=attempt,
+            )
+        }
+        return updated
+
+    return apply(run_dir, mutate, lock_timeout=lock_timeout, hooks=hooks)
+
+
+def apply_continuation_reconcile(
+    run_dir: str | Path,
+    slice_id: str,
+    continuation_id: str,
+    actual_tokens: int | None,
+    *,
+    lock_timeout: float = 5.0,
+    hooks: WriteHooks | None = None,
+) -> Document:
+    """Settle one continuation reservation through the same atomic ledger path."""
+
+    def mutate(document: Document) -> Document:
+        document["budgets"] = {
+            "ledger": reconcile(
+                _document_mapping(document, "continuation"),
+                slice_id,
+                actual_tokens,
+                continuation=continuation_id,
+            )
+        }
+        return document
+
+    return apply(run_dir, mutate, lock_timeout=lock_timeout, hooks=hooks)
+
+
+def _document_mapping(document: Mapping[str, object], label: str) -> Mapping[str, object]:
+    budgets = document.get("budgets")
+    if not isinstance(budgets, Mapping):
+        raise LedgerError(f"run state is missing the budgets object for {label}")
+    raw_ledger = budgets.get("ledger")
+    if not isinstance(raw_ledger, Mapping):
+        raise LedgerError(f"run state is missing the budget ledger for {label}")
+    return raw_ledger
+
+
 def _document(ledger: LedgerInput) -> dict[str, object]:
     if isinstance(ledger, BudgetLedger):
         return {
@@ -206,7 +358,7 @@ def _document(ledger: LedgerInput) -> dict[str, object]:
 
 
 def _encode_charge(charge: BudgetCharge) -> dict[str, object]:
-    return {
+    encoded: dict[str, object] = {
         "slice_id": charge.slice_id,
         "attempt": charge.attempt,
         "role": charge.role,
@@ -217,6 +369,9 @@ def _encode_charge(charge: BudgetCharge) -> dict[str, object]:
         "warning": charge.warning,
         "reconciled": charge.reconciled,
     }
+    if charge.continuation is not None:
+        encoded["continuation"] = charge.continuation
+    return encoded
 
 
 def _counter(document: Mapping[str, object], key: str) -> dict[str, int]:
@@ -243,12 +398,25 @@ def _charges(document: Mapping[str, object]) -> list[dict[str, object]]:
     return result
 
 
-def _pending_charge_index(charges: list[dict[str, object]], slice_id: str) -> int | None:
+def _pending_charge_index(
+    charges: list[dict[str, object]],
+    slice_id: str,
+    continuation: str | None,
+) -> int | None:
     for index in range(len(charges) - 1, -1, -1):
         charge = charges[index]
-        if charge.get("slice_id") == slice_id and charge.get("reconciled") is not True:
+        if (
+            charge.get("slice_id") == slice_id
+            and charge.get("reconciled") is not True
+            and _charge_continuation(charge) == continuation
+        ):
             return index
     return None
+
+
+def _charge_continuation(charge: Mapping[str, object]) -> str | None:
+    value = charge.get("continuation")
+    return value if isinstance(value, str) and value else None
 
 
 def _drop_zero(values: dict[str, int], key: str) -> None:
@@ -282,8 +450,12 @@ __all__ = [
     "ChargeNotFound",
     "DuplicateCharge",
     "LedgerError",
+    "apply_continuation_and_charge",
+    "apply_continuation_reconcile",
     "apply_spawn_and_charge",
+    "charge_continuation",
     "charge_spawn",
+    "find_continuation_charge",
     "reconcile",
     "resolve_actual_tokens",
 ]

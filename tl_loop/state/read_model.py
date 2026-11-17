@@ -308,10 +308,11 @@ class BudgetChargeReadModel:
     delta_tokens: int | None
     warning: bool
     reconciled: bool
+    continuation: str | None = None
 
     def to_document(self) -> dict[str, object]:
         """Return the JSON representation."""
-        return {
+        document: dict[str, object] = {
             "slice_id": self.slice_id,
             "attempt": self.attempt,
             "role": self.role,
@@ -322,6 +323,9 @@ class BudgetChargeReadModel:
             "warning": self.warning,
             "reconciled": self.reconciled,
         }
+        if self.continuation is not None:
+            document["continuation"] = self.continuation
+        return document
 
 
 @dataclass(frozen=True)
@@ -984,6 +988,7 @@ def _charge_model(charge: BudgetCharge) -> BudgetChargeReadModel:
         delta_tokens=charge.delta_tokens,
         warning=charge.warning,
         reconciled=charge.reconciled,
+        continuation=charge.continuation,
     )
 
 

@@ -120,14 +120,32 @@ rejects a genuinely invalid run.
 | reviewer harness request surface | `spawn_reviewer` / `restart_review` effect arguments | PASS; neither carries harness/model/effort/agent-type, so there is no unguarded per-call reviewer harness override. A future field fails the structural test | `reviewer_effect_requests_cannot_override_the_configured_route` |
 | reviewer failure escalation | selector removes a failed worker harness after `roles.<role>.escalate_after_attempts` | N/A; no selector call and no model/harness escalation exists for the reviewer role. The configured `[reviewer]` route is the base and is not widened by an escalation | `test_no_reviewer_harness_escalation_path_exists` |
 | `escalate_after_attempts` | slice attempts + verdict decide when a harness leaves rotation | PASS; a configured change does not reset the counter, and a NO-GO on harness A selects another allowlisted harness | `test_no_go_escalates_only_after_attempt_threshold`, H4 test |
-| role budget / `per_harness_budget` | a dispatch reserves against the role and the selected harness | PASS for a new dispatch attempt: harness B is charged and harness A's spend is kept. A same-slice `resume_pr`/`resume_blocked_leaf` continuation is not a new dispatch attempt and is **not** charged again | `test_harness_change_charges_the_new_harness_and_keeps_the_old_spend`, `test_harness_budget_is_charged_to_the_harness_that_actually_runs` |
+| role budget / `per_harness_budget` | a dispatch reserves against the role and the selected harness; a same-slice `resume_pr`/`resume_blocked_leaf` continuation reserves again, on the route it actually runs | PASS for a new dispatch attempt: harness B is charged and harness A's spend is kept. PASS for a continuation: the resume-time route is charged (harness B), A's earlier spend is untouched, and the same ledger reconcile settles it | `test_harness_change_charges_the_new_harness_and_keeps_the_old_spend`, `test_harness_budget_is_charged_to_the_harness_that_actually_runs`, `test_configured_harness_switch_blocked_resume_charges_the_new_harness`, `test_review_repair_continuation_charges_the_configured_new_harness` |
 | owner / scope / worktree / predecessor / epoch | exact identity binding | REFUSE on mismatch; the route change never relaxes them | `test_harness_change_does_not_weaken_identity_bindings`, `test_a_stale_controller_epoch_still_refuses_a_changed_harness_dispatch`, `test_a_stale_controller_epoch_is_still_rejected` |
 
-Budget note: the controller charges a slice attempt when it dispatches a fresh
-attempt (`apply_spawn_and_charge`). `resume_pr` and `resume_blocked_leaf`
-continue the same attempt with a new invocation, so they do not add a second
-reservation. That is an accounting limit, not a route refusal; if per-invocation
-metering is needed, it belongs in the resume effect, not in the guard.
+Budget note: a fresh dispatch reserves one charge with
+`apply_spawn_and_charge`/`charge_spawn` against the role and the selected
+harness. A same-slice `resume_pr` or `resume_blocked_leaf` continuation runs on
+a route too, so it reserves one continuation charge through the sibling
+`charge_continuation` in the same ledger, under a stable continuation identity
+(the effect/action intent key) that is distinct from the attempt's dispatch
+charge. `resume_pr` charges the configured role route resolved at resume time;
+`resume_blocked_leaf` charges the accepted route the resume effect carries.
+The earlier dispatch's spend and the original harness's counters are never
+rewritten, and the reservation is settled by the same `reconcile` call a
+dispatch charge uses: a measured actual moves the estimate to spend, missing
+usage conserves the estimate with `actual="unknown"` and a warning, and a
+resume that is refused before running releases the reservation with a zero
+actual.
+
+Both ceilings still apply. If the continuation would exceed the role ceiling or
+the route harness's `per_harness_budget`, the resume is not issued: the slice is
+parked with `park_cause=budget_exhausted` and the existing needs-human issue
+path, with the refusal reason, continuation identity, harness, role, and
+estimate in `park_audit`. The route is never silently retargeted to a cheaper
+harness, and the old harness is never charged as a fallback. Same-harness
+continuations are charged by the same rule because they are real invocations
+that spend tokens; there is no route-change special case.
 
 ## Reviewer
 

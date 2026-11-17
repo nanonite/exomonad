@@ -889,6 +889,32 @@ actual="unknown" and conservatively applies its estimate to spent counters; it
 never claims the estimate was actual usage. A measured estimate delta is
 flagged when its absolute value exceeds 20% of the estimate.
 
+A same-slice `resume_pr` or `resume_blocked_leaf` continuation is a real
+invocation that spends tokens, so it reserves a charge through
+`charge_continuation`, the sibling of `charge_spawn` in
+`tl_loop/select/ledger.py`, and settles through the same `reconcile`. It names
+the continuation by a stable identity derived from the action/effect intent, so
+a replayed continuation is never charged twice and is distinct from the
+attempt's dispatch charge. The continuation charge names the route the resume
+actually runs on: the configured role route for `resume_pr` (the role allow
+list ordered by the selector's cost rank) and the accepted route carried by the
+resume effect for `resume_blocked_leaf`. The earlier harness's `harness_spent`
+is never rewritten.
+
+The continuation uses the selector's own estimate rule
+(`estimate_cost` with the role's `cost_rank`) and the same role and harness
+ceilings. If the estimate would exceed either ceiling, the resume is not
+issued: the slice is parked with `park_cause=budget_exhausted` and the existing
+needs-human issue path, and `park_audit` records the continuation identity,
+harness, role, estimate, and refusal reason. The route is never retargeted to
+another harness and the old harness is never charged as a fallback. A resume
+that is refused before it runs releases its reservation by reconciling the
+charge with a zero actual. `slice.attempts`, `review_rounds`,
+`tl_intervention_attempts`, `escalate_after_attempts`, and the harness
+escalation ladder are not inputs or outputs of the charge. The charge record
+carries one extra optional `continuation` field; checkpoints written before it
+decode with `continuation=None` and behave unchanged.
+
 A selector result of None with SelectionFailure.OVER_BUDGET is a bounded needs-human parking signal; the controller must not widen the allowlist or silently raise a ceiling to continue.
 
 ## Per-slice model tier selection

@@ -245,6 +245,8 @@ from tl_loop.rlm.tl_judgment import (
 from tl_loop.select.agent_type import (
     HarnessChoice,
     SelectionFailure,
+    configured_continuation_harness,
+    continuation_choice,
     parse_harness_identifier,
     select_agent_type,
     selection_failure,
@@ -252,7 +254,15 @@ from tl_loop.select.agent_type import (
 from tl_loop.select.capability import CapabilityMap, load_capability
 from tl_loop.select.harness import HarnessRoute, normalize_runtime_label
 from tl_loop.select.learned_policy import LearnedPolicy
-from tl_loop.select.ledger import apply_spawn_and_charge
+from tl_loop.select.ledger import (
+    BudgetCeilingExceeded,
+    DuplicateCharge,
+    apply_continuation_and_charge,
+    apply_continuation_reconcile,
+    apply_spawn_and_charge,
+    charge_continuation,
+    find_continuation_charge,
+)
 from tl_loop.select.model import ModelCatalog, select_model, select_model_for_difficulty
 from tl_loop.select.policy import HarnessPolicy, RolePolicy, load_policy
 from tl_loop.state.aggregate_approval import (
@@ -7299,6 +7309,7 @@ def _terminal_owner_recovery_proof(
             capabilities,
             config.learned_policy,
             requested_harness=None,
+            ignore_budget=True,
         )
         if choice is None:
             failure = selection_failure(
@@ -8592,6 +8603,7 @@ def _resume_approved_blocked_leaf(
     try:
         arguments = _blocked_leaf_resume_action_arguments(proof, state)
         intent = EffectIntent("resume_blocked_leaf", proof.leaf.name, arguments, True)
+        continuation_id = f"resume_blocked_leaf:{proof.intent_id}"
         journal = effects_log if isinstance(effects_log, EffectJournal) else None
         if journal is None:
             raise ActionJournalError("blocked-leaf resume requires a durable action journal")
@@ -8702,6 +8714,58 @@ def _resume_approved_blocked_leaf(
                         effects_log,
                         "required reference verification changed at the owner-resume boundary; no new owner resume was issued",
                     )
+            ledger_state = store.load()
+            ledger_slice = ledger_state.slices[proof.leaf.name]
+            route_fields = cast(Mapping[str, object], proof.route_fields)
+            try:
+                choice = _continuation_route_choice(
+                    ledger_slice,
+                    config,
+                    harness=cast(str | None, route_fields.get("harness")),
+                )
+            except ContinuationRouteError as error:
+                return _park_continuation_refusal(
+                    proof.leaf.name,
+                    ledger_state,
+                    effects,
+                    store,
+                    cause=error.cause,
+                    reason=error.reason,
+                    audit={"continuation": continuation_id},
+                )
+            if choice is not None and not _continuation_charge_recorded(
+                ledger_state, proof.leaf.name, continuation_id, choice
+            ):
+                try:
+                    apply_continuation_and_charge(
+                        store.run_dir,
+                        choice,
+                        ledger_slice,
+                        continuation_id,
+                        lambda document: document,
+                        attempt=attempt.attempt,
+                    )
+                except DuplicateCharge as error:
+                    raise TLLoopError(
+                        f"continuation {continuation_id!r} is already charged"
+                    ) from error
+                except BudgetCeilingExceeded as error:
+                    return _park_continuation_refusal(
+                        proof.leaf.name,
+                        ledger_state,
+                        effects,
+                        store,
+                        cause=ParkCause.BUDGET_EXHAUSTED,
+                        reason=(
+                            f"continuation on harness {choice.harness!r} is refused: {error}"
+                        ),
+                        audit={
+                            "continuation": continuation_id,
+                            "harness": choice.harness,
+                            "role": choice.role,
+                            "estimated_tokens": choice.estimated_cost,
+                        },
+                    )
             try:
                 result = effects.resume_blocked_leaf(
                     chainlink_issue_id=proof.owner.issue_id,
@@ -8734,7 +8798,14 @@ def _resume_approved_blocked_leaf(
                     f"blocked-leaf resume outcome is unknown: {type(error).__name__}",
                 )
             journal.mark_result(intent, result)
+        pending_charge = find_continuation_charge(
+            store.load().budgets, proof.leaf.name, continuation_id
+        )
         if result.success is not True:
+            if pending_charge is not None and not pending_charge.reconciled:
+                state = _release_continuation_charge(
+                    store, proof.leaf.name, continuation_id
+                )
             return _hold_owner_resume(
                 state,
                 proof,
@@ -8743,6 +8814,10 @@ def _resume_approved_blocked_leaf(
                 store,
                 effects_log,
                 "configured blocked-leaf resume was rejected; inspect the exact owner evidence",
+            )
+        if pending_charge is not None and not pending_charge.reconciled:
+            state = _settle_continuation_charge(
+                store, proof.leaf.name, continuation_id, None
             )
         try:
             successor = _validated_blocked_resume_result(proof, result)
@@ -16540,6 +16615,16 @@ def _reconcile_confirmed_repair_actions(
             attempts=attempts,
             repair_attempts=repair_attempts,
         )
+        continuation_id = f"resume_pr:{action.intent_id}"
+        pending_charge = find_continuation_charge(
+            state.budgets, slice_id, continuation_id
+        )
+        if pending_charge is not None and not pending_charge.reconciled:
+            # The confirmed effect ran before the crash; conserve its estimate
+            # exactly as a dispatch charge reconciles without authoritative usage.
+            state = _settle_continuation_charge(
+                store, slice_id, continuation_id, None
+            )
         state = _checkpoint_slice_action(
             store,
             state,
@@ -29592,6 +29677,113 @@ def _ci_reason_file(event: EventEnvelope) -> str:
     return value.strip() if isinstance(value, str) and value.strip() else "CI"
 
 
+class ContinuationRouteError(RuntimeError):
+    """A same-slice continuation cannot be resolved to a chargeable route."""
+
+    def __init__(self, cause: ParkCause, reason: str) -> None:
+        super().__init__(reason)
+        self.cause = cause
+        self.reason = reason
+
+
+def _continuation_route_choice(
+    current: SliceState,
+    config: TLLoopConfig,
+    *,
+    harness: str | None = None,
+) -> HarnessChoice | None:
+    """Resolve the route a same-slice continuation will run on.
+
+    ``resume_pr`` runs the operator's currently configured worker route, which
+    is the role's allowlist ordered by the selector's own cost rank.
+    ``resume_blocked_leaf`` already carries its accepted route and passes it as
+    ``harness``. Dispatch-only filters (capability and remaining budget) are not
+    reapplied: a continuation that cannot afford its configured route must be
+    refused by the ledger, not silently moved to a cheaper harness.
+
+    Returns None when the controller has no validated role policy; such a
+    configuration does not charge a dispatch either.
+    """
+    if config.policy is None:
+        return None
+    if harness is None:
+        harness = configured_continuation_harness(
+            current, config.role, config.policy, config.learned_policy
+        )
+    try:
+        return continuation_choice(current, config.role, config.policy, harness)
+    except ValueError as error:
+        raise ContinuationRouteError(ParkCause.NO_CAPABLE_HARNESS, str(error)) from error
+
+
+def _continuation_charge_recorded(
+    state: RunState,
+    slice_id: str,
+    continuation_id: str,
+    choice: HarnessChoice,
+) -> bool:
+    """Whether this exact continuation is already charged to this route."""
+    existing = find_continuation_charge(state.budgets, slice_id, continuation_id)
+    if existing is None:
+        return False
+    if existing.harness != choice.harness or existing.estimated_tokens != choice.estimated_cost:
+        raise TLLoopError(
+            "continuation budget charge disagrees with its resolved continuation route"
+        )
+    return True
+
+
+def _settle_continuation_charge(
+    store: RunStore,
+    slice_id: str,
+    continuation_id: str,
+    actual_tokens: int | None,
+) -> RunState:
+    """Reconcile one continuation charge through the shared atomic ledger path."""
+    apply_continuation_reconcile(
+        store.run_dir, slice_id, continuation_id, actual_tokens
+    )
+    return store.load()
+
+
+def _release_continuation_charge(
+    store: RunStore, slice_id: str, continuation_id: str
+) -> RunState:
+    """Release a reserved continuation that provably did not run."""
+    state = store.load()
+    charge = find_continuation_charge(state.budgets, slice_id, continuation_id)
+    if charge is None or charge.reconciled:
+        return state
+    return _settle_continuation_charge(store, slice_id, continuation_id, 0)
+
+
+def _park_continuation_refusal(
+    slice_id: str,
+    state: RunState,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    *,
+    cause: ParkCause,
+    reason: str,
+    audit: Mapping[str, object] | None = None,
+) -> RunState:
+    """Park a slice whose continuation cannot be charged inside its ceiling."""
+    current = state.slices.get(slice_id)
+    if current is None:
+        raise TLLoopError(f"continuation budget refusal references unknown slice {slice_id!r}")
+    if not isinstance(effects, EffectClient):
+        raise TLLoopError("a continuation budget refusal requires an active effect client")
+    park(
+        current,
+        cause,
+        store=store,
+        issue_creator=effects,
+        ledger=state.budgets,
+        audit={**dict(audit or {}), "reason": reason},
+    )
+    return store.load()
+
+
 def _route_repair(
     store: RunStore,
     state: RunState,
@@ -29637,10 +29829,55 @@ def _route_repair(
         else slice_transition(current, RepairQueued())
     )
     repairing = slice_transition(repairing, ActionChanged(repair_action))
+    continuation_id = f"resume_pr:{repair_action.intent_id}"
+    budgets: BudgetLedger | Mapping[str, object] = state.budgets
+    try:
+        choice = _continuation_route_choice(current, config)
+    except ContinuationRouteError as error:
+        return _park_continuation_refusal(
+            slice_id,
+            state,
+            effects,
+            store,
+            cause=error.cause,
+            reason=error.reason,
+            audit={"continuation": continuation_id},
+        )
+    if choice is not None:
+        if not isinstance(effects, EffectClient):
+            raise TLLoopError(
+                "continuation budget charging requires an active effect client"
+            )
+        if not _continuation_charge_recorded(state, slice_id, continuation_id, choice):
+            try:
+                budgets = charge_continuation(
+                    state.budgets, choice, current, continuation_id
+                )
+            except DuplicateCharge as error:
+                raise TLLoopError(
+                    f"continuation {continuation_id!r} is already charged"
+                ) from error
+            except BudgetCeilingExceeded as error:
+                return _park_continuation_refusal(
+                    slice_id,
+                    state,
+                    effects,
+                    store,
+                    cause=ParkCause.BUDGET_EXHAUSTED,
+                    reason=(
+                        f"continuation on harness {choice.harness!r} is refused: {error}"
+                    ),
+                    audit={
+                        "continuation": continuation_id,
+                        "harness": choice.harness,
+                        "role": choice.role,
+                        "estimated_tokens": choice.estimated_cost,
+                    },
+                )
     state = store.checkpoint(
         phase,
         {**state.slices, slice_id: repairing},
-        state.budgets,
+        budgets,
         event_seq,
         current_order=state.current_order,
         ordered_stages=state.ordered_stages,
@@ -29711,6 +29948,8 @@ def _route_repair(
 
         repair_with(pr, live, dispatch_resume)
     except (RepairError, ValueError) as error:
+        if choice is not None:
+            state = _release_continuation_charge(store, slice_id, continuation_id)
         if gate_name_on_failure is not None:
             return _open_integration_gate(
                 slice_id,
@@ -29727,6 +29966,14 @@ def _route_repair(
             store, state, current, event_seq, error, config, effects, effects_log
         )
     refreshed = store.load()
+    if choice is not None:
+        charge = find_continuation_charge(refreshed.budgets, slice_id, continuation_id)
+        if charge is None:
+            raise TLLoopError("continuation reservation is missing from the checkpoint")
+        if not charge.reconciled:
+            refreshed = _settle_continuation_charge(
+                store, slice_id, continuation_id, None
+            )
     resumed = slice_transition(
         refreshed.slices[slice_id],
         ActionChanged(replace(repair_action, phase=ActionPhase.CONFIRMED)),

@@ -3471,7 +3471,7 @@ def _decode_goals(value: dict[str, object]) -> GoalState:
 
 
 def _encode_charge(charge: BudgetCharge) -> dict[str, object]:
-    return {
+    encoded: dict[str, object] = {
         "slice_id": charge.slice_id,
         "attempt": charge.attempt,
         "role": charge.role,
@@ -3482,6 +3482,9 @@ def _encode_charge(charge: BudgetCharge) -> dict[str, object]:
         "warning": charge.warning,
         "reconciled": charge.reconciled,
     }
+    if charge.continuation is not None:
+        encoded["continuation"] = charge.continuation
+    return encoded
 
 
 def _decode_charge(value: dict[str, object]) -> BudgetCharge:
@@ -3495,6 +3498,7 @@ def _decode_charge(value: dict[str, object]) -> BudgetCharge:
         delta_tokens=cast(int | None, value["delta_tokens"]),
         warning=cast(bool, value["warning"]),
         reconciled=cast(bool, value["reconciled"]),
+        continuation=cast(str | None, value.get("continuation")),
     )
 
 

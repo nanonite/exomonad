@@ -112,6 +112,8 @@ def select_agent_type(
     capabilities: CapabilityMap | None = None,
     learned_policy: LearnedPolicy | None = None,
     requested_harness: str | None = None,
+    *,
+    ignore_budget: bool = False,
 ) -> HarnessChoice | None:
     """Select the cheapest allowed capable harness that still has budget.
 
@@ -122,12 +124,24 @@ def select_agent_type(
     set exactly as they do to an unconstrained one. A narrowed set with no
     survivor returns ``None`` and is explained by :func:`selection_failure`, so
     a request is either honored or refused -- never silently replaced.
+
+    ``ignore_budget`` resolves the route without the remaining-ceiling filter.
+    A same-slice continuation uses it because its route is the operator's
+    configured route: the ledger must refuse an unaffordable continuation
+    rather than substitute a different harness for it.
     """
     role_policy = _role_policy(policy, role)
     capability_map = capabilities or load_capability()
     classification = classify_task(slice)
     candidates = _candidates(
-        slice, role, role_policy, ledger, capability_map, classification, requested_harness
+        slice,
+        role,
+        role_policy,
+        ledger,
+        capability_map,
+        classification,
+        requested_harness,
+        ignore_budget=ignore_budget,
     )
     if not candidates:
         return None
@@ -148,6 +162,67 @@ def select_agent_type(
         role_budget=role_policy.token_budget,
         harness_budget=role_policy.per_harness_budget.get(harness),
         requested_harness=requested_harness,
+    )
+
+
+def configured_continuation_harness(
+    slice: SliceState,
+    role: str,
+    policy: HarnessPolicy,
+    learned_policy: LearnedPolicy | None = None,
+) -> str:
+    """Return the role route a same-slice continuation runs on.
+
+    A continuation does not rediscover work: the operator's configured route is
+    the role's allowlist entry ordered by the selector's own cost rank, learned
+    preference, and allow order. The capability and remaining-budget filters are
+    dispatch-selection concerns; the ledger is what refuses an unaffordable
+    continuation, so skipping them here cannot widen a ceiling or substitute a
+    harness.
+    """
+    role_policy = _role_policy(policy, role)
+    classification = classify_task(slice)
+    return min(
+        role_policy.allow,
+        key=lambda harness: _selection_key(
+            (harness, 0), role_policy, classification, role, learned_policy
+        ),
+    )
+
+
+def continuation_choice(
+    slice: SliceState,
+    role: str,
+    policy: HarnessPolicy,
+    harness: str,
+) -> HarnessChoice:
+    """Return the charge metadata for a continuation on a resolved harness.
+
+    A ``resume_pr`` or ``resume_blocked_leaf`` continuation runs on a route the
+    controller already resolved (the current configured role route, or the
+    accepted route the resume effect carries). This helper applies the
+    selector's own estimate rule to that route and attaches the same role and
+    per-harness ceilings, so the ledger's charge is identical in shape to a
+    dispatch charge. It does not select, widen, or bypass anything: a harness
+    outside the role's allowlist is refused.
+    """
+    role_policy = _role_policy(policy, role)
+    if harness not in role_policy.allow:
+        raise ValueError(
+            f"continuation harness {harness!r} is not allowed for role {role!r}"
+        )
+    classification = classify_task(slice)
+    cost = estimate_cost(slice, classification.difficulty, role_policy.cost_rank[harness])
+    return HarnessChoice(
+        harness=harness,
+        reason="continuation",
+        difficulty=classification.difficulty,
+        matched_rule=classification.matched_rule_name,
+        estimated_cost=cost,
+        candidate_set=(harness,),
+        role=role,
+        role_budget=role_policy.token_budget,
+        harness_budget=role_policy.per_harness_budget.get(harness),
     )
 
 
@@ -241,12 +316,14 @@ def _candidates(
     capabilities: CapabilityMap,
     classification: Classification,
     requested_harness: str | None = None,
+    *,
+    ignore_budget: bool = False,
 ) -> list[tuple[str, int]]:
     capable = _capable_harnesses(slice, role_policy, capabilities, classification, requested_harness)
     result: list[tuple[str, int]] = []
     for harness in capable:
         cost = estimate_cost(slice, classification.difficulty, role_policy.cost_rank[harness])
-        if _within_budget(ledger, role, role_policy, harness, cost):
+        if ignore_budget or _within_budget(ledger, role, role_policy, harness, cost):
             result.append((harness, cost))
     return result
 
@@ -381,6 +458,8 @@ __all__ = [
     "HarnessRoute",
     "SelectionFailure",
     "SelectionLedger",
+    "configured_continuation_harness",
+    "continuation_choice",
     "estimate_cost",
     "parse_harness_identifier",
     "policy_approved_candidates",

@@ -439,6 +439,16 @@ the run checkpoint's `budgets.ledger.role_spent.tl` counter before the result
 can drive another controller action; continuation restores that counter before
 allowing another roles.tl call.
 
+A worker slice reserves budget when it is dispatched and again for each
+same-slice continuation (`resume_pr`, `resume_blocked_leaf`) on the route that
+continuation actually runs. The continuation charge is the same ledger record
+and reconciliation a dispatch uses, names a stable continuation identity so a
+replayed continuation is charged once, and never rewrites the earlier harness's
+spend. If either the role ceiling or the continuation harness's
+`per_harness_budget` would be exceeded, the resume is not issued: the slice is
+parked with `park_cause=budget_exhausted` and the needs-human issue path, and
+the route is never silently switched to a cheaper harness.
+
 Task duration uses one explicit precedence: a slice's `task_timeout_seconds` in
 `plan.json` overrides the role's value in `.exo/harness_policy.toml`, which
 overrides project `tl_task_timeout_seconds`, which defaults to 3600 seconds.
