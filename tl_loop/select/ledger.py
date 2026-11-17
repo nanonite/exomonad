@@ -159,6 +159,84 @@ def find_continuation_charge(
     return matches[0] if matches else None
 
 
+def retarget_continuation(
+    ledger: LedgerInput,
+    slice_id: str,
+    continuation_id: str,
+    choice: HarnessChoice,
+) -> dict[str, object]:
+    """Move one pending continuation reservation to the route actually launched.
+
+    This rewrites the same reservation and charge record; it does not create a
+    second charge or a second counter path. The old reservation is released
+    before the new ceiling check, so a retarget can never widen the role or
+    per-harness ceiling. A charge already naming the requested route and
+    estimate is returned unchanged, which makes a replayed continuation
+    idempotent.
+    """
+    slice_id = _non_empty(slice_id, "slice_id")
+    continuation_id = _non_empty(continuation_id, "continuation_id")
+    role = _non_empty(choice.role, "choice.role")
+    harness = _non_empty(choice.harness, "choice.harness")
+    estimated = _non_negative(choice.estimated_cost, "choice.estimated_cost")
+    if estimated == 0:
+        raise LedgerError("choice.estimated_cost must be positive")
+    result = _document(ledger)
+    charges = _charges(result)
+    index = _pending_charge_index(charges, slice_id, continuation_id)
+    if index is None:
+        raise ChargeNotFound(
+            f"no pending continuation charge exists for slice {slice_id!r}"
+        )
+    charge = dict(charges[index])
+    old_estimate = _non_negative(charge["estimated_tokens"], "charge.estimated_tokens")
+    old_role = _non_empty(cast(str, charge["role"]), "charge.role")
+    old_harness = _non_empty(cast(str, charge["harness"]), "charge.harness")
+    if (old_role, old_harness, old_estimate) == (role, harness, estimated):
+        return result
+
+    role_reserved = _counter(result, "role_reserved")
+    harness_reserved = _counter(result, "harness_reserved")
+    role_spent = _counter(result, "role_spent")
+    harness_spent = _counter(result, "harness_spent")
+    if (
+        role_reserved.get(old_role, 0) < old_estimate
+        or harness_reserved.get(old_harness, 0) < old_estimate
+    ):
+        raise LedgerError("reservation is smaller than the charge estimate")
+    role_reserved[old_role] -= old_estimate
+    harness_reserved[old_harness] -= old_estimate
+    _drop_zero(role_reserved, old_role)
+    _drop_zero(harness_reserved, old_harness)
+
+    role_limit = choice.role_budget
+    harness_limit = choice.harness_budget
+    if (
+        role_limit is not None
+        and role_reserved.get(role, 0) + role_spent.get(role, 0) + estimated > role_limit
+    ):
+        raise BudgetCeilingExceeded(f"role {role!r} budget would be exceeded")
+    if (
+        harness_limit is not None
+        and harness_reserved.get(harness, 0) + harness_spent.get(harness, 0) + estimated
+        > harness_limit
+    ):
+        raise BudgetCeilingExceeded(f"harness {harness!r} budget would be exceeded")
+
+    role_reserved[role] = role_reserved.get(role, 0) + estimated
+    harness_reserved[harness] = harness_reserved.get(harness, 0) + estimated
+    result["role_reserved"] = role_reserved
+    result["harness_reserved"] = harness_reserved
+    result["role_spent"] = role_spent
+    result["harness_spent"] = harness_spent
+    charge["role"] = role
+    charge["harness"] = harness
+    charge["estimated_tokens"] = estimated
+    charges[index] = charge
+    result["charges"] = charges
+    return result
+
+
 
 def reconcile(
     ledger: LedgerInput,
@@ -328,6 +406,31 @@ def apply_continuation_reconcile(
     return apply(run_dir, mutate, lock_timeout=lock_timeout, hooks=hooks)
 
 
+def apply_continuation_retarget(
+    run_dir: str | Path,
+    slice_id: str,
+    continuation_id: str,
+    choice: HarnessChoice,
+    *,
+    lock_timeout: float = 5.0,
+    hooks: WriteHooks | None = None,
+) -> Document:
+    """Move one pending continuation reservation to the launched route atomically."""
+
+    def mutate(document: Document) -> Document:
+        document["budgets"] = {
+            "ledger": retarget_continuation(
+                _document_mapping(document, "continuation"),
+                slice_id,
+                continuation_id,
+                choice,
+            )
+        }
+        return document
+
+    return apply(run_dir, mutate, lock_timeout=lock_timeout, hooks=hooks)
+
+
 def _document_mapping(document: Mapping[str, object], label: str) -> Mapping[str, object]:
     budgets = document.get("budgets")
     if not isinstance(budgets, Mapping):
@@ -452,10 +555,12 @@ __all__ = [
     "LedgerError",
     "apply_continuation_and_charge",
     "apply_continuation_reconcile",
+    "apply_continuation_retarget",
     "apply_spawn_and_charge",
     "charge_continuation",
     "charge_spawn",
     "find_continuation_charge",
     "reconcile",
     "resolve_actual_tokens",
+    "retarget_continuation",
 ]

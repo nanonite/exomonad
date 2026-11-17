@@ -511,6 +511,13 @@ to agree with the same role's allow list before it starts a controller; the
 guard still accepts either source for an already-running dispatch. See
 [docs/guides/changing-routes-mid-run.md](../../../docs/guides/changing-routes-mid-run.md).
 
+The `resume_pr` response's `InvocationHandoff` also carries the launched
+`runtime`, `model`, and `effort` (proto fields 3, 11, and 12). The controller
+uses them to meter the continuation on the exact route this host launched
+instead of inferring it from the Python allowlist ordering. They are launch
+evidence only: the handoff never widens the allowlist and does not replace the
+accepted role-route receipt used by blocked-leaf recovery.
+
 The reviewer is the same rule with a role-specific route. Reviewer spawns read
 `configured_runtime_route("reviewer")` (`[reviewer]` in `config.toml`); they do
 not pass through the worker harness-switch guard because there is no caller

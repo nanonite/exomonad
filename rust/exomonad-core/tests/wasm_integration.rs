@@ -810,6 +810,7 @@ impl EffectHandler for MockAgentHandler {
                     ready: true,
                     outcome: "started".into(),
                     role_route: None,
+                    ..Default::default()
                 });
                 Ok(SpawnLeafSubtreeResponse {
                     agent: Some(agent),

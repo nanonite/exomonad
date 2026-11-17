@@ -757,6 +757,11 @@ PARK_AUDIT_KEYS = frozenset(
         "publication_attempt",
         "publication_approval_consumed",
         "missing_evidence",
+        "continuation",
+        "reserved_harness",
+        "launched_harness",
+        "role",
+        "estimated_tokens",
     }
 )
 RECOVERY_KEYS = frozenset(
@@ -1967,6 +1972,8 @@ def _park_audit(value: object, path: str, errors: list[tuple[str, str]]) -> None
         _non_negative_int(audit, "attempt", f"{path}.park_audit", errors)
     if "publication_attempt" in audit:
         _non_negative_int(audit, "publication_attempt", f"{path}.park_audit", errors)
+    if "estimated_tokens" in audit:
+        _non_negative_int(audit, "estimated_tokens", f"{path}.park_audit", errors)
     if "missing_evidence" in audit:
         _string_list(audit, "missing_evidence", f"{path}.park_audit", errors, allow_empty=True)
     for key in (
@@ -2000,6 +2007,10 @@ def _park_audit(value: object, path: str, errors: list[tuple[str, str]]) -> None
         "activity_identity_sha256",
         "superseded_by_epoch",
         "supersession_reason",
+        "continuation",
+        "reserved_harness",
+        "launched_harness",
+        "role",
     ):
         if key in audit:
             _nullable_string(audit, key, f"{path}.park_audit", errors)

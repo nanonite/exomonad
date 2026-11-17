@@ -9,7 +9,11 @@ from math import ceil
 
 from tl_loop.select.capability import CapabilityMap, load_capability
 from tl_loop.select.classify import Classification, Difficulty, classify_task
-from tl_loop.select.harness import HarnessRoute, parse_harness_identifier
+from tl_loop.select.harness import (
+    HarnessRoute,
+    normalize_runtime_label,
+    parse_harness_identifier,
+)
 from tl_loop.select.learned_policy import LearnedPolicy
 from tl_loop.select.policy import HarnessPolicy, RolePolicy
 from tl_loop.state.schema import BudgetLedger, SliceState, Verdict
@@ -171,14 +175,15 @@ def configured_continuation_harness(
     policy: HarnessPolicy,
     learned_policy: LearnedPolicy | None = None,
 ) -> str:
-    """Return the role route a same-slice continuation runs on.
+    """Return the route the pre-effect continuation reservation is taken against.
 
-    A continuation does not rediscover work: the operator's configured route is
-    the role's allowlist entry ordered by the selector's own cost rank, learned
-    preference, and allow order. The capability and remaining-budget filters are
-    dispatch-selection concerns; the ledger is what refuses an unaffordable
-    continuation, so skipping them here cannot widen a ceiling or substitute a
-    harness.
+    The host resolves the route a ``resume_pr`` actually launches from
+    ``config.toml``, which this controller cannot read. Until the effect
+    confirms that route, the reservation uses the role's allowlist entry
+    ordered by the selector's own cost rank, learned preference, and allow
+    order. The confirmed invocation handoff then retargets the reservation to
+    the route the host launched, so this value is a reservation guess and never
+    the settled charge.
     """
     role_policy = _role_policy(policy, role)
     classification = classify_task(slice)
@@ -196,15 +201,17 @@ def continuation_choice(
     policy: HarnessPolicy,
     harness: str,
 ) -> HarnessChoice:
-    """Return the charge metadata for a continuation on a resolved harness.
+    """Return the charge metadata for a continuation on a resolved route.
 
     A ``resume_pr`` or ``resume_blocked_leaf`` continuation runs on a route the
-    controller already resolved (the current configured role route, or the
-    accepted route the resume effect carries). This helper applies the
-    selector's own estimate rule to that route and attaches the same role and
-    per-harness ceilings, so the ledger's charge is identical in shape to a
-    dispatch charge. It does not select, widen, or bypass anything: a harness
-    outside the role's allowlist is refused.
+    host resolved: ``resume_blocked_leaf`` carries the accepted route, and
+    ``resume_pr`` carries the launched route in its invocation handoff after the
+    effect. The pre-effect reservation uses the configured-allowlist guess until
+    that handoff confirms the route. This helper applies the selector's own
+    estimate rule to the named route and attaches the same role and per-harness
+    ceilings, so the ledger's charge is identical in shape to a dispatch charge.
+    It does not select, widen, or bypass anything: a harness outside the role's
+    allowlist is refused.
     """
     role_policy = _role_policy(policy, role)
     if harness not in role_policy.allow:
@@ -223,6 +230,43 @@ def continuation_choice(
         role=role,
         role_budget=role_policy.token_budget,
         harness_budget=role_policy.per_harness_budget.get(harness),
+    )
+
+
+def continuation_harness_for_route(
+    policy: HarnessPolicy,
+    role: str,
+    agent_type: str,
+    model: str | None,
+) -> str:
+    """Return the allowlist entry that names the launched route.
+
+    The host resolves the real route from ``config.toml``; this helper only maps
+    that resolved ``agent_type``/``model`` back to the operator's allowlist so
+    the ledger can key the per-harness ceiling. A model-qualified entry wins
+    over a bare entry for the same harness, and a bare entry allows any model,
+    matching the init consistency rule. A route the role cannot run on is a
+    refusal, never a substitution.
+    """
+    normalized = normalize_runtime_label(agent_type)
+    if normalized is None:
+        raise ValueError(f"unsupported launched harness {agent_type!r}")
+    model = model.strip() if isinstance(model, str) and model.strip() else None
+    role_policy = _role_policy(policy, role)
+    bare: str | None = None
+    for harness in role_policy.allow:
+        parsed = parse_harness_identifier(harness)
+        if parsed.agent_type != normalized:
+            continue
+        if parsed.model == model:
+            return harness
+        if parsed.model is None and bare is None:
+            bare = harness
+    if bare is not None:
+        return bare
+    launch = normalized if model is None else f"{normalized}/{model}"
+    raise ValueError(
+        f"launched continuation harness {launch!r} is not allowed for role {role!r}"
     )
 
 
@@ -460,6 +504,7 @@ __all__ = [
     "SelectionLedger",
     "configured_continuation_harness",
     "continuation_choice",
+    "continuation_harness_for_route",
     "estimate_cost",
     "parse_harness_identifier",
     "policy_approved_candidates",

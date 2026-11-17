@@ -895,25 +895,38 @@ invocation that spends tokens, so it reserves a charge through
 `tl_loop/select/ledger.py`, and settles through the same `reconcile`. It names
 the continuation by a stable identity derived from the action/effect intent, so
 a replayed continuation is never charged twice and is distinct from the
-attempt's dispatch charge. The continuation charge names the route the resume
-actually runs on: the configured role route for `resume_pr` (the role allow
-list ordered by the selector's cost rank) and the accepted route carried by the
-resume effect for `resume_blocked_leaf`. The earlier harness's `harness_spent`
-is never rewritten.
+attempt's dispatch charge. `resume_blocked_leaf` reserves and settles the
+accepted route its effect carries.
+
+`resume_pr` resolves its real route in the host, not in Python. The controller
+cannot read `config.toml`, so before the effect it reserves against the
+configured-allowlist guess (`configured_continuation_harness`: the role's
+cost-ranked entry). The confirmed invocation handoff returns the launched
+`runtime`, `model`, and `effort`; `_launch_route_from_result` reads them and
+`continuation_harness_for_route` names the matching allowlist entry without
+widening it. `_settle_continuation_to_launched_route` then calls
+`retarget_continuation` on the same pending charge, releasing the old
+reservation before the new ceiling check, and only then reconciles. The charge
+therefore always names the launched route, in both directions; no second charge
+or counter path is created. If the launched route exceeds the role or
+per-harness ceiling, the controller releases the reservation and parks with
+`park_cause=budget_exhausted`, recording the reserved and launched routes in
+`park_audit`. A host response without invocation coordinates (a legacy result)
+keeps the reservation route conservatively, with no invented route.
 
 The continuation uses the selector's own estimate rule
 (`estimate_cost` with the role's `cost_rank`) and the same role and harness
-ceilings. If the estimate would exceed either ceiling, the resume is not
-issued: the slice is parked with `park_cause=budget_exhausted` and the existing
-needs-human issue path, and `park_audit` records the continuation identity,
-harness, role, estimate, and refusal reason. The route is never retargeted to
-another harness and the old harness is never charged as a fallback. A resume
-that is refused before it runs releases its reservation by reconciling the
-charge with a zero actual. `slice.attempts`, `review_rounds`,
+ceilings. The earlier dispatch's spend and the original harness's counters are
+never rewritten. A resume that is refused before it runs releases its
+reservation by reconciling the charge with a zero actual. The handoff is also
+the measured-usage source when a host reports it; the current resume response
+carries no usage, so continuations settle `actual="unknown"` and conserve the
+estimate. `slice.attempts`, `review_rounds`,
 `tl_intervention_attempts`, `escalate_after_attempts`, and the harness
 escalation ladder are not inputs or outputs of the charge. The charge record
 carries one extra optional `continuation` field; checkpoints written before it
-decode with `continuation=None` and behave unchanged.
+decode with `continuation=None` and behave unchanged. No new checkpoint field
+was added for route retargeting: the same charge record is rewritten in place.
 
 A selector result of None with SelectionFailure.OVER_BUDGET is a bounded needs-human parking signal; the controller must not widen the allowlist or silently raise a ceiling to continue.
 

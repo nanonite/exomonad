@@ -139,6 +139,8 @@ data SpawnResult = SpawnResult
     invocationId :: Maybe Text,
     invocationTrigger :: Maybe Text,
     invocationRuntime :: Maybe Text,
+    invocationModel :: Maybe Text,
+    invocationEffort :: Maybe Text,
     routingTargetType :: Maybe Text,
     routingTargetId :: Maybe Text,
     invocationFresh :: Maybe Bool,
@@ -161,6 +163,8 @@ instance FromJSON SpawnResult where
       <*> v .:? "invocation_id"
       <*> v .:? "invocation_trigger"
       <*> v .:? "invocation_runtime"
+      <*> v .:? "invocation_model"
+      <*> v .:? "invocation_effort"
       <*> v .:? "routing_target_type"
       <*> v .:? "routing_target_id"
       <*> v .:? "invocation_fresh"
@@ -181,6 +185,8 @@ instance ToJSON SpawnResult where
         invocationId
         invocationTrigger
         invocationRuntime
+        invocationModel
+        invocationEffort
         routingTargetType
         routingTargetId
         invocationFresh
@@ -199,6 +205,8 @@ instance ToJSON SpawnResult where
           "invocation_id" .= invocationId,
           "invocation_trigger" .= invocationTrigger,
           "invocation_runtime" .= invocationRuntime,
+          "invocation_model" .= invocationModel,
+          "invocation_effort" .= invocationEffort,
           "routing_target_type" .= routingTargetType,
           "routing_target_id" .= routingTargetId,
           "invocation_fresh" .= invocationFresh,
@@ -405,6 +413,8 @@ runAgentControlSuspend = interpret $ \case
                     { invocationId = Just (toText (PA.invocationHandoffInvocationId handoff)),
                       invocationTrigger = Just (toText (PA.invocationHandoffTrigger handoff)),
                       invocationRuntime = Just (toText (PA.invocationHandoffRuntime handoff)),
+                      invocationModel = Just (toText (PA.invocationHandoffModel handoff)),
+                      invocationEffort = Just (toText (PA.invocationHandoffEffort handoff)),
                       routingTargetType = Just (toText (PA.invocationHandoffTargetType handoff)),
                       routingTargetId = Just (toText (PA.invocationHandoffTargetId handoff)),
                       invocationFresh = Just (PA.invocationHandoffFresh handoff),
@@ -534,6 +544,8 @@ protoAgentInfoToSpawnResult info =
       invocationId = Nothing,
       invocationTrigger = Nothing,
       invocationRuntime = Nothing,
+      invocationModel = Nothing,
+      invocationEffort = Nothing,
       routingTargetType = Nothing,
       routingTargetId = Nothing,
       invocationFresh = Nothing,
@@ -549,6 +561,8 @@ applyInvocationHandoff result (Just handoff) =
     { invocationId = Just (toText (PA.invocationHandoffInvocationId handoff)),
       invocationTrigger = Just (toText (PA.invocationHandoffTrigger handoff)),
       invocationRuntime = Just (toText (PA.invocationHandoffRuntime handoff)),
+      invocationModel = Just (toText (PA.invocationHandoffModel handoff)),
+      invocationEffort = Just (toText (PA.invocationHandoffEffort handoff)),
       routingTargetType = Just (toText (PA.invocationHandoffTargetType handoff)),
       routingTargetId = Just (toText (PA.invocationHandoffTargetId handoff)),
       invocationFresh = Just (PA.invocationHandoffFresh handoff),

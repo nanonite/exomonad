@@ -29328,6 +29328,301 @@ def test_charged_continuation_keeps_attempts_review_rounds_and_interventions(
     assert after.repair_attempts == 0
 
 
+CONFIGURED_RESUME_HARNESS = "codex/gpt-6.1-sol"
+CHEAP_RESUME_HARNESS = "opencode/deepseek-v4.1-flash"
+
+
+def _resume_route_policy(
+    first: str,
+    second: str,
+    *,
+    per_harness_budget: dict[str, int] | None = None,
+) -> HarnessPolicy:
+    """Two worker entries whose cost order can differ from the launched route."""
+    budgets = per_harness_budget or {first: 80000, second: 80000}
+    role = {
+        "allow": [first, second],
+        "cost_rank": {first: 1, second: 5},
+        "token_budget": 200000,
+        "per_harness_budget": budgets,
+        "escalate_after_attempts": 1,
+    }
+    return validate_policy(
+        {"roles": {role_name: dict(role) for role_name in ("tl", "worker", "reviewer")}}
+    )
+
+
+class _LaunchedRouteTransport(_ReviewContinuationTransport):
+    """Answer ``resume_pr`` with the exact route the host actually launched."""
+
+    def __init__(
+        self,
+        store: RunStore,
+        *,
+        runtime: str,
+        model: str | None,
+        effort: str | None = None,
+        usage: Mapping[str, JsonValue] | None = None,
+    ) -> None:
+        super().__init__()
+        self.store = store
+        self.runtime = runtime
+        self.model = model
+        self.effort = effort
+        self.usage = usage
+        self.reserved_at_resume: list[dict[str, int]] = []
+        self.spent_at_resume: list[dict[str, int]] = []
+
+    def call_tool(
+        self, role: str, name: str, tool_name: str, arguments: JsonObject
+    ) -> JsonObject:
+        if tool_name != "resume_pr":
+            return super().call_tool(role, name, tool_name, arguments)
+        self.calls.append((tool_name, arguments))
+        state = self.store.load()
+        self.reserved_at_resume.append(dict(state.budgets.harness_reserved))
+        self.spent_at_resume.append(dict(state.budgets.harness_spent))
+        result: JsonObject = {
+            "agent": {
+                "id": "review-pr-42-codex",
+                "agent_type": self.runtime,
+                "branch_name": "main.leaf-a",
+                "is_alive": True,
+            },
+            "invocation": {
+                "invocation_id": "invocation-resumed-1",
+                "trigger": "resume_pr",
+                "runtime": self.runtime,
+                "model": self.model,
+                "effort": self.effort,
+                "branch_name": "main.leaf-a",
+                "target_type": "window",
+                "target_id": "@43",
+                "fresh": True,
+                "ready": True,
+                "outcome": "started",
+            },
+        }
+        if self.usage is not None:
+            result["usage"] = dict(self.usage)
+        return {"success": True, "result": result}
+
+
+def _dispatch_resume_repair(
+    pr: Mapping[str, object],
+    live: EffectClient,
+    dispatch: Callable[[JsonObject], object],
+) -> object:
+    return dispatch(
+        {
+            "pr_number": cast(JsonValue, pr["pr_number"]),
+            "expected_head_sha": "head-a",
+            "task": "fix the failure path",
+        }
+    )
+
+
+def _repair_once(
+    store: RunStore,
+    config: TLLoopConfig,
+    transport: ReviewRepairTransport,
+    effects_log: list[EffectIntent] | EffectJournal | None = None,
+) -> RunState:
+    return driver_module._route_repair(
+        store,
+        store.load(),
+        TLPlanning(),
+        1,
+        "leaf-a",
+        config,
+        EffectClient(transport),
+        [] if effects_log is None else cast(list[EffectIntent], effects_log),
+        _dispatch_resume_repair,
+    )
+
+
+def test_resume_pr_continuation_charges_the_launched_route_not_the_cheapest_entry(
+    tmp_path: Path,
+) -> None:
+    """A two-entry allowlist must be charged to the route Rust launched, not cost rank."""
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    config = _review_continuation_config(
+        _resume_route_policy(CHEAP_RESUME_HARNESS, CONFIGURED_RESUME_HARNESS)
+    )
+    transport = _LaunchedRouteTransport(
+        store, runtime="codex", model="gpt-6.1-sol", effort="xhigh"
+    )
+    expected = _continuation_estimate(
+        store.load(), config, "leaf-a", CONFIGURED_RESUME_HARNESS
+    )
+
+    state = _repair_once(store, config, transport)
+
+    assert [name for name, _ in transport.calls if name == "resume_pr"] == ["resume_pr"]
+    charges = _continuation_charges(state, "leaf-a")
+    assert len(charges) == 1
+    assert charges[0].harness == CONFIGURED_RESUME_HARNESS
+    assert charges[0].reconciled is True
+    assert state.budgets.harness_spent[CONFIGURED_RESUME_HARNESS] == expected
+    assert CHEAP_RESUME_HARNESS not in state.budgets.harness_spent
+    assert state.budgets.harness_reserved == {}
+    assert state.budgets.role_reserved == {}
+
+
+def test_continuation_reserves_before_the_resume_effect_and_settles_after(
+    tmp_path: Path,
+) -> None:
+    """The reservation exists at the effect boundary; settlement happens after it."""
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    config = _review_continuation_config(
+        _resume_route_policy(CHEAP_RESUME_HARNESS, CONFIGURED_RESUME_HARNESS)
+    )
+    transport = _LaunchedRouteTransport(
+        store, runtime="codex", model="gpt-6.1-sol", effort="xhigh"
+    )
+    reserved = _continuation_estimate(store.load(), config, "leaf-a", CHEAP_RESUME_HARNESS)
+
+    state = _repair_once(store, config, transport)
+
+    assert transport.reserved_at_resume == [{CHEAP_RESUME_HARNESS: reserved}]
+    assert transport.spent_at_resume == [{"codex/test-model": 7}]
+    assert state.budgets.harness_reserved == {}
+    assert state.budgets.harness_spent["codex/test-model"] == 7
+
+
+def test_continuation_retargets_down_when_the_launched_route_is_cheaper(
+    tmp_path: Path,
+) -> None:
+    """The reservation follows the launched route in both directions, never the guess."""
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    config = _review_continuation_config(
+        _resume_route_policy(CONFIGURED_RESUME_HARNESS, CHEAP_RESUME_HARNESS)
+    )
+    transport = _LaunchedRouteTransport(
+        store, runtime="opencode", model="deepseek-v4.1-flash", effort="high"
+    )
+    expected = _continuation_estimate(
+        store.load(), config, "leaf-a", CHEAP_RESUME_HARNESS
+    )
+
+    state = _repair_once(store, config, transport)
+
+    charges = _continuation_charges(state, "leaf-a")
+    assert len(charges) == 1
+    assert charges[0].harness == CHEAP_RESUME_HARNESS
+    assert state.budgets.harness_spent[CHEAP_RESUME_HARNESS] == expected
+    assert CONFIGURED_RESUME_HARNESS not in state.budgets.harness_spent
+    assert state.budgets.harness_reserved == {}
+
+
+def test_continuation_launched_route_over_its_ceiling_parks_budget_exhausted(
+    tmp_path: Path,
+) -> None:
+    """An under-reserved launch that cannot be charged parks instead of widening."""
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    config = _review_continuation_config(
+        _resume_route_policy(
+            CHEAP_RESUME_HARNESS,
+            CONFIGURED_RESUME_HARNESS,
+            per_harness_budget={CHEAP_RESUME_HARNESS: 80000, CONFIGURED_RESUME_HARNESS: 1},
+        )
+    )
+    transport = _LaunchedRouteTransport(
+        store, runtime="codex", model="gpt-6.1-sol", effort="xhigh"
+    )
+
+    state = _repair_once(store, config, transport)
+
+    assert [name for name, _ in transport.calls if name == "resume_pr"] == ["resume_pr"]
+    leaf = state.slices["leaf-a"]
+    assert leaf.status is SliceStatus.PARKED
+    assert leaf.park_cause is ParkCause.BUDGET_EXHAUSTED
+    assert leaf.park_audit is not None
+    assert leaf.park_audit["launched_harness"] == CONFIGURED_RESUME_HARNESS
+    assert leaf.park_audit["reserved_harness"] == CHEAP_RESUME_HARNESS
+    assert "budget" in str(leaf.park_audit["reason"])
+    assert state.budgets.harness_reserved == {}
+    assert state.budgets.role_reserved == {}
+    assert {key: value for key, value in state.budgets.harness_spent.items() if value} == {
+        "codex/test-model": 7
+    }
+
+
+def test_continuation_settles_measured_usage_when_the_resume_reports_it(
+    tmp_path: Path,
+) -> None:
+    """Measured per-invocation usage replaces the estimate through reconcile."""
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    config = _review_continuation_config(
+        _resume_route_policy(CHEAP_RESUME_HARNESS, CONFIGURED_RESUME_HARNESS)
+    )
+    usage = {"input_tokens": 11, "output_tokens": 9}
+    transport = _LaunchedRouteTransport(
+        store, runtime="codex", model="gpt-6.1-sol", effort="xhigh", usage=usage
+    )
+    expected = _continuation_estimate(
+        store.load(), config, "leaf-a", CONFIGURED_RESUME_HARNESS
+    )
+
+    state = _repair_once(store, config, transport)
+
+    charge = _continuation_charges(state, "leaf-a")[0]
+    assert charge.actual == 20
+    assert charge.delta_tokens == 20 - expected
+    assert charge.warning is (abs(20 - expected) / max(expected, 1) > 0.20)
+    assert state.budgets.harness_spent[CONFIGURED_RESUME_HARNESS] == 20
+    assert state.budgets.harness_reserved == {}
+
+
+def test_continuation_without_measured_usage_keeps_the_estimate_and_warns(
+    tmp_path: Path,
+) -> None:
+    """Missing usage is never invented: the estimate is conserved with a warning."""
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    config = _review_continuation_config(
+        _resume_route_policy(CHEAP_RESUME_HARNESS, CONFIGURED_RESUME_HARNESS)
+    )
+    transport = _LaunchedRouteTransport(
+        store, runtime="codex", model="gpt-6.1-sol", effort="xhigh"
+    )
+    expected = _continuation_estimate(
+        store.load(), config, "leaf-a", CONFIGURED_RESUME_HARNESS
+    )
+
+    state = _repair_once(store, config, transport)
+
+    charge = _continuation_charges(state, "leaf-a")[0]
+    assert charge.actual == "unknown"
+    assert charge.delta_tokens is None
+    assert charge.warning is True
+    assert state.budgets.harness_spent[CONFIGURED_RESUME_HARNESS] == expected
+
+
+def test_replayed_continuation_route_reconciliation_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    """Replaying the confirmed effect neither recharges nor moves spend again."""
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    config = _review_continuation_config(
+        _resume_route_policy(CHEAP_RESUME_HARNESS, CONFIGURED_RESUME_HARNESS)
+    )
+    transport = _LaunchedRouteTransport(
+        store, runtime="codex", model="gpt-6.1-sol", effort="xhigh"
+    )
+    journal = EffectJournal("review-run", store.run_dir / "action-journal.json")
+
+    first = _repair_once(store, config, transport, journal)
+    settled = _continuation_charges(first, "leaf-a")
+    assert len(settled) == 1
+
+    replayed = _repair_once(store, config, transport, journal)
+
+    assert [name for name, _ in transport.calls if name == "resume_pr"] == ["resume_pr"]
+    assert _continuation_charges(replayed, "leaf-a") == settled
+    assert replayed.budgets.harness_spent == first.budgets.harness_spent
+    assert replayed.budgets.harness_reserved == {}
+
+
 @pytest.mark.parametrize(
     "field",
     ("owner", "scope", "worktree", "predecessor"),
@@ -31754,7 +32049,9 @@ def test_confirmed_repair_without_a_recorded_attempt_fails_closed(tmp_path: Path
     )
 
     with pytest.raises(TLLoopError, match="repair action is missing its attempt"):
-        driver_module._reconcile_confirmed_repair_actions(state, store, journal)
+        driver_module._reconcile_confirmed_repair_actions(
+            state, store, journal, TLLoopConfig(active=False)
+        )
 
 
 def test_exit_marker_matches_checkpoint_uses_child_store_load(tmp_path: Path) -> None:

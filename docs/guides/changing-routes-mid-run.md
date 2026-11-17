@@ -19,7 +19,7 @@ A slice's harness/model/effort is resolved in exactly one place:
 | harness | `tl_loop/select/agent_type.py:select_agent_type` | difficulty + capability + the role's `.exo/harness_policy.toml` allowlist + role/per-harness budget, narrowed by an optional plan request |
 | model | `tl_loop/select/model.py:select_model` / `select_model_for_difficulty` (called from `_selected_spawn_model`) | catalog tier for the selected harness, or the configured/requested model |
 | effort | `tl_loop/loop/driver.py:_dispatch_route_fields` | `config.worker_effort_level` plus the configuration/policy/manifest fingerprints |
-| route proof | Rust `spawn_leaf_subtree` / `resume_pr` / `resume_blocked_leaf` | accepted role route (configuration fingerprint + dispatch-intent event) or the configured role route |
+| route proof | Rust `spawn_leaf_subtree` / `resume_pr` / `resume_blocked_leaf` | accepted role route (configuration fingerprint + dispatch-intent event) or the configured role route; the resume response's invocation handoff returns the launched `runtime`/`model`/`effort` to the controller |
 | transition row | Rust `configured_route_transition_id` / `record_configured_route_transition` | `agent.harness_switch` carrying old and new harness/model/effort, prior invocation/generation, worktree fingerprint |
 
 `tl_loop/tests/test_route_seam.py` is a structural test over every
@@ -149,7 +149,7 @@ rejects a genuinely invalid run.
 | reviewer harness request surface | `spawn_reviewer` / `restart_review` effect arguments | PASS; neither carries harness/model/effort/agent-type, so there is no unguarded per-call reviewer harness override. A future field fails the structural test | `reviewer_effect_requests_cannot_override_the_configured_route` |
 | reviewer failure escalation | selector removes a failed worker harness after `roles.<role>.escalate_after_attempts` | N/A; no selector call and no model/harness escalation exists for the reviewer role. The configured `[reviewer]` route is the base and is not widened by an escalation | `test_no_reviewer_harness_escalation_path_exists` |
 | `escalate_after_attempts` | slice attempts + verdict decide when a harness leaves rotation | PASS; a configured change does not reset the counter, and a NO-GO on harness A selects another allowlisted harness | `test_no_go_escalates_only_after_attempt_threshold`, H4 test |
-| role budget / `per_harness_budget` | a dispatch reserves against the role and the selected harness; a same-slice `resume_pr`/`resume_blocked_leaf` continuation reserves again, on the route it actually runs | PASS for a new dispatch attempt: harness B is charged and harness A's spend is kept. PASS for a continuation: the resume-time route is charged (harness B), A's earlier spend is untouched, and the same ledger reconcile settles it | `test_harness_change_charges_the_new_harness_and_keeps_the_old_spend`, `test_harness_budget_is_charged_to_the_harness_that_actually_runs`, `test_configured_harness_switch_blocked_resume_charges_the_new_harness`, `test_review_repair_continuation_charges_the_configured_new_harness` |
+| role budget / `per_harness_budget` | a dispatch reserves against the role and the selected harness; a same-slice `resume_pr`/`resume_blocked_leaf` continuation reserves again, on the route it actually runs | PASS for a new dispatch attempt: harness B is charged and harness A's spend is kept. PASS for a continuation: the host's launched route is charged (harness B), A's earlier spend is untouched, and the same ledger reconcile settles it; a launched route that cannot be charged parks as budget exhausted | `test_harness_change_charges_the_new_harness_and_keeps_the_old_spend`, `test_harness_budget_is_charged_to_the_harness_that_actually_runs`, `test_configured_harness_switch_blocked_resume_charges_the_new_harness`, `test_resume_pr_continuation_charges_the_launched_route_not_the_cheapest_entry`, `test_continuation_retargets_down_when_the_launched_route_is_cheaper`, `test_continuation_launched_route_over_its_ceiling_parks_budget_exhausted` |
 | owner / scope / worktree / predecessor / epoch | exact identity binding | REFUSE on mismatch; the route change never relaxes them | `test_harness_change_does_not_weaken_identity_bindings`, `test_a_stale_controller_epoch_still_refuses_a_changed_harness_dispatch`, `test_a_stale_controller_epoch_is_still_rejected` |
 | worker harness change / reviewer dedup (A1) | the reviewer assignment and the watcher's exact-head `has_reviewer_invocation` dedup are keyed by the reviewer's own `Review` invocation for the PR/head | PASS; a configured Codex -> OpenCode change to the worker owner keeps one reviewer, one attempt, and the persisted verdict for the exact head | `reviewer_assignment_does_not_depend_on_the_worker_harness`, `test_worker_harness_change_keeps_the_same_head_verdict_and_merge` |
 | same-head CI after a worker harness change (A2) | CI observations bind to the exact head; success permits merge, failure sends one same-owner `resume_pr` | PASS; the route change does not retarget the owner or require a new reviewer | `test_worker_harness_change_keeps_the_same_head_verdict_and_merge`, `test_worker_harness_change_sends_one_same_owner_repair_on_ci_failure` |
@@ -165,20 +165,38 @@ harness. A same-slice `resume_pr` or `resume_blocked_leaf` continuation runs on
 a route too, so it reserves one continuation charge through the sibling
 `charge_continuation` in the same ledger, under a stable continuation identity
 (the effect/action intent key) that is distinct from the attempt's dispatch
-charge. `resume_pr` charges the configured role route resolved at resume time;
-`resume_blocked_leaf` charges the accepted route the resume effect carries.
+charge. `resume_blocked_leaf` reserves and settles the accepted route its resume
+effect carries.
+
+`resume_pr` cannot know the host's configured route before the effect, because
+Rust resolves it from `config.toml`. The controller therefore reserves against
+its configured-allowlist guess (the role's cost-ranked entry) before issuing the
+effect, then reads the route the host launched from the confirmed invocation
+handoff (`runtime`, `model`) and retargets the same charge to the allowlist
+entry naming that route. Retargeting releases the old reservation before the
+new ceiling check, so a continuation can never widen a ceiling; it is one
+atomic ledger mutation and leaves exactly one charge for the continuation.
+When the launched route differs in either direction the charge follows it:
+a dearer launch replaces a cheaper reservation and a cheaper launch releases the
+dearer one. If the launched route exceeds the role or per-harness ceiling, the
+controller releases the reservation and parks the slice with
+`park_cause=budget_exhausted`; the refusal and both routes are recorded in
+`park_audit`.
+
 The earlier dispatch's spend and the original harness's counters are never
 rewritten, and the reservation is settled by the same `reconcile` call a
 dispatch charge uses: a measured actual moves the estimate to spend, missing
 usage conserves the estimate with `actual="unknown"` and a warning, and a
 resume that is refused before running releases the reservation with a zero
-actual.
+actual. The resume handoff is also the measured-usage source when a host
+reports it; the current host response carries no usage, so today's continuation
+settles `actual="unknown"` at the launched route.
 
 Both ceilings still apply. If the continuation would exceed the role ceiling or
 the route harness's `per_harness_budget`, the resume is not issued: the slice is
 parked with `park_cause=budget_exhausted` and the existing needs-human issue
 path, with the refusal reason, continuation identity, harness, role, and
-estimate in `park_audit`. The route is never silently retargeted to a cheaper
+estimate in `park_audit`. A pre-effect refusal never substitutes a cheaper
 harness, and the old harness is never charged as a fallback. Same-harness
 continuations are charged by the same rule because they are real invocations
 that spend tokens; there is no route-change special case.

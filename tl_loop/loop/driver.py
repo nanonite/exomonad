@@ -247,6 +247,7 @@ from tl_loop.select.agent_type import (
     SelectionFailure,
     configured_continuation_harness,
     continuation_choice,
+    continuation_harness_for_route,
     parse_harness_identifier,
     select_agent_type,
     selection_failure,
@@ -259,6 +260,7 @@ from tl_loop.select.ledger import (
     DuplicateCharge,
     apply_continuation_and_charge,
     apply_continuation_reconcile,
+    apply_continuation_retarget,
     apply_spawn_and_charge,
     charge_continuation,
     find_continuation_charge,
@@ -4902,7 +4904,7 @@ def _prepare_startup_recovery(
         project_root=config.project_root,
         ledger_run_id=config.ledger_run_id,
     )
-    state = _reconcile_confirmed_repair_actions(state, store, effects_log)
+    state = _reconcile_confirmed_repair_actions(state, store, effects_log, config)
     state = _reconcile_dispatches(state, config, effects, store, effects_log)
     state = _reconcile_nonterminal_slices(plan, state, config, effects, store, effects_log)
     inconsistency = _recovery_inconsistency(plan, state)
@@ -8817,7 +8819,10 @@ def _resume_approved_blocked_leaf(
             )
         if pending_charge is not None and not pending_charge.reconciled:
             state = _settle_continuation_charge(
-                store, proof.leaf.name, continuation_id, None
+                store,
+                proof.leaf.name,
+                continuation_id,
+                _measured_usage_tokens(result),
             )
         try:
             successor = _validated_blocked_resume_result(proof, result)
@@ -16585,6 +16590,7 @@ def _reconcile_confirmed_repair_actions(
     state: RunState,
     store: RunStore,
     effects_log: list[EffectIntent],
+    config: TLLoopConfig,
 ) -> RunState:
     """Adopt a confirmed repair effect before retry derivation can run."""
     if not isinstance(effects_log, EffectJournal):
@@ -16620,11 +16626,33 @@ def _reconcile_confirmed_repair_actions(
             state.budgets, slice_id, continuation_id
         )
         if pending_charge is not None and not pending_charge.reconciled:
-            # The confirmed effect ran before the crash; conserve its estimate
-            # exactly as a dispatch charge reconciles without authoritative usage.
-            state = _settle_continuation_charge(
-                store, slice_id, continuation_id, None
-            )
+            # The confirmed effect ran before the crash. Read its launched route
+            # from the journal result and settle that route when it fits; the
+            # recovery boundary issues no human-gate effect, so an unchargeable
+            # launch keeps the existing reservation conservatively.
+            try:
+                result = effects_log.replay(confirmed)
+            except ActionJournalError:
+                result = None
+            try:
+                state = _settle_continuation_to_launched_route(
+                    store,
+                    slice_id,
+                    continuation_id,
+                    config,
+                    _launch_route_from_result(result),
+                    _measured_usage_tokens(result),
+                )
+            except ContinuationRouteError as error:
+                LOGGER.warning(
+                    "[TL loop] confirmed continuation %s could not be retargeted "
+                    "during startup recovery: %s; conserving the existing reservation",
+                    continuation_id,
+                    error.reason,
+                )
+                state = _settle_continuation_charge(
+                    store, slice_id, continuation_id, _measured_usage_tokens(result)
+                )
         state = _checkpoint_slice_action(
             store,
             state,
@@ -29692,14 +29720,16 @@ def _continuation_route_choice(
     *,
     harness: str | None = None,
 ) -> HarnessChoice | None:
-    """Resolve the route a same-slice continuation will run on.
+    """Resolve the route the pre-effect continuation reservation uses.
 
-    ``resume_pr`` runs the operator's currently configured worker route, which
-    is the role's allowlist ordered by the selector's own cost rank.
     ``resume_blocked_leaf`` already carries its accepted route and passes it as
-    ``harness``. Dispatch-only filters (capability and remaining budget) are not
-    reapplied: a continuation that cannot afford its configured route must be
-    refused by the ledger, not silently moved to a cheaper harness.
+    ``harness``. ``resume_pr`` cannot know the host's configured route before
+    the effect, so its reservation uses the role allowlist ordered by the
+    selector's own cost rank; the confirmed invocation handoff then retargets
+    the same charge to the route the host launched. Dispatch-only filters
+    (capability and remaining budget) are not reapplied: a continuation that
+    cannot afford its route must be refused by the ledger, not silently moved
+    to a cheaper harness.
 
     Returns None when the controller has no validated role policy; such a
     configuration does not charge a dispatch either.
@@ -29722,15 +29752,87 @@ def _continuation_charge_recorded(
     continuation_id: str,
     choice: HarnessChoice,
 ) -> bool:
-    """Whether this exact continuation is already charged to this route."""
+    """Whether this continuation already owns a charge record.
+
+    A pending record is the reservation made before the effect; a reconciled
+    record is a continuation that already ran. Neither needs a second charge, so
+    a replayed continuation stays idempotent even after the reservation was
+    retargeted to the launched route. The role is the one field a retarget never
+    changes, so a disagreement there is still a corrupted checkpoint.
+    """
     existing = find_continuation_charge(state.budgets, slice_id, continuation_id)
     if existing is None:
         return False
-    if existing.harness != choice.harness or existing.estimated_tokens != choice.estimated_cost:
+    if existing.role != choice.role:
         raise TLLoopError(
-            "continuation budget charge disagrees with its resolved continuation route"
+            "continuation budget charge disagrees with its resolved continuation role"
         )
     return True
+
+
+def _launch_route_from_result(result: ToolResult | None) -> HarnessRoute | None:
+    """Read the route the host reported for the invocation a resume launched."""
+    if result is None or result.success is not True:
+        return None
+    payload = result.result
+    invocation = payload.get("invocation") if isinstance(payload, Mapping) else None
+    if not isinstance(invocation, Mapping):
+        return None
+    runtime = normalize_runtime_label(invocation.get("runtime"))
+    if runtime is None:
+        return None
+    value = invocation.get("model")
+    model = value.strip() if isinstance(value, str) and value.strip() else None
+    return HarnessRoute(
+        harness=runtime if model is None else f"{runtime}/{model}",
+        agent_type=runtime,
+        model=model,
+    )
+
+
+def _measured_usage_tokens(result: ToolResult | None) -> int | None:
+    """Read a measured per-invocation usage total when the host reports one.
+
+    The shape matches the RLM envelope's ``usage`` object. No current resume
+    response carries it, so production continues to settle ``actual="unknown"``;
+    a malformed report is treated as absent rather than guessed.
+    """
+    if result is None or result.success is not True:
+        return None
+    payload = result.result
+    usage = payload.get("usage") if isinstance(payload, Mapping) else None
+    if usage is None:
+        return None
+    if not isinstance(usage, Mapping):
+        LOGGER.warning("[TL loop] resume usage is not an object; keeping the estimate")
+        return None
+    total = 0
+    for key in ("input_tokens", "output_tokens"):
+        value = usage.get(key, 0)
+        if type(value) is not int or value < 0:
+            LOGGER.warning(
+                "[TL loop] resume usage %s is invalid; keeping the estimate", key
+            )
+            return None
+        total += value
+    return total
+
+
+def _launched_continuation_choice(
+    current: SliceState,
+    config: TLLoopConfig,
+    route: HarnessRoute,
+) -> HarnessChoice | None:
+    """Bind the launched route to the role allowlist and its ceilings."""
+    if config.policy is None:
+        return None
+    try:
+        harness = continuation_harness_for_route(
+            config.policy, config.role, route.agent_type, route.model
+        )
+        return continuation_choice(current, config.role, config.policy, harness)
+    except ValueError as error:
+        raise ContinuationRouteError(ParkCause.NO_CAPABLE_HARNESS, str(error)) from error
 
 
 def _settle_continuation_charge(
@@ -29744,6 +29846,44 @@ def _settle_continuation_charge(
         store.run_dir, slice_id, continuation_id, actual_tokens
     )
     return store.load()
+
+
+def _settle_continuation_to_launched_route(
+    store: RunStore,
+    slice_id: str,
+    continuation_id: str,
+    config: TLLoopConfig,
+    launched: HarnessRoute | None,
+    actual_tokens: int | None,
+) -> RunState:
+    """Settle one continuation on the route its resume effect actually launched.
+
+    The reservation was taken before the effect against the controller's
+    configured-route guess. When the confirmed response names a different route,
+    the same pending charge is retargeted in one atomic ledger mutation and only
+    then settled. A retarget that would exceed a ceiling raises a typed refusal
+    without changing the checkpoint, so the caller can release and park.
+    """
+    state = store.load()
+    charge = find_continuation_charge(state.budgets, slice_id, continuation_id)
+    if charge is None or charge.reconciled:
+        return state
+    if launched is not None:
+        choice = _launched_continuation_choice(state.slices[slice_id], config, launched)
+        if choice is not None and (
+            choice.harness != charge.harness
+            or choice.estimated_cost != charge.estimated_tokens
+        ):
+            try:
+                apply_continuation_retarget(
+                    store.run_dir, slice_id, continuation_id, choice
+                )
+            except BudgetCeilingExceeded as error:
+                raise ContinuationRouteError(
+                    ParkCause.BUDGET_EXHAUSTED,
+                    f"continuation on launched harness {choice.harness!r} is refused: {error}",
+                ) from error
+    return _settle_continuation_charge(store, slice_id, continuation_id, actual_tokens)
 
 
 def _release_continuation_charge(
@@ -29899,6 +30039,7 @@ def _route_repair(
             True,
         )
     )
+    resume_result: list[ToolResult | None] = [None]
     try:
 
         def dispatch_resume(arguments: JsonObject) -> object:
@@ -29946,7 +30087,13 @@ def _route_repair(
                 raise_on_failure=False,
             )
 
-        repair_with(pr, live, dispatch_resume)
+        def record_resume_result(arguments: JsonObject) -> object:
+            outcome = dispatch_resume(arguments)
+            if isinstance(outcome, ToolResult):
+                resume_result[0] = outcome
+            return outcome
+
+        repair_with(pr, live, record_resume_result)
     except (RepairError, ValueError) as error:
         if choice is not None:
             state = _release_continuation_charge(store, slice_id, continuation_id)
@@ -29971,9 +30118,39 @@ def _route_repair(
         if charge is None:
             raise TLLoopError("continuation reservation is missing from the checkpoint")
         if not charge.reconciled:
-            refreshed = _settle_continuation_charge(
-                store, slice_id, continuation_id, None
-            )
+            result = resume_result[0]
+            launched = _launch_route_from_result(result)
+            actual_tokens = _measured_usage_tokens(result)
+            try:
+                refreshed = _settle_continuation_to_launched_route(
+                    store,
+                    slice_id,
+                    continuation_id,
+                    config,
+                    launched,
+                    actual_tokens,
+                )
+            except ContinuationRouteError as error:
+                refreshed = _release_continuation_charge(
+                    store, slice_id, continuation_id
+                )
+                audit: dict[str, object] = {
+                    "continuation": continuation_id,
+                    "reserved_harness": charge.harness,
+                    "role": charge.role,
+                    "estimated_tokens": charge.estimated_tokens,
+                }
+                if launched is not None:
+                    audit["launched_harness"] = launched.harness
+                return _park_continuation_refusal(
+                    slice_id,
+                    refreshed,
+                    effects,
+                    store,
+                    cause=error.cause,
+                    reason=error.reason,
+                    audit=audit,
+                )
     resumed = slice_transition(
         refreshed.slices[slice_id],
         ActionChanged(replace(repair_action, phase=ActionPhase.CONFIRMED)),

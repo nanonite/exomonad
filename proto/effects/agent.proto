@@ -580,6 +580,10 @@ message InvocationHandoff {
   string outcome = 9;
   // Exact selected route associated with the invocation, when route-bound.
   RoleRoute role_route = 10;
+  // Model the launched invocation runs, empty when the runtime has none.
+  string model = 11;
+  // Effort level the launched invocation runs, empty when unset.
+  string effort = 12;
 }
 
 

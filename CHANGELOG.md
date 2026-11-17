@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Meter a `resume_pr` continuation to the route the host actually launched (read back from the invocation handoff, which now carries `model` and `effort`) instead of the allowlist's cheapest entry, retargeting the same reservation without widening a ceiling (#1398)
 - Prove offline that a worker harness change keeps one reviewer, the exact-head verdict, CI handling, owner attribution and counters, and that the harness policy is read once at start, and document which source needs which restart (#1393)
 - Charge the role and per-harness budget for a `resume_pr` or `resume_blocked_leaf` continuation on the harness it runs on, refusing one over a ceiling with a budget-exhausted park (#1391)
 - Record the exomonad build commit, the redacted launch command (marked actual or reconstructed) and the source of each resolved harness, model and effort in every invocation record, with credential flag values and environment values never persisted (#1352)

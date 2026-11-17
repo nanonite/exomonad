@@ -54,6 +54,11 @@ _AUDIT_FIELDS = frozenset(
         "activity_identity_sha256",
         "superseded_by_epoch",
         "supersession_reason",
+        "continuation",
+        "reserved_harness",
+        "launched_harness",
+        "role",
+        "estimated_tokens",
     }
 )
 _BLOCKED_AUDIT_FIELDS = frozenset(
@@ -532,6 +537,7 @@ def _ledger_snapshot(ledger: LedgerInput | None) -> dict[str, object]:
                     "delta_tokens": charge.delta_tokens,
                     "warning": charge.warning,
                     "reconciled": charge.reconciled,
+                    "continuation": charge.continuation,
                 }
                 for charge in ledger.charges
             ],

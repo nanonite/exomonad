@@ -6010,6 +6010,8 @@ fn invocation_handoff_to_proto(
             .role_route
             .as_ref()
             .map(role_route_provenance_to_proto),
+        model: invocation.model.clone().unwrap_or_default(),
+        effort: invocation.effort.clone().unwrap_or_default(),
     }
 }
 

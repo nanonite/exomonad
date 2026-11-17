@@ -11,9 +11,11 @@ three dispatch paths may call those helpers:
 * terminal-owner / blocked-leaf recovery: ``_terminal_owner_recovery_proof``
   and ``_route_fields_for_blocked_resume``
 
-A same-slice continuation does not select dispatch work: ``_continuation_route_choice``
-asks ``configured_continuation_harness`` for the role's configured allowlist entry
-(ordered by the selector's cost rank) and never calls ``select_agent_type``.
+A same-slice continuation does not select dispatch work: `_continuation_route_choice`
+asks `configured_continuation_harness` for the pre-effect reservation guess and
+never calls `select_agent_type`. The confirmed `resume_pr` invocation handoff
+then names the launched route and `_settle_continuation_to_launched_route`
+retargets the reservation; that is budget accounting, not a dispatch selection.
 
 A new call site is a second resolution path. This test fails so the reviewer
 must either move the new code through the seam or deliberately extend this
