@@ -203,7 +203,7 @@ def test_main_config_no_go_below_ceiling_forwards_findings_with_no_model_call(
     config = _config_built_by_main(tmp_path, monkeypatch, backend)
     # The shipped runner never sets review_model_choice; the inner loop needs none.
     assert config.review_model_choice is None
-    transport = ReviewRepairTransport()
+    transport = ReviewRepairTransport(resume_model="gpt-test")
     store = _owned_store(tmp_path / "run")
     config = replace(
         config, review_policy_path=_project(tmp_path / "policy") / ".exo" / "review-policy.toml"
@@ -290,7 +290,7 @@ class _IssueTransport(ReviewRepairTransport):
         if tool_name == "chainlink_issue_create":
             self.calls.append((tool_name, arguments))
             return {"success": True, "result": {"issue_id": 1010}}
-        if tool_name == "watcher_pr_state":
+        if tool_name in {"watcher_pr_state", "resume_pr"}:
             return ReviewRepairTransport.call_tool(self, role, name, tool_name, arguments)
         return RecordingTransport.call_tool(self, role, name, tool_name, arguments)
 

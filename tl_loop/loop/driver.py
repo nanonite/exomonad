@@ -311,6 +311,7 @@ from tl_loop.state.schema import (
     ActionKind,
     ActionPhase,
     ActionState,
+    BudgetCharge,
     BudgetLedger,
     FSMState,
     GateState,
@@ -4907,7 +4908,10 @@ def _prepare_startup_recovery(
         project_root=config.project_root,
         ledger_run_id=config.ledger_run_id,
     )
-    state = _reconcile_confirmed_repair_actions(state, store, effects_log, config)
+    state = _reconcile_confirmed_repair_actions(
+        state, store, effects_log, config, effects
+    )
+    state = _reconcile_unbound_continuations(state, config, store, effects)
     state = _settle_finished_continuations(state, config, store)
     state = _reconcile_dispatches(state, config, effects, store, effects_log)
     state = _reconcile_nonterminal_slices(plan, state, config, effects, store, effects_log)
@@ -9719,6 +9723,7 @@ def _run_loop(
         else None
     )
     while not config.test_harness or len(consumed) < config.max_events:
+        state = _reconcile_unbound_continuations(state, config, store, effects)
         state = _settle_finished_continuations(
             state, config, store, reader=continuation_reader
         )
@@ -16607,6 +16612,7 @@ def _reconcile_confirmed_repair_actions(
     store: RunStore,
     effects_log: list[EffectIntent],
     config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient | None = None,
 ) -> RunState:
     """Adopt a confirmed repair effect before retry derivation can run."""
     if not isinstance(effects_log, EffectJournal):
@@ -16644,9 +16650,10 @@ def _reconcile_confirmed_repair_actions(
         if pending_charge is not None and not pending_charge.reconciled:
             # The confirmed effect ran before the crash. Read its launched route
             # and invocation from the journal result and bind the same pending
-            # charge; settlement waits for that invocation's finished row. The
-            # recovery boundary issues no human-gate effect, so an unchargeable
-            # launch keeps the existing reservation conservatively.
+            # charge; settlement waits for that invocation's finished row. When
+            # the handoff names no invocation, the same evidence rule resolves
+            # it. An unresolvable or unchargeable launch is released and parked
+            # with its human gate instead of keeping the reservation silently.
             try:
                 result = effects_log.replay(confirmed)
             except ActionJournalError:
@@ -16661,12 +16668,28 @@ def _reconcile_confirmed_repair_actions(
                     _launched_invocation_from_result(result),
                 )
             except ContinuationRouteError as error:
-                LOGGER.warning(
-                    "[TL loop] confirmed continuation %s could not be retargeted "
-                    "during startup recovery: %s; conserving the existing reservation",
-                    continuation_id,
-                    error.reason,
-                )
+                if effects is None:
+                    LOGGER.warning(
+                        "[TL loop] confirmed continuation %s could not be bound "
+                        "during read-only startup recovery: %s; the unbound "
+                        "continuation reconciliation will decide it",
+                        continuation_id,
+                        error.reason,
+                    )
+                else:
+                    state = _release_continuation_charge(
+                        store, slice_id, continuation_id
+                    )
+                    state = _park_unresolved_continuation(
+                        slice_id,
+                        state,
+                        effects,
+                        store,
+                        cause=error.cause,
+                        reason=error.reason,
+                        audit=_continuation_park_audit(pending_charge, error),
+                    )
+                    continue
         state = _checkpoint_slice_action(
             store,
             state,
@@ -29722,10 +29745,16 @@ def _ci_reason_file(event: EventEnvelope) -> str:
 class ContinuationRouteError(RuntimeError):
     """A same-slice continuation cannot be resolved to a chargeable route."""
 
-    def __init__(self, cause: ParkCause, reason: str) -> None:
+    def __init__(
+        self, cause: ParkCause, reason: str, *, evidence: str | None = None
+    ) -> None:
         super().__init__(reason)
         self.cause = cause
         self.reason = reason
+        #: Classification of the authoritative launch evidence when the
+        #: refusal is about a continuation that never learned its invocation:
+        #: ``unique`` never raises, ``absent``, ``ambiguous``, or ``unreadable``.
+        self.evidence = evidence
 
 
 def _continuation_route_choice(
@@ -29885,6 +29914,206 @@ def _settle_continuation_charge(
     return store.load()
 
 
+class _ContinuationLaunchEvidence(NamedTuple):
+    """The invocation one confirmed continuation launched, or why it is unknown."""
+
+    invocation_id: str | None
+    route: HarnessRoute | None
+    evidence: str
+
+
+def _continuation_resume_head(current: SliceState) -> str | None:
+    """Return the exact head the continuation resumed, never a guessed one."""
+    action = current.action
+    if action is not None and isinstance(action.head_sha, str) and action.head_sha:
+        return action.head_sha
+    return current.reviewed_head
+
+
+def _continuation_owner(current: SliceState) -> str | None:
+    """Return the durable owner agent id a resume_pr continuation belongs to."""
+    value = current.dispatch_agent_id
+    return value if isinstance(value, str) and value else None
+
+
+def _continuation_path_matches(
+    recorded: object, expected: object, project_root: Path | None
+) -> bool:
+    """Compare a recorded worktree with the checkpoint's, resolving relative paths."""
+    if expected is None:
+        return True
+    if not isinstance(recorded, str) or not recorded or not isinstance(expected, str):
+        return False
+
+    def resolved(value: str) -> Path | None:
+        path = Path(value)
+        if not path.is_absolute() and project_root is not None:
+            path = project_root / path
+        try:
+            return path.resolve()
+        except OSError:
+            return None
+
+    left = resolved(recorded)
+    right = resolved(expected)
+    return left is not None and left == right
+
+
+def _continuation_route_from_record(
+    record: Mapping[str, object],
+) -> HarnessRoute | None:
+    """Read the launched route from one authoritative invocation record."""
+    runtime = normalize_runtime_label(record.get("runtime"))
+    if runtime is None:
+        runtime = normalize_runtime_label(record.get("agent_type"))
+    if runtime is None:
+        return None
+    value = record.get("model")
+    model = value.strip() if isinstance(value, str) and value.strip() else None
+    return HarnessRoute(
+        harness=runtime if model is None else f"{runtime}/{model}",
+        agent_type=runtime,
+        model=model,
+    )
+
+
+def _durable_resume_record_matches(
+    record: Mapping[str, object],
+    current: SliceState,
+    owner: str,
+    head: str,
+    project_root: Path | None,
+) -> bool:
+    """Whether one owner invocation record is this resume_pr continuation's launch."""
+    invocation_id = record.get("invocation_id")
+    recorded_owner = record.get("runtime_agent_id")
+    recorded_slice = record.get("slice_id")
+    return bool(
+        isinstance(invocation_id, str)
+        and invocation_id
+        and record.get("trigger") == "resume_pr"
+        and (recorded_owner is None or recorded_owner == owner)
+        and (recorded_slice is None or recorded_slice == current.id)
+        and type(record.get("pr_number")) is int
+        and record.get("pr_number") == current.pr_number
+        and record.get("head_sha") == head
+        and (current.branch is None or record.get("branch") == current.branch)
+        and _continuation_path_matches(
+            record.get("worktree"), current.worktree, project_root
+        )
+    )
+
+
+def _resume_started_row_matches(
+    record: Mapping[str, object],
+    data: Mapping[str, object],
+    current: SliceState,
+    owner: str,
+    head: str,
+    project_root: Path | None,
+    ledger_run_id: str | None,
+) -> bool:
+    """Whether one agent.invocation.started row is this continuation's launch."""
+    row_agent = record.get("agent_id")
+    recorded_owner = data.get("runtime_agent_id", row_agent)
+    recorded_slice = data.get("slice_id")
+    invocation_id = data.get("invocation_id")
+    return bool(
+        _ledger_row_type(record) == "agent.invocation.started"
+        and isinstance(invocation_id, str)
+        and invocation_id
+        and data.get("trigger") == "resume_pr"
+        and (recorded_owner is None or recorded_owner == owner)
+        and (recorded_slice is None or recorded_slice == current.id)
+        and type(data.get("pr_number")) is int
+        and data.get("pr_number") == current.pr_number
+        and data.get("head_sha") == head
+        and (current.branch is None or data.get("branch") == current.branch)
+        and _continuation_path_matches(
+            data.get("worktree"), current.worktree, project_root
+        )
+        and (ledger_run_id is None or record.get("run_id") == ledger_run_id)
+    )
+
+
+def _resolve_continuation_launch(
+    state: RunState,
+    config: TLLoopConfig,
+    slice_id: str,
+    continuation_id: str,
+) -> _ContinuationLaunchEvidence:
+    """Resolve the invocation a confirmed continuation launched from evidence.
+
+    The confirmed resume handoff normally names its invocation. A legacy or
+    truncated handoff does not, so the controller reads the authoritative
+    records the host already wrote: the durable owner invocation record and the
+    exact ``agent.invocation.started`` rows for this owner, slice, PR, head,
+    branch, and worktree. The union of those sources must name exactly one
+    invocation id. Zero candidates are ``absent`` and more than one are
+    ``ambiguous``; neither is ever resolved by elapsed time, silence, or a
+    nearest match. A record that cannot be read is ``unreadable``.
+    """
+    current = state.slices.get(slice_id)
+    charge = find_continuation_charge(state.budgets, slice_id, continuation_id)
+    if (
+        current is None
+        or charge is None
+        or charge.reconciled
+        or current.pr_number is None
+    ):
+        return _ContinuationLaunchEvidence(None, None, "absent")
+    owner = _continuation_owner(current)
+    head = _continuation_resume_head(current)
+    if owner is None or head is None:
+        return _ContinuationLaunchEvidence(None, None, "absent")
+
+    candidates: dict[str, HarnessRoute | None] = {}
+    conflict = False
+    project_root = Path(config.project_root) if config.project_root is not None else None
+    if project_root is not None:
+        durable = _read_durable_sub_tl_invocation(project_root, owner)
+        if durable is not None and _durable_resume_record_matches(
+            durable, current, owner, head, project_root
+        ):
+            invocation_id = cast(str, durable.get("invocation_id"))
+            candidates[invocation_id] = _continuation_route_from_record(durable)
+        try:
+            reader = LedgerReader(
+                project_root / ".exo" / "ledger" / "segments",
+                ledger_run_id=config.ledger_run_id,
+            )
+            records = reader.lifecycle_records(("agent.invocation.started",))
+        except (LedgerReadError, EnvelopeError, OSError, ValueError):
+            return _ContinuationLaunchEvidence(None, None, "unreadable")
+        for record in records:
+            data = record.get("data")
+            if not isinstance(data, Mapping):
+                continue
+            if not _resume_started_row_matches(
+                record,
+                data,
+                current,
+                owner,
+                head,
+                project_root,
+                config.ledger_run_id,
+            ):
+                continue
+            invocation_id = cast(str, data["invocation_id"])
+            route = _continuation_route_from_record(data)
+            existing = candidates.get(invocation_id)
+            if existing is not None and route is not None and existing != route:
+                conflict = True
+            elif existing is None:
+                candidates[invocation_id] = route
+    if conflict or len(candidates) > 1:
+        return _ContinuationLaunchEvidence(None, None, "ambiguous")
+    if not candidates:
+        return _ContinuationLaunchEvidence(None, None, "absent")
+    invocation_id, route = next(iter(candidates.items()))
+    return _ContinuationLaunchEvidence(invocation_id, route, "unique")
+
+
 def _bind_continuation_to_launched_route(
     store: RunStore,
     slice_id: str,
@@ -29907,6 +30136,23 @@ def _bind_continuation_to_launched_route(
     charge = find_continuation_charge(state.budgets, slice_id, continuation_id)
     if charge is None or charge.reconciled:
         return state
+    if invocation_id is None:
+        resolution = _resolve_continuation_launch(
+            state, config, slice_id, continuation_id
+        )
+        if resolution.invocation_id is None:
+            raise ContinuationRouteError(
+                ParkCause.MISSING_HANDOFF,
+                (
+                    f"confirmed continuation {continuation_id!r} named no launched "
+                    f"invocation id and authoritative launch evidence is "
+                    f"{resolution.evidence}"
+                ),
+                evidence=resolution.evidence,
+            )
+        invocation_id = resolution.invocation_id
+        if launched is None:
+            launched = resolution.route
     if launched is not None:
         choice = _launched_continuation_choice(state.slices[slice_id], config, launched)
         if choice is not None and (
@@ -29922,13 +30168,6 @@ def _bind_continuation_to_launched_route(
                     ParkCause.BUDGET_EXHAUSTED,
                     f"continuation on launched harness {choice.harness!r} is refused: {error}",
                 ) from error
-    if invocation_id is None:
-        LOGGER.warning(
-            "[TL loop] confirmed continuation %s did not name its launched invocation; "
-            "keeping the reservation until terminal evidence identifies it",
-            continuation_id,
-        )
-        return store.load()
     apply_continuation_launch(store.run_dir, slice_id, continuation_id, invocation_id)
     return store.load()
 
@@ -30031,6 +30270,118 @@ def _park_continuation_refusal(
         audit={**dict(audit or {}), "reason": reason},
     )
     return store.load()
+
+
+def _continuation_park_audit(
+    charge: BudgetCharge, error: ContinuationRouteError
+) -> dict[str, object]:
+    """Record the unresolvable continuation and the reservation it held."""
+    audit: dict[str, object] = {
+        "continuation": charge.continuation,
+        "reserved_harness": charge.harness,
+        "role": charge.role,
+        "estimated_tokens": charge.estimated_tokens,
+    }
+    if error.evidence is not None:
+        audit["launch_evidence"] = error.evidence
+    return audit
+
+
+def _park_unresolved_continuation(
+    slice_id: str,
+    state: RunState,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    *,
+    cause: ParkCause,
+    reason: str,
+    audit: Mapping[str, object],
+) -> RunState:
+    """Park a continuation whose launched invocation cannot be identified.
+
+    An active client uses the same needs-human issue path as a budget refusal.
+    A read-only client still opens the existing local blocked gate and records
+    the park, because it cannot create an issue it is not authorized to create.
+    """
+    current = state.slices.get(slice_id)
+    if current is None:
+        raise TLLoopError(
+            f"unresolved continuation references unknown slice {slice_id!r}"
+        )
+    full_audit = {**dict(audit), "reason": reason}
+    if isinstance(effects, EffectClient):
+        park(
+            current,
+            cause,
+            store=store,
+            issue_creator=effects,
+            ledger=state.budgets,
+            audit=full_audit,
+        )
+    else:
+        park(
+            current,
+            cause,
+            store=store,
+            issue_creator=None,
+            ledger=state.budgets,
+            audit=full_audit,
+            create_issue=False,
+        )
+    return store.load()
+
+
+def _reconcile_unbound_continuations(
+    state: RunState,
+    config: TLLoopConfig,
+    store: RunStore,
+    effects: EffectClient | ReadOnlyEffectClient,
+) -> RunState:
+    """Resolve or park every resume_pr reservation that never learned its launch.
+
+    This is the restart and loop boundary for a charge left unbound by a
+    confirmed handoff without invocation coordinates. One rule: authoritative
+    evidence that names exactly one launched invocation binds the charge (and
+    retargets it through the same ceiling check); absent or ambiguous evidence
+    releases the reservation and parks the slice with the existing
+    ``missing_handoff`` human gate. A reconciled charge is never selected again,
+    so a replay cannot park or settle the same continuation twice.
+    """
+    state = store.load()
+    for charge in list(state.budgets.charges):
+        continuation_id = charge.continuation
+        if (
+            continuation_id is None
+            or not continuation_id.startswith("resume_pr:")
+            or charge.reconciled
+            or charge.launched_invocation_id is not None
+        ):
+            continue
+        if charge.slice_id not in state.slices:
+            continue
+        try:
+            state = _bind_continuation_to_launched_route(
+                store,
+                charge.slice_id,
+                continuation_id,
+                config,
+                None,
+                None,
+            )
+        except ContinuationRouteError as error:
+            state = _release_continuation_charge(
+                store, charge.slice_id, continuation_id
+            )
+            state = _park_unresolved_continuation(
+                charge.slice_id,
+                state,
+                effects,
+                store,
+                cause=error.cause,
+                reason=error.reason,
+                audit=_continuation_park_audit(charge, error),
+            )
+    return state
 
 
 def _route_repair(
@@ -30251,6 +30602,8 @@ def _route_repair(
                 }
                 if launched is not None:
                     audit["launched_harness"] = launched.harness
+                if error.evidence is not None:
+                    audit["launch_evidence"] = error.evidence
                 return _park_continuation_refusal(
                     slice_id,
                     refreshed,

@@ -537,6 +537,32 @@ class _RecoveryTransport(RecordingTransport):
                     "status": "open",
                 },
             }
+        if tool_name == "resume_pr":
+            self.calls.append((tool_name, dict(arguments)))
+            return {
+                "success": True,
+                "result": {
+                    "agent": {
+                        "id": "leaf-a-owner",
+                        "agent_type": "codex",
+                        "branch_name": "main.leaf-a",
+                        "is_alive": True,
+                    },
+                    "invocation": {
+                        "invocation_id": "invocation-recovery-resume",
+                        "trigger": "resume_pr",
+                        "runtime": "codex",
+                        "model": "gpt-luna",
+                        "effort": "high",
+                        "branch_name": "main.leaf-a",
+                        "target_type": "window",
+                        "target_id": "@89",
+                        "fresh": True,
+                        "ready": True,
+                        "outcome": "started",
+                    },
+                },
+            }
         return super().call_tool(role, name, tool_name, arguments)
 
 

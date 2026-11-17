@@ -460,7 +460,13 @@ charge names a stable continuation identity so a replayed continuation is
 charged once, and it never rewrites the earlier harness's spend. If the role
 ceiling or the launched route's `per_harness_budget` would be exceeded, the
 resume is parked with `park_cause=budget_exhausted` and the needs-human issue
-path, and the route is never silently switched to a cheaper harness.
+path, and the route is never silently switched to a cheaper harness. If the
+confirmed handoff names no invocation, the controller resolves it from the
+durable owner invocation record and the matching `agent.invocation.started`
+rows; unique evidence binds and settles, while absent or ambiguous evidence
+releases the reservation and parks with `missing_handoff`, the human gate, and
+the continuation and reservation recorded in `park_audit`. Time and silence are
+never evidence.
 
 Task duration uses one explicit precedence: a slice's `task_timeout_seconds` in
 `plan.json` overrides the role's value in `.exo/harness_policy.toml`, which

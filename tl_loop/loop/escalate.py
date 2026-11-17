@@ -59,6 +59,7 @@ _AUDIT_FIELDS = frozenset(
         "launched_harness",
         "role",
         "estimated_tokens",
+        "launch_evidence",
     }
 )
 _BLOCKED_AUDIT_FIELDS = frozenset(

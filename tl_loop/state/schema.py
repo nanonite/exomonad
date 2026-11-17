@@ -762,6 +762,7 @@ PARK_AUDIT_KEYS = frozenset(
         "launched_harness",
         "role",
         "estimated_tokens",
+        "launch_evidence",
     }
 )
 RECOVERY_KEYS = frozenset(
@@ -2017,6 +2018,7 @@ def _park_audit(value: object, path: str, errors: list[tuple[str, str]]) -> None
         "reserved_harness",
         "launched_harness",
         "role",
+        "launch_evidence",
     ):
         if key in audit:
             _nullable_string(audit, key, f"{path}.park_audit", errors)

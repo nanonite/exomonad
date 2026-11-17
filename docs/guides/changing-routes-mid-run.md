@@ -197,6 +197,19 @@ before running releases the reservation with a zero actual. No current spawn
 harness writes per-invocation usage on that row, so a continuation today settles
 conserved; no usage is inferred from elapsed time or text length.
 
+The confirmed handoff normally names the invocation. When it does not, the
+controller applies one evidence rule instead of leaving the reservation silent:
+the durable owner `invocation.json` record and the matching
+`agent.invocation.started` rows for the same owner, slice, PR, resumed head,
+branch, and worktree must name exactly one invocation. Exactly one candidate
+binds the same pending charge (retargeted through the same ceiling check); zero
+(`absent`) or several (`ambiguous`) release the reservation with a zero actual
+and park the slice with `park_cause=missing_handoff`, the existing blocked human
+gate, and `park_audit` naming the continuation id, reserved route, estimate, and
+`launch_evidence`. Elapsed time and silence are never evidence. A handoff that
+already names its id is unchanged, and a released charge is never selected
+again, so restart replay neither parks nor settles the same continuation twice.
+
 Both ceilings still apply. If the continuation would exceed the role ceiling or
 the route harness's `per_harness_budget`, the resume is not issued: the slice is
 parked with `park_cause=budget_exhausted` and the existing needs-human issue

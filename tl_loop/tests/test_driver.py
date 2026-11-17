@@ -151,6 +151,7 @@ from tl_loop.rlm.store import RlmCallStore, RlmModelChoice, RlmRequest, RlmRespo
 from tl_loop.select.capability import CapabilityMap
 from tl_loop.select.classify import Difficulty
 from tl_loop.select.harness import parse_harness_identifier
+from tl_loop.select.ledger import apply_continuation_and_charge
 from tl_loop.select.model import ModelCatalog
 from tl_loop.select.policy import HarnessPolicy, validate_policy
 from tl_loop.state.plan_manifest import ManifestNode, PlanManifest, build_plan_manifest
@@ -2625,6 +2626,12 @@ class IntegrationTransport(RecordingTransport):
         if tool_name == "merge_pr" and self.merge_response is not None:
             self.calls.append((tool_name, arguments))
             return self.merge_response
+        if tool_name == "resume_pr":
+            self.calls.append((tool_name, arguments))
+            return {
+                "success": True,
+                "result": _resume_pr_handoff("invocation-integration-repair"),
+            }
         return super().call_tool(role, name, tool_name, arguments)
 
 
@@ -2756,9 +2763,43 @@ def _merge_decisions(transport: RecordingTransport) -> list[JsonObject]:
     ]
 
 
+def _resume_pr_handoff(
+    invocation_id: str,
+    *,
+    runtime: str = "codex",
+    model: str | None = "gpt-luna",
+    effort: str = "high",
+) -> JsonObject:
+    return {
+        "agent": {
+            "id": "leaf-a-owner",
+            "agent_type": runtime,
+            "branch_name": "main.leaf-a",
+            "is_alive": True,
+        },
+        "invocation": {
+            "invocation_id": invocation_id,
+            "trigger": "resume_pr",
+            "runtime": runtime,
+            "model": model,
+            "effort": effort,
+            "branch_name": "main.leaf-a",
+            "target_type": "window",
+            "target_id": "@88",
+            "fresh": True,
+            "ready": True,
+            "outcome": "started",
+        },
+    }
+
+
 @dataclass
 class ReviewRepairTransport(RecordingTransport):
     """Effect double that exposes the PR state required by compose_repair."""
+
+    resume_runtime: str = "codex"
+    resume_model: str | None = "gpt-luna"
+    resume_effort: str = "high"
 
     def call_tool(
         self,
@@ -2778,6 +2819,16 @@ class ReviewRepairTransport(RecordingTransport):
                     "head_branch": "main.leaf-a",
                     "head_sha": "head-a",
                 },
+            }
+        if tool_name == "resume_pr":
+            return {
+                "success": True,
+                "result": _resume_pr_handoff(
+                    "invocation-review-repair",
+                    runtime=self.resume_runtime,
+                    model=self.resume_model,
+                    effort=self.resume_effort,
+                ),
             }
         return {"success": True, "result": None}
 
@@ -29068,7 +29119,9 @@ def test_review_repair_continuation_charges_the_configured_new_harness(
     config = _review_continuation_config(
         _continuation_policy(OPENCODE_CONTINUATION_HARNESS)
     )
-    transport = ReviewRepairTransport()
+    transport = _LaunchedRouteTransport(
+        store, runtime="opencode", model="deepseek-v4.1-flash", effort="high"
+    )
     expected = _continuation_estimate(store.load(), config, "leaf-a", OPENCODE_CONTINUATION_HARNESS)
 
     state = driver_module._route_review_event(
@@ -29188,7 +29241,9 @@ def test_replayed_review_repair_does_not_double_charge_or_reissue(
     config = _review_continuation_config(
         _continuation_policy(OPENCODE_CONTINUATION_HARNESS)
     )
-    transport = ReviewRepairTransport()
+    transport = _LaunchedRouteTransport(
+        store, runtime="opencode", model="deepseek-v4.1-flash", effort="high"
+    )
     journal = EffectJournal("review-run", store.run_dir / "action-journal.json")
 
     def repair_with(
@@ -29290,7 +29345,9 @@ def test_charged_continuation_keeps_attempts_review_rounds_and_interventions(
     config = _review_continuation_config(
         _continuation_policy(OPENCODE_CONTINUATION_HARNESS)
     )
-    transport = ReviewRepairTransport()
+    transport = _LaunchedRouteTransport(
+        store, runtime="opencode", model="deepseek-v4.1-flash", effort="high"
+    )
     journal = EffectJournal("review-run", store.run_dir / "action-journal.json")
     before = store.load().slices["leaf-a"]
 
@@ -29622,6 +29679,456 @@ def test_replayed_continuation_route_reconciliation_is_idempotent(
     assert _continuation_charges(replayed, "leaf-a") == bound
     assert replayed.budgets.harness_spent == first.budgets.harness_spent
     assert replayed.budgets.harness_reserved == first.budgets.harness_reserved
+
+
+CONTINUATION_OWNER = "leaf-a-owner"
+RESOLVED_CONTINUATION_INVOCATION = "invocation-recovered-1"
+
+
+class _NoInvocationIdTransport(_LaunchedRouteTransport):
+    """Answer the configured route but omit the launched invocation id."""
+
+    def call_tool(
+        self, role: str, name: str, tool_name: str, arguments: JsonObject
+    ) -> JsonObject:
+        response = super().call_tool(role, name, tool_name, arguments)
+        if tool_name != "resume_pr":
+            return response
+        result = response.get("result")
+        invocation = result.get("invocation") if isinstance(result, dict) else None
+        if isinstance(invocation, dict):
+            invocation.pop("invocation_id", None)
+        return response
+
+
+def _resume_evidence_config(tmp_path: Path, policy: HarnessPolicy) -> TLLoopConfig:
+    return replace(
+        _review_continuation_config(policy),
+        project_root=tmp_path,
+        ledger_run_id="review-run",
+    )
+
+
+def _own_review_slice(store: RunStore, owner: str = CONTINUATION_OWNER) -> None:
+    state = store.load()
+    store.checkpoint(
+        state.fsm,
+        {
+            **state.slices,
+            "leaf-a": replace(state.slices["leaf-a"], dispatch_agent_id=owner),
+        },
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+
+
+def _resume_worktree(tmp_path: Path) -> str:
+    return str((tmp_path / ".worktrees" / "leaf-a").resolve())
+
+
+def _write_durable_resume_invocation(
+    tmp_path: Path,
+    *,
+    owner: str = CONTINUATION_OWNER,
+    invocation_id: str = RESOLVED_CONTINUATION_INVOCATION,
+    pr_number: int = 42,
+    head_sha: str = "head-a",
+    branch: str = "main.leaf-a",
+    slice_id: str = "leaf-a",
+    runtime: str = "codex",
+    model: str = "gpt-6.1-sol",
+    effort: str = "xhigh",
+) -> None:
+    directory = tmp_path / ".exo" / "agents" / owner
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "invocation.json").write_text(
+        json.dumps(
+            {
+                "invocation_id": invocation_id,
+                "runtime": runtime,
+                "model": model,
+                "effort": effort,
+                "trigger": "resume_pr",
+                "generation": 2,
+                "prior_invocation_id": "invocation-predecessor",
+                "status": "running",
+                "pr_number": pr_number,
+                "head_sha": head_sha,
+                "branch": branch,
+                "worktree": _resume_worktree(tmp_path),
+                "runtime_agent_id": owner,
+                "slice_id": slice_id,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _append_ledger_row(tmp_path: Path, row: Mapping[str, object]) -> None:
+    segments = tmp_path / ".exo" / "ledger" / "segments"
+    segments.mkdir(parents=True, exist_ok=True)
+    path = segments / "segment-000000000000.jsonl"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _write_resume_started_row(
+    tmp_path: Path,
+    invocation_id: str,
+    *,
+    owner: str = CONTINUATION_OWNER,
+    pr_number: int = 42,
+    head_sha: str = "head-a",
+    branch: str = "main.leaf-a",
+    slice_id: str = "leaf-a",
+) -> None:
+    _append_ledger_row(
+        tmp_path,
+        {
+            "type": "agent.invocation.started",
+            "agent_id": owner,
+            "run_id": "review-run",
+            "data": {
+                "invocation_id": invocation_id,
+                "trigger": "resume_pr",
+                "runtime": "codex",
+                "model": "gpt-6.1-sol",
+                "effort": "xhigh",
+                "generation": 2,
+                "pr_number": pr_number,
+                "head_sha": head_sha,
+                "branch": branch,
+                "worktree": _resume_worktree(tmp_path),
+                "runtime_agent_id": owner,
+                "slice_id": slice_id,
+            },
+        },
+    )
+
+
+def _write_resume_finished_row(
+    tmp_path: Path,
+    invocation_id: str,
+    *,
+    owner: str = CONTINUATION_OWNER,
+    total_tokens: int = 16,
+) -> None:
+    _append_ledger_row(
+        tmp_path,
+        {
+            "type": "agent.invocation.finished",
+            "agent_id": owner,
+            "run_id": "review-run",
+            "data": {
+                "invocation_id": invocation_id,
+                "slice_id": "leaf-a",
+                "status": "exited",
+                "usage": {"total_tokens": total_tokens},
+            },
+        },
+    )
+
+
+def test_confirmed_resume_without_invocation_id_binds_durable_owner_invocation(
+    tmp_path: Path,
+) -> None:
+    """The durable owner record identifies the launch the handoff omitted."""
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    _own_review_slice(store)
+    config = _resume_evidence_config(
+        tmp_path,
+        _resume_route_policy(CHEAP_RESUME_HARNESS, CONFIGURED_RESUME_HARNESS),
+    )
+    _write_durable_resume_invocation(tmp_path)
+    transport = _NoInvocationIdTransport(
+        store, runtime="codex", model="gpt-6.1-sol", effort="xhigh"
+    )
+
+    state = _repair_once(store, config, transport)
+
+    charge = _continuation_charges(state, "leaf-a")[0]
+    assert charge.launched_invocation_id == RESOLVED_CONTINUATION_INVOCATION
+    assert charge.harness == CONFIGURED_RESUME_HARNESS
+    assert charge.reconciled is False
+    assert state.slices["leaf-a"].status is not SliceStatus.PARKED
+
+    _write_resume_finished_row(tmp_path, RESOLVED_CONTINUATION_INVOCATION)
+    settled = driver_module._settle_finished_continuations(
+        store.load(), config, store
+    )
+
+    charge = _continuation_charges(settled, "leaf-a")[0]
+    assert charge.reconciled is True
+    assert charge.actual == 16
+    assert settled.budgets.harness_spent == {
+        "codex/test-model": 7,
+        CONFIGURED_RESUME_HARNESS: 16,
+    }
+
+
+def test_confirmed_resume_without_invocation_id_or_evidence_parks_missing_handoff(
+    tmp_path: Path,
+) -> None:
+    """Absent launch evidence releases the reservation and opens a human gate."""
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    _own_review_slice(store)
+    config = _resume_evidence_config(
+        tmp_path,
+        _resume_route_policy(CHEAP_RESUME_HARNESS, CONFIGURED_RESUME_HARNESS),
+    )
+    transport = _NoInvocationIdTransport(
+        store, runtime="codex", model="gpt-6.1-sol", effort="xhigh"
+    )
+
+    state = _repair_once(store, config, transport)
+
+    charge = _continuation_charges(state, "leaf-a")[0]
+    assert charge.reconciled is True
+    assert charge.actual == 0
+    assert state.budgets.harness_reserved == {}
+    assert state.budgets.role_reserved == {}
+    leaf = state.slices["leaf-a"]
+    assert leaf.status is SliceStatus.PARKED
+    assert leaf.park_cause is ParkCause.MISSING_HANDOFF
+    assert leaf.park_issue_id == 2022
+    assert leaf.park_audit is not None
+    assert leaf.park_audit["launch_evidence"] == "absent"
+    assert leaf.park_audit["continuation"] == charge.continuation
+    assert leaf.park_audit["reserved_harness"] == CHEAP_RESUME_HARNESS
+    assert leaf.park_audit["launched_harness"] == CONFIGURED_RESUME_HARNESS
+    assert isinstance(leaf.park_audit["estimated_tokens"], int)
+    assert any(
+        gate.name.endswith(":missing_handoff")
+        and gate.status is GateStatus.PENDING
+        for gate in state.gates
+    )
+
+
+def test_confirmed_resume_with_ambiguous_launch_evidence_parks_missing_handoff(
+    tmp_path: Path,
+) -> None:
+    """Two authoritative invocation rows are ambiguous, never nearest-match."""
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    _own_review_slice(store)
+    config = _resume_evidence_config(
+        tmp_path,
+        _resume_route_policy(CHEAP_RESUME_HARNESS, CONFIGURED_RESUME_HARNESS),
+    )
+    _write_resume_started_row(tmp_path, "invocation-candidate-a")
+    _write_resume_started_row(tmp_path, "invocation-candidate-b")
+    transport = _NoInvocationIdTransport(
+        store, runtime="codex", model="gpt-6.1-sol", effort="xhigh"
+    )
+
+    state = _repair_once(store, config, transport)
+
+    leaf = state.slices["leaf-a"]
+    assert leaf.status is SliceStatus.PARKED
+    assert leaf.park_cause is ParkCause.MISSING_HANDOFF
+    assert leaf.park_audit is not None
+    assert leaf.park_audit["launch_evidence"] == "ambiguous"
+    assert state.budgets.harness_reserved == {}
+    assert state.budgets.role_reserved == {}
+    assert _continuation_charges(state, "leaf-a")[0].reconciled is True
+
+
+def test_same_invocation_with_conflicting_routes_across_sources_parks_ambiguous(
+    tmp_path: Path,
+) -> None:
+    """One id carrying two different routes is conflicting evidence, never unique."""
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    _own_review_slice(store)
+    config = _resume_evidence_config(
+        tmp_path,
+        _resume_route_policy(CHEAP_RESUME_HARNESS, CONFIGURED_RESUME_HARNESS),
+    )
+    _write_durable_resume_invocation(tmp_path)
+    _write_resume_started_row(tmp_path, RESOLVED_CONTINUATION_INVOCATION)
+    record = tmp_path / ".exo" / "agents" / CONTINUATION_OWNER / "invocation.json"
+    document = json.loads(record.read_text())
+    document["runtime"] = "opencode"
+    document["model"] = "deepseek-v4.1-flash"
+    record.write_text(json.dumps(document))
+    transport = _NoInvocationIdTransport(
+        store, runtime="codex", model="gpt-6.1-sol", effort="xhigh"
+    )
+
+    state = _repair_once(store, config, transport)
+
+    leaf = state.slices["leaf-a"]
+    assert leaf.status is SliceStatus.PARKED
+    assert leaf.park_cause is ParkCause.MISSING_HANDOFF
+    assert leaf.park_audit is not None
+    assert leaf.park_audit["launch_evidence"] == "ambiguous"
+    assert _continuation_charges(state, "leaf-a")[0].launched_invocation_id is None
+
+
+def test_handoff_that_names_its_invocation_is_unchanged_by_other_evidence(
+    tmp_path: Path,
+) -> None:
+    """A named handoff invocation wins; conflicting ledger rows are not consulted."""
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    _own_review_slice(store)
+    config = _resume_evidence_config(
+        tmp_path,
+        _resume_route_policy(CHEAP_RESUME_HARNESS, CONFIGURED_RESUME_HARNESS),
+    )
+    _write_resume_started_row(tmp_path, "invocation-candidate-a")
+    _write_resume_started_row(tmp_path, "invocation-candidate-b")
+    transport = _LaunchedRouteTransport(
+        store, runtime="codex", model="gpt-6.1-sol", effort="xhigh"
+    )
+
+    state = _repair_once(store, config, transport)
+
+    charge = _continuation_charges(state, "leaf-a")[0]
+    assert charge.launched_invocation_id == "invocation-resumed-1"
+    assert charge.reconciled is False
+    assert state.slices["leaf-a"].status is not SliceStatus.PARKED
+
+
+def test_resolved_continuation_restart_settles_once_without_rebinding(
+    tmp_path: Path,
+) -> None:
+    """Restart replay binds and settles the same continuation exactly once."""
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    _own_review_slice(store)
+    config = _resume_evidence_config(
+        tmp_path,
+        _resume_route_policy(CHEAP_RESUME_HARNESS, CONFIGURED_RESUME_HARNESS),
+    )
+    _write_durable_resume_invocation(tmp_path)
+    transport = _NoInvocationIdTransport(
+        store, runtime="codex", model="gpt-6.1-sol", effort="xhigh"
+    )
+    state = _repair_once(store, config, transport)
+    continuation = _continuation_charges(state, "leaf-a")[0].continuation
+    assert continuation is not None
+
+    # A restart sees the same durable evidence and the same pending charge.
+    rebind = driver_module._bind_continuation_to_launched_route(
+        store, "leaf-a", continuation, config, None, None
+    )
+    assert _continuation_charges(rebind, "leaf-a")[0].launched_invocation_id == (
+        RESOLVED_CONTINUATION_INVOCATION
+    )
+
+    _write_resume_finished_row(tmp_path, RESOLVED_CONTINUATION_INVOCATION)
+    first = driver_module._settle_finished_continuations(store.load(), config, store)
+    replayed = driver_module._settle_finished_continuations(
+        store.load(), config, store
+    )
+
+    assert _continuation_charges(replayed, "leaf-a") == _continuation_charges(
+        first, "leaf-a"
+    )
+    assert replayed.budgets.harness_spent == first.budgets.harness_spent == {
+        "codex/test-model": 7,
+        CONFIGURED_RESUME_HARNESS: 16,
+    }
+    assert replayed.budgets.harness_reserved == {}
+    assert replayed.slices["leaf-a"].status is not SliceStatus.PARKED
+
+
+def _confirmed_repair_action(intent_id: str) -> ActionState:
+    return ActionState(
+        ActionKind.REPAIR,
+        ActionPhase.CONFIRMED,
+        intent_id=intent_id,
+        head_sha="head-a",
+        attempt=1,
+    )
+
+
+def _seed_unbound_continuation(
+    store: RunStore,
+    config: TLLoopConfig,
+    *,
+    continuation_id: str,
+) -> None:
+    state = store.load()
+    current = replace(
+        state.slices["leaf-a"],
+        action=_confirmed_repair_action(continuation_id.rsplit(":", 1)[-1]),
+    )
+    store.checkpoint(
+        state.fsm,
+        {**state.slices, "leaf-a": current},
+        state.budgets,
+        state.events.last_consumed_offset,
+    )
+    choice = driver_module._continuation_route_choice(current, config)
+    assert choice is not None
+    apply_continuation_and_charge(
+        store.run_dir,
+        choice,
+        current,
+        continuation_id,
+        lambda document: document,
+    )
+
+
+def test_restart_binds_old_unbound_continuation_from_durable_evidence(
+    tmp_path: Path,
+) -> None:
+    """A checkpoint written before the id was known still resolves on restart."""
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    _own_review_slice(store)
+    config = _resume_evidence_config(
+        tmp_path,
+        _resume_route_policy(CHEAP_RESUME_HARNESS, CONFIGURED_RESUME_HARNESS),
+    )
+    _seed_unbound_continuation(
+        store, config, continuation_id="resume_pr:restart-intent"
+    )
+    assert _continuation_charges(store.load(), "leaf-a")[0].launched_invocation_id is None
+    _write_durable_resume_invocation(tmp_path)
+    transport = _ReviewContinuationTransport()
+
+    reconciled = driver_module._reconcile_unbound_continuations(
+        store.load(), config, store, EffectClient(transport)
+    )
+
+    charge = _continuation_charges(reconciled, "leaf-a")[0]
+    assert charge.launched_invocation_id == RESOLVED_CONTINUATION_INVOCATION
+    assert charge.reconciled is False
+    assert reconciled.slices["leaf-a"].status is not SliceStatus.PARKED
+
+
+def test_restart_does_not_park_the_same_unbound_continuation_twice(
+    tmp_path: Path,
+) -> None:
+    """A parked, released reservation is not parked or issued again on replay."""
+    store = _seed_review_codex_spend(_review_store(tmp_path))
+    _own_review_slice(store)
+    config = _resume_evidence_config(
+        tmp_path,
+        _resume_route_policy(CHEAP_RESUME_HARNESS, CONFIGURED_RESUME_HARNESS),
+    )
+    _seed_unbound_continuation(
+        store, config, continuation_id="resume_pr:restart-intent"
+    )
+    transport = _ReviewContinuationTransport()
+
+    first = driver_module._reconcile_unbound_continuations(
+        store.load(), config, store, EffectClient(transport)
+    )
+    first_issues = [name for name, _ in transport.calls if name == "chainlink_issue_create"]
+    first_gates = [gate.name for gate in first.gates if gate.name.endswith(":missing_handoff")]
+    assert first.slices["leaf-a"].status is SliceStatus.PARKED
+    assert first.slices["leaf-a"].park_cause is ParkCause.MISSING_HANDOFF
+    assert len(first_issues) == len(first_gates) == 1
+
+    replayed = driver_module._reconcile_unbound_continuations(
+        first, config, store, EffectClient(transport)
+    )
+
+    assert [name for name, _ in transport.calls if name == "chainlink_issue_create"] == first_issues
+    assert [gate.name for gate in replayed.gates if gate.name.endswith(":missing_handoff")] == first_gates
+    assert _continuation_charges(replayed, "leaf-a")[0].reconciled is True
+    assert replayed.budgets.harness_reserved == {}
+    assert replayed.budgets.role_reserved == {}
 
 
 @pytest.mark.parametrize(

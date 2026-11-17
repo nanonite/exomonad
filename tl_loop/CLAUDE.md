@@ -928,6 +928,20 @@ never widens a ceiling. A finished row with no usage keeps today's behavior:
 atomic `reconcile` and a reconciled charge is never selected again, so restart
 replay cannot settle the same continuation twice.
 
+The confirmed handoff normally names the invocation. When it does not, one
+evidence rule resolves it: the durable owner `invocation.json` record and the
+exact `agent.invocation.started` rows for the same owner, slice, PR, resumed
+head, branch, and worktree must agree on exactly one invocation id. One
+candidate binds the charge (and retargets it through the same ceiling check);
+zero (`absent`) or several (`ambiguous`) release the reservation with a zero
+actual and park with `missing_handoff`, the existing blocked human gate, and
+`park_audit` naming the continuation, reserved route, estimate, and evidence
+classification. `_reconcile_unbound_continuations` applies that rule at startup
+and on every loop pass, so a checkpoint written by older code is not left
+reserved. Time and silence are never evidence. A handoff that already names its
+id is untouched, and a released charge is never selected again, so replay is
+idempotent.
+
 No spawn harness currently writes usage counters on the finished row: the
 Codex, OpenCode, and Claude tmux invocations do not report per-invocation
 usage to the host, and the only harness-reported usage today is the RLM
