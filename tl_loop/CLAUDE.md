@@ -951,6 +951,10 @@ route, and the route-authorization digest) and the durable host record
 share the same definition of a configured harness: the resolved `config.toml`
 role route plus the role's `.exo/harness_policy.toml` allowlist, pinned by
 `rust/exomonad-core/tests/fixtures/harness_policy_agreement.{toml,json}`.
+`exomonad init` uses that same definition to reject a worker or reviewer route
+the role allowlist does not authorize before the controller starts. TL is not
+checked there: `root_agent_type` is legacy and the controller resolves its own
+`roles.tl` route at startup.
 See [docs/guides/changing-routes-mid-run.md](../docs/guides/changing-routes-mid-run.md).
 
 Per-slice route *prescription* is not implemented. It would extend the closed

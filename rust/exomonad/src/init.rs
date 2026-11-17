@@ -1,8 +1,11 @@
 use crate::{clean, opencode_models, uds_client};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use exomonad::config::{
-    Config, EffortLevel, ResolvedEffort, REVIEWER_EFFORT_ENV, REVIEWER_MAX_ROUNDS_ENV,
-    REVIEWER_MODEL_ENV, TL_PREFLIGHT_RUNTIME_PATHS_ENV,
+    Config, EffortLevel, ResolvedEffort, ResolvedRoleRoute, RouteValueSource, REVIEWER_EFFORT_ENV,
+    REVIEWER_MAX_ROUNDS_ENV, REVIEWER_MODEL_ENV, TL_PREFLIGHT_RUNTIME_PATHS_ENV,
+};
+use exomonad_core::services::harness_policy::{
+    policy_role, HarnessPolicyAllowlist, RoutePolicyMismatch,
 };
 use exomonad_core::services::runtime_manifest::{
     PLAN_COMPATIBILITY_VERSION, PUBLICATION_REGISTRY_SCHEMA_VERSION, RUNTIME_PROTOCOL_VERSION,
@@ -4784,6 +4787,131 @@ fn init_model_validation_targets(
     Ok(targets)
 }
 
+/// Validate the configured worker and reviewer routes against the operator's
+/// harness-policy allow lists before init starts any controller.
+///
+/// A missing policy is not a new error here: the TL controller preflight
+/// already requires it, and `--skip-preflight` keeps that behaviour. A
+/// malformed policy uses the one Rust parser in `harness_policy` rather than a
+/// second parser in init.
+fn validate_configured_harness_policy(cwd: &Path, config: &Config) -> Result<()> {
+    let policy_path = cwd.join(".exo/harness_policy.toml");
+    let policy = match HarnessPolicyAllowlist::load(&policy_path) {
+        Ok(Some(policy)) => policy,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read the harness policy at {}",
+                    policy_path.display()
+                )
+            })
+        }
+    };
+    let overrides = crate::config::RoleRouteOverrides::default();
+    for role in ["worker", "reviewer"] {
+        let route = config.resolve_role_route(role, None, &overrides, None)?;
+        let policy_role = policy_role(role).expect("worker and reviewer are policy roles");
+        if let Some(mismatch) =
+            policy.route_mismatch(policy_role, route.agent_type, route.model.as_deref())
+        {
+            return Err(harness_policy_disagreement(
+                role,
+                policy_role,
+                &route,
+                &mismatch,
+                config,
+                &policy,
+                &policy_path,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Build the fail-closed diagnostic for one configured route disagreement.
+///
+/// The message names the role, the resolved `harness/model`, the config field
+/// and file (or override) that supplied it, the policy allow list, and both
+/// files the operator can change.
+fn harness_policy_disagreement(
+    role: &str,
+    policy_role: &str,
+    route: &ResolvedRoleRoute,
+    mismatch: &RoutePolicyMismatch,
+    config: &Config,
+    policy: &HarnessPolicyAllowlist,
+    policy_path: &Path,
+) -> anyhow::Error {
+    let harness = route.agent_type.suffix();
+    let harness_field = role_harness_field(role);
+    let model_field = role_model_field(role, config, route);
+    let allow_list = policy
+        .entries(policy_role)
+        .iter()
+        .map(|entry| format!("`{}`", entry.identifier()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let policy_display = policy_path.display();
+    match mismatch {
+        RoutePolicyMismatch::HarnessNotAllowed => anyhow!(
+            "the {role} role's configured harness `{harness}` from {} is not allowed by `{policy_display}` `roles.{policy_role}.allow` (allow list: {allow_list}). \
+             Change `{harness_field}` at the source named above, or add `{harness}` to `roles.{policy_role}.allow` in `{policy_display}`.",
+            route_value_location(route.agent_type_source, harness_field),
+        ),
+        RoutePolicyMismatch::ModelNotAllowed { allowed_models } => {
+            let model = route.model.as_deref().unwrap_or_default();
+            let allowed = allowed_models
+                .iter()
+                .map(|allowed| format!("`{harness}/{allowed}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow!(
+                "the {role} role's configured route `{harness}/{model}` from {} is not allowed by `{policy_display}` `roles.{policy_role}.allow` (allow list: {allow_list}): every entry for harness `{harness}` is model-qualified and allows only {allowed}. \
+                 Change `{model_field}` at the source named above to one of those models, or add `{harness}/{model}` to `roles.{policy_role}.allow` in `{policy_display}`.",
+                route_value_location(route.model_source, model_field),
+            )
+        }
+    }
+}
+
+fn route_value_location(source: RouteValueSource, field: &str) -> String {
+    match source {
+        RouteValueSource::ProjectConfig => format!("`{field}` in `.exo/config.toml`"),
+        RouteValueSource::LocalConfig => format!("`{field}` in `.exo/config.local.toml`"),
+        RouteValueSource::Cli => format!("the `{field}` command-line override"),
+        RouteValueSource::Environment => format!("the `{field}` environment override"),
+        RouteValueSource::Default => format!("the built-in default for `{field}`"),
+        RouteValueSource::HarnessDefault => format!("the harness default for `{field}`"),
+        RouteValueSource::Policy => format!("the accepted policy route for `{field}`"),
+        RouteValueSource::Unresolved => format!("the unresolved `{field}`"),
+    }
+}
+
+fn role_harness_field(role: &str) -> &'static str {
+    match role {
+        "worker" => "spawn_agent_type",
+        "reviewer" => "[reviewer].agent_type",
+        _ => "agent_type",
+    }
+}
+
+fn role_model_field(role: &str, config: &Config, route: &ResolvedRoleRoute) -> &'static str {
+    match role {
+        "worker" => {
+            if config.worker_model.as_deref() == route.model.as_deref() {
+                "worker_model"
+            } else if config.opencode.worker_model.as_deref() == route.model.as_deref() {
+                "[opencode].worker_model"
+            } else {
+                "worker_model"
+            }
+        }
+        "reviewer" => "[reviewer].model",
+        _ => "model",
+    }
+}
+
 fn reviewer_max_rounds_tmux_args(session: &str, value: Option<u32>) -> Vec<String> {
     let mut args = vec![
         "set-environment".to_string(),
@@ -7770,6 +7898,9 @@ pub async fn run(
         &crate::config::RoleRouteOverrides::default(),
         None,
     )?;
+    // A disagreement between the config.toml route and the role's policy
+    // allow list is a hard error before any controller side effect.
+    validate_configured_harness_policy(&cwd, &config)?;
     // Every role goes through the one harness-aware validator. TL, worker, and
     // reviewer models cannot diverge in which catalog rule they obey.
     for target in init_model_validation_targets(&config, &worker_effort, &reviewer_effort)? {
@@ -16004,6 +16135,333 @@ mod tests {
             Some("opencode-go/deepseek-v4-flash")
         );
         assert_eq!(opencode_targets[0].effort, "max");
+    }
+
+    fn policy_document(worker_allow: &[&str], reviewer_allow: &[&str]) -> String {
+        let list = |entries: &[&str]| {
+            entries
+                .iter()
+                .map(|entry| format!("\"{entry}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let ranks = |entries: &[&str]| {
+            entries
+                .iter()
+                .map(|entry| format!("\"{entry}\" = 1"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "[roles.tl]\nallow = [\"codex/gpt-5.6-luna\"]\ncost_rank = {{ \"codex/gpt-5.6-luna\" = 1 }}\ntoken_budget = 120000\nescalate_after_attempts = 1\n\n\
+             [roles.worker]\nallow = [{}]\ncost_rank = {{ {} }}\ntoken_budget = 120000\nescalate_after_attempts = 1\n\n\
+             [roles.reviewer]\nallow = [{}]\ncost_rank = {{ {} }}\ntoken_budget = 60000\nescalate_after_attempts = 1\n",
+            list(worker_allow),
+            ranks(worker_allow),
+            list(reviewer_allow),
+            ranks(reviewer_allow),
+        )
+    }
+
+    fn write_init_config(dir: &Path, body: &str) -> Config {
+        std::fs::create_dir_all(dir.join(".exo")).unwrap();
+        std::fs::write(dir.join(".exo/config.toml"), body).unwrap();
+        Config::discover_from(dir, &|_| None).unwrap()
+    }
+
+    fn write_policy(dir: &Path, worker_allow: &[&str], reviewer_allow: &[&str]) {
+        std::fs::create_dir_all(dir.join(".exo")).unwrap();
+        std::fs::write(
+            dir.join(".exo/harness_policy.toml"),
+            policy_document(worker_allow, reviewer_allow),
+        )
+        .unwrap();
+    }
+
+    const BEAST_CONFIG: &str = "spawn_agent_type = \"opencode\"\nworker_model = \"opencode-go/deepseek-v4.1-flash\"\n\n[reviewer]\nagent_type = \"opencode\"\nmodel = \"opencode-go/glm-5.3-flash\"\n";
+    const BEAST_WORKER_ALLOW: &[&str] = &["opencode/opencode-go/deepseek-v4.1-flash"];
+    const BEAST_REVIEWER_ALLOW: &[&str] = &["opencode/opencode-go/glm-5.3-flash"];
+
+    #[test]
+    fn init_harness_policy_accepts_the_beast_shaped_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_init_config(dir.path(), BEAST_CONFIG);
+        write_policy(dir.path(), BEAST_WORKER_ALLOW, BEAST_REVIEWER_ALLOW);
+
+        validate_configured_harness_policy(dir.path(), &config)
+            .expect("the beast-shaped config route and allow lists agree");
+    }
+
+    #[test]
+    fn init_harness_policy_rejects_worker_harness_not_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_init_config(
+            dir.path(),
+            "spawn_agent_type = \"codex\"\nworker_model = \"gpt-5.6-luna\"\n\n[reviewer]\nagent_type = \"opencode\"\nmodel = \"opencode-go/glm-5.3-flash\"\n",
+        );
+        write_policy(dir.path(), BEAST_WORKER_ALLOW, BEAST_REVIEWER_ALLOW);
+
+        let error = format!(
+            "{:#}",
+            validate_configured_harness_policy(dir.path(), &config).unwrap_err()
+        );
+
+        for expected in [
+            "worker",
+            "codex",
+            "spawn_agent_type",
+            ".exo/config.toml",
+            "roles.worker.allow",
+            ".exo/harness_policy.toml",
+        ] {
+            assert!(error.contains(expected), "missing {expected:?} in {error}");
+        }
+    }
+
+    #[test]
+    fn init_harness_policy_rejects_reviewer_harness_not_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_init_config(
+            dir.path(),
+            "spawn_agent_type = \"opencode\"\nworker_model = \"opencode-go/deepseek-v4.1-flash\"\n\n[reviewer]\nagent_type = \"codex\"\nmodel = \"gpt-5.6-luna\"\n",
+        );
+        write_policy(dir.path(), BEAST_WORKER_ALLOW, &["claude/sonnet"]);
+
+        let error = format!(
+            "{:#}",
+            validate_configured_harness_policy(dir.path(), &config).unwrap_err()
+        );
+
+        for expected in [
+            "reviewer",
+            "codex",
+            "[reviewer].agent_type",
+            ".exo/config.toml",
+            "roles.reviewer.allow",
+            ".exo/harness_policy.toml",
+        ] {
+            assert!(error.contains(expected), "missing {expected:?} in {error}");
+        }
+    }
+
+    #[test]
+    fn init_harness_policy_rejects_a_model_outside_model_qualified_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_init_config(
+            dir.path(),
+            "spawn_agent_type = \"opencode\"\nworker_model = \"opencode-go/other-model\"\n\n[reviewer]\nagent_type = \"opencode\"\nmodel = \"opencode-go/glm-5.3-flash\"\n",
+        );
+        write_policy(dir.path(), BEAST_WORKER_ALLOW, BEAST_REVIEWER_ALLOW);
+
+        let error = format!(
+            "{:#}",
+            validate_configured_harness_policy(dir.path(), &config).unwrap_err()
+        );
+
+        for expected in [
+            "worker",
+            "worker_model",
+            "opencode-go/other-model",
+            "opencode-go/deepseek-v4.1-flash",
+            "model-qualified",
+            "roles.worker.allow",
+        ] {
+            assert!(error.contains(expected), "missing {expected:?} in {error}");
+        }
+    }
+
+    #[test]
+    fn init_harness_policy_bare_harness_entry_allows_any_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_init_config(
+            dir.path(),
+            "spawn_agent_type = \"opencode\"\nworker_model = \"any/model/at/all\"\n\n[reviewer]\nagent_type = \"opencode\"\nmodel = \"opencode-go/glm-5.3-flash\"\n",
+        );
+        write_policy(dir.path(), &["opencode"], BEAST_REVIEWER_ALLOW);
+
+        validate_configured_harness_policy(dir.path(), &config)
+            .expect("a bare harness entry authorizes any model of that harness");
+    }
+
+    #[test]
+    fn init_harness_policy_checks_codex_and_opencode_in_both_directions() {
+        let cases = [
+            (
+                "spawn_agent_type = \"codex\"\nworker_model = \"gpt-5.6-luna\"\n\n[reviewer]\nagent_type = \"opencode\"\nmodel = \"opencode-go/glm-5.3-flash\"\n",
+                vec!["codex/gpt-5.6-luna"],
+                true,
+            ),
+            (
+                "spawn_agent_type = \"opencode\"\nworker_model = \"opencode-go/deepseek-v4.1-flash\"\n\n[reviewer]\nagent_type = \"opencode\"\nmodel = \"opencode-go/glm-5.3-flash\"\n",
+                vec!["opencode/opencode-go/deepseek-v4.1-flash"],
+                true,
+            ),
+            (
+                "spawn_agent_type = \"codex\"\nworker_model = \"gpt-5.6-luna\"\n\n[reviewer]\nagent_type = \"opencode\"\nmodel = \"opencode-go/glm-5.3-flash\"\n",
+                vec!["opencode/opencode-go/deepseek-v4.1-flash"],
+                false,
+            ),
+            (
+                "spawn_agent_type = \"opencode\"\nworker_model = \"opencode-go/deepseek-v4.1-flash\"\n\n[reviewer]\nagent_type = \"opencode\"\nmodel = \"opencode-go/glm-5.3-flash\"\n",
+                vec!["codex/gpt-5.6-luna"],
+                false,
+            ),
+        ];
+        for (body, worker_allow, accepted) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_init_config(dir.path(), body);
+            write_policy(dir.path(), &worker_allow, BEAST_REVIEWER_ALLOW);
+            assert_eq!(
+                validate_configured_harness_policy(dir.path(), &config).is_ok(),
+                accepted,
+                "worker direction for allow {worker_allow:?} disagreed"
+            );
+        }
+
+        let reviewer_cases = [
+            (
+                "spawn_agent_type = \"opencode\"\nworker_model = \"opencode-go/deepseek-v4.1-flash\"\n\n[reviewer]\nagent_type = \"codex\"\nmodel = \"gpt-5.6-luna\"\n",
+                vec!["codex/gpt-5.6-luna"],
+                true,
+            ),
+            (
+                "spawn_agent_type = \"opencode\"\nworker_model = \"opencode-go/deepseek-v4.1-flash\"\n\n[reviewer]\nagent_type = \"opencode\"\nmodel = \"opencode-go/glm-5.3-flash\"\n",
+                vec!["opencode/opencode-go/glm-5.3-flash"],
+                true,
+            ),
+            (
+                "spawn_agent_type = \"opencode\"\nworker_model = \"opencode-go/deepseek-v4.1-flash\"\n\n[reviewer]\nagent_type = \"codex\"\nmodel = \"gpt-5.6-luna\"\n",
+                vec!["opencode/opencode-go/glm-5.3-flash"],
+                false,
+            ),
+            (
+                "spawn_agent_type = \"opencode\"\nworker_model = \"opencode-go/deepseek-v4.1-flash\"\n\n[reviewer]\nagent_type = \"opencode\"\nmodel = \"opencode-go/glm-5.3-flash\"\n",
+                vec!["codex/gpt-5.6-luna"],
+                false,
+            ),
+        ];
+        for (body, reviewer_allow, accepted) in reviewer_cases {
+            let dir = tempfile::tempdir().unwrap();
+            let config = write_init_config(dir.path(), body);
+            write_policy(dir.path(), BEAST_WORKER_ALLOW, &reviewer_allow);
+            assert_eq!(
+                validate_configured_harness_policy(dir.path(), &config).is_ok(),
+                accepted,
+                "reviewer direction for allow {reviewer_allow:?} disagreed"
+            );
+        }
+    }
+
+    #[test]
+    fn init_harness_policy_uses_the_python_case_and_whitespace_grammar() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_init_config(
+            dir.path(),
+            "spawn_agent_type = \"opencode\"\nworker_model = \"opencode-go/deepseek-v4.1-flash/extra\"\n\n[reviewer]\nagent_type = \"opencode\"\nmodel = \"opencode-go/glm-5.3-flash\"\n",
+        );
+        write_policy(
+            dir.path(),
+            &[" OpenCode / opencode-go/deepseek-v4.1-flash/extra "],
+            BEAST_REVIEWER_ALLOW,
+        );
+
+        validate_configured_harness_policy(dir.path(), &config)
+            .expect("harness case and surrounding whitespace follow the Python grammar");
+    }
+
+    #[test]
+    fn init_harness_policy_missing_file_is_not_a_new_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_init_config(dir.path(), BEAST_CONFIG);
+
+        validate_configured_harness_policy(dir.path(), &config)
+            .expect("a missing policy is left to the controller's existing startup error");
+
+        assert!(!dir.path().join(".exo/harness_policy.toml").exists());
+    }
+
+    #[test]
+    fn init_harness_policy_malformed_file_uses_the_one_parser() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_init_config(dir.path(), BEAST_CONFIG);
+        std::fs::create_dir_all(dir.path().join(".exo")).unwrap();
+        std::fs::write(dir.path().join(".exo/harness_policy.toml"), "not = [valid").unwrap();
+
+        let error = format!(
+            "{:#}",
+            validate_configured_harness_policy(dir.path(), &config).unwrap_err()
+        );
+
+        assert!(error.contains(".exo/harness_policy.toml"), "{error}");
+        assert!(error.contains("harness policy"), "{error}");
+    }
+
+    #[test]
+    fn init_harness_policy_failure_writes_no_controller_lifecycle_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_init_config(
+            dir.path(),
+            "spawn_agent_type = \"codex\"\nworker_model = \"gpt-5.6-luna\"\n\n[reviewer]\nagent_type = \"opencode\"\nmodel = \"opencode-go/glm-5.3-flash\"\n",
+        );
+        write_policy(dir.path(), BEAST_WORKER_ALLOW, BEAST_REVIEWER_ALLOW);
+
+        let lifecycle_paths = [
+            ROOT_CONTROLLER_OWNERSHIP_RELATIVE_PATH,
+            ROOT_CONTROLLER_PENDING_OWNERSHIP_RELATIVE_PATH,
+            CONTROLLER_STARTUP_INTENT_RELATIVE_PATH,
+            ".exo/tl-loop/root.controller-epoch",
+            ".exo/tl-loop/root/controller-target.json",
+        ];
+        for relative in lifecycle_paths {
+            assert!(
+                !dir.path().join(relative).exists(),
+                "{relative} existed before the rejected validation"
+            );
+        }
+
+        validate_configured_harness_policy(dir.path(), &config)
+            .expect_err("the disagreement must fail init");
+
+        for relative in lifecycle_paths {
+            assert!(
+                !dir.path().join(relative).exists(),
+                "the rejected validation wrote controller lifecycle state at {relative}"
+            );
+        }
+    }
+
+    #[test]
+    fn init_harness_policy_has_one_call_site_before_the_controller() {
+        let source = include_str!("init.rs");
+        let tests_module = source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("init.rs keeps its tests in one module");
+        let production = &source[..tests_module];
+
+        assert_eq!(
+            production
+                .matches("fn validate_configured_harness_policy(")
+                .count(),
+            1
+        );
+        assert_eq!(
+            production
+                .matches("validate_configured_harness_policy(")
+                .count(),
+            2,
+            "the configured harness-policy check must have exactly one call site"
+        );
+        let call = production
+            .find("validate_configured_harness_policy(&cwd, &config)?")
+            .expect("init calls the configured harness-policy check");
+        let model_validation = production
+            .find("for target in init_model_validation_targets")
+            .expect("init validates the resolved role targets");
+        let record_mode = production
+            .find("record_session_mode(&cwd, mode)?")
+            .expect("init records the session mode");
+        assert!(call < model_validation);
+        assert!(call < record_mode);
     }
 
     #[cfg(unix)]

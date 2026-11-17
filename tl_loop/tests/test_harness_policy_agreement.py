@@ -9,7 +9,8 @@ from typing import cast
 import pytest
 
 from tl_loop.loop.escalate import authorize_harness_switch
-from tl_loop.select.harness import canonical_agent_type
+from tl_loop.select.agent_type import policy_approved_candidates
+from tl_loop.select.harness import canonical_agent_type, parse_harness_identifier
 from tl_loop.select.policy import load_policy
 
 FIXTURE_ROOT = (
@@ -20,11 +21,15 @@ EXPECTED_PATH = FIXTURE_ROOT / "harness_policy_agreement.json"
 ROLES = ("tl", "worker", "reviewer")
 
 
-def _expected() -> dict[str, list[str]]:
+def _fixture() -> dict[str, object]:
     return cast(
-        dict[str, list[str]],
+        dict[str, object],
         json.loads(EXPECTED_PATH.read_text(encoding="utf-8")),
     )
+
+
+def _expected() -> dict[str, list[str]]:
+    return cast(dict[str, list[str]], _fixture()["canonical"])
 
 
 def test_python_policy_loader_matches_the_shared_allowlist_fixture() -> None:
@@ -37,6 +42,48 @@ def test_python_policy_loader_matches_the_shared_allowlist_fixture() -> None:
         }
         assert canonical == set(expected[role]), (
             f"Python role {role!r} canonical allowlist disagrees with the shared fixture"
+        )
+
+
+def test_python_policy_entries_match_the_shared_fixture() -> None:
+    policy = load_policy(POLICY_PATH)
+    entries = cast(dict[str, list[dict[str, object]]], _fixture()["entries"])
+
+    for role in ROLES:
+        parsed = [
+            parse_harness_identifier(identifier) for identifier in policy.roles[role].allow
+        ]
+        expected = [
+            (entry["harness"], entry["model"]) for entry in entries[role]
+        ]
+        assert [(route.agent_type, route.model) for route in parsed] == expected, (
+            f"Python role {role!r} entries disagree with the shared fixture"
+        )
+
+
+def test_python_grammar_matches_the_shared_fixture() -> None:
+    fixture = _fixture()
+    for row in cast(list[dict[str, object]], fixture["grammar"]):
+        route = parse_harness_identifier(cast(str, row["identifier"]))
+        assert route.agent_type == row["harness"], row["identifier"]
+        assert route.model == row["model"], row["identifier"]
+    for identifier in cast(list[str], fixture["invalid_grammar"]):
+        with pytest.raises(ValueError):
+            parse_harness_identifier(identifier)
+
+
+def test_python_route_cases_match_the_shared_fixture() -> None:
+    policy = load_policy(POLICY_PATH)
+    cases = cast(list[dict[str, object]], _fixture()["route_cases"])
+
+    for case in cases:
+        role = cast(str, case["role"])
+        harness = cast(str, case["harness"])
+        model = cast(str | None, case["model"])
+        request = harness if model is None else f"{harness}/{model}"
+        approved = policy_approved_candidates(request, policy.roles[role])
+        assert bool(approved) is case["allowed"], (
+            f"Python role {role!r} route {request!r} disagrees with the shared fixture"
         )
 
 

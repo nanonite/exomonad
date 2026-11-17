@@ -1,6 +1,7 @@
-# Shared harness-policy fixture for the Rust spawn guard and the Python
-# controller selector. Both implementations must derive the same canonical
-# agent-type allowlist from this file; see harness_policy_agreement.json.
+# Shared harness-policy fixture for the Rust spawn guard, init's configured
+# route check, and the Python controller selector. Both implementations must
+# derive the same canonical entries and route decisions from this file; see
+# harness_policy_agreement.json.
 
 [roles.tl]
 allow = ["codex/gpt-5.6-luna"]
@@ -9,10 +10,10 @@ token_budget = 120000
 escalate_after_attempts = 1
 
 [roles.worker]
-allow = ["codex/gpt-5.6-luna", "opencode/deepseek-v4.1-flash"]
-cost_rank = { "codex/gpt-5.6-luna" = 1, "opencode/deepseek-v4.1-flash" = 2 }
+allow = ["codex/gpt-5.6-luna", "codex/gpt-5.6-sol", "opencode/deepseek-v4.1-flash"]
+cost_rank = { "codex/gpt-5.6-luna" = 1, "codex/gpt-5.6-sol" = 2, "opencode/deepseek-v4.1-flash" = 3 }
 token_budget = 120000
-per_harness_budget = { "codex/gpt-5.6-luna" = 80000, "opencode/deepseek-v4.1-flash" = 40000 }
+per_harness_budget = { "codex/gpt-5.6-luna" = 80000, "codex/gpt-5.6-sol" = 60000, "opencode/deepseek-v4.1-flash" = 40000 }
 escalate_after_attempts = 1
 
 [roles.reviewer]

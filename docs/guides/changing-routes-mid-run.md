@@ -46,7 +46,27 @@ The Rust and Python definitions are pinned to one fixture,
 `rust/exomonad-core/tests/fixtures/harness_policy_agreement.{toml,json}`.
 `rust/exomonad-core/src/services/harness_policy.rs` and
 `tl_loop/tests/test_harness_policy_agreement.py` both canonicalize
-`harness/model` identifiers to the same agent-type sets.
+`harness/model` identifiers to the same entries, grammar, and route decisions.
+
+`exomonad init` does not widen either source. Before it starts or continues a
+controller, it checks that the worker and reviewer routes resolved from
+`config.toml` (including CLI/environment overrides) agree with the same role's
+`allow` list:
+
+- the route's harness must appear in `roles.<role>.allow`;
+- when the route names a model and every allow entry for that harness is
+  model-qualified, the model must equal one of those entries; a bare
+  `harness` entry allows any model of that harness.
+
+A disagreement is a hard error naming the role, the resolved `harness/model`,
+the config field and file, the allow list, and both files the operator can
+change (`config.toml` field or `roles.<role>.allow` in
+`harness_policy.toml`). There is no bypass flag, environment switch,
+warning-and-continue, or automatic edit. A missing policy is left to the
+controller's existing startup error; a malformed policy is parsed once by the
+shared Rust definition. `root_agent_type` is legacy compatibility only: the
+Python controller does not read it, and `roles.tl.allow` is validated by
+`tl_loop` startup, so init does not check a TL route.
 
 ## Operator actions
 
@@ -59,10 +79,12 @@ The Rust and Python definitions are pinned to one fixture,
 | policy-escalated switch after NO-GO | add the replacement harness to the same role's `allow`; the selector removes the failed harness after `escalate_after_attempts` | yes | no |
 | reviewer harness/model/effort change | `[reviewer]` in `.exo/config.toml` **and** the matching `roles.reviewer.allow` in `.exo/harness_policy.toml` (see [Reviewer](#reviewer)) | yes | no |
 
-Changing only the allowlist is enough for the *guard*, but the selector will
-only choose the new harness when it is allowed, capable, and inside the role and
-per-harness budgets. Changing only `spawn_agent_type` is enough for the default
-route, but the selector still cannot select a harness absent from `allow`.
+Changing only the allowlist is enough for the *guard*, but init now rejects a
+configured route the allowlist does not authorize. Changing only
+`spawn_agent_type` is enough for the default route, but the selector still
+cannot select a harness absent from `allow`, and init rejects the
+disagreement. Change both sources together; init catches a mismatch before the
+controller starts.
 
 ## Guard, record, log, and budget audit
 
@@ -160,7 +182,12 @@ the `spawn_reviewer` effect) reads `configured_runtime_route("reviewer")` from
    configured harness. Switching Codex to OpenCode changes the validator from
    the Codex `gpt-`/live-catalog rule to the #1358 committed OpenCode table, and
    an unknown model, an unrecorded effort, or an unsupported effort fails init
-   naming `rust/exomonad/data/opencode/<version>.json`.
+   naming `rust/exomonad/data/opencode/<version>.json`. Separately, init's
+   configured harness-policy check requires `[reviewer].agent_type` and
+   `[reviewer].model` to agree with `roles.reviewer.allow` before the controller
+   starts, exactly as it does for the worker. The reviewer spawn itself still
+   reads only `[reviewer]`; the allow list is the operator's boundary that init
+   keeps in step.
 7. **No reviewer escalation.** The selector's
    `roles.<role>.escalate_after_attempts` removes a failed *worker* harness from
    rotation. No code path calls the selector for the reviewer, so there is no

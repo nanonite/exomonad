@@ -247,8 +247,8 @@ per_harness_budget = {{ "{codex_harness}" = 80000, "claude/sonnet" = 40000 }}
 escalate_after_attempts = 1
 
 [roles.reviewer]
-allow = ["{codex_harness}"]
-cost_rank = {{ "{codex_harness}" = 1 }}
+allow = ["{codex_harness}", "claude/sonnet"]
+cost_rank = {{ "{codex_harness}" = 1, "claude/sonnet" = 2 }}
 token_budget = 60000
 escalate_after_attempts = 1
 "#
@@ -534,6 +534,32 @@ mod tests {
                 assert!(ratings.contains_key(harness), "no rating for {harness}");
             }
         }
+    }
+
+    #[test]
+    fn scaffold_reviewer_policy_allows_the_default_reviewer_harness() {
+        // The scaffolded config.toml leaves the reviewer at its built-in
+        // Claude default, so the generated policy must allow that harness or
+        // the first `exomonad init` would reject its own scaffold.
+        let dir = tempfile::tempdir().unwrap();
+        write_tl_loop_defaults(dir.path(), HARNESS).unwrap();
+
+        let policy: toml::Value = toml::from_str(
+            &std::fs::read_to_string(dir.path().join(".exo/harness_policy.toml")).unwrap(),
+        )
+        .unwrap();
+        let allow = policy
+            .get("roles")
+            .and_then(|roles| roles.get("reviewer"))
+            .and_then(|reviewer| reviewer.get("allow"))
+            .and_then(toml::Value::as_array)
+            .expect("roles.reviewer.allow must exist");
+        assert!(
+            allow
+                .iter()
+                .any(|entry| entry.as_str() == Some("claude/sonnet")),
+            "the scaffolded reviewer allow list must cover the default Claude reviewer: {allow:?}"
+        );
     }
 
     #[test]

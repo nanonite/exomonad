@@ -404,6 +404,22 @@ old route is retained as evidence. A configured harness is the role route from
 outside both still requires explicit human approval. See
 [docs/guides/changing-routes-mid-run.md](docs/guides/changing-routes-mid-run.md).
 
+`exomonad init` checks that those two sources agree before it starts or
+continues a controller. For the worker and reviewer roles it resolves the route
+from `config.toml` (including CLI/environment overrides) and requires the
+harness to appear in that role's `allow` list. When the route names a model and
+every allow entry for that harness is model-qualified, the model must equal one
+of those entries; a bare `harness` entry allows any model of that harness. A
+disagreement is a hard error that names the role, the resolved `harness/model`,
+the config field and file, the allow list, and both files the operator can
+change (`config.toml` field or `roles.<role>.allow` in
+`harness_policy.toml`). There is no bypass flag, environment switch, warning
+path, or automatic edit. A missing policy is left to the controller's existing
+startup error, and a malformed policy is parsed once by the shared Rust
+definition. `root_agent_type` is legacy compatibility only: init always starts
+the Python TL controller, which does not read it, and `roles.tl.allow` is
+validated by `tl_loop` startup.
+
 **TL-loop harness policy:** `.exo/harness_policy.toml` is the required human-authored
 allowlist and budget boundary for the programmatic controller. It must contain exactly
 `roles.tl`, `roles.worker`, and `roles.reviewer`. Each role declares `allow` (ordered
@@ -411,7 +427,11 @@ allowlist and budget boundary for the programmatic controller. It must contain e
 `token_budget` (a positive role ceiling), `per_harness_budget` (optional positive
 ceilings whose keys must be allowed), and `escalate_after_attempts` (a positive
 NO-GO threshold). A missing or invalid file is a startup error; the selector never
-creates a permissive default or widens these boundaries.
+creates a permissive default or widens these boundaries. The Rust definition in
+`rust/exomonad-core/src/services/harness_policy.rs` is shared by the spawn guard
+and init, and is pinned to `tl_loop` by
+`rust/exomonad-core/tests/fixtures/harness_policy_agreement.{toml,json}` and
+`tl_loop/tests/test_harness_policy_agreement.py`.
 
 `roles.tl.token_budget` covers model-authored plan proposals and review-stuck
 judgments across controller restarts. Their observed token usage is added to

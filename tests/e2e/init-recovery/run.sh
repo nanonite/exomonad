@@ -103,6 +103,32 @@ install_verified_wasm_and_roles() {
     fi
 }
 
+# The checked-in repository policy allows only the Codex reviewer, while the
+# fixture configs below leave the reviewer at its built-in Claude default. init
+# now rejects that config/policy disagreement, so the copied fixture policy has
+# to allow the default reviewer harness too. The capability map already rates
+# claude/sonnet.
+allow_default_reviewer_harness() {
+    python3 - .exo/harness_policy.toml <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+policy = path.read_text(encoding="utf-8")
+before = (
+    '[roles.reviewer]\nallow = ["codex/gpt-5.6-luna"]\n'
+    'cost_rank = { "codex/gpt-5.6-luna" = 1 }'
+)
+after = (
+    '[roles.reviewer]\nallow = ["codex/gpt-5.6-luna", "claude/sonnet"]\n'
+    'cost_rank = { "codex/gpt-5.6-luna" = 1, "claude/sonnet" = 2 }'
+)
+if policy.count(before) != 1:
+    raise SystemExit("expected the copied policy to allow the default reviewer harness")
+path.write_text(policy.replace(before, after), encoding="utf-8")
+PY
+}
+
 count_pull_publications() {
     python3 - "$1" <<'PY'
 import json
@@ -1893,6 +1919,7 @@ install_verified_wasm_and_roles
 cp "$PROJECT_ROOT/.exo/harness_policy.toml" .exo/harness_policy.toml
 cp "$PROJECT_ROOT/.exo/review-policy.toml" .exo/review-policy.toml
 cp "$PROJECT_ROOT/.exo/harness_capability.toml" .exo/harness_capability.toml
+allow_default_reviewer_harness
 mkdir -p .exo/tl-loop
 printf '{"run_id":"root","plan":{"leaves":[]}}\n' > .exo/tl-loop/plan.json
 e2e_write_basic_config "$SESSION"
@@ -2081,6 +2108,7 @@ install_verified_wasm_and_roles
 cp "$PROJECT_ROOT/.exo/harness_policy.toml" .exo/harness_policy.toml
 cp "$PROJECT_ROOT/.exo/review-policy.toml" .exo/review-policy.toml
 cp "$PROJECT_ROOT/.exo/harness_capability.toml" .exo/harness_capability.toml
+allow_default_reviewer_harness
 mkdir -p .exo/tl-loop
 printf '{"run_id":"root","plan":{"leaves":[{"name":"leaf-a","task":"leaf-a change","chainlink_issue_id":null}]}}\n' > .exo/tl-loop/plan.json
 cp .exo/tl-loop/plan.json .exo/tl-loop/plan.snapshot

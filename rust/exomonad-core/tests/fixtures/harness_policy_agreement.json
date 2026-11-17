@@ -1,5 +1,136 @@
 {
-  "tl": ["codex"],
-  "worker": ["codex", "opencode"],
-  "reviewer": ["claude"]
+  "canonical": {
+    "tl": ["codex"],
+    "worker": ["codex", "opencode"],
+    "reviewer": ["claude"]
+  },
+  "entries": {
+    "tl": [
+      {
+        "identifier": "codex/gpt-5.6-luna",
+        "harness": "codex",
+        "model": "gpt-5.6-luna"
+      }
+    ],
+    "worker": [
+      {
+        "identifier": "codex/gpt-5.6-luna",
+        "harness": "codex",
+        "model": "gpt-5.6-luna"
+      },
+      {
+        "identifier": "codex/gpt-5.6-sol",
+        "harness": "codex",
+        "model": "gpt-5.6-sol"
+      },
+      {
+        "identifier": "opencode/deepseek-v4.1-flash",
+        "harness": "opencode",
+        "model": "deepseek-v4.1-flash"
+      }
+    ],
+    "reviewer": [
+      {
+        "identifier": "claude/sonnet",
+        "harness": "claude",
+        "model": "sonnet"
+      }
+    ]
+  },
+  "grammar": [
+    {
+      "identifier": " codex/gpt-5.6-luna ",
+      "harness": "codex",
+      "model": "gpt-5.6-luna"
+    },
+    {
+      "identifier": "CODEX",
+      "harness": "codex",
+      "model": null
+    },
+    {
+      "identifier": "OpenCode / opencode-go/deepseek-v4.1-flash",
+      "harness": "opencode",
+      "model": "opencode-go/deepseek-v4.1-flash"
+    },
+    {
+      "identifier": "opencode/opencode-go/deepseek-v4.1-flash/extra",
+      "harness": "opencode",
+      "model": "opencode-go/deepseek-v4.1-flash/extra"
+    },
+    {
+      "identifier": "claude/ sonnet ",
+      "harness": "claude",
+      "model": "sonnet"
+    }
+  ],
+  "invalid_grammar": ["", "opencode/", "retired/gemini"],
+  "route_cases": [
+    {
+      "role": "worker",
+      "harness": "codex",
+      "model": "gpt-5.6-luna",
+      "allowed": true
+    },
+    {
+      "role": "worker",
+      "harness": "codex",
+      "model": "gpt-5.6-sol",
+      "allowed": true
+    },
+    {
+      "role": "worker",
+      "harness": "codex",
+      "model": "gpt-5.6-other",
+      "allowed": false
+    },
+    {
+      "role": "worker",
+      "harness": "codex",
+      "model": null,
+      "allowed": true
+    },
+    {
+      "role": "worker",
+      "harness": "opencode",
+      "model": "deepseek-v4.1-flash",
+      "allowed": true
+    },
+    {
+      "role": "worker",
+      "harness": "opencode",
+      "model": "other",
+      "allowed": false
+    },
+    {
+      "role": "worker",
+      "harness": "claude",
+      "model": "sonnet",
+      "allowed": false
+    },
+    {
+      "role": "reviewer",
+      "harness": "claude",
+      "model": "sonnet",
+      "allowed": true
+    },
+    {
+      "role": "reviewer",
+      "harness": "claude",
+      "model": null,
+      "allowed": true
+    },
+    {
+      "role": "reviewer",
+      "harness": "claude",
+      "model": "opus",
+      "allowed": false
+    },
+    {
+      "role": "reviewer",
+      "harness": "codex",
+      "model": "gpt-5.6-luna",
+      "allowed": false
+    }
+  ]
 }

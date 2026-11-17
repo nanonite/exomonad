@@ -506,7 +506,10 @@ Python selector by `tests/fixtures/harness_policy_agreement.{toml,json}`. A
 configured cross-runtime change therefore does not require
 `EXOMONAD_ALLOW_HARNESS_SWITCH`. An explicit request outside both sources still
 emits `[STUCK: harness-switch]`/`agent.stuck` and is approved only by that flag.
-See [docs/guides/changing-routes-mid-run.md](../../../docs/guides/changing-routes-mid-run.md).
+`exomonad init` additionally requires the resolved worker and reviewer routes
+to agree with the same role's allow list before it starts a controller; the
+guard still accepts either source for an already-running dispatch. See
+[docs/guides/changing-routes-mid-run.md](../../../docs/guides/changing-routes-mid-run.md).
 
 The reviewer is the same rule with a role-specific route. Reviewer spawns read
 `configured_runtime_route("reviewer")` (`[reviewer]` in `config.toml`); they do

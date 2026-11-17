@@ -138,7 +138,7 @@ shell_command = "nix develop"  # environment wrapper for TL tab + server
 wasm_dir = ".exo/wasm"        # project-local default
 wasm_name = "devswarm"        # auto-detected from .exo/roles/ if exactly one exists
 model = "sonnet"              # optional — --model flag for root TL agent
-root_agent_type = "claude"    # claude | opencode | codex | shoal
+root_agent_type = "claude"    # legacy compatibility; the Python TL controller does not read it
 spawn_agent_type = "codex"    # default worker/leaf/companion harness
 tl_effort_level = "medium"    # CLI overrides config
 worker_effort_level = "medium"
@@ -176,6 +176,24 @@ harness version fails naming the detected version, the known versions, and the
 table entry a new version needs; there is no nearest-version fallback. There is
 no bypass flag or silent skip, and no ETXTBSY retry loop in production; test
 fixtures create their executable atomically instead.
+
+**Configured harness-policy check:** before any controller side effect, `init`
+validates the worker and reviewer routes it resolved from `config.toml` (and any
+CLI/environment override) against the same roles' `allow` lists in
+`.exo/harness_policy.toml`. The harness must appear in the list. When the route
+names a model and every allow entry for that harness is model-qualified, the
+model must equal one of those entries; a bare `harness` entry allows any model.
+A disagreement is a hard error naming the role, the resolved `harness/model`,
+the config field and file, the allow list, and both files the operator can
+change. There is no bypass flag, warning path, or automatic edit. A missing
+policy is not a new error here (the controller's existing startup error
+remains), and a malformed policy is parsed by the one shared Rust definition in
+`exomonad-core::services::harness_policy`, pinned to the Python controller by
+`tests/fixtures/harness_policy_agreement.{toml,json}`. TL is deliberately not
+checked: `root_agent_type` is legacy compatibility only and the Python
+controller does not read it; `roles.tl.allow` is validated by `tl_loop`
+startup. `init` still does not catalog-validate a non-OpenCode worker route or
+any TL route.
 
 **Adding an OpenCode harness version:** commit
 `rust/exomonad/data/opencode/<version>.json` (schema_version 1, harness
