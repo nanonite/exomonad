@@ -28875,15 +28875,14 @@ def test_configured_harness_switch_blocked_resume_charges_the_new_harness(
     assert charge.role == "worker"
     assert charge.attempt == seeded.slices[slice_id].attempts + 1
     assert charge.estimated_tokens == expected
-    assert charge.reconciled is True
+    assert charge.reconciled is False
     assert charge.actual == "unknown"
-    assert charge.warning is True
-    # The earlier Codex spend is untouched and the role ceiling sees both.
+    assert charge.launched_invocation_id == transport.successors[0]["invocation_id"]
+    # The earlier Codex spend is untouched and the reservation names OpenCode.
     assert state.budgets.harness_spent[CODEX_CONTINUATION_HARNESS] == 7
-    assert state.budgets.harness_spent[OPENCODE_CONTINUATION_HARNESS] == expected
-    assert state.budgets.role_spent["worker"] == 7 + expected
-    assert state.budgets.harness_reserved == {}
-    assert state.budgets.role_reserved == {}
+    assert state.budgets.harness_spent.get(OPENCODE_CONTINUATION_HARNESS, 0) == 0
+    assert state.budgets.role_spent["worker"] == 7
+    assert state.budgets.harness_reserved == {OPENCODE_CONTINUATION_HARNESS: expected}
 
 
 class _RejectingResumeTransport(RepeatedTransitionTransport):
@@ -29091,11 +29090,11 @@ def test_review_repair_continuation_charges_the_configured_new_harness(
     assert charge.harness == OPENCODE_CONTINUATION_HARNESS
     assert charge.attempt == 1
     assert charge.estimated_tokens == expected
-    assert charge.reconciled is True
+    assert charge.reconciled is False
     assert state.budgets.harness_spent["codex/test-model"] == 7
-    assert state.budgets.harness_spent[OPENCODE_CONTINUATION_HARNESS] == expected
-    assert state.budgets.role_spent["worker"] == 7 + expected
-    assert state.budgets.harness_reserved == {}
+    assert state.budgets.harness_spent.get(OPENCODE_CONTINUATION_HARNESS, 0) == 0
+    assert state.budgets.role_spent["worker"] == 7
+    assert state.budgets.harness_reserved == {OPENCODE_CONTINUATION_HARNESS: expected}
 
 
 def test_review_repair_continuation_over_the_ceiling_parks_without_a_resume(
@@ -29234,7 +29233,7 @@ def test_replayed_review_repair_does_not_double_charge_or_reissue(
     assert [name for name, _ in transport.calls if name == "resume_pr"] == ["resume_pr"]
     assert _continuation_charges(replayed, "leaf-a") == settled
     assert replayed.budgets.harness_spent == first.budgets.harness_spent
-    assert replayed.budgets.harness_reserved == {}
+    assert replayed.budgets.harness_reserved == first.budgets.harness_reserved
 
 
 def test_refused_review_repair_releases_the_continuation_reservation(
@@ -29462,17 +29461,18 @@ def test_resume_pr_continuation_charges_the_launched_route_not_the_cheapest_entr
     charges = _continuation_charges(state, "leaf-a")
     assert len(charges) == 1
     assert charges[0].harness == CONFIGURED_RESUME_HARNESS
-    assert charges[0].reconciled is True
-    assert state.budgets.harness_spent[CONFIGURED_RESUME_HARNESS] == expected
+    assert charges[0].reconciled is False
+    assert charges[0].launched_invocation_id == "invocation-resumed-1"
+    assert state.budgets.harness_reserved == {CONFIGURED_RESUME_HARNESS: expected}
+    assert CHEAP_RESUME_HARNESS not in state.budgets.harness_reserved
     assert CHEAP_RESUME_HARNESS not in state.budgets.harness_spent
-    assert state.budgets.harness_reserved == {}
-    assert state.budgets.role_reserved == {}
+    assert state.budgets.role_reserved == {"worker": expected}
 
 
 def test_continuation_reserves_before_the_resume_effect_and_settles_after(
     tmp_path: Path,
 ) -> None:
-    """The reservation exists at the effect boundary; settlement happens after it."""
+    """The reservation exists at the effect boundary; settlement waits for the finish."""
     store = _seed_review_codex_spend(_review_store(tmp_path))
     config = _review_continuation_config(
         _resume_route_policy(CHEAP_RESUME_HARNESS, CONFIGURED_RESUME_HARNESS)
@@ -29486,8 +29486,9 @@ def test_continuation_reserves_before_the_resume_effect_and_settles_after(
 
     assert transport.reserved_at_resume == [{CHEAP_RESUME_HARNESS: reserved}]
     assert transport.spent_at_resume == [{"codex/test-model": 7}]
-    assert state.budgets.harness_reserved == {}
     assert state.budgets.harness_spent["codex/test-model"] == 7
+    assert state.budgets.harness_spent.get(CONFIGURED_RESUME_HARNESS, 0) == 0
+    assert _continuation_charges(state, "leaf-a")[0].reconciled is False
 
 
 def test_continuation_retargets_down_when_the_launched_route_is_cheaper(
@@ -29510,9 +29511,10 @@ def test_continuation_retargets_down_when_the_launched_route_is_cheaper(
     charges = _continuation_charges(state, "leaf-a")
     assert len(charges) == 1
     assert charges[0].harness == CHEAP_RESUME_HARNESS
-    assert state.budgets.harness_spent[CHEAP_RESUME_HARNESS] == expected
+    assert charges[0].reconciled is False
+    assert state.budgets.harness_reserved == {CHEAP_RESUME_HARNESS: expected}
+    assert state.budgets.harness_spent.get(CHEAP_RESUME_HARNESS, 0) == 0
     assert CONFIGURED_RESUME_HARNESS not in state.budgets.harness_spent
-    assert state.budgets.harness_reserved == {}
 
 
 def test_continuation_launched_route_over_its_ceiling_parks_budget_exhausted(
@@ -29548,10 +29550,10 @@ def test_continuation_launched_route_over_its_ceiling_parks_budget_exhausted(
     }
 
 
-def test_continuation_settles_measured_usage_when_the_resume_reports_it(
+def test_resume_result_usage_never_settles_before_the_invocation_finishes(
     tmp_path: Path,
 ) -> None:
-    """Measured per-invocation usage replaces the estimate through reconcile."""
+    """A resume response's usage object is not a settlement source by itself."""
     store = _seed_review_codex_spend(_review_store(tmp_path))
     config = _review_continuation_config(
         _resume_route_policy(CHEAP_RESUME_HARNESS, CONFIGURED_RESUME_HARNESS)
@@ -29567,17 +29569,16 @@ def test_continuation_settles_measured_usage_when_the_resume_reports_it(
     state = _repair_once(store, config, transport)
 
     charge = _continuation_charges(state, "leaf-a")[0]
-    assert charge.actual == 20
-    assert charge.delta_tokens == 20 - expected
-    assert charge.warning is (abs(20 - expected) / max(expected, 1) > 0.20)
-    assert state.budgets.harness_spent[CONFIGURED_RESUME_HARNESS] == 20
-    assert state.budgets.harness_reserved == {}
+    assert charge.actual == "unknown"
+    assert charge.reconciled is False
+    assert state.budgets.harness_reserved == {CONFIGURED_RESUME_HARNESS: expected}
+    assert state.budgets.harness_spent.get(CONFIGURED_RESUME_HARNESS, 0) == 0
 
 
-def test_continuation_without_measured_usage_keeps_the_estimate_and_warns(
+def test_continuation_without_a_finished_row_keeps_the_reservation(
     tmp_path: Path,
 ) -> None:
-    """Missing usage is never invented: the estimate is conserved with a warning."""
+    """Missing terminal evidence is never guessed; the reservation stays put."""
     store = _seed_review_codex_spend(_review_store(tmp_path))
     config = _review_continuation_config(
         _resume_route_policy(CHEAP_RESUME_HARNESS, CONFIGURED_RESUME_HARNESS)
@@ -29593,15 +29594,15 @@ def test_continuation_without_measured_usage_keeps_the_estimate_and_warns(
 
     charge = _continuation_charges(state, "leaf-a")[0]
     assert charge.actual == "unknown"
-    assert charge.delta_tokens is None
-    assert charge.warning is True
-    assert state.budgets.harness_spent[CONFIGURED_RESUME_HARNESS] == expected
+    assert charge.reconciled is False
+    assert state.budgets.harness_reserved == {CONFIGURED_RESUME_HARNESS: expected}
+    assert state.budgets.harness_spent.get(CONFIGURED_RESUME_HARNESS, 0) == 0
 
 
 def test_replayed_continuation_route_reconciliation_is_idempotent(
     tmp_path: Path,
 ) -> None:
-    """Replaying the confirmed effect neither recharges nor moves spend again."""
+    """Replaying the confirmed effect neither recharges nor binds a new invocation."""
     store = _seed_review_codex_spend(_review_store(tmp_path))
     config = _review_continuation_config(
         _resume_route_policy(CHEAP_RESUME_HARNESS, CONFIGURED_RESUME_HARNESS)
@@ -29612,15 +29613,15 @@ def test_replayed_continuation_route_reconciliation_is_idempotent(
     journal = EffectJournal("review-run", store.run_dir / "action-journal.json")
 
     first = _repair_once(store, config, transport, journal)
-    settled = _continuation_charges(first, "leaf-a")
-    assert len(settled) == 1
+    bound = _continuation_charges(first, "leaf-a")
+    assert len(bound) == 1
 
     replayed = _repair_once(store, config, transport, journal)
 
     assert [name for name, _ in transport.calls if name == "resume_pr"] == ["resume_pr"]
-    assert _continuation_charges(replayed, "leaf-a") == settled
+    assert _continuation_charges(replayed, "leaf-a") == bound
     assert replayed.budgets.harness_spent == first.budgets.harness_spent
-    assert replayed.budgets.harness_reserved == {}
+    assert replayed.budgets.harness_reserved == first.budgets.harness_reserved
 
 
 @pytest.mark.parametrize(

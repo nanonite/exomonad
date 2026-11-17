@@ -895,8 +895,8 @@ invocation that spends tokens, so it reserves a charge through
 `tl_loop/select/ledger.py`, and settles through the same `reconcile`. It names
 the continuation by a stable identity derived from the action/effect intent, so
 a replayed continuation is never charged twice and is distinct from the
-attempt's dispatch charge. `resume_blocked_leaf` reserves and settles the
-accepted route its effect carries.
+attempt's dispatch charge. `resume_blocked_leaf` reserves the accepted route its
+effect carries.
 
 `resume_pr` resolves its real route in the host, not in Python. The controller
 cannot read `config.toml`, so before the effect it reserves against the
@@ -904,29 +904,51 @@ configured-allowlist guess (`configured_continuation_harness`: the role's
 cost-ranked entry). The confirmed invocation handoff returns the launched
 `runtime`, `model`, and `effort`; `_launch_route_from_result` reads them and
 `continuation_harness_for_route` names the matching allowlist entry without
-widening it. `_settle_continuation_to_launched_route` then calls
+widening it. `_bind_continuation_to_launched_route` then calls
 `retarget_continuation` on the same pending charge, releasing the old
-reservation before the new ceiling check, and only then reconciles. The charge
-therefore always names the launched route, in both directions; no second charge
-or counter path is created. If the launched route exceeds the role or
-per-harness ceiling, the controller releases the reservation and parks with
-`park_cause=budget_exhausted`, recording the reserved and launched routes in
-`park_audit`. A host response without invocation coordinates (a legacy result)
-keeps the reservation route conservatively, with no invented route.
+reservation before the new ceiling check, and records the launched
+`invocation_id` on that charge. The charge therefore always names the launched
+route, in both directions; no second charge or counter path is created. If the
+launched route exceeds the role or per-harness ceiling, the controller releases
+the reservation and parks with `park_cause=budget_exhausted`, recording the
+reserved and launched routes in `park_audit`. A host response without
+invocation coordinates (a legacy result) keeps the reservation route
+conservatively, with no invented route.
+
+The resume effect returns before its invocation runs, so usage is not known at
+effect time. Settlement therefore waits for the invocation's authoritative
+`agent.invocation.finished` ledger row. `_settle_finished_continuations` reads
+that row by the `invocation_id` recorded on the pending charge, extracts
+`input_tokens` + `output_tokens` (or `total_tokens` from a `usage` object or the
+same inline counters), and passes it through `resolve_actual_tokens` — Chainlink
+usage first, then the harness report — before reconciling the continuation.
+Until the row exists the reservation stays in place, so a running continuation
+never widens a ceiling. A finished row with no usage keeps today's behavior:
+`actual="unknown"` conserves the estimate with a warning. Settlement is one
+atomic `reconcile` and a reconciled charge is never selected again, so restart
+replay cannot settle the same continuation twice.
+
+No spawn harness currently writes usage counters on the finished row: the
+Codex, OpenCode, and Claude tmux invocations do not report per-invocation
+usage to the host, and the only harness-reported usage today is the RLM
+`claude` JSON envelope for TL judgment calls, which is charged directly to the
+role. Chainlink's `token_usage` table is a per-agent/per-issue store, not a
+per-invocation one. A finished row without usage therefore conserves the
+estimate; the settlement path is ready for a host that reports it, and no
+usage number is invented from elapsed time or text length.
 
 The continuation uses the selector's own estimate rule
 (`estimate_cost` with the role's `cost_rank`) and the same role and harness
 ceilings. The earlier dispatch's spend and the original harness's counters are
 never rewritten. A resume that is refused before it runs releases its
-reservation by reconciling the charge with a zero actual. The handoff is also
-the measured-usage source when a host reports it; the current resume response
-carries no usage, so continuations settle `actual="unknown"` and conserve the
-estimate. `slice.attempts`, `review_rounds`,
-`tl_intervention_attempts`, `escalate_after_attempts`, and the harness
-escalation ladder are not inputs or outputs of the charge. The charge record
-carries one extra optional `continuation` field; checkpoints written before it
-decode with `continuation=None` and behave unchanged. No new checkpoint field
-was added for route retargeting: the same charge record is rewritten in place.
+reservation by reconciling the charge with a zero actual. `slice.attempts`,
+`review_rounds`, `tl_intervention_attempts`, `escalate_after_attempts`, and the
+harness escalation ladder are not inputs or outputs of the charge. The charge
+record carries two extra optional fields: `continuation` (the stable
+continuation identity) and `launched_invocation_id` (the invocation settlement
+waits for). Checkpoints written before either field decode with `None` and
+behave unchanged. No other checkpoint field was added: the same charge record
+is rewritten in place.
 
 A selector result of None with SelectionFailure.OVER_BUDGET is a bounded needs-human parking signal; the controller must not widen the allowlist or silently raise a ceiling to continue.
 

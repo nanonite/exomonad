@@ -14,8 +14,10 @@ three dispatch paths may call those helpers:
 A same-slice continuation does not select dispatch work: `_continuation_route_choice`
 asks `configured_continuation_harness` for the pre-effect reservation guess and
 never calls `select_agent_type`. The confirmed `resume_pr` invocation handoff
-then names the launched route and `_settle_continuation_to_launched_route`
-retargets the reservation; that is budget accounting, not a dispatch selection.
+then names the launched route and `_bind_continuation_to_launched_route`
+retargets the reservation and records the launched invocation; that is budget
+accounting, not a dispatch selection. Settlement waits for that invocation's
+finished ledger row.
 
 A new call site is a second resolution path. This test fails so the reviewer
 must either move the new code through the seam or deliberately extend this

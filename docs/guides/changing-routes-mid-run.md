@@ -185,12 +185,17 @@ controller releases the reservation and parks the slice with
 
 The earlier dispatch's spend and the original harness's counters are never
 rewritten, and the reservation is settled by the same `reconcile` call a
-dispatch charge uses: a measured actual moves the estimate to spend, missing
-usage conserves the estimate with `actual="unknown"` and a warning, and a
-resume that is refused before running releases the reservation with a zero
-actual. The resume handoff is also the measured-usage source when a host
-reports it; the current host response carries no usage, so today's continuation
-settles `actual="unknown"` at the launched route.
+dispatch charge uses. The resume effect returns before its invocation runs, so
+the confirmed handoff cannot carry a final usage number: the controller records
+the launched `invocation_id` on the pending charge and keeps the reservation.
+When the invocation's `agent.invocation.finished` ledger row appears, the
+controller reads that row's measured usage and settles the charge through
+`reconcile(continuation=...)`; a measured actual moves the estimate to spend and
+a delta over 20% is flagged. A finished row that reports no usage conserves the
+estimate with `actual="unknown"` and a warning, and a resume that is refused
+before running releases the reservation with a zero actual. No current spawn
+harness writes per-invocation usage on that row, so a continuation today settles
+conserved; no usage is inferred from elapsed time or text length.
 
 Both ceilings still apply. If the continuation would exceed the role ceiling or
 the route harness's `per_harness_budget`, the resume is not issued: the slice is

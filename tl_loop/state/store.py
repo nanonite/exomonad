@@ -3484,6 +3484,8 @@ def _encode_charge(charge: BudgetCharge) -> dict[str, object]:
     }
     if charge.continuation is not None:
         encoded["continuation"] = charge.continuation
+    if charge.launched_invocation_id is not None:
+        encoded["launched_invocation_id"] = charge.launched_invocation_id
     return encoded
 
 
@@ -3499,6 +3501,7 @@ def _decode_charge(value: dict[str, object]) -> BudgetCharge:
         warning=cast(bool, value["warning"]),
         reconciled=cast(bool, value["reconciled"]),
         continuation=cast(str | None, value.get("continuation")),
+        launched_invocation_id=cast(str | None, value.get("launched_invocation_id")),
     )
 
 

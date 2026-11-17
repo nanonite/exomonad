@@ -859,6 +859,7 @@ CHARGE_KEYS = frozenset(
         "warning",
         "reconciled",
         "continuation",
+        "launched_invocation_id",
     }
 )
 GATE_KEYS = frozenset({"name", "status"})
@@ -991,6 +992,11 @@ class BudgetCharge:
     #: None for a dispatch charge. It keeps a replayed continuation from being
     #: charged twice without changing the slice attempt counters.
     continuation: str | None = None
+    #: Invocation the confirmed resume effect launched for this continuation.
+    #: Settlement waits for that invocation's ``agent.invocation.finished``
+    #: ledger row, so the charge records which invocation it is waiting for.
+    #: None on older checkpoints and on dispatch charges.
+    launched_invocation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -2578,6 +2584,16 @@ def _charges(value: object, path: str, errors: list[tuple[str, str]]) -> None:
         ):
             errors.append(
                 (f"{charge_path}.continuation", "must be a non-empty string or null")
+            )
+        launched_invocation_id = charge.get("launched_invocation_id")
+        if launched_invocation_id is not None and (
+            not isinstance(launched_invocation_id, str) or not launched_invocation_id
+        ):
+            errors.append(
+                (
+                    f"{charge_path}.launched_invocation_id",
+                    "must be a non-empty string or null",
+                )
             )
         slice_id = charge.get("slice_id")
         attempt = charge.get("attempt")

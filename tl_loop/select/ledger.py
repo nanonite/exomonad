@@ -159,6 +159,43 @@ def find_continuation_charge(
     return matches[0] if matches else None
 
 
+def attach_continuation_launch(
+    ledger: LedgerInput,
+    slice_id: str,
+    continuation_id: str,
+    invocation_id: str,
+) -> dict[str, object]:
+    """Record the invocation a pending continuation launched.
+
+    Settlement waits for that invocation's finished ledger row, so the charge
+    carries the exact invocation it is waiting for. Replaying the same launch is
+    idempotent; a different invocation for one continuation is a conflict, not
+    a replacement.
+    """
+    slice_id = _non_empty(slice_id, "slice_id")
+    continuation_id = _non_empty(continuation_id, "continuation_id")
+    invocation_id = _non_empty(invocation_id, "invocation_id")
+    result = _document(ledger)
+    charges = _charges(result)
+    index = _pending_charge_index(charges, slice_id, continuation_id)
+    if index is None:
+        raise ChargeNotFound(
+            f"no pending continuation charge exists for slice {slice_id!r}"
+        )
+    charge = dict(charges[index])
+    existing = charge.get("launched_invocation_id")
+    if existing == invocation_id:
+        return result
+    if existing is not None:
+        raise LedgerError(
+            f"continuation {continuation_id!r} is already bound to another invocation"
+        )
+    charge["launched_invocation_id"] = invocation_id
+    charges[index] = charge
+    result["charges"] = charges
+    return result
+
+
 def retarget_continuation(
     ledger: LedgerInput,
     slice_id: str,
@@ -431,6 +468,31 @@ def apply_continuation_retarget(
     return apply(run_dir, mutate, lock_timeout=lock_timeout, hooks=hooks)
 
 
+def apply_continuation_launch(
+    run_dir: str | Path,
+    slice_id: str,
+    continuation_id: str,
+    invocation_id: str,
+    *,
+    lock_timeout: float = 5.0,
+    hooks: WriteHooks | None = None,
+) -> Document:
+    """Bind one pending continuation to the invocation its resume launched."""
+
+    def mutate(document: Document) -> Document:
+        document["budgets"] = {
+            "ledger": attach_continuation_launch(
+                _document_mapping(document, "continuation"),
+                slice_id,
+                continuation_id,
+                invocation_id,
+            )
+        }
+        return document
+
+    return apply(run_dir, mutate, lock_timeout=lock_timeout, hooks=hooks)
+
+
 def _document_mapping(document: Mapping[str, object], label: str) -> Mapping[str, object]:
     budgets = document.get("budgets")
     if not isinstance(budgets, Mapping):
@@ -554,9 +616,11 @@ __all__ = [
     "DuplicateCharge",
     "LedgerError",
     "apply_continuation_and_charge",
+    "apply_continuation_launch",
     "apply_continuation_reconcile",
     "apply_continuation_retarget",
     "apply_spawn_and_charge",
+    "attach_continuation_launch",
     "charge_continuation",
     "charge_spawn",
     "find_continuation_charge",

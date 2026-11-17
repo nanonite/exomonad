@@ -309,6 +309,24 @@ class LedgerReader:
             match = data
         return match
 
+    def find_finished_invocation(
+        self,
+        invocation_id: str,
+    ) -> Mapping[str, object] | None:
+        """Return the newest finished payload for one exact invocation id.
+
+        Invocation ids are unique per generation, so this lookup is not scoped
+        by agent or slice and cannot attribute another invocation's usage.
+        """
+        if not isinstance(invocation_id, str) or not invocation_id:
+            raise ValueError("invocation_id must be a non-empty string")
+        self._read_rows()
+        match: Mapping[str, object] | None = None
+        for _agent_id, _recorded_slice, data in self._terminal_matches:
+            if data.get("invocation_id") == invocation_id:
+                match = data
+        return match
+
     def has_record(self, event_type: str, payload: Mapping[str, object]) -> bool:
         """Return whether one authoritative raw ledger record matches payload."""
         if not isinstance(event_type, str) or not event_type:

@@ -445,16 +445,22 @@ A worker slice reserves budget when it is dispatched and again for each
 same-slice continuation (`resume_pr`, `resume_blocked_leaf`) on the route that
 continuation actually runs. For `resume_pr` the controller reserves against its
 configured-allowlist guess before the effect, reads the `runtime`/`model` the
-host launches from the confirmed invocation handoff, retargets the same charge
-to that allowlist entry, and settles it. `resume_blocked_leaf` reserves and
-settles the accepted route it carries. The continuation charge is the same
-ledger record and reconciliation a dispatch uses, names a stable continuation
-identity so a replayed continuation is charged once, and never rewrites the
-earlier harness's spend. If the role ceiling or the launched route's
-`per_harness_budget` would be exceeded, the resume is parked with
-`park_cause=budget_exhausted` and the needs-human issue path, and the route is
-never silently switched to a cheaper harness. Measured usage is used when the
-handoff reports it; otherwise the estimate is conserved with a warning.
+host launches from the confirmed invocation handoff, and retargets the same
+charge to that allowlist entry; `resume_blocked_leaf` reserves the accepted
+route it carries. Because the resume effect returns before its invocation runs,
+the charge is not settled at effect time: it records the launched
+`invocation_id` and stays reserved until the controller reads that invocation's
+`agent.invocation.finished` ledger row. A finished row that reports usage
+settles the measured actual through the same `reconcile` a dispatch uses; a
+finished row with no usage keeps `actual="unknown"`, conserves the estimate, and
+warns. Settlement is one atomic reconcile, so a reconciled charge is never
+settled twice. No current spawn harness reports per-invocation usage, so a
+continuation today remains conserved rather than measured. The continuation
+charge names a stable continuation identity so a replayed continuation is
+charged once, and it never rewrites the earlier harness's spend. If the role
+ceiling or the launched route's `per_harness_budget` would be exceeded, the
+resume is parked with `park_cause=budget_exhausted` and the needs-human issue
+path, and the route is never silently switched to a cheaper harness.
 
 Task duration uses one explicit precedence: a slice's `task_timeout_seconds` in
 `plan.json` overrides the role's value in `.exo/harness_policy.toml`, which

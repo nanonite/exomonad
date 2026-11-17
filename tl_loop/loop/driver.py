@@ -257,13 +257,16 @@ from tl_loop.select.harness import HarnessRoute, normalize_runtime_label
 from tl_loop.select.learned_policy import LearnedPolicy
 from tl_loop.select.ledger import (
     BudgetCeilingExceeded,
+    ChargeNotFound,
     DuplicateCharge,
     apply_continuation_and_charge,
+    apply_continuation_launch,
     apply_continuation_reconcile,
     apply_continuation_retarget,
     apply_spawn_and_charge,
     charge_continuation,
     find_continuation_charge,
+    resolve_actual_tokens,
 )
 from tl_loop.select.model import ModelCatalog, select_model, select_model_for_difficulty
 from tl_loop.select.policy import HarnessPolicy, RolePolicy, load_policy
@@ -4905,6 +4908,7 @@ def _prepare_startup_recovery(
         ledger_run_id=config.ledger_run_id,
     )
     state = _reconcile_confirmed_repair_actions(state, store, effects_log, config)
+    state = _settle_finished_continuations(state, config, store)
     state = _reconcile_dispatches(state, config, effects, store, effects_log)
     state = _reconcile_nonterminal_slices(plan, state, config, effects, store, effects_log)
     inconsistency = _recovery_inconsistency(plan, state)
@@ -8817,13 +8821,6 @@ def _resume_approved_blocked_leaf(
                 effects_log,
                 "configured blocked-leaf resume was rejected; inspect the exact owner evidence",
             )
-        if pending_charge is not None and not pending_charge.reconciled:
-            state = _settle_continuation_charge(
-                store,
-                proof.leaf.name,
-                continuation_id,
-                _measured_usage_tokens(result),
-            )
         try:
             successor = _validated_blocked_resume_result(proof, result)
         except BlockedLeafRouteProvenanceError as error:
@@ -8847,6 +8844,14 @@ def _resume_approved_blocked_leaf(
                 "blocked-leaf resume response does not match the persisted owner successor",
             )
         invocation_id, runtime, model, effort = successor
+        if pending_charge is not None and not pending_charge.reconciled:
+            apply_continuation_launch(
+                store.run_dir,
+                proof.leaf.name,
+                continuation_id,
+                invocation_id,
+            )
+            state = store.load()
         attempt = attempt.routed(
             harness=f"{runtime}/{model}" if model else runtime,
             agent_type=runtime,
@@ -9705,7 +9710,18 @@ def _run_loop(
         state = _apply_convergence(state, convergence, store, config, effects, effects_log)
         phase = _phase_from_state(state)
 
+    continuation_reader = (
+        LedgerReader(
+            Path(config.project_root) / ".exo" / "ledger" / "segments",
+            ledger_run_id=config.ledger_run_id,
+        )
+        if config.project_root is not None
+        else None
+    )
     while not config.test_harness or len(consumed) < config.max_events:
+        state = _settle_finished_continuations(
+            state, config, store, reader=continuation_reader
+        )
         if not recovery_pending and not (
             isinstance(_phase_from_state(state), RecursiveTLAllMerged)
             and _source_has_pending(source)
@@ -16627,7 +16643,8 @@ def _reconcile_confirmed_repair_actions(
         )
         if pending_charge is not None and not pending_charge.reconciled:
             # The confirmed effect ran before the crash. Read its launched route
-            # from the journal result and settle that route when it fits; the
+            # and invocation from the journal result and bind the same pending
+            # charge; settlement waits for that invocation's finished row. The
             # recovery boundary issues no human-gate effect, so an unchargeable
             # launch keeps the existing reservation conservatively.
             try:
@@ -16635,13 +16652,13 @@ def _reconcile_confirmed_repair_actions(
             except ActionJournalError:
                 result = None
             try:
-                state = _settle_continuation_to_launched_route(
+                state = _bind_continuation_to_launched_route(
                     store,
                     slice_id,
                     continuation_id,
                     config,
                     _launch_route_from_result(result),
-                    _measured_usage_tokens(result),
+                    _launched_invocation_from_result(result),
                 )
             except ContinuationRouteError as error:
                 LOGGER.warning(
@@ -16649,9 +16666,6 @@ def _reconcile_confirmed_repair_actions(
                     "during startup recovery: %s; conserving the existing reservation",
                     continuation_id,
                     error.reason,
-                )
-                state = _settle_continuation_charge(
-                    store, slice_id, continuation_id, _measured_usage_tokens(result)
                 )
         state = _checkpoint_slice_action(
             store,
@@ -29790,32 +29804,55 @@ def _launch_route_from_result(result: ToolResult | None) -> HarnessRoute | None:
     )
 
 
-def _measured_usage_tokens(result: ToolResult | None) -> int | None:
-    """Read a measured per-invocation usage total when the host reports one.
-
-    The shape matches the RLM envelope's ``usage`` object. No current resume
-    response carries it, so production continues to settle ``actual="unknown"``;
-    a malformed report is treated as absent rather than guessed.
-    """
+def _launched_invocation_from_result(result: ToolResult | None) -> str | None:
+    """Read the exact invocation a confirmed resume effect launched."""
     if result is None or result.success is not True:
         return None
     payload = result.result
-    usage = payload.get("usage") if isinstance(payload, Mapping) else None
-    if usage is None:
+    invocation = payload.get("invocation") if isinstance(payload, Mapping) else None
+    if not isinstance(invocation, Mapping):
         return None
-    if not isinstance(usage, Mapping):
-        LOGGER.warning("[TL loop] resume usage is not an object; keeping the estimate")
+    value = invocation.get("invocation_id")
+    if not isinstance(value, str):
         return None
-    total = 0
+    invocation_id = value.strip()
+    return invocation_id or None
+
+
+def _finished_usage_tokens(row: Mapping[str, object] | None) -> int | None:
+    """Read measured per-invocation usage from one finished ledger row.
+
+    The row may carry the RLM envelope's ``usage`` object or the same counters
+    inline. A malformed or absent report is treated as absent, never guessed.
+    """
+    if row is None:
+        return None
+    payload: Mapping[str, object] = row
+    nested = row.get("usage")
+    if isinstance(nested, Mapping):
+        payload = nested
+    elif nested is not None:
+        LOGGER.warning("[TL loop] finished invocation usage is not an object")
+        return None
+    total = payload.get("total_tokens")
+    if total is not None:
+        if type(total) is not int or total < 0:
+            LOGGER.warning("[TL loop] finished invocation total_tokens is invalid")
+            return None
+        # A zero report is not a measurement of zero spend; conserve the estimate.
+        return total or None
+    if "input_tokens" not in payload and "output_tokens" not in payload:
+        return None
+    summed = 0
     for key in ("input_tokens", "output_tokens"):
-        value = usage.get(key, 0)
+        value = payload.get(key, 0)
         if type(value) is not int or value < 0:
             LOGGER.warning(
-                "[TL loop] resume usage %s is invalid; keeping the estimate", key
+                "[TL loop] finished invocation %s is invalid; keeping the estimate", key
             )
             return None
-        total += value
-    return total
+        summed += value
+    return summed or None
 
 
 def _launched_continuation_choice(
@@ -29848,21 +29885,23 @@ def _settle_continuation_charge(
     return store.load()
 
 
-def _settle_continuation_to_launched_route(
+def _bind_continuation_to_launched_route(
     store: RunStore,
     slice_id: str,
     continuation_id: str,
     config: TLLoopConfig,
     launched: HarnessRoute | None,
-    actual_tokens: int | None,
+    invocation_id: str | None,
 ) -> RunState:
-    """Settle one continuation on the route its resume effect actually launched.
+    """Bind one continuation to the route and invocation its resume launched.
 
     The reservation was taken before the effect against the controller's
     configured-route guess. When the confirmed response names a different route,
-    the same pending charge is retargeted in one atomic ledger mutation and only
-    then settled. A retarget that would exceed a ceiling raises a typed refusal
-    without changing the checkpoint, so the caller can release and park.
+    the same pending charge is retargeted in one atomic ledger mutation and the
+    launched invocation is recorded. Settlement is deferred until that
+    invocation's finished ledger row exists, so the estimate is never spent as
+    if it were measured. A retarget that would exceed a ceiling raises a typed
+    refusal without changing the checkpoint, so the caller can release and park.
     """
     state = store.load()
     charge = find_continuation_charge(state.budgets, slice_id, continuation_id)
@@ -29883,7 +29922,77 @@ def _settle_continuation_to_launched_route(
                     ParkCause.BUDGET_EXHAUSTED,
                     f"continuation on launched harness {choice.harness!r} is refused: {error}",
                 ) from error
-    return _settle_continuation_charge(store, slice_id, continuation_id, actual_tokens)
+    if invocation_id is None:
+        LOGGER.warning(
+            "[TL loop] confirmed continuation %s did not name its launched invocation; "
+            "keeping the reservation until terminal evidence identifies it",
+            continuation_id,
+        )
+        return store.load()
+    apply_continuation_launch(store.run_dir, slice_id, continuation_id, invocation_id)
+    return store.load()
+
+
+def _settle_finished_continuations(
+    state: RunState,
+    config: TLLoopConfig,
+    store: RunStore,
+    *,
+    reader: LedgerReader | None = None,
+) -> RunState:
+    """Settle continuations whose invocation has an authoritative finished row.
+
+    The reservation stays in place until the invocation finishes, so a ceiling
+    is never widened by a continuation still running. Once the finished row
+    exists, its measured usage is resolved through the same order a dispatch
+    uses (Chainlink first, then a harness report); a row without usage conserves
+    the estimate with ``actual="unknown"`` and a warning. A reconciled charge is
+    never settled twice, so restart replay is idempotent.
+    """
+    if config.project_root is None:
+        return state
+    pending = [
+        charge
+        for charge in state.budgets.charges
+        if charge.continuation is not None
+        and not charge.reconciled
+        and charge.launched_invocation_id is not None
+    ]
+    if not pending:
+        return state
+    try:
+        if reader is None:
+            reader = LedgerReader(
+                Path(config.project_root) / ".exo" / "ledger" / "segments",
+                ledger_run_id=config.ledger_run_id,
+            )
+        finished = {
+            charge.launched_invocation_id: reader.find_finished_invocation(
+                cast(str, charge.launched_invocation_id)
+            )
+            for charge in pending
+        }
+    except (LedgerReadError, ValueError) as error:
+        LOGGER.warning(
+            "[TL loop] could not read finished continuations; keeping reservations: %s",
+            error,
+        )
+        return state
+    for charge in pending:
+        row = finished.get(charge.launched_invocation_id)
+        if row is None:
+            continue
+        actual = resolve_actual_tokens(
+            harness_reported_usage=_finished_usage_tokens(row)
+        )
+        try:
+            state = _settle_continuation_charge(
+                store, charge.slice_id, cast(str, charge.continuation), actual
+            )
+        except ChargeNotFound:
+            # Another writer settled the same continuation first.
+            state = store.load()
+    return state
 
 
 def _release_continuation_charge(
@@ -30120,15 +30229,15 @@ def _route_repair(
         if not charge.reconciled:
             result = resume_result[0]
             launched = _launch_route_from_result(result)
-            actual_tokens = _measured_usage_tokens(result)
+            invocation_id = _launched_invocation_from_result(result)
             try:
-                refreshed = _settle_continuation_to_launched_route(
+                refreshed = _bind_continuation_to_launched_route(
                     store,
                     slice_id,
                     continuation_id,
                     config,
                     launched,
-                    actual_tokens,
+                    invocation_id,
                 )
             except ContinuationRouteError as error:
                 refreshed = _release_continuation_charge(
