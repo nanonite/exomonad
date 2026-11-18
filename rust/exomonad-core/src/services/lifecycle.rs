@@ -4,7 +4,9 @@
 //! PR publication, review verdicts, and CI remain the workflow state machine;
 //! an invocation or a delivered message is never treated as authoritative.
 
-use super::agent_control::{AgentType, InvocationRecord, InvocationStatus, InvocationTrigger};
+use super::agent_control::{
+    AgentType, InvocationRecord, InvocationStatus, InvocationTrigger, InvocationUsage,
+};
 use super::event_log::EventLog;
 use super::guidance_queue::GuidanceBatch;
 use super::pr_registry::PublicationAdoption;
@@ -150,6 +152,10 @@ pub struct LifecycleTelemetry {
     pub delivery_vs_authoritative: String,
     pub rollout_mode: OneShotLifecycleMode,
     pub channel: Option<String>,
+    /// Measured per-invocation usage, only when the harness produced an
+    /// authoritative source. Absent means the controller conserves its estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<InvocationUsage>,
 }
 
 impl LifecycleTelemetry {
@@ -186,6 +192,7 @@ impl LifecycleTelemetry {
             delivery_vs_authoritative: "metadata_only".to_string(),
             rollout_mode: OneShotLifecycleMode::from_env(),
             channel: None,
+            usage: record.usage.clone(),
         }
     }
 
@@ -234,6 +241,7 @@ impl LifecycleTelemetry {
             delivery_vs_authoritative: "delivery_only".to_string(),
             rollout_mode: OneShotLifecycleMode::from_env(),
             channel: Some(channel.to_string()),
+            usage: None,
         }
     }
 
@@ -704,6 +712,11 @@ mod tests {
             prior_invocation_id: None,
             recovery_round: 0,
             authorization_source: None,
+            usage: Some(InvocationUsage {
+                input_tokens: 200,
+                output_tokens: 25,
+                total_tokens: 225,
+            }),
         };
         let telemetry = LifecycleTelemetry::from_invocation(&record, "finished");
         let value = serde_json::to_value(telemetry).expect("telemetry JSON");
@@ -712,6 +725,18 @@ mod tests {
         assert_eq!(value["pr_number"], 585);
         assert_eq!(value["head_sha"], "sha");
         assert_eq!(value["delivery_vs_authoritative"], "metadata_only");
+        assert_eq!(value["usage"]["input_tokens"], 200);
+        assert_eq!(value["usage"]["output_tokens"], 25);
+        assert_eq!(value["usage"]["total_tokens"], 225);
+
+        let mut legacy = value.clone();
+        legacy
+            .as_object_mut()
+            .expect("telemetry object")
+            .remove("usage");
+        let decoded: LifecycleTelemetry =
+            serde_json::from_value(legacy).expect("a row written before usage still decodes");
+        assert!(decoded.usage.is_none());
 
         let guidance = LifecycleTelemetry::guidance(
             AgentType::Codex,
@@ -762,6 +787,7 @@ mod tests {
             prior_invocation_id: None,
             recovery_round: 0,
             authorization_source: None,
+            usage: None,
         };
         record_invocation_started(&agent_dir, &record);
         let files = fs::read_dir(root.path().join(".exo/events"))

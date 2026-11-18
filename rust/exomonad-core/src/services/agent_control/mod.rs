@@ -40,9 +40,9 @@ pub use invocation::{
     start_invocation_with_provenance_and_context,
     start_invocation_with_provenance_and_context_and_mode, InvocationExitContext,
     InvocationFinishResult, InvocationIdentityContext, InvocationMetadata, InvocationMode,
-    InvocationRecord, InvocationStatus, InvocationTrigger, LaunchCommandSource,
+    InvocationRecord, InvocationStatus, InvocationTrigger, InvocationUsage, LaunchCommandSource,
     RecoveryAuthorization, RecoveryInvocationLineage, RoleRouteProvenance, RouteConfigSources,
-    INVOCATION_FILENAME,
+    INVOCATION_FILENAME, INVOCATION_USAGE_FILENAME,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

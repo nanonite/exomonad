@@ -10,11 +10,24 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::OnceLock;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub const INVOCATION_FILENAME: &str = "invocation.json";
+
+/// Harness-written usage source for the invocation that owns this agent dir.
+///
+/// A one-shot Claude invocation writes its `claude -p --output-format json`
+/// envelope here. The finish path consumes the file, so a later invocation in
+/// the same directory cannot inherit the earlier invocation's numbers.
+pub const INVOCATION_USAGE_FILENAME: &str = "usage.json";
+
+/// The read is local and bounded; a stalled or oversized source is no usage.
+const MAX_INVOCATION_USAGE_BYTES: u64 = 1024 * 1024;
+const INVOCATION_USAGE_READ_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Compile-time identity of the runtime that wrote this invocation record.
 ///
@@ -293,6 +306,16 @@ where
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvocationUsage {
+    /// Prompt tokens including cache creation and cache reads, matching the
+    /// harness envelope's own input accounting.
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// `input_tokens + output_tokens`, carried explicitly for the controller.
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InvocationRecord {
     pub invocation_id: String,
     pub runtime: AgentType,
@@ -356,6 +379,10 @@ pub struct InvocationRecord {
     /// Provenance of each resolved route field for this attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_sources: Option<RouteConfigSources>,
+    /// Measured usage for this invocation, when its harness produced an
+    /// authoritative per-invocation source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<InvocationUsage>,
 }
 
 impl InvocationRecord {
@@ -429,6 +456,141 @@ async fn next_generation(agent_dir: &Path) -> Result<u64> {
         .map(|record| record.generation)
         .unwrap_or(0)
         .saturating_add(1))
+}
+
+/// Parse the authoritative `claude -p --output-format json` envelope.
+///
+/// The envelope shape and the cache-inclusive input sum are the ones the
+/// repository's tool-free RLM backend already reads (`_claude_reply` /
+/// `_usage_tokens`). A missing, partial, malformed, or zero report is not a
+/// measurement and returns an explicit reason instead of a number.
+pub fn parse_claude_usage_envelope(raw: &str) -> Result<InvocationUsage, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| format!("usage envelope is not exactly one JSON object: {error}"))?;
+    let envelope = value
+        .as_object()
+        .ok_or_else(|| "usage envelope is not a JSON object".to_string())?;
+    let usage = envelope
+        .get("usage")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "usage envelope has no usage object".to_string())?;
+
+    let cache_creation_tokens = optional_usage_counter(usage, "cache_creation_input_tokens")?;
+    let cache_read_tokens = optional_usage_counter(usage, "cache_read_input_tokens")?;
+    let input_tokens = required_usage_counter(usage, "input_tokens")?
+        .checked_add(cache_creation_tokens)
+        .and_then(|value| value.checked_add(cache_read_tokens))
+        .ok_or_else(|| "input token counters overflow".to_string())?;
+    let output_tokens = required_usage_counter(usage, "output_tokens")?;
+    let total_tokens = input_tokens
+        .checked_add(output_tokens)
+        .ok_or_else(|| "token counters overflow".to_string())?;
+    if total_tokens == 0 {
+        return Err("usage envelope reports zero tokens".to_string());
+    }
+    Ok(InvocationUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+    })
+}
+
+fn required_usage_counter(
+    usage: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<u64, String> {
+    usage
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("usage {key} must be a non-negative integer"))
+}
+
+fn optional_usage_counter(
+    usage: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<u64, String> {
+    match usage.get(key) {
+        None => Ok(0),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("usage {key} must be a non-negative integer")),
+    }
+}
+
+/// Read and consume the invocation-owned usage source.
+///
+/// The read is local, bounded, and time-limited so finish never waits on a
+/// slow or hostile file. Absent is normal (Codex, OpenCode, Shoal, and
+/// interactive Claude have no source); a file that exists but cannot be used
+/// logs why and contributes no usage.
+async fn read_invocation_usage(agent_dir: &Path) -> Option<InvocationUsage> {
+    let path = agent_dir.join(INVOCATION_USAGE_FILENAME);
+    match tokio::fs::metadata(&path).await {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            debug!(path = %path.display(), "Ignoring non-file invocation usage source");
+            return None;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            debug!(path = %path.display(), "No per-invocation usage source");
+            return None;
+        }
+        Err(error) => {
+            warn!(path = %path.display(), %error, "Ignoring unreadable invocation usage source");
+            return None;
+        }
+    }
+
+    let outcome = tokio::time::timeout(
+        INVOCATION_USAGE_READ_TIMEOUT,
+        read_bounded_usage_source(&path),
+    )
+    .await;
+    let _ = tokio::fs::remove_file(&path).await;
+
+    match outcome {
+        Err(_) => {
+            warn!(path = %path.display(), "Invocation usage source read timed out");
+            None
+        }
+        Ok(Err(reason)) => {
+            warn!(path = %path.display(), reason = %reason, "Ignoring invocation usage source");
+            None
+        }
+        Ok(Ok(raw)) => match parse_claude_usage_envelope(&raw) {
+            Ok(usage) => Some(usage),
+            Err(reason) => {
+                warn!(path = %path.display(), reason = %reason, "Ignoring invocation usage source");
+                None
+            }
+        },
+    }
+}
+
+async fn read_bounded_usage_source(path: &Path) -> Result<String, String> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|error| format!("cannot stat usage source: {error}"))?;
+    if metadata.len() > MAX_INVOCATION_USAGE_BYTES {
+        return Err(format!(
+            "usage source is {} bytes, over the {MAX_INVOCATION_USAGE_BYTES}-byte bound",
+            metadata.len()
+        ));
+    }
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| format!("cannot open usage source: {error}"))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_INVOCATION_USAGE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| format!("cannot read usage source: {error}"))?;
+    if bytes.len() as u64 > MAX_INVOCATION_USAGE_BYTES {
+        return Err(format!(
+            "usage source grew past the {MAX_INVOCATION_USAGE_BYTES}-byte bound"
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| format!("usage source is not UTF-8: {error}"))
 }
 
 async fn write_atomic(agent_dir: &Path, record: &InvocationRecord) -> Result<()> {
@@ -870,6 +1032,7 @@ async fn start_invocation_with_context(
         prior_invocation_id: None,
         recovery_round: 0,
         authorization_source: None,
+        usage: None,
     };
     write_atomic(agent_dir, &record).await?;
     persist_routing_ownership(
@@ -1131,6 +1294,7 @@ pub async fn start_invocation_with_provenance_and_context_and_mode_with_id_guard
         launch_command,
         launch_command_source,
         config_sources,
+        usage: None,
     };
     write_atomic(agent_dir, &record).await?;
     #[cfg(test)]
@@ -1178,6 +1342,7 @@ async fn finish_locked(
     record.exit_reason = exit_context.reason;
     record.exit_classification = exit_context.classification;
     record.stderr_tail = exit_context.stderr_tail;
+    record.usage = read_invocation_usage(agent_dir).await;
     write_atomic(agent_dir, &record).await?;
     crate::services::lifecycle::record_invocation_finished(agent_dir, &record);
     info!(
@@ -2202,5 +2367,128 @@ mod tests {
         assert!(record.launch_command.is_none());
         assert!(record.launch_command_source.is_none());
         assert!(record.config_sources.is_none());
+        assert!(record.usage.is_none());
+    }
+
+    #[test]
+    fn claude_usage_envelope_sums_cache_inclusive_input_and_output() {
+        let usage = parse_claude_usage_envelope(
+            &serde_json::json!({
+                "type": "result",
+                "is_error": false,
+                "result": "done",
+                "usage": {
+                    "input_tokens": 120,
+                    "cache_creation_input_tokens": 30,
+                    "cache_read_input_tokens": 50,
+                    "output_tokens": 25
+                }
+            })
+            .to_string(),
+        )
+        .expect("authoritative envelope");
+        assert_eq!(
+            usage,
+            InvocationUsage {
+                input_tokens: 200,
+                output_tokens: 25,
+                total_tokens: 225,
+            }
+        );
+    }
+
+    #[test]
+    fn partial_zero_and_ambiguous_usage_envelopes_are_not_measurements() {
+        for raw in [
+            r#"{"usage":{"input_tokens":10}}"#,
+            r#"{"usage":{"input_tokens":10,"output_tokens":-1}}"#,
+            r#"{"usage":{"input_tokens":0,"output_tokens":0}}"#,
+            r#"{"result":"done"}"#,
+            "not json",
+            concat!(
+                r#"{"usage":{"input_tokens":10,"output_tokens":2}}"#,
+                "\n",
+                r#"{"usage":{"input_tokens":99,"output_tokens":1}}"#
+            ),
+        ] {
+            assert!(
+                parse_claude_usage_envelope(raw).is_err(),
+                "must not invent usage from {raw:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn finish_reads_and_consumes_the_invocation_owned_usage_source() {
+        let dir = tempdir().expect("tempdir");
+        let record = start_invocation(
+            dir.path(),
+            AgentType::Claude,
+            InvocationTrigger::Spawn,
+            RoutingInfo::window(WindowId::parse("@42").expect("window")),
+            None,
+            None,
+        )
+        .await
+        .expect("start");
+        tokio::fs::write(
+            dir.path().join(INVOCATION_USAGE_FILENAME),
+            serde_json::json!({
+                "usage": {
+                    "input_tokens": 7,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 3
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("usage source");
+        let InvocationFinishResult::Finished(finished) = finish_invocation(
+            dir.path(),
+            &record.invocation_id,
+            InvocationStatus::Exited,
+            Some(0),
+        )
+        .await
+        .expect("finish") else {
+            panic!("expected the current invocation to finish");
+        };
+        assert_eq!(
+            finished.usage,
+            Some(InvocationUsage {
+                input_tokens: 7,
+                output_tokens: 3,
+                total_tokens: 10,
+            })
+        );
+        assert!(!dir.path().join(INVOCATION_USAGE_FILENAME).exists());
+    }
+
+    #[tokio::test]
+    async fn a_missing_usage_source_leaves_the_finished_invocation_conserved() {
+        let dir = tempdir().expect("tempdir");
+        let record = start_invocation(
+            dir.path(),
+            AgentType::Claude,
+            InvocationTrigger::Spawn,
+            RoutingInfo::window(WindowId::parse("@42").expect("window")),
+            None,
+            None,
+        )
+        .await
+        .expect("start");
+        let InvocationFinishResult::Finished(finished) = finish_invocation(
+            dir.path(),
+            &record.invocation_id,
+            InvocationStatus::Exited,
+            Some(0),
+        )
+        .await
+        .expect("finish") else {
+            panic!("expected the current invocation to finish");
+        };
+        assert!(finished.usage.is_none());
     }
 }

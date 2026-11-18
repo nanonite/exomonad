@@ -942,14 +942,19 @@ reserved. Time and silence are never evidence. A handoff that already names its
 id is untouched, and a released charge is never selected again, so replay is
 idempotent.
 
-No spawn harness currently writes usage counters on the finished row: the
-Codex, OpenCode, and Claude tmux invocations do not report per-invocation
-usage to the host, and the only harness-reported usage today is the RLM
-`claude` JSON envelope for TL judgment calls, which is charged directly to the
-role. Chainlink's `token_usage` table is a per-agent/per-issue store, not a
-per-invocation one. A finished row without usage therefore conserves the
-estimate; the settlement path is ready for a host that reports it, and no
-usage number is invented from elapsed time or text length.
+No spawn harness writes usage counters on the finished row except one-shot
+Claude. The host launches a one-shot Claude agent with
+`claude -p --output-format json` and captures that envelope into the
+invocation's own `.exo/agents/<agent>/usage.json`; the Rust finish path reads
+the bounded file once, sums input tokens (including cache creation and cache
+reads) plus output tokens, and writes `usage` on the finished row. Codex,
+OpenCode, Shoal, `Process`, and interactive Claude companions have no
+established per-invocation usage source, so a finished row from those paths
+carries no usage and its continuation conserves the estimate. The only other
+harness-reported usage is the RLM `claude` JSON envelope for TL judgment calls,
+which is charged directly to the role. Chainlink's `token_usage` table is a
+per-agent/per-issue store, not a per-invocation one. No usage number is invented
+from elapsed time or text length.
 
 The continuation uses the selector's own estimate rule
 (`estimate_cost` with the role's `cost_rank`) and the same role and harness

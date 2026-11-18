@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Report per-invocation token usage on the finished ledger row of a one-shot Claude agent by launching it with `claude -p --output-format json` and capturing the envelope into the invocation's own `usage.json`, so a continuation settles measured spend instead of the estimate; the captured envelope no longer appears in the agent's tmux pane, and every launch now clears a stale `usage.json` first. Codex, OpenCode, Shoal and Process report no usage and keep conserving the estimate. [#1416]
 - Identify a continuation's launched invocation from the durable owner record and the started ledger rows when the resume handoff names none, and otherwise release the reservation and park with `missing_handoff` and the human gate instead of leaking it against a ceiling (#1417)
 - Settle a `resume_pr` or `resume_blocked_leaf` continuation's budget charge once its invocation has a finished ledger row, from the usage that row reports, instead of spending the estimate at effect time; a row without usage still conserves the estimate with a warning (#1400)
 - Meter a `resume_pr` continuation to the route the host actually launched (read back from the invocation handoff, which now carries `model` and `effort`) instead of the allowlist's cheapest entry, retargeting the same reservation without widening a ceiling (#1398)

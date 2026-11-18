@@ -484,6 +484,23 @@ agent.spawned/agent.resumed events carry the same bounded model, effort,
 topology, branch, and spawn-type provenance. Prompts and secrets are never
 copied into these provenance fields.
 
+Measured per-invocation usage is additive on the same record and on the
+`agent.invocation.finished` payload as `usage: { input_tokens, output_tokens,
+total_tokens }`. It is written only from an authoritative source the harness
+produced for this exact invocation. A one-shot Claude agent is launched with
+`claude -p --output-format json` and its stdout is captured into the
+invocation's own `.exo/agents/<agent>/usage.json`; the finish path reads that
+file under a 1 MiB bound and a 500 ms timeout, sums `input_tokens` with
+`cache_creation_input_tokens` and `cache_read_input_tokens` plus
+`output_tokens`, consumes the file, and records the result. The one-shot pane
+therefore carries no prose on stdout: the envelope is the invocation's usage
+evidence and the workflow result remains the PR/review/CI outcome. A missing,
+unreadable, partial, zero, oversized, or ambiguous source writes no `usage` and
+logs why; it is never zero and never an estimate. Codex, OpenCode, Shoal,
+`Process`, and interactive Claude companions have no established
+per-invocation usage source, so their records and finished rows stay absent.
+Old records and old finished rows without `usage` decode unchanged.
+
 ### Configured-route transitions at resume
 
 Resume/continuation treats the currently configured harness/model/effort as the

@@ -1221,6 +1221,16 @@ impl<
         env_vars.insert("EXOMONAD_SESSION_ID".to_string(), session_id.to_string());
         env_vars.insert("EXOMONAD_ROLE".to_string(), role.as_str().to_string());
         env_vars.insert(
+            "EXOMONAD_INVOCATION_USAGE_FILE".to_string(),
+            self.ctx
+                .project_dir()
+                .join(".exo/agents")
+                .join(agent_name.as_str())
+                .join(super::INVOCATION_USAGE_FILENAME)
+                .display()
+                .to_string(),
+        );
+        env_vars.insert(
             "EXOMONAD_SPAWN_AGENT_TYPE".to_string(),
             self.spawn_agent_type.suffix().to_string(),
         );
@@ -1500,6 +1510,21 @@ impl<
             format!(" {}", one_shot_flag)
         };
 
+        // Claude's `-p --output-format json` envelope is the one harness-owned
+        // per-invocation usage source this repository can establish: the RLM
+        // backend already parses exactly this shape. Only a prompted one-shot
+        // Claude invocation that has an invocation-owned usage file requests it.
+        let usage_file = env_vars.get("EXOMONAD_INVOCATION_USAGE_FILE");
+        let writes_claude_usage = agent_type == AgentType::Claude
+            && mode == super::InvocationMode::OneShot
+            && prompt_file.is_some()
+            && usage_file.is_some();
+        let usage_output_flag = if writes_claude_usage {
+            " --output-format json"
+        } else {
+            ""
+        };
+
         let agent_command = match (prompt_file, fork_session_id) {
             (Some(pf), Some(session_id)) => {
                 let escaped_session = Self::escape_for_shell_command(session_id);
@@ -1526,12 +1551,13 @@ impl<
                     }
                     _ => {
                         format!(
-                            "{}{}{}{}{} --resume {} --fork-session \"$(cat {})\"",
+                            "{}{}{}{}{}{} --resume {} --fork-session \"$(cat {})\"",
                             cmd,
                             one_shot_flag,
                             perms_flags,
                             model_flag,
                             effort_flag,
+                            usage_output_flag,
                             escaped_session,
                             escaped_path
                         )
@@ -1560,8 +1586,14 @@ impl<
                         )
                     }
                     _ => format!(
-                        "{}{}{}{}{} \"$(cat {})\"",
-                        cmd, one_shot_flag, perms_flags, model_flag, effort_flag, escaped_path
+                        "{}{}{}{}{}{} \"$(cat {})\"",
+                        cmd,
+                        one_shot_flag,
+                        perms_flags,
+                        model_flag,
+                        effort_flag,
+                        usage_output_flag,
+                        escaped_path
                     ),
                 }
             }
@@ -1594,6 +1626,26 @@ impl<
             agent_command
         } else {
             format!("{} {}", env_prefix, agent_command)
+        };
+
+        // Retire any previous invocation's source before the harness starts, so
+        // an absent or failed source can never inherit stale numbers. This runs
+        // for every harness that carries the env var; only one-shot Claude
+        // writes the file back.
+        let full_command = if let Some(usage_file) = usage_file {
+            let escaped_path = Self::escape_for_shell_command(usage_file);
+            format!("rm -f {}; {}", escaped_path, full_command)
+        } else {
+            full_command
+        };
+
+        let full_command = if writes_claude_usage {
+            let escaped_path = Self::escape_for_shell_command(
+                usage_file.expect("checked when writes_claude_usage is true"),
+            );
+            format!("{{ {}; }} > {}", full_command, escaped_path)
+        } else {
+            full_command
         };
 
         let full_command =
@@ -6768,6 +6820,26 @@ mod tests {
     }
 
     #[test]
+    fn test_common_spawn_env_names_the_invocation_owned_usage_source() {
+        let project_dir = PathBuf::from("/tmp/exo-test-project");
+        let services = test_services(project_dir);
+        let service = AgentControlService::new(services).with_birth_branch(
+            BirthBranch::try_from_str("main").expect("literal validated string is non-empty"),
+        );
+        let agent = AgentName::try_from_str("fix-oauth-claude")
+            .expect("literal validated string is non-empty");
+        let session_id =
+            BranchName::try_from_str("main.fix-oauth-claude").expect("validated branch");
+        let env = service.common_spawn_env(&agent, &session_id, &crate::domain::Role::dev());
+
+        assert_eq!(
+            env.get("EXOMONAD_INVOCATION_USAGE_FILE")
+                .map(String::as_str),
+            Some("/tmp/exo-test-project/.exo/agents/fix-oauth-claude/usage.json")
+        );
+    }
+
+    #[test]
     fn test_common_spawn_env_tmux_session() {
         let services = test_services(PathBuf::from("."));
         let service = AgentControlService::new(services)
@@ -7070,6 +7142,76 @@ mod tests {
             super::InvocationMode::Interactive,
         );
         assert!(!companion.contains(" -p "));
+    }
+
+    #[test]
+    fn test_one_shot_claude_with_a_usage_file_writes_the_json_envelope_there() {
+        let prompt = Path::new("/tmp/test-prompt.txt");
+        let mut env = HashMap::new();
+        env.insert(
+            "EXOMONAD_INVOCATION_USAGE_FILE".to_string(),
+            "/tmp/exo-usage.json".to_string(),
+        );
+        let command = ACS::build_agent_command_with_effort(
+            AgentType::Claude,
+            Some(prompt),
+            None,
+            &env,
+            Path::new("/tmp/test"),
+            None,
+            false,
+            Some("sonnet"),
+            None,
+            super::InvocationMode::OneShot,
+        );
+
+        assert!(command.contains("--output-format json"));
+        assert!(command.contains("rm -f '/tmp/exo-usage.json';"));
+        assert!(
+            command.contains("> '/tmp/exo-usage.json'"),
+            "the envelope must be captured in the invocation's own file: {command}"
+        );
+    }
+
+    #[test]
+    fn test_interactive_claude_and_other_harnesses_do_not_request_the_usage_envelope() {
+        let prompt = Path::new("/tmp/test-prompt.txt");
+        let mut env = HashMap::new();
+        env.insert(
+            "EXOMONAD_INVOCATION_USAGE_FILE".to_string(),
+            "/tmp/exo-usage.json".to_string(),
+        );
+
+        for (agent_type, mode) in [
+            (AgentType::Claude, super::InvocationMode::Interactive),
+            (AgentType::Codex, super::InvocationMode::OneShot),
+            (AgentType::OpenCode, super::InvocationMode::OneShot),
+        ] {
+            let command = ACS::build_agent_command_with_effort(
+                agent_type,
+                Some(prompt),
+                None,
+                &env,
+                Path::new("/tmp/test"),
+                None,
+                false,
+                None,
+                None,
+                mode,
+            );
+            assert!(
+                !command.contains("--output-format json"),
+                "{agent_type:?} has no established usage envelope: {command}"
+            );
+            assert!(
+                !command.contains("> '/tmp/exo-usage.json'"),
+                "{agent_type:?} must not claim a usage source: {command}"
+            );
+            assert!(
+                command.contains("rm -f '/tmp/exo-usage.json';"),
+                "{agent_type:?} must retire a stale source at launch: {command}"
+            );
+        }
     }
 
     #[test]

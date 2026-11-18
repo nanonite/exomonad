@@ -454,8 +454,15 @@ the charge is not settled at effect time: it records the launched
 settles the measured actual through the same `reconcile` a dispatch uses; a
 finished row with no usage keeps `actual="unknown"`, conserves the estimate, and
 warns. Settlement is one atomic reconcile, so a reconciled charge is never
-settled twice. No current spawn harness reports per-invocation usage, so a
-continuation today remains conserved rather than measured. The continuation
+settled twice. A one-shot Claude invocation reports usage: the host launches it
+with `claude -p --output-format json`, captures the harness envelope into the
+invocation's own `.exo/agents/<agent>/usage.json`, and the finish path reads
+that bounded file once, sums input tokens (including cache creation and cache
+reads) plus output tokens, and writes `usage` on the finished row. Codex,
+OpenCode, Shoal, `Process`, and interactive Claude companions have no
+established per-invocation usage source, so their finished rows carry no usage
+and their continuations conserve the estimate. No usage is ever inferred from
+elapsed time, text length, or a per-agent/per-issue store. The continuation
 charge names a stable continuation identity so a replayed continuation is
 charged once, and it never rewrites the earlier harness's spend. If the role
 ceiling or the launched route's `per_harness_budget` would be exceeded, the

@@ -50,6 +50,28 @@ def test_finished_continuation_settles_measured_usage_and_flags_the_delta(
     assert state.budgets.role_spent == {"worker": 14}
 
 
+def test_finished_row_with_the_host_usage_shape_settles_the_measured_actual(
+    tmp_path: Path,
+) -> None:
+    """The host writes input, output, and total; total settles the charge once."""
+    store = _charged_run(tmp_path, cost=10, harness=LAUNCHED)
+    _write_finished(
+        tmp_path,
+        INVOCATION,
+        {"input_tokens": 200, "output_tokens": 25, "total_tokens": 225},
+    )
+
+    state = driver_module._settle_finished_continuations(
+        store.load(), _config(tmp_path), store
+    )
+
+    charge = _charge(state)
+    assert charge.reconciled is True
+    assert charge.actual == 225
+    assert state.budgets.harness_spent == {LAUNCHED: 225}
+    assert state.budgets.role_spent == {"worker": 225}
+
+
 def test_finished_continuation_without_usage_conserves_the_estimate_and_warns(
     tmp_path: Path,
 ) -> None:

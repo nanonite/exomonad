@@ -6527,6 +6527,7 @@ mod tests {
             exit_reason: None,
             exit_classification: None,
             stderr_tail: None,
+            usage: None,
         };
         std::fs::write(
             owner_dir.join("invocation.json"),
@@ -6566,6 +6567,7 @@ mod tests {
             exit_reason: Some("review_requested_changes".to_string()),
             exit_classification: Some("review_complete".to_string()),
             stderr_tail: None,
+            usage: None,
         };
         let event_log = Arc::new(
             crate::services::EventLog::open(project_dir.join(".exo/logs"))
@@ -8172,6 +8174,7 @@ mod tests {
             exit_classification: None,
             stderr_tail: None,
             role_route: None,
+            usage: None,
         };
         (owner, invocation)
     }
@@ -8439,6 +8442,7 @@ mod tests {
             prior_invocation_id: None,
             recovery_round: 0,
             authorization_source: None,
+            usage: None,
         };
         let same_generation = InvocationRecord {
             build: crate::services::agent_control::invocation::BUILD_IDENTITY.to_string(),
@@ -8512,6 +8516,7 @@ mod tests {
             exit_classification: None,
             stderr_tail: None,
             role_route: None,
+            usage: None,
         };
 
         assert!(configured_route_changed(

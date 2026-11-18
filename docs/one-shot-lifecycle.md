@@ -52,7 +52,11 @@ JSONL facilities. The structured payload includes:
 - PR number and head SHA when known;
 - outcome/status and delivery channel; and
 - `delivery_vs_authoritative`, which is `delivery_only` for inbox/tmux/UDS
-  guidance and `metadata_only` for process lifecycle events.
+  guidance and `metadata_only` for process lifecycle events; and
+- measured `usage` (`input_tokens`, `output_tokens`, `total_tokens`) when a
+  one-shot Claude invocation produced its JSON envelope. No other harness has
+  an established per-invocation usage source, so those finished rows carry no
+  `usage` and their continuations conserve the budget estimate.
 
 An injection success, process exit, or local push is not a PR/review/CI state
 transition. The Forgejo publication, exact-SHA review verdict, and CI

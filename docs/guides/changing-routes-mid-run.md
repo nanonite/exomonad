@@ -193,9 +193,14 @@ controller reads that row's measured usage and settles the charge through
 `reconcile(continuation=...)`; a measured actual moves the estimate to spend and
 a delta over 20% is flagged. A finished row that reports no usage conserves the
 estimate with `actual="unknown"` and a warning, and a resume that is refused
-before running releases the reservation with a zero actual. No current spawn
-harness writes per-invocation usage on that row, so a continuation today settles
-conserved; no usage is inferred from elapsed time or text length.
+before running releases the reservation with a zero actual. A one-shot Claude
+invocation reports usage from its harness envelope, which the host captures in
+the invocation's own `.exo/agents/<agent>/usage.json`; the finished row then
+carries summed `input_tokens` (including cache creation and cache reads),
+`output_tokens`, and `total_tokens`. Codex, OpenCode, Shoal, `Process`, and
+interactive Claude companions have no established per-invocation usage source,
+so a finished row from those paths carries no usage and its continuation
+conserves the estimate. No usage is inferred from elapsed time or text length.
 
 The confirmed handoff normally names the invocation. When it does not, the
 controller applies one evidence rule instead of leaving the reservation silent:
