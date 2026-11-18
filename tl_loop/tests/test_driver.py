@@ -28208,6 +28208,10 @@ def _seed_legacy_terminal_resume(
     strip_route_fingerprint: bool = True,
     journal_status: str | None = None,
     drop_result: bool = False,
+    nested_success: object = True,
+    include_nested_success: bool = True,
+    outer_success: bool | None = True,
+    payload_overrides: Mapping[str, object] | None = None,
 ) -> _LegacyResumeFixture:
     """Seed the genuine historical resume receipt and old host chronology.
 
@@ -28274,13 +28278,17 @@ def _seed_legacy_terminal_resume(
     }
     agent.update(agent_overrides or {})
     invocation.update(invocation_overrides or {})
+    legacy_payload: dict[str, object] = {
+        "chainlink_issue_id": 814,
+        "agent": cast(JsonValue, agent),
+        "invocation": cast(JsonValue, invocation),
+    }
+    if include_nested_success:
+        legacy_payload["success"] = nested_success
+    legacy_payload.update(payload_overrides or {})
     result_document: JsonObject = {
-        "success": True,
-        "result": {
-            "chainlink_issue_id": 814,
-            "agent": cast(JsonValue, agent),
-            "invocation": cast(JsonValue, invocation),
-        },
+        "success": outer_success,
+        "result": cast(JsonValue, legacy_payload),
     }
     result = ToolResult.from_raw(result_document)
     journal.mark_result(intent, result)
@@ -28517,6 +28525,199 @@ def test_legacy_resume_receipt_accepts_the_old_live_shape(tmp_path: Path) -> Non
     assert proof is not None, reason
     assert repeated is not None, repeated_reason
     assert fixture.snapshot() == before
+
+
+def test_legacy_resume_receipt_accepts_the_genuine_nested_success_shape(
+    tmp_path: Path,
+) -> None:
+    """The preserved live response nested success=true inside the result."""
+    fixture = _seed_legacy_terminal_resume(tmp_path)
+    payload = _required_mapping(fixture.result.result, "confirmed resume result")
+    assert payload["success"] is True
+    assert fixture.result.success is True
+    before = fixture.snapshot()
+
+    proof, reason = fixture.proof()
+
+    assert proof is not None, reason
+    assert proof.resume.owner.prior_invocation_id == fixture.successor_id
+    assert fixture.snapshot() == before
+
+
+@pytest.mark.parametrize(
+    "nested_success",
+    (False, 1, "true", None, 0, "false"),
+)
+def test_legacy_resume_receipt_refuses_a_nested_success_that_is_not_boolean_true(
+    tmp_path: Path, nested_success: object
+) -> None:
+    """Only the boolean true is the historical result status."""
+    fixture = _seed_legacy_terminal_resume(tmp_path, nested_success=nested_success)
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason == "legacy resume result success is not the historical boolean true"
+
+
+@pytest.mark.parametrize("outer_success", (False, None))
+def test_legacy_resume_receipt_refuses_nested_true_without_outer_true(
+    tmp_path: Path, outer_success: bool | None
+) -> None:
+    """A genuine outer-false result is refused by the exact journal outcome."""
+    fixture = _seed_legacy_terminal_resume(tmp_path, outer_success=outer_success)
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason == (
+        "terminal owner registry evidence is unavailable or conflicting: "
+        "BlockedLeafOwnerError: the exact blocked-leaf resume request was rejected"
+    )
+
+
+@pytest.mark.parametrize("outer_success", (False, None))
+def test_legacy_resume_projection_refuses_nested_true_without_outer_true(
+    outer_success: bool | None,
+) -> None:
+    """A forged confirmed status still cannot pair nested true with a false wrapper."""
+    payload = {
+        "success": True,
+        "chainlink_issue_id": 814,
+        "agent": {},
+        "invocation": {},
+    }
+
+    reason = driver_module._legacy_resume_projection_error(
+        payload, {}, {}, outer_success
+    )
+
+    assert reason == "legacy resume result success conflicts with its outer result"
+
+
+def test_legacy_resume_receipt_refuses_a_missing_nested_success(
+    tmp_path: Path,
+) -> None:
+    """The exact historical producer shape includes the nested boolean."""
+    fixture = _seed_legacy_terminal_resume(tmp_path, include_nested_success=False)
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason == "legacy resume result success is not the historical boolean true"
+
+
+def test_legacy_resume_receipt_refuses_nested_success_beside_an_unknown_field(
+    tmp_path: Path,
+) -> None:
+    """Nested success never turns an unknown projection key into legacy."""
+    fixture = _seed_legacy_terminal_resume(
+        tmp_path,
+        payload_overrides={"route_resolution_digest": "sha256:not-historical"},
+    )
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason == "legacy resume result has an unsupported field"
+
+
+def test_legacy_resume_receipt_nested_success_refusal_holds_without_an_effect(
+    tmp_path: Path,
+) -> None:
+    """A contradictory nested status is a typed hold, not a dispatch."""
+    fixture = _seed_legacy_terminal_resume(tmp_path, nested_success=False)
+    transport = RecordingTransport()
+    journal = EffectJournal(
+        fixture.store.run_id, fixture.store.run_dir / "action-journal.json"
+    )
+    leaf_name = fixture.plan.leaves[0].name
+
+    state = driver_module._resume_terminal_owner_failure(
+        fixture.plan,
+        fixture.store.load(),
+        fixture.config,
+        EffectClient(transport),
+        fixture.store,
+        journal,
+    )
+
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in transport.calls)
+    recovery = state.slices[leaf_name].recovery
+    assert recovery is not None
+    assert recovery.evidence["terminal_owner_recovery_hold"] == (
+        "legacy resume result success is not the historical boolean true"
+    )
+    assert len(journal.entries_for("resume_blocked_leaf", leaf_name)) == 1
+
+
+def test_legacy_resume_nested_success_does_not_admit_a_modern_receipt(
+    tmp_path: Path,
+) -> None:
+    """A route-bound modern receipt keeps the modern proof despite nested success."""
+    fixture = _seed_legacy_terminal_resume(tmp_path, strip_route_fingerprint=False)
+    payload = _required_mapping(fixture.result.result, "confirmed resume result")
+    assert payload["success"] is True
+
+    proof, reason = fixture.proof()
+
+    assert proof is None
+    assert reason is not None
+    assert reason.startswith(
+        "terminal owner role-route provenance is incomplete or conflicting"
+    )
+
+
+def test_legacy_resume_nested_success_replays_without_a_second_effect(
+    tmp_path: Path,
+) -> None:
+    """A restart replays the same confirmed result without dispatching twice."""
+    fixture = _seed_legacy_terminal_resume(tmp_path)
+    leaf_name = fixture.plan.leaves[0].name
+    transport = RepeatedTransitionTransport(
+        owner_dir=fixture.owner_dir,
+        owner_name=fixture.owner_name,
+        slice_id=leaf_name,
+    )
+    journal = EffectJournal(
+        fixture.store.run_id, fixture.store.run_dir / "action-journal.json"
+    )
+
+    first = driver_module._resume_terminal_owner_failure(
+        fixture.plan,
+        fixture.store.load(),
+        fixture.config,
+        EffectClient(transport),
+        fixture.store,
+        journal,
+    )
+
+    assert len(transport.successors) == 1
+    launched = transport.successors[0]
+    confirmed_entries = journal.entries_for("resume_blocked_leaf", leaf_name)
+    assert [entry["status"] for entry in confirmed_entries] == ["confirmed", "confirmed"]
+
+    restarted_journal = EffectJournal(
+        fixture.store.run_id, fixture.store.run_dir / "action-journal.json"
+    )
+    restart_transport = RecordingTransport()
+
+    restarted = driver_module._resume_terminal_owner_failure(
+        fixture.plan,
+        fixture.store.load(),
+        fixture.config,
+        EffectClient(restart_transport),
+        fixture.store,
+        restarted_journal,
+    )
+
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in restart_transport.calls)
+    assert (
+        restarted_journal.entries_for("resume_blocked_leaf", leaf_name)
+        == confirmed_entries
+    )
+    assert restarted.slices[leaf_name].dispatch_invocation_id == launched["invocation_id"]
+    assert restarted.slices[leaf_name] == first.slices[leaf_name]
 
 
 def test_legacy_resume_receipt_resolves_owner_and_intent_without_a_launch_row(

@@ -209,6 +209,27 @@ def assert_historical_shape(rows: list[dict[str, Any]]) -> list[str]:
     return failures
 
 
+def assert_legacy_resume_projection(fixture: Any) -> list[str]:
+    """Require the genuine historical resume result, including nested success."""
+    builder = getattr(fixture, "legacy_resume_result_payload", None)
+    if builder is None:
+        return ["fixture no longer exposes the historical resume result builder"]
+    payload = builder({}, {})
+    failures: list[str] = []
+    if payload.get("success") is not True:
+        failures.append(
+            "seeded historical resume result dropped the nested success=true field"
+        )
+    expected = {"success", "chainlink_issue_id", "agent", "invocation"}
+    unexpected = sorted(set(payload) ^ expected)
+    if unexpected:
+        failures.append(
+            "seeded historical resume result fields diverge from the producer "
+            f"shape: {unexpected}"
+        )
+    return failures
+
+
 def main() -> None:
     required, optional = rust_required_fields()
     overlap = sorted(required & optional)
@@ -217,6 +238,7 @@ def main() -> None:
     fixture = load_fixture()
     assert_fixture_schema_parity(fixture, required)
     failures: list[str] = []
+    failures.extend(assert_legacy_resume_projection(fixture))
     with tempfile.TemporaryDirectory(prefix="ledger-fixture-schema-") as temporary:
         root = Path(temporary)
         repository = root / "repo"

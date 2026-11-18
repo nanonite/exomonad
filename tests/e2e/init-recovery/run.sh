@@ -975,6 +975,8 @@ historical = resumes[0]
 historical_result = historical["result"]["result"]
 historical_agent = historical_result["agent"]
 historical_invocation = historical_result["invocation"]
+assert historical["result"]["success"] is True
+assert historical_result["success"] is True
 # The saved historical result is the genuine pre-launch-row projection: the
 # old host never wrote owner/scope/intent/route fields, so the actual Sol/xhigh
 # outcome is proven only by the durable invocation/identity lineage that the
@@ -3933,6 +3935,8 @@ if terminal_provider_failure:
         assert resume_actions[0] == historical["action"], "historical Sol result changed"
         assert resume_actions[0]["arguments"]["desired_model"] == "gpt-6-luna"
         historical_response = resume_actions[0]["result"]["result"]
+        assert resume_actions[0]["result"]["success"] is True
+        assert historical_response["success"] is True
         assert not set(historical_response["agent"]) & {
             "id", "agent_id", "issue", "intent_id", "model", "effort",
             "generation", "prior_invocation_id", "role_route",

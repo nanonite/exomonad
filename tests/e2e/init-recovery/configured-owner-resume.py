@@ -881,6 +881,24 @@ LEGACY_MODERN_MARKERS = frozenset(
 )
 
 
+def legacy_resume_result_payload(
+    agent: Mapping[str, Any], invocation: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Return the genuine historical ``resume_blocked_leaf`` result payload.
+
+    The pre-launch-event producer nested the boolean status beside the issue,
+    agent, and invocation fields. Both that value and the outer ``ToolResult``
+    success are exactly ``True``; the fixture-schema check asserts this shape so
+    a seed cannot silently drop the nested field again.
+    """
+    return {
+        "success": True,
+        "chainlink_issue_id": BLOCKED_ISSUE_ID,
+        "agent": dict(agent),
+        "invocation": dict(invocation),
+    }
+
+
 def legacy_successor_lifecycle_rows(
     *,
     owner_name: str,
@@ -1235,11 +1253,7 @@ def seed_confirmed_wrong_route_successor(repository: Path, baseline_path: Path) 
     response = ToolResult.from_raw(
         {
             "success": True,
-            "result": {
-                "chainlink_issue_id": BLOCKED_ISSUE_ID,
-                "agent": legacy_agent,
-                "invocation": legacy_invocation,
-            },
+            "result": legacy_resume_result_payload(legacy_agent, legacy_invocation),
         }
     )
     journal.mark_result(intent, response)
@@ -1952,6 +1966,8 @@ def verify_controller(
             or "route_fingerprint" in old_action.get("arguments", {})
             or set(old_agent) & LEGACY_MODERN_MARKERS
             or set(old_invocation) & LEGACY_MODERN_MARKERS
+            or old_result.get("success") is not True
+            or (old_action.get("result") or {}).get("success") is not True
             or old_result.get("chainlink_issue_id") != BLOCKED_ISSUE_ID
             or old_agent.get("agent_type") != "codex"
             or old_agent.get("invocation_id") != durable_history.get("invocation_id")

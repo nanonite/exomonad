@@ -5515,8 +5515,12 @@ _LEGACY_SPAWN_ARGUMENT_FIELDS = frozenset(
 
 # Historical resume_blocked_leaf result projection and host lifecycle
 # chronology emitted before the host wrote an agent.spawned launch
-# confirmation and route receipts. Any other key is modern provenance.
+# confirmation and route receipts. The historical producer also nested its
+# boolean result status beside ``chainlink_issue_id``; that key is accepted only
+# by the strict check below when both it and the outer ToolResult are true. Any
+# other key is modern provenance.
 _LEGACY_RESUME_RESULT_FIELDS = frozenset({"chainlink_issue_id", "agent", "invocation"})
+_LEGACY_RESUME_SUCCESS = "success"
 _LEGACY_RESUME_AGENT_FIELDS = frozenset(
     {
         "agent_type",
@@ -5759,11 +5763,16 @@ def _legacy_resume_projection_error(
     payload: object,
     agent: Mapping[str, object],
     invocation: Mapping[str, object],
+    outer_success: bool | None,
 ) -> str | None:
     """Reject anything but the exact historical resume result projection."""
     if not isinstance(payload, Mapping):
         return "confirmed resume result is missing or malformed"
-    if set(payload) - _LEGACY_RESUME_RESULT_FIELDS:
+    if payload.get(_LEGACY_RESUME_SUCCESS) is not True:
+        return "legacy resume result success is not the historical boolean true"
+    if outer_success is not True:
+        return "legacy resume result success conflicts with its outer result"
+    if set(payload) - (_LEGACY_RESUME_RESULT_FIELDS | {_LEGACY_RESUME_SUCCESS}):
         return "legacy resume result has an unsupported field"
     if set(agent) - _LEGACY_RESUME_AGENT_FIELDS:
         return "legacy resume result.agent has an unsupported field"
@@ -6054,7 +6063,7 @@ def _legacy_terminal_resume_receipt(
     if not isinstance(successor_id, str) or not successor_id:
         return None, "confirmed resume result has no successor invocation"
     projection_error = _legacy_resume_projection_error(
-        result.result, agent, invocation
+        result.result, agent, invocation, result.success
     )
     if projection_error is not None:
         return None, projection_error

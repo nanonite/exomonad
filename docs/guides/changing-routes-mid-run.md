@@ -224,6 +224,23 @@ harness, and the old harness is never charged as a fallback. Same-harness
 continuations are charged by the same rule because they are real invocations
 that spend tokens; there is no route-change special case.
 
+## Historical blocked-leaf receipts
+
+A terminal-owner recovery may continue from a `resume_blocked_leaf` result that
+predates `agent.spawned` launch confirmations and route receipts. Its result is
+the historical producer projection: `success: true` nested beside
+`chainlink_issue_id`, `agent`, and `invocation`, exactly as the
+`ToolResult.success` that wraps it. The nested boolean is accepted only when it
+is exactly `true` and the outer result is also exactly `true`; `false`, `1`,
+`"true"`, `null`, any other non-`true` value, a contradictory outer envelope,
+or any additional key is held with a typed refusal. The nested success is not a
+route receipt: the historical proof still needs the durable
+invocation/identity lineage and the `agent.invocation.started` /
+`agent.resumed` / `agent.invocation.finished` trio. Modern receipts keep their
+complete route-provenance requirements, and the init-recovery fixture must emit
+this shape (`just check-e2e-init-recovery` rejects a seed that drops the nested
+`success`).
+
 ## Reviewer
 
 The reviewer has its own route. A worker route change never selects a reviewer,
