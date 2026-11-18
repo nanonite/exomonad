@@ -6335,7 +6335,11 @@ def _terminal_resume_history_proof(
                     return None, "resume history contains an unsupported prior runtime label"
             if prior_value != observed:
                 return None, "resume history prior route conflicts with the preceding invocation"
-        if status in {"not_dispatched"} or _is_legacy_missing_role_route_refusal(entry):
+        if (
+            status in {"not_dispatched"}
+            or _is_legacy_missing_role_route_refusal(entry)
+            or _is_prelaunch_role_configuration_refusal(entry)
+        ):
             continue
         if status in {"intended", "unknown"}:
             if index != len(entries) - 1:
@@ -6856,6 +6860,7 @@ def _resolve_blocked_leaf_owner(
         prior_entries_are_safe = allow_terminal_route_refusal and all(
             entry.get("status") in allowed_prior_statuses
             or _is_legacy_missing_role_route_refusal(entry)
+            or _is_prelaunch_role_configuration_refusal(entry)
             for entry in entries[:-1]
         )
         if not prior_entries_are_safe:
@@ -6881,7 +6886,11 @@ def _resolve_blocked_leaf_owner(
                 "blocked-leaf resume journal conflicts with this declaration"
             )
         if entry.get("status") == "rejected" and not (
-            allow_terminal_route_refusal and _is_legacy_missing_role_route_refusal(entry)
+            allow_terminal_route_refusal
+            and (
+                _is_legacy_missing_role_route_refusal(entry)
+                or _is_prelaunch_role_configuration_refusal(entry)
+            )
         ):
             raise BlockedLeafOwnerError("the exact blocked-leaf resume request was rejected")
         if entry.get("status") in {"intended", "unknown"} and not isinstance(
@@ -7528,7 +7537,10 @@ def _terminal_owner_recovery_proof(
         if conflicts:
             fresh_legacy_refusal_retry = (
                 latest_resume_entry is not None
-                and _is_legacy_missing_role_route_refusal(latest_resume_entry)
+                and (
+                    _is_legacy_missing_role_route_refusal(latest_resume_entry)
+                    or _is_prelaunch_role_configuration_refusal(latest_resume_entry)
+                )
                 and isinstance(gate_authorization, Mapping)
                 and gate_authorization.get("gate_name") == gate_name
                 and gate_authorization.get("status") == GateStatus.APPROVED.value
@@ -7577,7 +7589,10 @@ def _terminal_owner_recovery_proof(
             action_arguments = None
         elif (
             latest_resume_entry is not None
-            and _is_legacy_missing_role_route_refusal(latest_resume_entry)
+            and (
+                _is_legacy_missing_role_route_refusal(latest_resume_entry)
+                or _is_prelaunch_role_configuration_refusal(latest_resume_entry)
+            )
             and isinstance(gate_authorization, Mapping)
             and gate_authorization.get("gate_name") == gate_name
             and gate_authorization.get("status") == GateStatus.APPROVED.value
@@ -8289,11 +8304,49 @@ def _terminal_route_authorization_record(
 
 
 def _is_role_route_configuration_fingerprint(value: object) -> bool:
-    prefix = "sha256:v1:"
+    """Accept a versioned configuration identity.
+
+    `v1` values remain valid historical evidence and decode unchanged. New
+    values use `v2`, the effective-value identity; equality, never the version
+    tag alone, decides whether one is the accepted snapshot.
+    """
+    if not isinstance(value, str):
+        return False
+    for prefix in ("sha256:v1:", "sha256:v2:"):
+        if value.startswith(prefix):
+            return _is_sha256_text(value[len(prefix) :])
+    return False
+
+
+ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED = (
+    "Invalid input: role route configuration is stale or was not accepted by this server"
+)
+
+
+def _is_prelaunch_role_configuration_refusal(entry: Mapping[str, object]) -> bool:
+    """Recognize only the host refusal that proves no effect was launched.
+
+    The historical action already carried a complete route receipt under the
+    old configuration identity, so it is not the older missing-route refusal.
+    The result must be the exact rejected envelope: a false success, no result
+    payload, and the configuration-not-accepted message. Anything else stays
+    held for its own outcome.
+    """
+    arguments = entry.get("arguments")
+    result = entry.get("result")
     return (
-        isinstance(value, str)
-        and value.startswith(prefix)
-        and _is_sha256_text(value[len(prefix) :])
+        entry.get("operation") == "resume_blocked_leaf"
+        and entry.get("status") == "rejected"
+        and isinstance(arguments, Mapping)
+        and isinstance(arguments.get("route_configuration_fingerprint"), str)
+        and _is_role_route_configuration_fingerprint(
+            arguments.get("route_configuration_fingerprint")
+        )
+        and isinstance(result, Mapping)
+        and result.get("success") is False
+        and result.get("result") is None
+        and result.get("error") == ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED
+        and entry.get("error") == ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED
     )
 
 

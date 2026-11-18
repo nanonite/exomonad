@@ -2723,6 +2723,7 @@ fn append_init_invocation_log(
             "worker_effort": config.worker_effort_level,
             "reviewer_effort": config.reviewer_effort_level,
             "role_route_config_fingerprint": config.routing_configuration_fingerprint(),
+            "role_route_config_provenance": config.routing_configuration_provenance(),
         }
     });
     let mut file = std::fs::OpenOptions::new()
@@ -5997,6 +5998,98 @@ async fn server_socket_is_healthy(project_dir: &Path) -> bool {
         .await
 }
 
+/// Structured refusal for an init/server configuration disagreement.
+///
+/// `NotAccepted` is distinct from a role/model conflict: the values may be
+/// individually valid while the running server still accepts a different
+/// snapshot. `Unavailable` means the server could not prove its snapshot, so
+/// init must not release a controller on an unaccepted configuration.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RoleConfigurationPreflightError {
+    #[error(
+        "role configuration not accepted by the running server (kind=role_configuration_not_accepted): init resolved {expected} but the server accepts {received}; restart `exomonad serve` with the same role flags, or restore the configured role values, then rerun `exomonad init --continue`. No controller was released and no worker was touched"
+    )]
+    NotAccepted { expected: String, received: String },
+    #[error(
+        "the running server did not expose its accepted role configuration (kind=role_configuration_unavailable): {reason}; restart `exomonad serve` and rerun `exomonad init --continue`. No controller was released"
+    )]
+    Unavailable { reason: String },
+}
+
+impl RoleConfigurationPreflightError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::NotAccepted { .. } => "role_configuration_not_accepted",
+            Self::Unavailable { .. } => "role_configuration_unavailable",
+        }
+    }
+}
+
+/// Compare init's resolved effective role configuration with the identity the
+/// running server accepted. This runs before any controller release so a
+/// genuine override, a stale server, or a lost acceptance cannot turn into a
+/// late opaque launch rejection.
+async fn ensure_server_accepts_role_configuration(
+    project_dir: &Path,
+    config: &Config,
+) -> Result<()> {
+    let expected = config.routing_configuration_fingerprint();
+    let init_provenance = config.routing_configuration_provenance();
+    let client = uds_client::ServerClient::new(project_dir.join(".exo/server.sock"));
+    let health = client.health_info().await.map_err(|error| {
+        RoleConfigurationPreflightError::Unavailable {
+            reason: format!("health request failed: {error}"),
+        }
+    })?;
+    let accepted_identity = compare_role_configuration_identities(
+        expected.clone(),
+        health
+            .role_route_configuration
+            .as_ref()
+            .map(|accepted| accepted.identity.clone()),
+    )?;
+    let server_provenance = health
+        .role_route_configuration
+        .map(|accepted| accepted.provenance)
+        .unwrap_or(serde_json::Value::Null);
+    info!(
+        identity = %accepted_identity,
+        provenance = %serde_json::to_string(&init_provenance)?,
+        server_provenance = %server_provenance,
+        "init agrees with the running server's accepted role configuration"
+    );
+    Ok(())
+}
+
+/// The single acceptance rule shared by the server preflight and its unit
+/// tests. An absent identity is a refusal, never a wildcard.
+fn compare_role_configuration_identities(
+    expected: String,
+    observed: Option<String>,
+) -> Result<String> {
+    let Some(observed) = observed else {
+        let error = RoleConfigurationPreflightError::Unavailable {
+            reason: "the health response has no role_route_configuration identity".to_string(),
+        };
+        warn!(kind = error.kind(), reason = %error, "role configuration preflight refused");
+        return Err(error.into());
+    };
+    if observed != expected {
+        warn!(
+            kind = "role_configuration_not_accepted",
+            expected = %expected,
+            received = %observed,
+            "init and the running server disagree on the accepted role configuration"
+        );
+        return Err(RoleConfigurationPreflightError::NotAccepted {
+            expected,
+            received: observed,
+        }
+        .into());
+    }
+    Ok(observed)
+}
+
 async fn launch_server_recovery(
     ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
     project_dir: &Path,
@@ -6506,6 +6599,8 @@ async fn launch_tl_recovery(
         }
         _ => None,
     };
+    // No controller may be released on a snapshot this server did not accept.
+    ensure_server_accepts_role_configuration(project_dir, config).await?;
     let server = ipc.server_identity().await?;
     let mut startup_intent = ControllerStartupIntent {
         schema_version: 1,
@@ -7011,6 +7106,10 @@ async fn reconcile_existing_session(
         }
     }
 
+    // An existing same-build server is not enough: its accepted role
+    // configuration must equal the one init just resolved before any
+    // controller is kept, restarted, or released.
+    ensure_server_accepts_role_configuration(project_dir, config).await?;
     ensure_watcher_dashboard_window(ipc, project_dir, shell).await?;
     let interrupted_startup = reconcile_interrupted_controller_startup(ipc, project_dir).await?;
     if interrupted_startup == InterruptedControllerStartup::Resumed {
@@ -9524,6 +9623,166 @@ mod tests {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
+
+    const LIVE_PROJECT_CONFIG: &str = "root_agent_type = 'opencode'\nmodel = 'opencode-go/glm-5.3-flash'\ntl_effort_level = 'high'\nspawn_agent_type = 'opencode'\nworker_model = 'opencode-go/deepseek-v4.1-flash'\nworker_effort_level = 'high'\n[reviewer]\nagent_type = 'opencode'\nmodel = 'opencode-go/glm-5.3-flash'\neffort_level = 'high'\n";
+
+    fn load_project_config() -> (tempfile::TempDir, Config) {
+        let project = tempfile::tempdir().unwrap();
+        let exo = project.path().join(".exo");
+        std::fs::create_dir_all(&exo).unwrap();
+        std::fs::write(exo.join("config.toml"), LIVE_PROJECT_CONFIG).unwrap();
+        let config = Config::discover_from(project.path(), &|_| None).unwrap();
+        (project, config)
+    }
+
+    fn apply_repeated_reviewer_flags(config: &mut Config) {
+        config.reviewer.agent_type = AgentType::OpenCode;
+        config.reviewer_agent_type_source = RouteValueSource::Cli;
+        config.reviewer.model = Some("opencode-go/glm-5.3-flash".to_string());
+        config.reviewer_model_source = RouteValueSource::Cli;
+        config.reviewer_effort_level = ResolvedEffort::from_cli(EffortLevel::High);
+    }
+
+    #[test]
+    fn init_repeating_project_values_as_flags_agrees_with_the_served_identity() {
+        let (_project, serve_config) = load_project_config();
+        let mut init_config = serve_config.clone();
+        apply_worker_route_overrides(
+            &mut init_config,
+            Some("opencode"),
+            Some("opencode-go/deepseek-v4.1-flash".to_string()),
+            Some(EffortLevel::High),
+        )
+        .unwrap();
+        apply_repeated_reviewer_flags(&mut init_config);
+
+        assert_eq!(
+            serve_config.routing_configuration_fingerprint(),
+            init_config.routing_configuration_fingerprint()
+        );
+        let serve_worker = serve_config
+            .resolve_role_route(
+                "worker",
+                None,
+                &crate::config::RoleRouteOverrides::default(),
+                None,
+            )
+            .unwrap();
+        let init_worker = init_config
+            .resolve_role_route(
+                "worker",
+                None,
+                &crate::config::RoleRouteOverrides::default(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            serve_worker.configuration_fingerprint,
+            init_worker.configuration_fingerprint
+        );
+        assert_eq!(serve_worker.agent_type, init_worker.agent_type);
+        assert_eq!(serve_worker.model, init_worker.model);
+        assert_eq!(serve_worker.effort.level, init_worker.effort.level);
+    }
+
+    #[test]
+    fn genuine_worker_overrides_change_the_init_identity() {
+        let (_project, serve_config) = load_project_config();
+        let baseline = serve_config.routing_configuration_fingerprint();
+        for (name, harness, model, effort) in [
+            (
+                "model-only",
+                "opencode",
+                "opencode-go/other-model",
+                EffortLevel::High,
+            ),
+            (
+                "effort-only",
+                "opencode",
+                "opencode-go/deepseek-v4.1-flash",
+                EffortLevel::Max,
+            ),
+            (
+                "harness-only",
+                "codex",
+                "opencode-go/deepseek-v4.1-flash",
+                EffortLevel::High,
+            ),
+        ] {
+            let mut overridden = serve_config.clone();
+            apply_worker_route_overrides(
+                &mut overridden,
+                Some(harness),
+                Some(model.to_string()),
+                Some(effort),
+            )
+            .unwrap();
+            assert_ne!(
+                baseline,
+                overridden.routing_configuration_fingerprint(),
+                "{name} override must not reuse the served identity"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_accepts_only_the_exact_accepted_identity() {
+        assert_eq!(
+            compare_role_configuration_identities(
+                "sha256:v2:same".to_string(),
+                Some("sha256:v2:same".to_string())
+            )
+            .unwrap(),
+            "sha256:v2:same"
+        );
+        for observed in [
+            Some(
+                "sha256:v1:0381301c6d4d364fd4a3de0a062c65d5fcda0f850d4d7013bf4422f63bd345a4"
+                    .to_string(),
+            ),
+            Some("sha256:v2:different".to_string()),
+            None,
+        ] {
+            let error =
+                compare_role_configuration_identities("sha256:v2:expected".to_string(), observed)
+                    .unwrap_err();
+            let preflight = error
+                .downcast_ref::<RoleConfigurationPreflightError>()
+                .expect("preflight errors stay structured");
+            assert!(matches!(
+                preflight.kind(),
+                "role_configuration_not_accepted" | "role_configuration_unavailable"
+            ));
+        }
+    }
+
+    #[test]
+    fn preflight_mismatch_kind_is_distinct_from_a_role_model_conflict() {
+        let error = compare_role_configuration_identities(
+            "sha256:v2:expected".to_string(),
+            Some("sha256:v2:received".to_string()),
+        )
+        .unwrap_err();
+        let preflight = error
+            .downcast_ref::<RoleConfigurationPreflightError>()
+            .unwrap();
+        assert_eq!(preflight.kind(), "role_configuration_not_accepted");
+        assert!(preflight.to_string().contains("sha256:v2:expected"));
+        assert!(preflight.to_string().contains("sha256:v2:received"));
+        assert!(!preflight
+            .to_string()
+            .contains("conflicts with the accepted role route"));
+    }
+
+    #[test]
+    fn preflight_absent_server_identity_is_an_explicit_refusal() {
+        let error = compare_role_configuration_identities("sha256:v2:expected".to_string(), None)
+            .unwrap_err();
+        let preflight = error
+            .downcast_ref::<RoleConfigurationPreflightError>()
+            .unwrap();
+        assert_eq!(preflight.kind(), "role_configuration_unavailable");
+    }
 
     #[test]
     fn backfilled_capability_covers_the_models_the_policy_names() {

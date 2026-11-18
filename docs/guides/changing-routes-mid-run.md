@@ -68,6 +68,58 @@ shared Rust definition. `root_agent_type` is legacy compatibility only: the
 Python controller does not read it, and `roles.tl.allow` is validated by
 `tl_loop` startup, so init does not check a TL route.
 
+## The accepted configuration identity
+
+`exomonad serve`, `exomonad init`, the controller handoff, and the host launch
+check share one identity:
+`Config::routing_configuration_fingerprint`. It is `sha256:v2:` over only the
+*effective* harness, model, and effort of `tl`, `worker`, and `reviewer`, in that
+deterministic order. A different value changes the identity; a different source
+for the same value does not.
+
+Provenance is recorded separately and never hashed into the identity. Each
+value's source (`project_config`, `local_config`, `environment`, `cli`, `policy`,
+`default`, `harness_default`) is written by `routing_configuration_provenance`
+to the init log and the serve startup log and exposed on the server's `/health`
+surface. It is audit evidence, including for an explicit CLI flag that repeats a
+project value; it is not authority. The old `sha256:v1:` values (which did hash
+source tags) remain historical receipts: the Python controller still reads them,
+but they are never reinterpreted as v2 and can never equal a v2 acceptance.
+
+Before it keeps or releases a controller, `init` reads the running server's
+identity from `/health` and compares it with its own resolved identity:
+
+- equal: the controller proceeds, and the server remains the authority;
+- different or absent: a structured early hold
+  (`role_configuration_not_accepted` or `role_configuration_unavailable`) names
+  both identities and the remedy, and no controller is released, no worker is
+  touched, and no gate is cleared. `init` never stamps a server, trusts a stale
+  `EXOMONAD_ROLE_ROUTE_CONFIG_FINGERPRINT`, or restarts a server that may have
+  independent work.
+
+A genuine CLI override therefore does **not** silently reuse a server started
+from different project values. Restart `exomonad serve` with the same role flags
+(or restore the configured values), then rerun `exomonad init --continue`. A
+fresh init-created server is started from the same resolved values and agrees by
+construction. A legacy global environment fingerprint is never authoritative on
+its own: the host still validates every launch against its accepted identity,
+route policy/capabilities, manifest, role/scope, and durable dispatch intent, so
+forged, stale, cross-role, and cross-scope fingerprints still fail before
+execution.
+
+### Recovering from a recorded pre-launch configuration rejection
+
+The host's rejection is `Invalid input: role route configuration is stale or was
+not accepted by this server`. It occurs before any worker or model runs, so the
+action may be retried once the configuration actually agrees. The controller
+recognizes exactly that rejected shape (a rejected `resume_blocked_leaf`, no
+result payload, no launched invocation) and preserves it. After the current
+identity is accepted and the existing terminal-owner gate is freshly approved,
+the normal retry/gate machinery issues one new linked attempt with the current
+route fields. It does not rewrite the rejected action, reset a journal, or clear
+an independent gate, and it does not retry an unknown effect or a rejection with
+a different error.
+
 ## Operator actions
 
 | Goal | Change | Restart? | Approval flag? |
@@ -109,7 +161,10 @@ guard/controller keeps its snapshot while a fresh load observes the edit.
 model, or effort change edits `.exo/config.toml` and, for a harness change, the
 role's `allow` list in `.exo/harness_policy.toml`. Restart `exomonad serve` and
 start a new controller invocation (`exomonad init --continue`); the old server
-and controller keep their startup snapshots. A `review-policy.toml`
+and controller keep their startup snapshots. Repeating the *same* effective
+values as explicit CLI flags does not require a server restart: the canonical
+identity is value-based, and init verifies it against `/health` before releasing
+the controller. A different value does require the restart (or is held early). A `review-policy.toml`
 `reviewer_max_rounds` change needs a new run, not a restart, because the first
 resolved ceiling is persisted in the checkpoint; a `review_freshness_window_secs`
 change is re-read from the file at the next gate, so a controller restart is

@@ -1703,11 +1703,14 @@ def _dispatch_route_binding(
 
 
 def _versioned_sha256(value: object) -> bool:
-    return (
-        isinstance(value, str)
-        and value.startswith("sha256:v1:")
-        and _raw_sha256(value.removeprefix("sha256:v1:"))
-    )
+    """A versioned digest. ``v1`` stays historical evidence; ``v2`` is the
+    effective-value configuration identity. Equality decides acceptance."""
+    if not isinstance(value, str):
+        return False
+    for prefix in ("sha256:v1:", "sha256:v2:"):
+        if value.startswith(prefix):
+            return _raw_sha256(value.removeprefix(prefix))
+    return False
 
 
 def _raw_sha256(value: object) -> bool:

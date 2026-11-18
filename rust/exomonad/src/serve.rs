@@ -1202,6 +1202,19 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
         env!("EXOMONAD_BUILD_GIT_COMMIT"),
         env!("EXOMONAD_TL_LOOP_GIT_COMMIT"),
     );
+    let role_route_configuration = state
+        .agent_control
+        .role_route_configuration_fingerprint()
+        .map(|identity| {
+            serde_json::json!({
+                "identity": identity,
+                "provenance": state
+                    .agent_control
+                    .role_route_configuration_provenance()
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            })
+        });
 
     Json(serde_json::json!({
         "status": "ok",
@@ -1209,6 +1222,7 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "role": state.default_role.as_str(),
         "wasm_hash": wasm_hash,
         "runtime_manifest": runtime_manifest,
+        "role_route_configuration": role_route_configuration,
     }))
 }
 
@@ -2002,10 +2016,20 @@ Run `exomonad recompile` first to build it.",
         watcher_runtime_state: watcher_runtime_state.clone(),
     });
 
+    let role_route_configuration_fingerprint = config.routing_configuration_fingerprint();
+    let role_route_configuration_provenance = config.routing_configuration_provenance();
+    info!(
+        identity = %role_route_configuration_fingerprint,
+        provenance = %serde_json::to_string(&role_route_configuration_provenance)?,
+        "Accepted role-routing configuration"
+    );
     let mut agent_control =
         exomonad_core::services::agent_control::AgentControlService::new(services.clone())
             .with_wasm_name(wasm_name.clone())
-            .with_role_route_configuration_fingerprint(config.routing_configuration_fingerprint());
+            .with_role_route_configuration_fingerprint(role_route_configuration_fingerprint)
+            .with_role_route_configuration_provenance(serde_json::to_value(
+                &role_route_configuration_provenance,
+            )?);
     let worktree_base = config.worktree_base.clone();
     agent_control = agent_control.with_worktree_base(worktree_base.clone());
     agent_control =

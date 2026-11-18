@@ -1021,7 +1021,11 @@ dispatch sites:
   tier, which wins over the harness-pinned model);
 - effort and provenance: `_dispatch_route_fields` binds
   `config.worker_effort_level` and the configuration/policy/manifest
-  fingerprints.
+  fingerprints. `config.role_route_configuration_fingerprint` is the
+  `sha256:v2:` effective-value identity handed down by `exomonad init`; this
+  controller never re-derives it from source tags. `sha256:v1:` values remain
+  readable historical evidence, but equality with the host's accepted v2
+  identity is what authorizes a launch.
 
 Only three dispatch paths call these helpers: `_prepare_spawn` (fresh and
 pre-execution retry), `_recovered_spawn_choice` with
@@ -1042,6 +1046,16 @@ role route plus the role's `.exo/harness_policy.toml` allowlist, pinned by
 the role allowlist does not authorize before the controller starts. TL is not
 checked there: `root_agent_type` is legacy and the controller resolves its own
 `roles.tl` route at startup.
+A rejected pre-launch `resume_blocked_leaf` whose exact result is
+`Invalid input: role route configuration is stale or was not accepted by this
+server` (no result payload, no launched invocation) is recognized by
+`_is_prelaunch_role_configuration_refusal`. Its rejected action/result is
+preserved. After the current accepted identity agrees and a fresh human-gate
+approval exists, the existing `fresh_legacy_refusal_retry` path authorizes one
+new linked attempt with the current route fields; an unresolved/unknown effect,
+an independent rejection, or a missing fresh gate stays held. Old `v1` action
+arguments are never rewritten.
+
 See [docs/guides/changing-routes-mid-run.md](../docs/guides/changing-routes-mid-run.md).
 
 The controller reads `.exo/harness_policy.toml` once at controller start

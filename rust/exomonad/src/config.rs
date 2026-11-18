@@ -1193,7 +1193,7 @@ mod role_routes_tests {
         assert_eq!(route.effort.level, EffortLevel::XHigh);
         assert_eq!(route.model_source, RouteValueSource::Policy);
         assert_eq!(route.effort.source, EffortSource::Policy);
-        assert!(route.configuration_fingerprint.starts_with("sha256:v1:"));
+        assert!(route.configuration_fingerprint.starts_with("sha256:v2:"));
         assert!(route.route_fingerprint.starts_with("sha256:v1:"));
     }
 
@@ -1329,6 +1329,233 @@ mod role_routes_tests {
         assert_ne!(
             first.routing_configuration_fingerprint(),
             changed.routing_configuration_fingerprint()
+        );
+    }
+
+    /// The project settings used by the live reproduction: TL/reviewer
+    /// `opencode-go/glm-5.3-flash` at high, worker
+    /// `opencode-go/deepseek-v4.1-flash` at high.
+    const LIVE_PROJECT_CONFIG: &str = "root_agent_type = 'opencode'\nmodel = 'opencode-go/glm-5.3-flash'\ntl_effort_level = 'high'\nspawn_agent_type = 'opencode'\nworker_model = 'opencode-go/deepseek-v4.1-flash'\nworker_effort_level = 'high'\n[reviewer]\nagent_type = 'opencode'\nmodel = 'opencode-go/glm-5.3-flash'\neffort_level = 'high'\n";
+
+    fn mark_worker_and_reviewer_sources_as_cli(config: &mut Config) {
+        config.spawn_agent_type_source = RouteValueSource::Cli;
+        config.worker_model_source = RouteValueSource::Cli;
+        config.opencode_worker_model_source = RouteValueSource::Cli;
+        config.worker_effort_level.source = EffortSource::Cli;
+        config.reviewer_agent_type_source = RouteValueSource::Cli;
+        config.reviewer_model_source = RouteValueSource::Cli;
+        config.reviewer_effort_level.source = EffortSource::Cli;
+    }
+
+    #[test]
+    fn repeated_cli_values_match_the_project_loaded_effective_identity() {
+        let project = discover_config(LIVE_PROJECT_CONFIG, &[]);
+        let mut cli = project.clone();
+        mark_worker_and_reviewer_sources_as_cli(&mut cli);
+
+        assert_eq!(
+            project.routing_configuration_fingerprint(),
+            cli.routing_configuration_fingerprint(),
+            "provenance is evidence, not identity"
+        );
+        assert!(project
+            .routing_configuration_fingerprint()
+            .starts_with("sha256:v2:"));
+
+        let project_worker = project
+            .resolve_role_route("worker", None, &RoleRouteOverrides::default(), None)
+            .unwrap();
+        let cli_worker = cli
+            .resolve_role_route("worker", None, &RoleRouteOverrides::default(), None)
+            .unwrap();
+        assert_eq!(
+            project_worker.configuration_fingerprint,
+            cli_worker.configuration_fingerprint
+        );
+        // The route receipt keeps its source-aware v1 binding as audit evidence.
+        assert_ne!(
+            project_worker.route_fingerprint,
+            cli_worker.route_fingerprint
+        );
+        assert!(project_worker.route_fingerprint.starts_with("sha256:v1:"));
+    }
+
+    #[test]
+    fn every_effective_role_value_changes_the_identity() {
+        let baseline = discover_config(LIVE_PROJECT_CONFIG, &[]);
+        let baseline_identity = baseline.routing_configuration_fingerprint();
+
+        let changes: Vec<(&str, Box<dyn Fn(&mut Config)>)> = vec![
+            (
+                "tl harness",
+                Box::new(|c| c.root_agent_type = AgentType::Codex),
+            ),
+            ("tl model", Box::new(|c| c.model = Some("other-tl".into()))),
+            (
+                "tl effort",
+                Box::new(|c| c.tl_effort_level = ResolvedEffort::from_cli(EffortLevel::Max)),
+            ),
+            (
+                "worker harness",
+                Box::new(|c| c.spawn_agent_type = AgentType::Codex),
+            ),
+            (
+                "worker model",
+                Box::new(|c| c.worker_model = Some("other-worker".into())),
+            ),
+            (
+                "worker effort",
+                Box::new(|c| c.worker_effort_level = ResolvedEffort::from_cli(EffortLevel::Low)),
+            ),
+            (
+                "reviewer harness",
+                Box::new(|c| c.reviewer.agent_type = AgentType::Claude),
+            ),
+            (
+                "reviewer model",
+                Box::new(|c| c.reviewer.model = Some("other-reviewer".into())),
+            ),
+            (
+                "reviewer effort",
+                Box::new(|c| c.reviewer_effort_level = ResolvedEffort::from_cli(EffortLevel::Low)),
+            ),
+        ];
+        for (name, change) in changes {
+            let mut changed = baseline.clone();
+            change(&mut changed);
+            assert_ne!(
+                baseline_identity,
+                changed.routing_configuration_fingerprint(),
+                "changing the {name} must change the accepted identity"
+            );
+        }
+    }
+
+    #[test]
+    fn provenance_records_sources_without_changing_the_identity() {
+        let project = discover_config(LIVE_PROJECT_CONFIG, &[]);
+        let mut cli = project.clone();
+        mark_worker_and_reviewer_sources_as_cli(&mut cli);
+
+        let project_provenance = project.routing_configuration_provenance();
+        let cli_provenance = cli.routing_configuration_provenance();
+        assert_eq!(project_provenance.worker.harness, "project_config");
+        assert_eq!(project_provenance.worker.model, "project_config");
+        assert_eq!(project_provenance.worker.effort, "config");
+        assert_eq!(cli_provenance.worker.harness, "cli");
+        assert_eq!(cli_provenance.worker.model, "cli");
+        assert_eq!(cli_provenance.worker.effort, "cli");
+        assert_eq!(cli_provenance.reviewer.harness, "cli");
+        assert_eq!(
+            project.routing_configuration_fingerprint(),
+            cli.routing_configuration_fingerprint()
+        );
+    }
+
+    #[test]
+    fn old_v1_configuration_values_are_never_the_current_identity() {
+        let config = discover_config(LIVE_PROJECT_CONFIG, &[]);
+        let identity = config.routing_configuration_fingerprint();
+        assert!(identity.starts_with("sha256:v2:"));
+        assert!(!identity.starts_with("sha256:v1:"));
+        assert_ne!(
+            identity,
+            "sha256:v1:0381301c6d4d364fd4a3de0a062c65d5fcda0f850d4d7013bf4422f63bd345a4"
+        );
+        assert_ne!(
+            identity,
+            "sha256:v1:73ef11c4b8f80a2e599e13d7a045e6a819a868034a6fccd84e740d2a2715e041"
+        );
+    }
+
+    #[test]
+    fn worker_and_reviewer_aliases_resolve_the_same_role_values() {
+        let config = discover_config(LIVE_PROJECT_CONFIG, &[]);
+        let worker = config
+            .resolve_role_route("worker", None, &RoleRouteOverrides::default(), None)
+            .unwrap();
+        for alias in ["dev", "dev-leaf", "dev_leaf", "leaf", "teammate"] {
+            let alias_route = config
+                .resolve_role_route(alias, None, &RoleRouteOverrides::default(), None)
+                .unwrap();
+            assert_eq!(alias_route.role, CanonicalRole::Worker);
+            assert_eq!(alias_route.agent_type, worker.agent_type);
+            assert_eq!(alias_route.model, worker.model);
+            assert_eq!(alias_route.effort.level, worker.effort.level);
+            assert_eq!(
+                alias_route.configuration_fingerprint,
+                worker.configuration_fingerprint
+            );
+        }
+        let reviewer = config
+            .resolve_role_route("reviewer", None, &RoleRouteOverrides::default(), None)
+            .unwrap();
+        assert_eq!(reviewer.role, CanonicalRole::Reviewer);
+        assert_eq!(reviewer.model.as_deref(), Some("opencode-go/glm-5.3-flash"));
+    }
+
+    #[test]
+    fn changing_one_role_does_not_leak_into_another_roles_resolved_route() {
+        let baseline = discover_config(LIVE_PROJECT_CONFIG, &[]);
+        let mut changed = baseline.clone();
+        changed.worker_model = Some("other-worker".into());
+        let baseline_tl = baseline
+            .resolve_role_route("tl", None, &RoleRouteOverrides::default(), None)
+            .unwrap();
+        let changed_tl = changed
+            .resolve_role_route("tl", None, &RoleRouteOverrides::default(), None)
+            .unwrap();
+        let baseline_reviewer = baseline
+            .resolve_role_route("reviewer", None, &RoleRouteOverrides::default(), None)
+            .unwrap();
+        let changed_reviewer = changed
+            .resolve_role_route("reviewer", None, &RoleRouteOverrides::default(), None)
+            .unwrap();
+        assert_eq!(baseline_tl.agent_type, changed_tl.agent_type);
+        assert_eq!(baseline_tl.model, changed_tl.model);
+        assert_eq!(baseline_reviewer.agent_type, changed_reviewer.agent_type);
+        assert_eq!(baseline_reviewer.model, changed_reviewer.model);
+        assert_ne!(
+            baseline.routing_configuration_fingerprint(),
+            changed.routing_configuration_fingerprint()
+        );
+    }
+
+    #[test]
+    fn all_three_runtime_adapters_have_a_distinct_stable_identity() {
+        let mut seen = std::collections::HashSet::new();
+        for harness in ["claude", "codex", "opencode"] {
+            let contents = format!(
+                "root_agent_type = '{harness}'\nmodel = 'root-{harness}'\nspawn_agent_type = '{harness}'\nworker_model = 'worker-{harness}'\n[reviewer]\nagent_type = '{harness}'\nmodel = 'reviewer-{harness}'\n"
+            );
+            let first = discover_config(&contents, &[]);
+            let second = discover_config(&contents, &[]);
+            assert_eq!(
+                first.routing_configuration_fingerprint(),
+                second.routing_configuration_fingerprint()
+            );
+            assert!(seen.insert(first.routing_configuration_fingerprint()));
+        }
+    }
+
+    #[test]
+    fn local_config_and_environment_precedence_are_reflected_in_the_identity() {
+        let project = discover_config(LIVE_PROJECT_CONFIG, &[]);
+        let environment = discover_config(
+            LIVE_PROJECT_CONFIG,
+            &[(WORKER_MODEL_ENV, "env-worker"), (WORKER_EFFORT_ENV, "max")],
+        );
+        assert_ne!(
+            project.routing_configuration_fingerprint(),
+            environment.routing_configuration_fingerprint()
+        );
+        assert_eq!(
+            environment.routing_configuration_provenance().worker.model,
+            "environment"
+        );
+        assert_eq!(
+            environment.routing_configuration_provenance().worker.effort,
+            "environment"
         );
     }
 
@@ -1630,6 +1857,25 @@ fn resolve_tmux_session(
     }
 }
 
+/// Provenance of one role's effective harness/model/effort. Evidence only:
+/// which source supplied each value never participates in the configuration
+/// identity, so an explicit CLI flag that repeats the project value is the
+/// same accepted configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RoleRouteSourceSummary {
+    pub harness: String,
+    pub model: String,
+    pub effort: String,
+}
+
+/// Safe, auditable provenance for the three role-routing identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RoleRoutingProvenance {
+    pub tl: RoleRouteSourceSummary,
+    pub worker: RoleRouteSourceSummary,
+    pub reviewer: RoleRouteSourceSummary,
+}
+
 impl Config {
     /// True if any configured role — root, spawned workers/leaves, the
     /// reviewer, or a companion — resolves to the Codex harness. Gates the
@@ -1645,33 +1891,95 @@ impl Config {
                 .any(|companion| companion.agent_type == Some(AgentType::Codex))
     }
 
-    /// Stable fingerprint of the role-routing configuration, excluding secrets
-    /// and non-routing runtime settings.
+    /// Canonical identity of the effective role-routing configuration.
+    ///
+    /// The identity hashes only each role's effective harness, model, and
+    /// effort in deterministic role order. Provenance (which config layer or
+    /// CLI flag supplied a value) is recorded separately by
+    /// [`Config::routing_configuration_provenance`]: it is audit evidence, not
+    /// part of the accepted identity. This lets `serve` loaded from project
+    /// configuration and `init` repeating the same values as explicit flags
+    /// agree on one identity while a genuinely different value still changes
+    /// it.
+    ///
+    /// The version tag is deliberate: `sha256:v1:` values are historical
+    /// receipts and are never reinterpreted as this identity.
     pub fn routing_configuration_fingerprint(&self) -> String {
-        digest_route_fields([
-            agent_type_name(self.root_agent_type).to_string(),
-            route_source_name(self.root_agent_type_source).to_string(),
-            model_hash_value(self.model.as_deref()),
-            route_source_name(self.model_source).to_string(),
-            model_hash_value(self.opencode.tl_model.as_deref()),
-            route_source_name(self.opencode_tl_model_source).to_string(),
-            self.tl_effort_level.level.to_string(),
-            self.tl_effort_level.source.to_string(),
-            agent_type_name(self.spawn_agent_type).to_string(),
-            route_source_name(self.spawn_agent_type_source).to_string(),
-            model_hash_value(self.worker_model.as_deref()),
-            route_source_name(self.worker_model_source).to_string(),
-            model_hash_value(self.opencode.worker_model.as_deref()),
-            route_source_name(self.opencode_worker_model_source).to_string(),
-            self.worker_effort_level.level.to_string(),
-            self.worker_effort_level.source.to_string(),
-            agent_type_name(self.reviewer.agent_type).to_string(),
-            route_source_name(self.reviewer_agent_type_source).to_string(),
-            model_hash_value(self.reviewer.model.as_deref()),
-            route_source_name(self.reviewer_model_source).to_string(),
-            self.reviewer_effort_level.level.to_string(),
-            self.reviewer_effort_level.source.to_string(),
-        ])
+        let (tl_agent, _, tl_model, _, tl_effort) = self.configured_route(CanonicalRole::Tl);
+        let (worker_agent, _, worker_model, _, worker_effort) =
+            self.configured_route(CanonicalRole::Worker);
+        let (reviewer_agent, _, reviewer_model, _, reviewer_effort) =
+            self.configured_route(CanonicalRole::Reviewer);
+        digest_effective_role_routes(
+            [
+                ("tl", tl_agent, tl_model, tl_effort.level.to_string()),
+                (
+                    "worker",
+                    worker_agent,
+                    worker_model,
+                    worker_effort.level.to_string(),
+                ),
+                (
+                    "reviewer",
+                    reviewer_agent,
+                    reviewer_model,
+                    reviewer_effort.level.to_string(),
+                ),
+            ]
+            .into_iter()
+            .flat_map(|(role, agent, model, effort)| {
+                [
+                    role.to_string(),
+                    agent_type_name(agent).to_string(),
+                    model_hash_value(model.as_deref()),
+                    effort,
+                ]
+            }),
+        )
+    }
+
+    /// Provenance of each effective route value, with no secrets, raw
+    /// environment values, or model credentials. This is safe to log and to
+    /// expose on the server health surface.
+    pub fn routing_configuration_provenance(&self) -> RoleRoutingProvenance {
+        let source = |harness: RouteValueSource, model: RouteValueSource, effort: &str| {
+            RoleRouteSourceSummary {
+                harness: route_source_name(harness).to_string(),
+                model: route_source_name(model).to_string(),
+                effort: effort.to_string(),
+            }
+        };
+        let (_, tl_model_source) = configured_model_for_harness(
+            self.model.clone(),
+            self.model_source,
+            self.opencode.tl_model.clone(),
+            self.opencode_tl_model_source,
+            self.root_agent_type,
+        );
+        let (_, worker_model_source) = configured_model_for_harness(
+            self.worker_model.clone(),
+            self.worker_model_source,
+            self.opencode.worker_model.clone(),
+            self.opencode_worker_model_source,
+            self.spawn_agent_type,
+        );
+        RoleRoutingProvenance {
+            tl: source(
+                self.root_agent_type_source,
+                tl_model_source,
+                &self.tl_effort_level.source.to_string(),
+            ),
+            worker: source(
+                self.spawn_agent_type_source,
+                worker_model_source,
+                &self.worker_effort_level.source.to_string(),
+            ),
+            reviewer: source(
+                self.reviewer_agent_type_source,
+                self.reviewer_model_source,
+                &self.reviewer_effort_level.source.to_string(),
+            ),
+        }
     }
 
     /// Resolve one runtime role using CLI overrides, an accepted task-policy
@@ -1846,6 +2154,20 @@ fn digest_route_fields(fields: impl IntoIterator<Item = String>) -> String {
         digest.update(bytes);
     }
     format!("sha256:v1:{:x}", digest.finalize())
+}
+
+/// Versioned identity of effective role values. `v1` route and policy
+/// receipts keep their own versioned domain; this identity is deliberately
+/// separate so an old hash can never be mistaken for a current acceptance.
+fn digest_effective_role_routes(fields: impl IntoIterator<Item = String>) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"exomonad-role-route-identity-v2");
+    for field in fields {
+        let bytes = field.as_bytes();
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    }
+    format!("sha256:v2:{:x}", digest.finalize())
 }
 
 fn model_hash_value(model: Option<&str>) -> String {

@@ -155,6 +155,28 @@ effort_level = "medium"
 local config > global config > medium default. OpenCode receives effort as a
 model-aware `--variant`; Shoal logs that effort is ignored.
 
+**Accepted role-routing identity:** `config.rs::routing_configuration_fingerprint`
+is the one canonical identity shared by `serve`, `init`, the controller handoff,
+and the host launch check. It is `sha256:v2:` over only each role's *effective*
+harness/model/effort in deterministic `tl`, `worker`, `reviewer` order. Which
+source supplied a value (`project_config`, `local_config`, `environment`, `cli`,
+`policy`, `default`, `harness_default`) is recorded separately by
+`routing_configuration_provenance` and exported as audit evidence in the init
+log, the serve startup log, and the `/health` surface — it is never hashed into
+the identity. Repeating a project value as an explicit `--worker-model`/effort/
+harness (or reviewer) flag is therefore the same accepted configuration, while a
+genuinely different value changes the identity. `sha256:v1:` values are
+historical receipts: they remain readable by the Python controller, are never
+reinterpreted as v2, and can never satisfy a v2 acceptance. Before it keeps or
+releases a controller, `init` reads the running server's identity from `/health`
+and compares it with its own resolved identity; a mismatch or an absent identity
+is a structured early hold (`role_configuration_not_accepted` /
+`role_configuration_unavailable`) naming both identities and the restart remedy,
+with no controller release and no worker or gate touched.
+`route.configuration_fingerprint` still comes from this identity;
+`route_fingerprint` keeps its source-aware `sha256:v1:` route-receipt binding as
+audit evidence.
+
 **OpenCode model validation:** `init` validates exactly the roles it validated
 before the probe existed: an OpenCode worker route and the reviewer (through the
 harness-aware validator for its configured harness). TL routes are resolved and

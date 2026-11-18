@@ -79,6 +79,15 @@ memory, and inbox changes emit session.state_changed, memory.state_changed, and
 inbox.state_changed events into L1. Human-readable --verbose tracing does not
 control these structured events.
 
+The server `/health` response also carries
+`role_route_configuration.identity` (the `sha256:v2:` effective-value
+role-routing configuration identity) and
+`role_route_configuration.provenance` (per-role source names only; no values,
+credentials, or environment dump). `init` reads the identity before releasing a
+controller, and the serve startup log records both. These are operational
+health/audit fields, not new ledger events and not an authorization bypass: the
+host still validates every launch against its accepted identity.
+
 ## Runtime MVP-C paths
 
 Corrections are append-only event.superseded events. L2 exposes the

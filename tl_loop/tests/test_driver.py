@@ -23740,6 +23740,340 @@ def test_terminal_owner_retries_exact_legacy_route_refusal_after_fresh_gate_appr
     )
 
 
+HISTORICAL_CONFIG_FINGERPRINT_V1 = (
+    "sha256:v1:0381301c6d4d364fd4a3de0a062c65d5fcda0f850d4d7013bf4422f63bd345a4"
+)
+
+
+def _prelaunch_configuration_refusal_entry(
+    arguments: Mapping[str, object],
+) -> dict[str, object]:
+    return {
+        "operation": "resume_blocked_leaf",
+        "status": "rejected",
+        "arguments": arguments,
+        "result": {
+            "success": False,
+            "result": None,
+            "error": driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+        },
+        "error": driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+    }
+
+
+def test_role_route_configuration_fingerprint_accepts_v1_and_v2_without_reinterpretation() -> None:
+    assert driver_module._is_role_route_configuration_fingerprint("sha256:v1:" + "a" * 64)
+    assert driver_module._is_role_route_configuration_fingerprint("sha256:v2:" + "b" * 64)
+    assert not driver_module._is_role_route_configuration_fingerprint("sha256:v3:" + "c" * 64)
+    assert not driver_module._is_role_route_configuration_fingerprint("sha256:v2:short")
+    assert driver_module._is_role_route_configuration_fingerprint(
+        HISTORICAL_CONFIG_FINGERPRINT_V1
+    )
+
+
+def test_prelaunch_configuration_refusal_is_recognized_only_for_the_exact_shape() -> None:
+    arguments = {
+        "route_configuration_fingerprint": HISTORICAL_CONFIG_FINGERPRINT_V1,
+        "route_fingerprint": "sha256:v1:" + "1" * 64,
+    }
+    entry = _prelaunch_configuration_refusal_entry(arguments)
+    assert driver_module._is_prelaunch_role_configuration_refusal(entry)
+
+    unknown = {**entry, "status": "unknown"}
+    assert not driver_module._is_prelaunch_role_configuration_refusal(unknown)
+
+    independent = {
+        **entry,
+        "result": {
+            "success": False,
+            "result": None,
+            "error": "Invalid input: top-level model conflicts with the accepted role route",
+        },
+        "error": "Invalid input: top-level model conflicts with the accepted role route",
+    }
+    assert not driver_module._is_prelaunch_role_configuration_refusal(independent)
+
+    launched = {
+        **entry,
+        "result": {
+            "success": False,
+            "result": {"invocation": {"invocation_id": "launched"}},
+            "error": driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+        },
+    }
+    assert not driver_module._is_prelaunch_role_configuration_refusal(launched)
+
+    contradictory = {
+        **entry,
+        "result": {
+            "success": True,
+            "result": None,
+            "error": driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+        },
+    }
+    assert not driver_module._is_prelaunch_role_configuration_refusal(contradictory)
+
+
+def test_terminal_owner_retries_prelaunch_configuration_refusal_after_fresh_gate_approval(
+    tmp_path: Path,
+) -> None:
+    plan, config, store, owner_dir, owner_name, prior_invocation_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    leaf = plan.leaves[0]
+    gate_name = driver_module._terminal_owner_recovery_gate_name(leaf.name)
+    store.set_gate(gate_name, GateStatus.PENDING)
+    state = store.load()
+    terminal, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
+    assert terminal is not None and reason is None
+    assert terminal.resume.desired_harness is not None
+    assert terminal.resume.desired_agent_type is not None
+    assert terminal.resume.desired_effort is not None
+
+    historical_config = replace(
+        config, role_route_configuration_fingerprint=HISTORICAL_CONFIG_FINGERPRINT_V1
+    )
+    historical_route = driver_module._dispatch_route_fields(
+        historical_config,
+        state,
+        harness=terminal.resume.desired_harness,
+        agent_type=terminal.resume.desired_agent_type,
+        model=terminal.resume.desired_model,
+        choice=None,
+    )
+    manifest_digest = _required_manifest_digest(state)
+    historical_digest = driver_module._terminal_route_authorization_digest(
+        historical_config,
+        terminal.resume.desired_harness,
+        terminal.resume.desired_agent_type,
+        terminal.resume.desired_model,
+        terminal.resume.desired_effort,
+        _required_object_string(terminal.route_authorization, "prior_runtime"),
+        terminal.route_authorization["prior_model"],
+        terminal.route_authorization["prior_effort"],
+        None,
+        manifest_digest,
+    )
+    historical_authorization = dict(terminal.route_authorization)
+    historical_authorization["configuration_fingerprint"] = HISTORICAL_CONFIG_FINGERPRINT_V1
+    historical_authorization["digest"] = historical_digest
+    historical_authorization["recovery_gate_authorization"] = {}
+    current = state.slices[leaf.name]
+    assert current.recovery is not None
+    recovery = replace(
+        current.recovery,
+        evidence={
+            **current.recovery.evidence,
+            "configured_route_authorization": historical_authorization,
+        },
+    )
+    store.checkpoint(
+        state.fsm,
+        {**state.slices, leaf.name: replace(current, recovery=recovery)},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        plan_manifest=state.plan_manifest,
+    )
+
+    historical_arguments = dict(
+        driver_module._blocked_leaf_resume_action_arguments(terminal.resume, state)
+    )
+    historical_arguments.update(historical_route)
+    historical_arguments["route_authorization_digest"] = historical_digest
+    historical_arguments["recovery_gate_authorization"] = {}
+    old_intent = EffectIntent("resume_blocked_leaf", leaf.name, historical_arguments, True)
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    journal.append(old_intent)
+    refusal = ToolResult.from_raw(
+        {
+            "success": False,
+            "error": driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+        }
+    )
+    journal.mark_result(old_intent, refusal)
+    original_refusal = journal.entries_for("resume_blocked_leaf", leaf.name)[0]
+    assert original_refusal["status"] == "rejected"
+
+    rejected = store.answer_gate(gate_name, GateStatus.REJECTED)
+    held_transport = RecordingTransport()
+    held = driver_module._resume_terminal_owner_failure(
+        plan,
+        rejected,
+        config,
+        EffectClient(held_transport),
+        store,
+        journal,
+    )
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in held_transport.calls)
+    assert journal.entries_for("resume_blocked_leaf", leaf.name) == (original_refusal,)
+    held_recovery = held.slices[leaf.name].recovery
+    assert held_recovery is not None
+    assert held_recovery.evidence["terminal_owner_recovery_gate_rejection"]
+
+    approved = store.answer_gate(gate_name, GateStatus.APPROVED)
+    approved_proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, approved, config, store
+    )
+    assert approved_proof is not None and reason is None, reason
+    retry_arguments = driver_module._blocked_leaf_resume_action_arguments(
+        approved_proof.resume, approved
+    )
+    assert retry_arguments["route_configuration_fingerprint"] == (
+        config.role_route_configuration_fingerprint
+    )
+    assert retry_arguments["route_fingerprint"] != historical_arguments["route_fingerprint"]
+
+    successor_id = "prelaunch-configuration-successor"
+
+    class AcceptedConfigurationTransport(RecordingTransport):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
+            if tool_name != "resume_blocked_leaf":
+                return super().call_tool(role, name, tool_name, arguments)
+            self.calls.append((tool_name, arguments))
+            route_receipt = _required_json_value_object(arguments["role_route"], "role_route")
+            desired_agent_type = "codex"
+            desired_model = "gpt-6-luna"
+            desired_effort = "xhigh"
+            identity_path = owner_dir / "identity.json"
+            identity = json.loads(identity_path.read_text(encoding="utf-8"))
+            identity.update(
+                {
+                    "agent_type": desired_agent_type,
+                    "model": desired_model,
+                    "effort": desired_effort,
+                    "role_route": route_receipt,
+                }
+            )
+            identity_path.write_text(json.dumps(identity), encoding="utf-8")
+            invocation = {
+                "invocation_id": successor_id,
+                "generation": 2,
+                "status": "running",
+                "runtime": identity["agent_type"],
+                "model": identity["model"],
+                "effort": identity["effort"],
+                "trigger": "resume_blocked",
+                "branch": identity["birth_branch"],
+                "worktree": identity["working_dir"],
+                "prior_invocation_id": prior_invocation_id,
+                "pr_number": None,
+                "head_sha": None,
+                "role_route": route_receipt,
+            }
+            (owner_dir / "invocation.json").write_text(json.dumps(invocation), encoding="utf-8")
+            (owner_dir / "dispatch_intent").write_text(
+                f"{route_receipt['dispatch_intent_id']}\n", encoding="utf-8"
+            )
+            (owner_dir / "routing.json").write_text(
+                json.dumps(
+                    {
+                        "owner_agent_id": owner_name,
+                        "owner_invocation_id": successor_id,
+                        "owner_generation": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return {
+                "success": True,
+                "result": {
+                    "chainlink_issue_id": 814,
+                    "agent": {
+                        "id": owner_name,
+                        "issue": leaf.name,
+                        "intent_id": route_receipt["dispatch_intent_id"],
+                        "agent_type": identity["agent_type"],
+                        "branch_name": identity["birth_branch"],
+                        "worktree_path": identity["working_dir"],
+                        "role_route": route_receipt,
+                    },
+                    "invocation": {
+                        "invocation_id": successor_id,
+                        "trigger": "resume_blocked",
+                        "runtime": identity["agent_type"],
+                        "ready": True,
+                        "fresh": True,
+                        "outcome": "started",
+                        "role_route": route_receipt,
+                    },
+                },
+            }
+
+    accepted_transport = AcceptedConfigurationTransport()
+    resumed = driver_module._resume_terminal_owner_failure(
+        plan,
+        approved,
+        config,
+        EffectClient(accepted_transport),
+        store,
+        journal,
+    )
+    assert sum(tool == "resume_blocked_leaf" for tool, _ in accepted_transport.calls) == 1
+    entries = journal.entries_for("resume_blocked_leaf", leaf.name)
+    assert len(entries) == 2
+    assert entries[0] == original_refusal
+    assert entries[0]["status"] == "rejected"
+    assert entries[1]["status"] == "confirmed"
+    successor_arguments = _required_mapping(entries[1]["arguments"], "arguments")
+    assert successor_arguments["route_configuration_fingerprint"] == (
+        config.role_route_configuration_fingerprint
+    )
+    assert successor_arguments["expected_invocation_id"] == prior_invocation_id
+    assert resumed.slices[leaf.name].dispatch_invocation_id == successor_id
+
+
+def test_terminal_owner_holds_an_independent_rejection_beside_config_refusal_history(
+    tmp_path: Path,
+) -> None:
+    plan, config, store, _owner_dir, _owner_name, _prior_invocation_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    leaf = plan.leaves[0]
+    gate_name = driver_module._terminal_owner_recovery_gate_name(leaf.name)
+    store.set_gate(gate_name, GateStatus.PENDING)
+    state = store.load()
+    terminal, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
+    assert terminal is not None and reason is None
+    arguments = dict(driver_module._blocked_leaf_resume_action_arguments(terminal.resume, state))
+    arguments.update(terminal.resume.route_fields or {})
+    intent = EffectIntent("resume_blocked_leaf", leaf.name, arguments, True)
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    journal.append(intent)
+    journal.mark_result(
+        intent,
+        ToolResult.from_raw(
+            {
+                "success": False,
+                "error": "Invalid input: top-level model conflicts with the accepted role route",
+            }
+        ),
+    )
+    original_entries = journal.entries_for("resume_blocked_leaf", leaf.name)
+
+    proof, proof_reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert proof is None and proof_reason is not None
+
+    transport = RecordingTransport()
+    held = driver_module._resume_terminal_owner_failure(
+        plan,
+        store.load(),
+        config,
+        EffectClient(transport),
+        store,
+        journal,
+    )
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in transport.calls)
+    assert journal.entries_for("resume_blocked_leaf", leaf.name) == original_entries
+    assert held.slices[leaf.name].recovery is not None
+
+
 def _required_manifest_digest_value(manifest: PlanManifest) -> str:
     digest = manifest.digest
     if digest is None:

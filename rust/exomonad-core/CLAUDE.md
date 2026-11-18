@@ -516,6 +516,20 @@ transition; it is never reported as an owner, scope, or worktree conflict. Owner
 scope, worktree, predecessor-invocation, epoch, and process-identity checks are
 unchanged.
 
+The accepted configuration itself is one canonical `sha256:v2:` identity over
+each role's effective harness/model/effort, computed by the single
+`exomonad::config::Config::routing_configuration_fingerprint`. Source provenance
+is a separate audited summary (`routing_configuration_provenance`, exported
+through `/health`), never part of the identity. `AgentControlService` stores the
+identity it accepted at server start; `AgentHandler::accepted_role_route` still
+compares every caller route byte-for-byte with that identity, then revalidates
+role/scope, top-level route agreement, dispatch-intent history, policy, manifest,
+and durable intent. An absent identity, an old `sha256:v1:` value, a forged or
+cross-scope identity, and a changed value disguised as the same configuration
+all fail before launch. `init` compares its own resolved identity with the
+server's `/health` identity before releasing a controller and holds early when
+they differ.
+
 A cross-runtime change is configured when it comes from `config.toml`'s resolved
 role route or from the role's `allow` list in `.exo/harness_policy.toml`; both
 sources are consulted by `crate::services::harness_policy` and are pinned to the

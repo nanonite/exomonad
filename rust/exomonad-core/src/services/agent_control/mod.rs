@@ -1354,6 +1354,8 @@ pub struct AgentControlService<C> {
     pub(crate) reviewer_context: Vec<String>,
     /// Role-routing configuration accepted by this server process.
     pub(crate) role_route_configuration_fingerprint: Option<String>,
+    /// Safe provenance summary for the accepted role-routing values.
+    pub(crate) role_route_configuration_provenance: Option<serde_json::Value>,
     /// Harnesses the operator allowlisted for controller-dispatched roles.
     pub(crate) harness_policy: HarnessPolicyAllowlist,
     /// Forgejo environment sourced from loaded config, overriding stale parent process env.
@@ -1408,6 +1410,7 @@ impl<
             reviewer_route_sources: None,
             reviewer_context: vec![],
             role_route_configuration_fingerprint: None,
+            role_route_configuration_provenance: None,
             harness_policy,
             forgejo_spawn_env: None,
         }
@@ -1462,8 +1465,23 @@ impl<
         self
     }
 
-    pub(crate) fn role_route_configuration_fingerprint(&self) -> Option<&str> {
+    /// Record the safe provenance summary beside the accepted identity.
+    pub fn with_role_route_configuration_provenance(
+        mut self,
+        provenance: serde_json::Value,
+    ) -> Self {
+        self.role_route_configuration_provenance = Some(provenance);
+        self
+    }
+
+    /// Identity of the role-routing configuration this server accepted.
+    pub fn role_route_configuration_fingerprint(&self) -> Option<&str> {
         self.role_route_configuration_fingerprint.as_deref()
+    }
+
+    /// Safe provenance summary of the accepted role-routing values.
+    pub fn role_route_configuration_provenance(&self) -> Option<&serde_json::Value> {
+        self.role_route_configuration_provenance.as_ref()
     }
 
     /// Get the configured default agent type for spawned workers/teammates.

@@ -64,9 +64,18 @@ struct ToolListResponse {
     tools: Vec<ToolDefinition>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RoleRouteConfigurationHealth {
+    pub identity: String,
+    #[serde(default)]
+    pub provenance: Value,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct HealthResponse {
     pub wasm_hash: String,
+    #[serde(default)]
+    pub role_route_configuration: Option<RoleRouteConfigurationHealth>,
 }
 
 /// Client for the exomonad UDS server.
@@ -391,6 +400,30 @@ mod tests {
             .unwrap();
         assert_eq!(receipt["dry_run"], true);
         server.await.unwrap();
+    }
+
+    #[test]
+    fn health_response_parses_the_accepted_role_configuration_identity() {
+        let response: HealthResponse = serde_json::from_value(serde_json::json!({
+            "wasm_hash": "abc",
+            "role_route_configuration": {
+                "identity": "sha256:v2:identity",
+                "provenance": {
+                    "worker": {"harness": "project_config", "model": "project_config", "effort": "config"}
+                }
+            }
+        }))
+        .unwrap();
+        let accepted = response.role_route_configuration.unwrap();
+        assert_eq!(accepted.identity, "sha256:v2:identity");
+        assert_eq!(accepted.provenance["worker"]["model"], "project_config");
+    }
+
+    #[test]
+    fn health_response_without_role_configuration_is_an_absent_identity() {
+        let response: HealthResponse =
+            serde_json::from_value(serde_json::json!({"wasm_hash": "abc"})).unwrap();
+        assert!(response.role_route_configuration.is_none());
     }
 
     #[test]
