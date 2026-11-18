@@ -97,6 +97,19 @@ identity from `/health` and compares it with its own resolved identity:
   `EXOMONAD_ROLE_ROUTE_CONFIG_FINGERPRINT`, or restarts a server that may have
   independent work.
 
+The preflight is not a convention that a future edit can accidentally skip.
+`init` constructs an `AcceptedRoleConfiguration` proof value only inside
+`ensure_server_accepts_role_configuration`, after the `/health` identity has
+been compared. `launch_tl_recovery` requires that proof, and both release entry
+points (fresh session and existing session) obtain it from the one function, so
+removing either call fails to compile. Unit tests exercise the producer against
+a real UDS health response (equal, different, absent, transport failure) and
+pin the two call sites; `check_role_config_preflight.py` rejects textual
+bypasses. The compiled acceptance is
+`E2E_ROLE_CONFIG_ONLY=1 tests/e2e/init-recovery/run.sh` (or
+`just e2e-role-config`), which prints `ROLECONFIG-1..5` and
+`ROLECONFIG-ALL PASS`.
+
 A genuine CLI override therefore does **not** silently reuse a server started
 from different project values. Restart `exomonad serve` with the same role flags
 (or restore the configured values), then rerun `exomonad init --continue`. A

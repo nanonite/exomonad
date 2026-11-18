@@ -539,7 +539,14 @@ configured cross-runtime change therefore does not require
 emits `[STUCK: harness-switch]`/`agent.stuck` and is approved only by that flag.
 `exomonad init` additionally requires the resolved worker and reviewer routes
 to agree with the same role's allow list before it starts a controller; the
-guard still accepts either source for an already-running dispatch. See
+guard still accepts either source for an already-running dispatch. The host
+check in `handlers/agent.rs` is unchanged: `accepted_role_route` still compares
+the caller's `configuration_fingerprint` byte-for-byte with the identity the
+server accepted and then validates policy, scope, manifest, role and the
+durable `tl.dispatch_intended` event. init cannot satisfy that check by
+asserting a value; it must read the server's `/health` identity, and its
+proof-carrying preflight makes releasing a controller without that read a
+compile error. See
 [docs/guides/changing-routes-mid-run.md](../../../docs/guides/changing-routes-mid-run.md).
 
 The `resume_pr` response's `InvocationHandoff` also carries the launched

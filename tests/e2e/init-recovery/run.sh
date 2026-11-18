@@ -1825,7 +1825,14 @@ PY
 }
 
 e2e_phase "Phase 0" "Checking preconditions..."
-e2e_require_commands nix tmux git curl rg chainlink python3
+if [[ "${E2E_ROLE_CONFIG_ONLY:-0}" == "1" ]]; then
+    # The role-configuration phase never shells out to ripgrep, so the fixed
+    # `E2E_ROLE_CONFIG_ONLY=1 ./run.sh` contract also works from a host shell
+    # that does not have rg on PATH. The other modes still require it.
+    e2e_require_commands nix tmux git curl chainlink python3
+else
+    e2e_require_commands nix tmux git curl rg chainlink python3
+fi
 
 cleanup() {
     local code=$?
@@ -1848,18 +1855,25 @@ cleanup() {
                 ;;
         esac
     fi
-    if [[ -n "$INITIAL_TMUX" ]]; then
-        env TMUX="$INITIAL_TMUX" tmux kill-session -t "$SESSION" 2>/dev/null
-        env TMUX="$INITIAL_TMUX" tmux kill-session -t "$CONTINUATION_SESSION" 2>/dev/null
-    elif [[ -n "$INITIAL_TMUX_TMPDIR" ]]; then
-        env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$INITIAL_TMUX_TMPDIR" \
-            tmux kill-session -t "$SESSION" 2>/dev/null
-        env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$INITIAL_TMUX_TMPDIR" \
-            tmux kill-session -t "$CONTINUATION_SESSION" 2>/dev/null
-    else
-        env -u TMUX -u TMUX_PANE -u TMUX_TMPDIR tmux kill-session -t "$SESSION" 2>/dev/null
-        env -u TMUX -u TMUX_PANE -u TMUX_TMPDIR \
-            tmux kill-session -t "$CONTINUATION_SESSION" 2>/dev/null
+    # The aggregate/composed and role-configuration modes run every tmux call
+    # on their own run-scoped AGGREGATE_TMUX_TMPDIR. Never fall back to the
+    # caller's/default server in those modes: even a kill-session for a
+    # non-existent name is a write to that server, and a same-named stale
+    # session there must never be removed by this harness.
+    if [[ -z "$AGGREGATE_TMUX_TMPDIR" ]]; then
+        if [[ -n "$INITIAL_TMUX" ]]; then
+            env TMUX="$INITIAL_TMUX" tmux kill-session -t "$SESSION" 2>/dev/null
+            env TMUX="$INITIAL_TMUX" tmux kill-session -t "$CONTINUATION_SESSION" 2>/dev/null
+        elif [[ -n "$INITIAL_TMUX_TMPDIR" ]]; then
+            env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$INITIAL_TMUX_TMPDIR" \
+                tmux kill-session -t "$SESSION" 2>/dev/null
+            env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$INITIAL_TMUX_TMPDIR" \
+                tmux kill-session -t "$CONTINUATION_SESSION" 2>/dev/null
+        else
+            env -u TMUX -u TMUX_PANE -u TMUX_TMPDIR tmux kill-session -t "$SESSION" 2>/dev/null
+            env -u TMUX -u TMUX_PANE -u TMUX_TMPDIR \
+                tmux kill-session -t "$CONTINUATION_SESSION" 2>/dev/null
+        fi
     fi
     if [[ -n "$MOCK_PID" ]] && kill -0 "$MOCK_PID" 2>/dev/null; then
         kill "$MOCK_PID" 2>/dev/null
@@ -1902,6 +1916,24 @@ GUEST_WASM_SHA256="$(sha256sum "$GUEST_WASM" | cut -d ' ' -f 1)"
 E2E_WASM_SHA256="$(sha256sum "$E2E_WASM" | cut -d ' ' -f 1)"
 e2e_log "Fresh devswarm WASM sha256=$GUEST_WASM_SHA256"
 e2e_log "Fresh e2e-test WASM sha256=$E2E_WASM_SHA256"
+
+# Role-configuration acceptance mode (#1433 R2-R4): reuse the Phase 0 build,
+# fresh WASM, isolated homes and run-scoped tmux server, then run only the
+# standalone-serve/identical-flags/override/repeat phase.
+if [[ "${E2E_ROLE_CONFIG_ONLY:-0}" == "1" ]]; then
+    AGGREGATE_TMUX_TMPDIR="$(mktemp -d "${E2E_TMUX_TMPDIR_ROOT:-${TMPDIR:-/tmp}}/exo1283-tmux.XXXXXX")"
+    unset TMUX TMUX_PANE
+    export TMUX_TMPDIR="$AGGREGATE_TMUX_TMPDIR"
+    e2e_log "Role-config tmux server isolated to $TMUX_TMPDIR"
+    ROLE_CONFIG_HOME="$WORK_DIR/role-config-home"
+    mkdir -p "$ROLE_CONFIG_HOME/.exo"
+    bash "$SCRIPT_DIR/role-config-acceptance.sh" \
+        "$EXOMONAD_BIN" "$WORK_DIR/role-config" "$ROLE_CONFIG_HOME" "$CODEX_HOME" \
+        "$PROJECT_ROOT" "$WASM_ARTIFACT_DIR"
+    printf 'ROLECONFIG-ALL PASS\n'
+    e2e_log "PASS: ROLECONFIG-ALL PASS"
+    exit 0
+fi
 
 if [[ "${E2E_AGGREGATE_ONLY:-0}" != "1" ]]; then
 e2e_phase "Phase 1" "Creating scratch repository..."

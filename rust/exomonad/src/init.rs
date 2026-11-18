@@ -6025,41 +6025,79 @@ impl RoleConfigurationPreflightError {
     }
 }
 
-/// Compare init's resolved effective role configuration with the identity the
-/// running server accepted. This runs before any controller release so a
-/// genuine override, a stale server, or a lost acceptance cannot turn into a
-/// late opaque launch rejection.
-async fn ensure_server_accepts_role_configuration(
-    project_dir: &Path,
-    config: &Config,
-) -> Result<()> {
-    let expected = config.routing_configuration_fingerprint();
-    let init_provenance = config.routing_configuration_provenance();
-    let client = uds_client::ServerClient::new(project_dir.join(".exo/server.sock"));
-    let health = client.health_info().await.map_err(|error| {
-        RoleConfigurationPreflightError::Unavailable {
-            reason: format!("health request failed: {error}"),
+/// Proof-carrying handoff from the one server preflight to controller release.
+///
+/// The private field makes this type impossible to construct outside this
+/// module, so `launch_tl_recovery` cannot be called on a configuration the
+/// running server has not accepted. Removing either call site's preflight
+/// therefore fails to compile instead of silently releasing a controller.
+mod accepted_role_configuration {
+    use super::*;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct AcceptedRoleConfiguration {
+        identity: String,
+    }
+
+    impl AcceptedRoleConfiguration {
+        pub fn identity(&self) -> &str {
+            &self.identity
         }
-    })?;
-    let accepted_identity = compare_role_configuration_identities(
-        expected.clone(),
-        health
+    }
+
+    /// Compare init's resolved effective role configuration with the identity
+    /// the running server accepted. This runs before any controller release so
+    /// a genuine override, a stale server, or a lost acceptance cannot turn
+    /// into a late opaque launch rejection.
+    pub async fn ensure_server_accepts_role_configuration(
+        project_dir: &Path,
+        config: &Config,
+    ) -> Result<AcceptedRoleConfiguration> {
+        let expected = config.routing_configuration_fingerprint();
+        let init_provenance = config.routing_configuration_provenance();
+        let client = uds_client::ServerClient::new(project_dir.join(".exo/server.sock"));
+        let health = client.health_info().await.map_err(|error| {
+            RoleConfigurationPreflightError::Unavailable {
+                reason: format!("health request failed: {error}"),
+            }
+        })?;
+        let accepted_identity = compare_role_configuration_identities(
+            expected.clone(),
+            health
+                .role_route_configuration
+                .as_ref()
+                .map(|accepted| accepted.identity.clone()),
+        )?;
+        let server_provenance = health
             .role_route_configuration
-            .as_ref()
-            .map(|accepted| accepted.identity.clone()),
-    )?;
-    let server_provenance = health
-        .role_route_configuration
-        .map(|accepted| accepted.provenance)
-        .unwrap_or(serde_json::Value::Null);
-    info!(
-        identity = %accepted_identity,
-        provenance = %serde_json::to_string(&init_provenance)?,
-        server_provenance = %server_provenance,
-        "init agrees with the running server's accepted role configuration"
-    );
-    Ok(())
+            .map(|accepted| accepted.provenance)
+            .unwrap_or(serde_json::Value::Null);
+        info!(
+            identity = %accepted_identity,
+            provenance = %serde_json::to_string(&init_provenance)?,
+            server_provenance = %server_provenance,
+            "init agrees with the running server's accepted role configuration"
+        );
+        Ok(AcceptedRoleConfiguration {
+            identity: accepted_identity,
+        })
+    }
+
+    /// Test-only proof for the release-guard unit tests below; the production
+    /// call sites must obtain their proof from the real preflight.
+    #[cfg(test)]
+    pub fn accepted_role_configuration_for_unit_test(identity: &str) -> AcceptedRoleConfiguration {
+        AcceptedRoleConfiguration {
+            identity: identity.to_string(),
+        }
+    }
 }
+
+#[cfg(test)]
+use accepted_role_configuration::accepted_role_configuration_for_unit_test;
+use accepted_role_configuration::{
+    ensure_server_accepts_role_configuration, AcceptedRoleConfiguration,
+};
 
 /// The single acceptance rule shared by the server preflight and its unit
 /// tests. An absent identity is a refusal, never a wildcard.
@@ -6565,15 +6603,21 @@ fn clear_controller_startup_intent(project_dir: &Path, epoch: &str) -> Result<()
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn launch_tl_recovery(
     ipc: &exomonad_core::services::tmux_ipc::TmuxIpc,
     project_dir: &Path,
     shell: &str,
     tl_loop_root: &Path,
     config: &Config,
+    accepted_role_configuration: &AcceptedRoleConfiguration,
     controller_plan_digest: Option<&str>,
     continue_mode: bool,
 ) -> Result<()> {
+    debug!(
+        identity = accepted_role_configuration.identity(),
+        "releasing controller on the server-accepted role configuration"
+    );
     if let Some(expected_digest) = controller_plan_digest {
         ensure_snapshot_digest_matches(project_dir, expected_digest)?;
     }
@@ -6599,8 +6643,6 @@ async fn launch_tl_recovery(
         }
         _ => None,
     };
-    // No controller may be released on a snapshot this server did not accept.
-    ensure_server_accepts_role_configuration(project_dir, config).await?;
     let server = ipc.server_identity().await?;
     let mut startup_intent = ControllerStartupIntent {
         schema_version: 1,
@@ -7109,7 +7151,8 @@ async fn reconcile_existing_session(
     // An existing same-build server is not enough: its accepted role
     // configuration must equal the one init just resolved before any
     // controller is kept, restarted, or released.
-    ensure_server_accepts_role_configuration(project_dir, config).await?;
+    let accepted_role_configuration =
+        ensure_server_accepts_role_configuration(project_dir, config).await?;
     ensure_watcher_dashboard_window(ipc, project_dir, shell).await?;
     let interrupted_startup = reconcile_interrupted_controller_startup(ipc, project_dir).await?;
     if interrupted_startup == InterruptedControllerStartup::Resumed {
@@ -7160,6 +7203,7 @@ async fn reconcile_existing_session(
             shell,
             tl_loop_root,
             config,
+            &accepted_role_configuration,
             controller_plan_digest,
             relaunch_continue_mode,
         )
@@ -7228,6 +7272,7 @@ async fn reconcile_existing_session(
         shell,
         tl_loop_root,
         config,
+        &accepted_role_configuration,
         controller_plan_digest,
         continue_mode,
     )
@@ -8584,12 +8629,17 @@ pub async fn run(
     }
     ensure_watcher_dashboard_window(&ipc, &cwd, &shell).await?;
 
+    // A freshly started server must accept init's resolved role configuration
+    // before this call site may release a controller.
+    let accepted_role_configuration =
+        ensure_server_accepts_role_configuration(&cwd, &config).await?;
     launch_tl_recovery(
         &ipc,
         &cwd,
         &shell,
         &tl_loop_root,
         &config,
+        &accepted_role_configuration,
         controller_plan_digest.as_deref(),
         mode == SessionMode::Continue,
     )
@@ -9782,6 +9832,257 @@ mod tests {
             .downcast_ref::<RoleConfigurationPreflightError>()
             .unwrap();
         assert_eq!(preflight.kind(), "role_configuration_unavailable");
+    }
+
+    // --- R1: the preflight proof is the only way to release a controller ---
+
+    const INIT_SOURCE: &str = include_str!("init.rs");
+
+    fn production_source() -> &'static str {
+        let tests = INIT_SOURCE
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the test module must follow the production source");
+        &INIT_SOURCE[..tests]
+    }
+
+    async fn serve_health_once(
+        socket: &Path,
+        body: serde_json::Value,
+    ) -> tokio::task::JoinHandle<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let body = serde_json::to_string(&body).unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        })
+    }
+
+    fn accepted_health(identity: &str) -> serde_json::Value {
+        serde_json::json!({
+            "wasm_hash": "unit-test",
+            "role_route_configuration": {
+                "identity": identity,
+                "provenance": {
+                    "worker": {"harness": "project_config", "model": "project_config", "effort": "config"}
+                }
+            }
+        })
+    }
+
+    async fn project_with_socket() -> tempfile::TempDir {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".exo")).unwrap();
+        project
+    }
+
+    #[tokio::test]
+    async fn preflight_returns_a_proof_when_the_server_identity_matches() {
+        let project = project_with_socket().await;
+        let config = Config::default();
+        let expected = config.routing_configuration_fingerprint();
+        let server = serve_health_once(
+            &project.path().join(".exo/server.sock"),
+            accepted_health(&expected),
+        )
+        .await;
+
+        let accepted = ensure_server_accepts_role_configuration(project.path(), &config)
+            .await
+            .expect("matching identity must produce a proof");
+
+        assert_eq!(accepted.identity(), expected);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preflight_yields_no_proof_for_a_different_server_identity() {
+        let project = project_with_socket().await;
+        let config = Config::default();
+        let server = serve_health_once(
+            &project.path().join(".exo/server.sock"),
+            accepted_health("sha256:v2:some-other-configuration"),
+        )
+        .await;
+
+        let error = ensure_server_accepts_role_configuration(project.path(), &config)
+            .await
+            .expect_err("a different identity must not produce a proof");
+        server.await.unwrap();
+
+        let preflight = error
+            .downcast_ref::<RoleConfigurationPreflightError>()
+            .unwrap();
+        assert_eq!(preflight.kind(), "role_configuration_not_accepted");
+        assert!(preflight
+            .to_string()
+            .contains(&config.routing_configuration_fingerprint()));
+        assert!(preflight
+            .to_string()
+            .contains("sha256:v2:some-other-configuration"));
+    }
+
+    #[tokio::test]
+    async fn preflight_yields_no_proof_when_the_server_omits_its_identity() {
+        let project = project_with_socket().await;
+        let config = Config::default();
+        let server = serve_health_once(
+            &project.path().join(".exo/server.sock"),
+            serde_json::json!({"wasm_hash": "old-binary"}),
+        )
+        .await;
+
+        let error = ensure_server_accepts_role_configuration(project.path(), &config)
+            .await
+            .expect_err("an absent identity must not produce a proof");
+        server.await.unwrap();
+
+        let preflight = error
+            .downcast_ref::<RoleConfigurationPreflightError>()
+            .unwrap();
+        assert_eq!(preflight.kind(), "role_configuration_unavailable");
+    }
+
+    #[tokio::test]
+    async fn preflight_yields_no_proof_when_the_health_transport_fails() {
+        let project = project_with_socket().await;
+        let config = Config::default();
+
+        let error = ensure_server_accepts_role_configuration(project.path(), &config)
+            .await
+            .expect_err("an unreachable server must not produce a proof");
+        let preflight = error
+            .downcast_ref::<RoleConfigurationPreflightError>()
+            .unwrap();
+        assert_eq!(preflight.kind(), "role_configuration_unavailable");
+        assert!(preflight.to_string().contains("health request failed"));
+    }
+
+    #[test]
+    fn controller_release_requires_the_accepted_role_configuration_proof() {
+        assert!(
+            production_source()
+                .contains("accepted_role_configuration: &AcceptedRoleConfiguration,"),
+            "launch_tl_recovery must take the proof value so a missing preflight cannot compile"
+        );
+    }
+
+    #[test]
+    fn the_preflight_is_invoked_exactly_at_the_two_release_entry_points() {
+        // One definition plus the existing-session and fresh-session call
+        // sites. A deletion or an extra bypass call changes this count.
+        assert_eq!(
+            production_source()
+                .matches("ensure_server_accepts_role_configuration(")
+                .count(),
+            3,
+            "expected the definition and exactly two controller-release preflights"
+        );
+    }
+
+    #[test]
+    fn the_proof_type_is_only_constructed_inside_the_preflight_module() {
+        let source = production_source();
+        let start = source
+            .find("mod accepted_role_configuration {")
+            .expect("the preflight proof module must exist");
+        let end = source[start..]
+            .find("/// The single acceptance rule")
+            .expect("the proof module must end before the comparison rule")
+            + start;
+        let constructions: Vec<usize> = source
+            .match_indices("AcceptedRoleConfiguration {")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            constructions.len(),
+            5,
+            "expected the struct/impl headers, the preflight construction, and the test-only helper"
+        );
+        for index in constructions {
+            assert!(
+                (start..end).contains(&index),
+                "AcceptedRoleConfiguration must not be constructed outside its proof module"
+            );
+        }
+    }
+
+    #[test]
+    fn the_preflight_compares_before_it_can_produce_a_proof() {
+        let source = production_source();
+        let start = source
+            .find("pub async fn ensure_server_accepts_role_configuration")
+            .unwrap();
+        let end = start
+            + source[start..]
+                .find("/// Test-only proof")
+                .expect("the preflight body must precede the test-only helper");
+        let body = &source[start..end];
+        let compare = body
+            .find("compare_role_configuration_identities(")
+            .expect("the preflight must call the one comparison rule");
+        let construct = body
+            .find("Ok(AcceptedRoleConfiguration {")
+            .expect("the preflight must construct the proof");
+        assert!(
+            compare < construct,
+            "the proof must be built only after the identities agree"
+        );
+    }
+
+    #[test]
+    fn preflight_never_accepts_a_case_or_prefix_variant_of_the_identity() {
+        for observed in [
+            "SHA256:V2:expected",
+            "sha256:v2:expecte",
+            "sha256:v2:expected ",
+            "sha256:v2:expected\n",
+        ] {
+            assert!(
+                compare_role_configuration_identities(
+                    "sha256:v2:expected".to_string(),
+                    Some(observed.to_string())
+                )
+                .is_err(),
+                "{observed:?} must never be accepted as the exact identity"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_v1_receipts_are_never_the_current_identity() {
+        for observed in [
+            "sha256:v1:0381301c6d4d364fd4a3de0a062c65d5fcda0f850d4d7013bf4422f63bd345a4",
+            "sha256:v1:73ef11c4b8f80a2e599e13d7a045e6a819a868034a6fccd84e740d2a2715e041",
+        ] {
+            assert!(compare_role_configuration_identities(
+                "sha256:v2:0381301c6d4d364fd4a3de0a062c65d5fcda0f850d4d7013bf4422f63bd345a4"
+                    .to_string(),
+                Some(observed.to_string())
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn accepted_proof_reports_exactly_the_identity_the_server_accepted() {
+        let proof = accepted_role_configuration_for_unit_test("sha256:v2:accepted");
+        assert_eq!(proof.identity(), "sha256:v2:accepted");
+        assert_eq!(
+            proof,
+            accepted_role_configuration_for_unit_test("sha256:v2:accepted")
+        );
+        assert_ne!(
+            proof,
+            accepted_role_configuration_for_unit_test("sha256:v2:different")
+        );
     }
 
     #[test]
@@ -15063,6 +15364,7 @@ mod tests {
             "/bin/sh",
             Path::new("/tmp/exo-tl-loop"),
             &Config::default(),
+            &accepted_role_configuration_for_unit_test("sha256:v2:unit-test"),
             None,
             true,
         )
@@ -15105,6 +15407,7 @@ mod tests {
             "/bin/sh",
             Path::new("/tmp/exo-tl-loop"),
             &Config::default(),
+            &accepted_role_configuration_for_unit_test("sha256:v2:unit-test"),
             None,
             true,
         )
@@ -15136,6 +15439,7 @@ mod tests {
             "/bin/sh",
             Path::new("/tmp/exo-tl-loop"),
             &Config::default(),
+            &accepted_role_configuration_for_unit_test("sha256:v2:unit-test"),
             None,
             true,
         )

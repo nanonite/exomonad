@@ -836,11 +836,19 @@ check-e2e-one-shot-lifecycle:
 e2e-init-recovery:
     ./tests/e2e/init-recovery/run.sh
 
+# Run only the #1433 role-configuration acceptance phase: standalone serve
+# from project config, identical init flags, genuine overrides held before
+# dispatch, repeat-init duplicate checks and the no-identity server hold.
+e2e-role-config:
+    E2E_ROLE_CONFIG_ONLY=1 ./tests/e2e/init-recovery/run.sh
+
 # Check the init-recovery E2E harness without launching tmux
 check-e2e-init-recovery:
     bash -n tests/e2e/init-recovery/run.sh
     bash -n tests/e2e/init-recovery/fake-codex.sh
     bash -n tests/e2e/init-recovery/fast-start-acceptance.sh
+    bash -n tests/e2e/init-recovery/role-config-acceptance.sh
+    {{py}} -m py_compile tests/e2e/init-recovery/check_role_config_preflight.py
     bash -n tests/e2e/init-recovery/tl-window-state.sh
     bash -n tests/e2e/init-recovery/test-tl-window-state.sh
     tests/e2e/init-recovery/test-tl-window-state.sh

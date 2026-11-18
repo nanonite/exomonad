@@ -376,7 +376,14 @@ after a `run_seq` value. `just check-e2e-init-recovery` runs
 non-optional `LedgerEvent` fields from
 `rust/exomonad-core/src/services/immutable_ledger.rs`, seeds the chronology into
 a throwaway repository, and fails when any row lacks a field the server parser
-requires or the seed invents a segment layout. The same check builds the
+requires or the seed invents a segment layout. The role-configuration
+acceptance (`E2E_ROLE_CONFIG_ONLY=1`, `just e2e-role-config`) exercises the
+v2 `route_configuration_fingerprint` end to end: the controller receives the
+server-accepted identity from init, every dispatch event and invocation receipt
+carries it, and genuine model/effort/harness overrides are held by init before
+any controller or dispatch exists. `check_e2e-init-recovery` also compiles
+`check_role_config_preflight.py`; that guard rejects a removed or bypassed
+preflight. `check_ledger_fixture_schema.py` also builds the
 fixture's historical resume result and fails if the genuine producer shape loses
 its nested `success: true`.
 

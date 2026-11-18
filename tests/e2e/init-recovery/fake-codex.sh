@@ -192,6 +192,44 @@ PY
     exit 0
 fi
 
+if [[ ( "$role" == "dev" || "$role" == "worker" ) && "${E2E_ROLE_CONFIG_ACCEPTANCE:-0}" == "1" ]]; then
+    record_event role_config_worker_started "$(python3 - "$PWD" "$(basename "$0")" "$role" "$agent" "$model" "$effort" "$@" <<'PY'
+import json
+import os
+import sys
+
+working_directory, harness, role, agent, model, effort, *argv = sys.argv[1:]
+print(json.dumps({
+    "working_directory": working_directory,
+    "harness": harness,
+    "role": role,
+    "agent_id": agent,
+    "model": model,
+    "effort": effort,
+    "argv": argv,
+    "shim_pid": os.getppid(),
+    "recorder_pid": os.getpid(),
+    "lifetime": os.environ.get("E2E_ROLE_CONFIG_WORKER_LIFETIME"),
+}))
+PY
+)"
+    printf 'role-config acceptance worker active\n' > "$PWD/role-config-worker.txt"
+    # Keep the invocation alive without depending on a PATH-provided sleep.
+    # The acceptance phase requests a clean, prompt exit after it has captured
+    # the independent-worker evidence; the deadline is only a safety net.
+    exec python3 -c '
+import os
+import time
+
+exit_file = os.environ.get("E2E_ROLE_CONFIG_WORKER_EXIT_FILE")
+deadline = time.time() + float(os.environ.get("E2E_ROLE_CONFIG_WORKER_LIFETIME", "120"))
+while time.time() < deadline:
+    if exit_file and os.path.exists(exit_file):
+        break
+    time.sleep(0.1)
+'
+fi
+
 if [[ "$role" == "dev" && "${E2E_FAST_START:-0}" == "1" ]]; then
     [[ "$(basename "$0")" == "codex" && "$model" == "gpt-6-luna" && "$effort" == "xhigh" ]] || {
         printf 'unexpected immediate-start worker route: %s/%s/%s\n' \

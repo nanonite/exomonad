@@ -843,7 +843,22 @@ just e2e-tl-loop-active    # Programmatic TL loop over a scratch repository
 just e2e-slice-abandon-redispatch # Real-server closed-PR recovery acceptance
 just e2e-recreated-leaf-recovery # Recreated-leaf recovery acceptance (T1-T9)
 just e2e-typecheck-ci      # Real CI typecheck job in a disposable Forgejo (no network)
+just e2e-role-config       # #1433 role-configuration preflight acceptance (ROLECONFIG-1..5)
 ```
+
+`just e2e-role-config` runs `tests/e2e/init-recovery/run.sh` with
+`E2E_ROLE_CONFIG_ONLY=1`. That mode reuses the same Phase 0 build, fresh WASM,
+isolated Codex home and run-scoped tmux server as the composed acceptance, then
+runs only `tests/e2e/init-recovery/role-config-acceptance.sh`: a standalone
+`exomonad serve` loaded from project configuration, an `init` repeating the
+same harness/model/effort values, repeat-init duplicate checks, genuine
+model/effort/harness overrides that must hold before dispatch, and a
+no-identity (old-binary) server that must hold with
+`role_configuration_unavailable`. It prints `ROLECONFIG-1..5` and
+`ROLECONFIG-ALL PASS`. The R1 regression is
+`tests/e2e/init-recovery/check_role_config_preflight.py` plus the
+`init::tests::*preflight*` unit tests; the recorded red-on-old-code logs live in
+the run's evidence directory.
 
 `just e2e-recreated-leaf-recovery` is non-interactive like
 `just e2e-tl-loop-active`: it builds the binary and WASM from this worktree,
@@ -927,7 +942,9 @@ All E2E tests live in `tests/e2e/{name}/` and follow the same structure:
   inside that directory and is not the default `/tmp/tmux-*` server. The
   init-recovery harness's `E2E_COMPOSED_RESTART=1` mode restarts only its own
   isolated server to reuse numeric ids; it never touches the operator's default
-  server.
+  server. `E2E_ROLE_CONFIG_ONLY=1` likewise creates a run-scoped
+  `TMUX_TMPDIR`, uses its own mock Forgejo and standalone server, and its
+  cleanup verifies that the isolated tmux server did not survive.
 
 **Adding a new E2E test:**
 1. Create `tests/e2e/{name}/run.sh` following the pattern above

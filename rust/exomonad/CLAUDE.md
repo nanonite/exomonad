@@ -173,6 +173,19 @@ and compares it with its own resolved identity; a mismatch or an absent identity
 is a structured early hold (`role_configuration_not_accepted` /
 `role_configuration_unavailable`) naming both identities and the restart remedy,
 with no controller release and no worker or gate touched.
+
+The preflight is proof-carrying, not advisory:
+`init::accepted_role_configuration::AcceptedRoleConfiguration` has a private
+field and is constructed only by
+`ensure_server_accepts_role_configuration`. `launch_tl_recovery` takes
+`&AcceptedRoleConfiguration`, and both release entry points (the fresh-session
+path and `reconcile_existing_session`) obtain it from that one function, so
+deleting or skipping a preflight is a compile error rather than a late launch
+rejection. Unit tests cover the producer against a real UDS `/health` response
+(equal, different, absent and transport-failure cases) and pin the two call
+sites; `tests/e2e/init-recovery/check_role_config_preflight.py` rejects textual
+bypasses. The compiled acceptance is
+`E2E_ROLE_CONFIG_ONLY=1 tests/e2e/init-recovery/run.sh` (`just e2e-role-config`).
 `route.configuration_fingerprint` still comes from this identity;
 `route_fingerprint` keeps its source-aware `sha256:v1:` route-receipt binding as
 audit evidence.
