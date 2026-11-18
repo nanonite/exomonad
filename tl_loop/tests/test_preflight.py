@@ -18,7 +18,7 @@ from tl_loop.select.policy import load_policy
 from tl_loop.state.plan_reconciliation import analyze_plan_reconciliation
 from tl_loop.state.plan_reconciliation_apply import apply_plan_reconciliation
 from tl_loop.state.store import RunStore
-from tl_loop.tests.test_plan_reconciliation import _project as _legacy_plan_project
+from tl_loop.tests.plan_reconciliation_fixtures import _project as _legacy_plan_project
 
 ROOT = Path(__file__).parents[2]
 

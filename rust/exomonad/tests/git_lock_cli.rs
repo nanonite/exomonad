@@ -14,8 +14,14 @@ fn git(path: &Path, args: &[&str]) {
     assert!(output.status.success(), "git {args:?} failed");
 }
 
+/// Run a read-only Git query. `--no-optional-locks` keeps a query such as
+/// `git status` from refreshing `.git/index`: when the index entries are
+/// racily clean Git rewrites the index, which changes the metadata that
+/// `git-lock inspect` fingerprints and makes a later `apply` refuse the
+/// recorded evidence.
 fn git_output(path: &Path, args: &[&str]) -> Vec<u8> {
     let output = std::process::Command::new("git")
+        .args(["--no-optional-locks"])
         .args(args)
         .current_dir(path)
         .env_remove("GIT_DIR")

@@ -41,7 +41,7 @@ pub fn seed_runnable_checkpoint(project: &Path) {
 import sys
 from pathlib import Path
 import shutil
-from tl_loop.tests.test_plan_reconciliation import _project
+from tl_loop.tests.plan_reconciliation_fixtures import _project
 
 project = Path(sys.argv[1])
 _project(
@@ -67,16 +67,51 @@ shutil.rmtree(project / ".exo" / "ledger", ignore_errors=True)
     fs::write(root_agent.join(".birth_branch"), "main\n").unwrap();
 }
 
+/// Harness policy for the fixture project.
+///
+/// The controller requires every allow entry to pin a model, so the policy
+/// names one synthetic fixture model for the harness the fixture config uses.
+/// Writing the fixture's own policy keeps this recovery test independent of the
+/// repository's evolving `.exo/harness_policy.toml`.
+const FIXTURE_HARNESS_POLICY: &str = "\
+[roles.tl]
+allow = [\"claude/fixture-model\"]
+cost_rank = { \"claude/fixture-model\" = 1 }
+token_budget = 120000
+escalate_after_attempts = 1
+
+[roles.worker]
+allow = [\"claude/fixture-model\"]
+cost_rank = { \"claude/fixture-model\" = 1 }
+token_budget = 120000
+escalate_after_attempts = 1
+
+[roles.reviewer]
+allow = [\"claude/fixture-model\"]
+cost_rank = { \"claude/fixture-model\" = 1 }
+token_budget = 60000
+escalate_after_attempts = 1
+";
+
+const FIXTURE_HARNESS_CAPABILITY: &str = "\
+[capabilities]
+\"claude/fixture-model\" = \"hard\"
+";
+
 fn install_controller_inputs(project: &Path, repository: &Path) {
     let exo = project.join(".exo");
     fs::create_dir_all(exo.join("tl-loop")).unwrap();
-    for name in [
-        "harness_policy.toml",
-        "review-policy.toml",
-        "harness_capability.toml",
-    ] {
-        fs::copy(repository.join(".exo").join(name), exo.join(name)).unwrap();
-    }
+    fs::copy(
+        repository.join(".exo").join("review-policy.toml"),
+        exo.join("review-policy.toml"),
+    )
+    .unwrap();
+    fs::write(exo.join("harness_policy.toml"), FIXTURE_HARNESS_POLICY).unwrap();
+    fs::write(
+        exo.join("harness_capability.toml"),
+        FIXTURE_HARNESS_CAPABILITY,
+    )
+    .unwrap();
     let plan = br#"{
   "run_id": "root",
   "budgets": {"tokens": 120000, "wall_seconds": 1800},
@@ -136,7 +171,7 @@ pub fn configure_project(project: &Path, session: &str) {
     fs::write(
         exo.join("config.toml"),
         format!(
-            "default_role = \"devswarm\"\nwasm_name = \"devswarm\"\nwasm_dir = \".exo/wasm\"\nshell_command = \"bash\"\ntmux_session = \"{session}\"\nyolo = true\nport = 0\n"
+            "default_role = \"devswarm\"\nwasm_name = \"devswarm\"\nwasm_dir = \".exo/wasm\"\nshell_command = \"bash\"\ntmux_session = \"{session}\"\nroot_agent_type = \"claude\"\nspawn_agent_type = \"claude\"\nyolo = true\nport = 0\n"
         ),
     )
     .unwrap();
@@ -167,6 +202,8 @@ pub fn run_init_mode(
         .env("TMUX_TMPDIR", socket_dir)
         .env("CODEX_HOME", home.join(".codex"))
         .env("EXOMONAD_TL_PREFLIGHT_ACK", "1")
+        .env_remove("EXOMONAD_ROOT_AGENT_TYPE")
+        .env_remove("EXOMONAD_SPAWN_AGENT_TYPE")
         .output()
         .expect("run the built exomonad binary")
 }

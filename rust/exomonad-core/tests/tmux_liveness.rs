@@ -7,9 +7,7 @@
 
 use exomonad_core::domain::RoutingInfo;
 use exomonad_core::services::event_log::EventLog;
-use exomonad_core::services::tmux_ipc::{
-    process_environment_variable, routing_target_alive, PaneId, TmuxIpc, WindowId,
-};
+use exomonad_core::services::tmux_ipc::{routing_target_alive, PaneId, TmuxIpc, WindowId};
 use serde_json::json;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -250,12 +248,15 @@ async fn created_controller_target_keeps_exact_ids_and_epoch_after_window_rename
     assert!(!before.dead);
     assert_eq!(before.window_id, target.window_id);
     assert_eq!(before.pane_id, target.pane_id);
-    assert_eq!(
-        process_environment_variable(before.pid, "EXOMONAD_CONTROLLER_EPOCH")
-            .expect("the owned pane environment is readable")
-            .as_deref(),
-        Some("controller-test-epoch")
-    );
+    let (pane_pid, epoch) = TmuxIpc::wait_for_pane_environment_variable(
+        target.window_id.as_str(),
+        "EXOMONAD_CONTROLLER_EPOCH",
+        "controller-test-epoch",
+    )
+    .await
+    .expect("the owned pane exposes the controller epoch");
+    assert_eq!(pane_pid, before.pid);
+    assert_eq!(epoch, "controller-test-epoch");
 
     let rename_target = format!("{}:{}", session.name, target.window_id);
     let renamed = test_tmux_command()

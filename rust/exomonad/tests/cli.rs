@@ -250,7 +250,7 @@ fn test_init_continue_requires_audited_migration_for_legacy_aggregate_defaults()
 
     let fixture_script = concat!(
         "import sys; from pathlib import Path; ",
-        "from tl_loop.tests.test_plan_reconciliation import _project; ",
+        "from tl_loop.tests.plan_reconciliation_fixtures import _project; ",
         "from tl_loop.fsm.scope import TLPRFiled; ",
         "from tl_loop.state.plan_reconciliation import analyze_plan_reconciliation; ",
         "_, _, child, accepted, candidate = _project(Path(sys.argv[1]), candidate_issue_id=None, ",

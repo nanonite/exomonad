@@ -17952,7 +17952,7 @@ mod tests {
             .unwrap();
         let fixture_script = concat!(
             "import sys; from pathlib import Path; ",
-            "from tl_loop.tests.test_plan_reconciliation import _project; ",
+            "from tl_loop.tests.plan_reconciliation_fixtures import _project; ",
             "_project(Path(sys.argv[1]), candidate_issue_id=None, ",
             "legacy_aggregate_review_default=True, ",
             "legacy_completed_issue_binding=True, ",
