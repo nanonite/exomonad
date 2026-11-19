@@ -360,6 +360,8 @@ def seed_terminal_provider_failure(
     output: Path,
     *,
     seed_parent_stall: bool = False,
+    run_id: str = "kani",
+    stage_branch: str = "main.kani",
 ) -> None:
     """Seed historical OpenCode records without launching that provider."""
     from tl_loop.client.effects import ToolResult
@@ -375,12 +377,12 @@ def seed_terminal_provider_failure(
     from tl_loop.state.store import RunStore
 
     transport = TransportClient(project_root=repository, timeout=30)
-    controller = EffectClient(transport, role="tl", name="kani")
+    controller = EffectClient(transport, role="tl", name=run_id)
     snapshot = json.loads(
         (repository / ".exo/tl-loop/plan.snapshot").read_text(encoding="utf-8")
     )
     kani_declaration = next(
-        row for row in snapshot["plan"]["sub_tls"] if row["name"] == "kani"
+        row for row in snapshot["plan"]["sub_tls"] if row["name"] == run_id
     )
     leaf_declaration = next(
         row for row in kani_declaration["plan"]["leaves"] if row["name"] == OWNER_SLICE
@@ -392,7 +394,7 @@ def seed_terminal_provider_failure(
         )
     intent_id = "e2e-terminal-opencode-814"
     owner_name = f"{OWNER_SLICE}-opencode"
-    parent_branch = "main.kani"
+    parent_branch = stage_branch
     branch = derive_child_branch(parent_branch, owner_name)
     worktree = repository / ".exo" / "worktrees" / owner_name
     subprocess.run(
@@ -480,8 +482,8 @@ def seed_terminal_provider_failure(
         "verify": leaf_declaration.get("verify", []),
     }
     spawn_intent = EffectIntent("spawn_leaf", OWNER_SLICE, arguments, True)
-    child_store = RunStore("kani", repository / ".exo/tl-loop/root")
-    journal = EffectJournal("kani", child_store.run_dir / "action-journal.json")
+    child_store = RunStore(run_id, repository / ".exo/tl-loop/root")
+    journal = EffectJournal(run_id, child_store.run_dir / "action-journal.json")
     journal.append(spawn_intent)
     journal.mark_result(
         spawn_intent,
@@ -570,7 +572,7 @@ def seed_terminal_provider_failure(
                     event_time=event_time,
                     run_seq=first_sequence + index,
                     event_type=event_type,
-                    agent_id="kani",
+                    agent_id=run_id,
                     run_id=runtime_run_id,
                     invocation_id=invocation_id,
                     generation=None,
@@ -670,7 +672,7 @@ def seed_terminal_provider_failure(
         row
         for row in canonical_events(repository)
         if row.get("type") == "agent.spawned"
-        and row.get("agent_id") == "kani"
+        and row.get("agent_id") == run_id
         and row.get("run_id") == runtime_run_id
         and row.get("invocation_id") == invocation_id
         and row.get("data", {}).get("intent_id") == intent_id
@@ -687,7 +689,7 @@ def seed_terminal_provider_failure(
         raise RuntimeError("accepted OpenCode spawn event has no durable sequence")
 
     controller = EffectClient(
-        TransportClient(project_root=repository, timeout=30), role="tl", name="kani"
+        TransportClient(project_root=repository, timeout=30), role="tl", name=run_id
     )
 
     state = child_store.load()
@@ -710,7 +712,7 @@ def seed_terminal_provider_failure(
         status=SliceStatus.SPAWNED,
         attempts=1,
         branch=branch,
-        base_ref="main.kani",
+        base_ref=parent_branch,
         agent_type="opencode",
         model="opencode-go/deepseek-v4.1-flash",
         requested_harness=requested_harness,
@@ -2861,6 +2863,16 @@ def main() -> None:
     parser.add_argument("--gate-approval", type=Path)
     parser.add_argument("--historical-parent-stall", action="store_true")
     parser.add_argument("--expected", type=Path)
+    parser.add_argument(
+        "--run-id",
+        default="kani",
+        help="child scope run id / stage name for the terminal-failure fixture",
+    )
+    parser.add_argument(
+        "--stage-branch",
+        default="main.kani",
+        help="parent stage branch for the terminal-failure fixture",
+    )
     arguments = parser.parse_args()
     if arguments.mode == "seed":
         if arguments.output is None:
@@ -2873,6 +2885,8 @@ def main() -> None:
             arguments.repo,
             arguments.output,
             seed_parent_stall=arguments.historical_parent_stall,
+            run_id=arguments.run_id,
+            stage_branch=arguments.stage_branch,
         )
     elif arguments.mode == "seed-wrong-route-successor":
         if arguments.baseline is None:

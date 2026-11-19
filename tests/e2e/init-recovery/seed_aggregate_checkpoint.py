@@ -370,6 +370,8 @@ def seed_root(
     merged_remote_head: str,
     active_kani_blocker: bool,
     terminal_provider_failure: bool = False,
+    kani_stage_name: str = "kani",
+    kani_manifest_document: dict[str, object] | None = None,
 ) -> dict[str, object]:
     from tl_loop.client.effects import EffectClient, ToolResult
     from tl_loop.fsm.child import ChildKind, ChildRecord
@@ -393,6 +395,7 @@ def seed_root(
         _child_controller_name,
         _initial_slices,
         _manifest_for_plan,
+        _manifest_plan,
         _parent_aggregate_approval,
         _parent_sync_arguments,
         _parent_sync_identity_fields,
@@ -400,11 +403,14 @@ def seed_root(
         _reopen_ordered_scope,
         _sub_tl_worktree,
         _verified_child_completion_evidence,
+        _work_plan_from_manifest,
         derive_child_branch,
         stable_action_key,
     )
     from tl_loop.loop.journal import EffectJournal
     from tl_loop.ordered import AggregateCandidate, IntegrationLifecycle
+    from tl_loop.state.plan_manifest import PlanManifest
+    from tl_loop.state.plan_revision_manifest import rebuild_manifest
     from tl_loop.state.repository_identity import canonical_repository_url
     from tl_loop.state.schema import (
         GateStatus,
@@ -422,6 +428,15 @@ def seed_root(
     state_root = repository / ".exo" / "tl-loop"
     remote_url = git(repository, "config", "--get", "remote.origin.url")
     identity = RepositoryIdentity(canonical_repository_url(remote_url))
+    kani_stage = kani_stage_name
+    literal_kani_manifest: PlanManifest | None = None
+    literal_kani_plan: dict[str, object] | None = None
+    if kani_manifest_document is not None:
+        literal_kani_manifest = PlanManifest.from_document(kani_manifest_document)
+        kani_stage = literal_kani_manifest.scope_id.rsplit("/", 1)[-1]
+        literal_kani_plan = _manifest_plan(
+            _work_plan_from_manifest(literal_kani_manifest)
+        )
     plan_spec = {
         "sub_tls": [
             {
@@ -443,10 +458,12 @@ def seed_root(
                 },
             },
             {
-                "name": "kani",
+                "name": kani_stage,
                 "order": 2,
                 "integration": {"aggregate_pr_required": False},
-                "plan": {
+                "plan": literal_kani_plan
+                if literal_kani_plan is not None
+                else {
                     "leaves": [
                         {
                             "name": "issue-814-substitution-model-kani",
@@ -536,6 +553,21 @@ def seed_root(
         active=True,
     )
     manifest = _manifest_for_plan(work_plan, "root", root_config)
+    if literal_kani_manifest is not None:
+        literal_node = next(
+            node for node in manifest.nodes if node.name == kani_stage
+        )
+        literal_children = dict(manifest.child_manifests)
+        literal_children[literal_node.node_id] = literal_kani_manifest
+        literal_nodes = tuple(
+            replace(node, child_manifest_digest=literal_kani_manifest.digest)
+            if node.node_id == literal_node.node_id
+            else node
+            for node in manifest.nodes
+        )
+        manifest = rebuild_manifest(
+            manifest, literal_nodes, literal_children, manifest.manifest_revision
+        )
     root_slices = _initial_slices(work_plan, root_config, state_root, "root")
     create(
         "root",
@@ -559,7 +591,7 @@ def seed_root(
         IntegrationRuntimeState(
             sub_tl_states={
                 "architecture": IntegrationLifecycle.MERGING,
-                "kani": IntegrationLifecycle.RUNNING,
+                kani_stage: IntegrationLifecycle.RUNNING,
             }
         ),
     )
@@ -599,16 +631,16 @@ def seed_root(
         patch_digest=patch_digest,
         architecture_worktree=architecture_worktree,
     )
-    kani_task = next(task for task in work_plan.sub_tls if task.name == "kani")
+    kani_task = next(task for task in work_plan.sub_tls if task.name == kani_stage)
     kani_branch = derive_child_branch("main", _child_controller_name(kani_task))
     kani_worktree = str(_sub_tl_worktree(root_config, state_root, "root", kani_task))
     kani_manifest = manifest.child_manifests[
-        next(node.node_id for node in manifest.nodes if node.name == "kani")
+        next(node.node_id for node in manifest.nodes if node.name == kani_stage)
     ]
     kani_config = replace(
         root_config,
         root_dir=root_store.run_dir,
-        run_id="kani",
+        run_id=kani_stage,
         branch=kani_branch,
         worktree=kani_worktree,
         parent_branch="main",
@@ -618,9 +650,9 @@ def seed_root(
         depth=1,
         declared_manifest=kani_manifest,
     )
-    kani_slices = _initial_slices(kani_task.plan, kani_config, state_root, "kani")
+    kani_slices = _initial_slices(kani_task.plan, kani_config, state_root, kani_stage)
     create(
-        "kani",
+        kani_stage,
         {
             "slices": kani_slices,
             "repository_identity": identity.to_document(),
@@ -633,7 +665,7 @@ def seed_root(
         },
         root_dir=root_store.run_dir,
     )
-    kani_store = RunStore("kani", root_store.run_dir)
+    kani_store = RunStore(kani_stage, root_store.run_dir)
     kani_store.set_plan_manifest(kani_manifest, slices=kani_slices)
     kani_state = kani_store.load()
     kani_task_plan = kani_task.plan
@@ -651,7 +683,7 @@ def seed_root(
             )
         kani_failure = None
         failed_kani = replace(
-            root_state.slices["kani"],
+            root_state.slices[kani_stage],
             status=SliceStatus.SPAWNED,
             attempts=1,
             branch=kani_branch,
@@ -709,7 +741,7 @@ def seed_root(
             },
             True,
         )
-        kani_journal = EffectJournal("kani", kani_store.run_dir / "action-journal.json")
+        kani_journal = EffectJournal(kani_stage, kani_store.run_dir / "action-journal.json")
         kani_journal.append(failed_spawn)
         kani_journal.mark_result(
             failed_spawn,
@@ -764,7 +796,7 @@ def seed_root(
                 kani_state.events.last_consumed_offset,
             )
         failed_kani = replace(
-            root_state.slices["kani"],
+            root_state.slices[kani_stage],
             status=SliceStatus.FAILED,
             attempts=1,
             branch=kani_branch,
@@ -864,7 +896,7 @@ def seed_root(
     kani_dispatch_arguments = {
         "event_type": "tl.dispatch_confirmed",
         "payload": {
-            "slice_id": "kani",
+            "slice_id": kani_stage,
             "intent_id": "seed-kani-dispatch-intent",
             "boundary": "sub_tl_started",
             "started_at": 1700000001.0,
@@ -874,7 +906,7 @@ def seed_root(
         },
     }
     kani_dispatch_intent = EffectIntent(
-        "emit_controller_event", "kani", kani_dispatch_arguments, True
+        "emit_controller_event", kani_stage, kani_dispatch_arguments, True
     )
     journal.append(kani_dispatch_intent)
     journal.mark_result(
@@ -1087,14 +1119,14 @@ def seed_root(
             pending_by_order={
                 2: (
                     ChildRecord(
-                        "kani",
+                        kani_stage,
                         ChildKind.SUB_TL,
                         dispatch_intent_id="seed-kani-dispatch-intent",
                         invocation_id=DORMANT_KANI_INVOCATION_ID,
                         manifest_node_id=next(
                             node.node_id
                             for node in manifest.nodes
-                            if node.name == "kani"
+                            if node.name == kani_stage
                         ),
                         manifest_revision=manifest.manifest_revision,
                     ),
@@ -1118,7 +1150,7 @@ def seed_root(
             lifecycle=IntegrationLifecycle.MERGED,
             sub_tl_states={
                 "architecture": IntegrationLifecycle.MERGED,
-                "kani": IntegrationLifecycle.FAILED,
+                kani_stage: IntegrationLifecycle.FAILED,
             },
             # The aggregate is already merged. The later Kani dispatch refusal
             # is the root's current outcome and must not change this candidate.
@@ -1203,14 +1235,14 @@ def seed_root(
             pending_by_order={
                 2: (
                     ChildRecord(
-                        "kani",
+                        kani_stage,
                         ChildKind.SUB_TL,
                         dispatch_intent_id="seed-kani-dispatch-intent",
                         invocation_id=DORMANT_KANI_INVOCATION_ID,
                         manifest_node_id=next(
                             node.node_id
                             for node in manifest.nodes
-                            if node.name == "kani"
+                            if node.name == kani_stage
                         ),
                         manifest_revision=manifest.manifest_revision,
                     ),
@@ -1228,7 +1260,7 @@ def seed_root(
         {
             **synced.slices,
             "architecture": synced_architecture,
-            "kani": failed_kani,
+            kani_stage: failed_kani,
         },
         synced.budgets,
         synced.events.last_consumed_offset,
@@ -1239,7 +1271,7 @@ def seed_root(
             lanes={lane_key: idle_lane},
             sub_tl_states={
                 **synced.integration.sub_tl_states,
-                "kani": kani_lifecycle,
+                kani_stage: kani_lifecycle,
             },
         ),
     )
@@ -1257,7 +1289,7 @@ def seed_root(
         "base_sha": base_sha,
         "patch_digest": patch_digest,
         "merge_tree": merge_tree,
-        "failed_child": "kani",
+        "failed_child": kani_stage,
         "failed_child_run": str(kani_store.path),
         "failed_child_worktree": kani_worktree,
         "failed_child_branch": kani_branch,
@@ -1266,7 +1298,7 @@ def seed_root(
 
 def seed_dormant_kani_controller(repository: Path, result: dict[str, object]) -> None:
     """Retain the owned Kani scope and a killed no-PR controller invocation."""
-    agent_name = "kani"
+    agent_name = str(result.get("failed_child", "kani"))
     branch = str(result["failed_child_branch"])
     worktree = Path(str(result["failed_child_worktree"]))
     git(repository, "worktree", "add", "--quiet", "-b", branch, str(worktree), "main")
@@ -1279,12 +1311,12 @@ def seed_dormant_kani_controller(repository: Path, result: dict[str, object]) ->
         "birth_branch": branch,
         "parent_branch": "main",
         "working_dir": str(worktree),
-        "display_name": "🤖 kani",
+        "display_name": f"🤖 {agent_name}",
         "topology": "worktree_per_agent",
         "model": None,
         "effort": None,
         "ledger_owned": True,
-        "slice_id": "kani",
+        "slice_id": agent_name,
     }
     (agent_dir / "identity.json").write_text(
         json.dumps(identity, indent=2) + "\n", encoding="utf-8"
@@ -1309,7 +1341,7 @@ def seed_dormant_kani_controller(repository: Path, result: dict[str, object]) ->
         "authorization_source": None,
         "generation": 1,
         "runtime_agent_id": agent_name,
-        "slice_id": "kani",
+        "slice_id": agent_name,
         "branch": branch,
         "worktree": str(worktree),
         "exit_reason": "tmux_target_exited_without_exit_marker",
@@ -1378,7 +1410,23 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--active-kani-blocker", action="store_true")
     parser.add_argument("--terminal-provider-failure", action="store_true")
+    parser.add_argument(
+        "--kani-stage-name",
+        default="kani",
+        help="sub-TL name for the Kani stage (default: kani)",
+    )
+    parser.add_argument(
+        "--kani-manifest-json",
+        type=Path,
+        default=None,
+        help="retained child manifest document whose declaration and digest must be preserved",
+    )
     args = parser.parse_args()
+    kani_manifest_document = (
+        json.loads(args.kani_manifest_json.read_text(encoding="utf-8"))
+        if args.kani_manifest_json is not None
+        else None
+    )
     (
         leaf_pr,
         aggregate_pr,
@@ -1398,9 +1446,12 @@ def main() -> None:
         merged_remote_head=merged_remote_head,
         active_kani_blocker=args.active_kani_blocker,
         terminal_provider_failure=args.terminal_provider_failure,
+        kani_stage_name=args.kani_stage_name,
+        kani_manifest_document=kani_manifest_document,
     )
     result["active_kani_blocker"] = args.active_kani_blocker
     result["terminal_provider_failure"] = args.terminal_provider_failure
+    result["kani_stage_name"] = result.get("failed_child", args.kani_stage_name)
     seed_dormant_kani_controller(args.repo, result)
     result["dormant_controller_invocation_id"] = DORMANT_KANI_INVOCATION_ID
     result["preserved_local_edits"] = seed_local_edits(args.repo)

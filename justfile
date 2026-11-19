@@ -852,6 +852,15 @@ e2e-role-config:
 e2e-stored-proof:
     E2E_STORED_PROOF_ONLY=1 ./tests/e2e/init-recovery/run.sh
 
+# Run the literal stored-proof acceptance: seed the ACTUAL retained sha256:v1
+# authorization (digest a8b9524b...), its historical policy and manifest
+# (4be5ddad...), the rejected prelaunch action and the approved #814 gate from
+# the read-only controlled-plan backup, then prove the integrated init/serve
+# path links exactly one generation-3 successor and preserves every historical
+# byte. Set E2E_STORED_PROOF_RETAINED to override the retained backup path.
+e2e-stored-proof-literal:
+    E2E_STORED_PROOF_ONLY=1 E2E_STORED_PROOF_LITERAL=1 ./tests/e2e/init-recovery/run.sh
+
 # Check the init-recovery E2E harness without launching tmux
 check-e2e-init-recovery:
     bash -n tests/e2e/init-recovery/run.sh
@@ -859,6 +868,7 @@ check-e2e-init-recovery:
     bash -n tests/e2e/init-recovery/fast-start-acceptance.sh
     bash -n tests/e2e/init-recovery/role-config-acceptance.sh
     bash -n tests/e2e/init-recovery/stored-proof-acceptance.sh
+    bash -n tests/e2e/init-recovery/stored-proof-literal-acceptance.sh
     {{py}} -m py_compile tests/e2e/init-recovery/check_role_config_preflight.py tests/e2e/init-recovery/seed-stored-proof.py tests/e2e/init-recovery/check-stored-proof-negatives.py
     bash -n tests/e2e/init-recovery/tl-window-state.sh
     bash -n tests/e2e/init-recovery/test-tl-window-state.sh

@@ -845,6 +845,7 @@ just e2e-recreated-leaf-recovery # Recreated-leaf recovery acceptance (T1-T9)
 just e2e-typecheck-ci      # Real CI typecheck job in a disposable Forgejo (no network)
 just e2e-role-config       # #1433 role-configuration preflight acceptance (ROLECONFIG-1..5)
 just e2e-stored-proof      # #1433 retained v1 terminal-owner proof acceptance (STOREDPROOF-1..6)
+just e2e-stored-proof-literal  # #1433 literal retained v1 proof acceptance (LITERAL-1..5)
 ```
 
 `just e2e-role-config` runs `tests/e2e/init-recovery/run.sh` with
@@ -876,6 +877,22 @@ every negative (forged/malformed digest, wrong owner/scope/manifest/predecessor,
 unaccepted identity, unknown prior effect, live worker, independent gate
 rejection, genuine model/effort change). It also re-runs the role-configuration
 acceptance and prints `STOREDPROOF-1..6` then `STOREDPROOF-ALL PASS`.
+
+`just e2e-stored-proof-literal` runs the same Phase 0 build with
+`E2E_STORED_PROOF_ONLY=1 E2E_STORED_PROOF_LITERAL=1`, then runs
+`tests/e2e/init-recovery/stored-proof-literal-acceptance.sh`. Instead of
+regenerating a v1 proof under a scratch policy, it copies the ACTUAL retained
+controlled-plan backup read-only and installs the retained historical
+`harness_policy.toml`, `harness_capability.toml` and child manifest
+(`4be5ddad...`). The shipped controller must reproduce the literal v1 digest
+`a8b9524b...` under that context before continuation, then link exactly one
+generation-3 OpenCode DeepSeek/high successor to `f285`, preserve every
+historical byte, and add no duplicate after repeat init or a server-only
+restart. It prints `LITERAL-1..5` then `LITERAL-ALL PASS`. The digest excludes
+the assignment coordinates (ledger sequence, dispatch intent id, terminal
+invocation digest, worktree fingerprint), so those alone are rebound to the
+disposable ledger and worktree; the retained values name the read-only Beast
+filesystem. Set `E2E_STORED_PROOF_RETAINED` to point at another backup copy.
 
 `just e2e-recreated-leaf-recovery` is non-interactive like
 `just e2e-tl-loop-active`: it builds the binary and WASM from this worktree,

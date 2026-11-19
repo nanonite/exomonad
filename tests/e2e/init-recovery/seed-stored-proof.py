@@ -27,7 +27,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -42,6 +42,40 @@ DIRECTED_WORKER_MODEL = "opencode-go/deepseek-v4.1-flash"
 DIRECTED_WORKER_EFFORT = "high"
 OWNER_SLICE = "issue-814-substitution-model-kani"
 BLOCKED_ISSUE_ID = 814
+# A retained authorization binds one assignment through these coordinates.
+# They are deliberately not part of the v1 digest: a disposable fixture keeps
+# the retained digest-relevant bytes and rebinds only these coordinates to its
+# own ledger rows, worktree and invocation.
+BINDING_FIELDS = (
+    "terminal_invocation_digest",
+    "slice_id",
+    "issue_id",
+    "owner_agent_id",
+    "prior_invocation_id",
+    "dispatch_intent_id",
+    "dispatch_generation",
+    "branch",
+    "worktree_fingerprint",
+    "accepted_spawn_event_seq",
+    "blocker_event_seq",
+)
+LITERAL_IDENTITY_FIELDS = (
+    "source",
+    "role",
+    "harness",
+    "agent_type",
+    "model",
+    "effort",
+    "prior_runtime",
+    "prior_model",
+    "prior_effort",
+    "manifest_digest",
+    "configuration_fingerprint",
+    "recovery_gate_authorization",
+    "supersedes_route_authorization_digest",
+    "transition",
+    "digest",
+)
 
 
 def _config(
@@ -49,6 +83,7 @@ def _config(
     *,
     fingerprint: str | None,
     worker_effort: str,
+    run_id: str = "kani",
 ) -> Any:
     from tl_loop.__main__ import _authoritative_ledger_run_id
     from tl_loop.loop.driver import TLLoopConfig
@@ -58,14 +93,14 @@ def _config(
     from tl_loop.state.store import RunStore
 
     root = repository / ".exo/tl-loop"
-    state = RunStore("kani", root / "root").load()
+    state = RunStore(run_id, root / "root").load()
     policy_path = repository / ".exo/harness_policy.toml"
     policy = load_policy(policy_path)
     return TLLoopConfig(
         active=True,
         root_dir=root,
         project_root=repository,
-        run_id="kani",
+        run_id=run_id,
         ledger_run_id=_authoritative_ledger_run_id(repository),
         branch=state.owner_branch,
         role="worker",
@@ -122,14 +157,14 @@ def _seed_legacy_successor_lifecycle(
     return True
 
 
-def _plan(repository: Path) -> Any:
+def _plan(repository: Path, run_id: str = "kani") -> Any:
     from tl_loop.loop.driver import WorkPlan
 
     snapshot = json.loads(
         (repository / ".exo/tl-loop/plan.snapshot").read_text(encoding="utf-8")
     )
     declaration = next(
-        row for row in snapshot["plan"]["sub_tls"] if row["name"] == "kani"
+        row for row in snapshot["plan"]["sub_tls"] if row["name"] == run_id
     )
     return WorkPlan.from_mapping(declaration["plan"])
 
@@ -206,7 +241,42 @@ def _ensure_human_recovery(repository: Path, child_store: Any) -> None:
     )
 
 
-def seed(repository: Path, baseline_path: Path, output: Path) -> None:
+def _adapt_literal_record(
+    literal: dict[str, Any], base: Mapping[str, object]
+) -> dict[str, Any]:
+    """Keep retained digest-relevant bytes and rebind fixture coordinates."""
+    adapted = dict(literal)
+    for field in BINDING_FIELDS:
+        adapted[field] = base.get(field)
+    return adapted
+
+
+def _assert_literal_identity(
+    adapted: Mapping[str, object], literal: Mapping[str, object]
+) -> None:
+    mismatched = [
+        field
+        for field in LITERAL_IDENTITY_FIELDS
+        if adapted.get(field) != literal.get(field)
+    ]
+    if mismatched:
+        raise SystemExit(
+            "the retained literal authorization identity was not preserved: "
+            + ", ".join(mismatched)
+        )
+
+
+def seed(
+    repository: Path,
+    baseline_path: Path,
+    output: Path,
+    *,
+    literal_authorization: Path | None = None,
+    literal_history: Path | None = None,
+    expected_v1_digest: str | None = None,
+    expected_v1_fingerprint: str | None = None,
+    run_id: str = "kani",
+) -> None:
     """Record the retained v1 authorization for the unanswered f285 predecessor."""
     from tl_loop.client.effects import ToolResult
     from tl_loop.loop.driver import (
@@ -225,13 +295,14 @@ def seed(repository: Path, baseline_path: Path, output: Path) -> None:
         "f4460477-40bf-4824-941b-dcc3d0ebc9a1"
     ):
         raise SystemExit("the seeded predecessor is not the retained f446 invocation")
-    plan = _plan(repository)
-    child_store = RunStore("kani", repository / ".exo/tl-loop/root")
+    plan = _plan(repository, run_id)
+    child_store = RunStore(run_id, repository / ".exo/tl-loop/root")
     _ensure_human_recovery(repository, child_store)
     historical_config = _config(
         repository,
         fingerprint=HISTORICAL_CONFIG_FINGERPRINT_V1,
         worker_effort=DIRECTED_WORKER_EFFORT,
+        run_id=run_id,
     )
     initial, reason = _terminal_owner_recovery_proof(
         plan, child_store.load(), historical_config, child_store
@@ -254,7 +325,7 @@ def seed(repository: Path, baseline_path: Path, output: Path) -> None:
     worktree = Path(baseline["worktree"]).resolve(strict=True)
     predecessor_id = baseline["prior_invocation"]["invocation_id"]
     successor_id = "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d"
-    journal = EffectJournal("kani", child_store.run_dir / "action-journal.json")
+    journal = EffectJournal(run_id, child_store.run_dir / "action-journal.json")
     arguments = dict(_blocked_leaf_resume_action_arguments(initial.resume, state))
     arguments.pop("route_fingerprint", None)
     intent = EffectIntent("resume_blocked_leaf", OWNER_SLICE, arguments, True)
@@ -334,7 +405,7 @@ def seed(repository: Path, baseline_path: Path, output: Path) -> None:
     lifecycle_seeded = _seed_legacy_successor_lifecycle(
         repository,
         owner_name=owner_name,
-        controller_run_id="kani",
+        controller_run_id=run_id,
         successor_id=successor_id,
         predecessor_id=predecessor_id,
         branch=branch,
@@ -379,6 +450,77 @@ def seed(repository: Path, baseline_path: Path, output: Path) -> None:
     stored_recovery = state.slices[OWNER_SLICE].recovery
     assert stored_recovery is not None
     stored = stored_recovery.evidence["configured_route_authorization"]
+    literal_check: dict[str, object] = {}
+    if literal_authorization is not None:
+        from dataclasses import replace
+
+        from tl_loop.loop.driver import (
+            _historical_terminal_route_authorization_is_genuine,
+            _require_manifest_digest,
+        )
+
+        literal = json.loads(literal_authorization.read_text(encoding="utf-8"))
+        if expected_v1_digest is not None and literal.get("digest") != expected_v1_digest:
+            raise SystemExit("the retained authorization digest differs from the expected v1 digest")
+        if (
+            expected_v1_fingerprint is not None
+            and literal.get("configuration_fingerprint") != expected_v1_fingerprint
+        ):
+            raise SystemExit("the retained authorization does not carry the expected v1 identity")
+        adapted = _adapt_literal_record(literal, stored)
+        _assert_literal_identity(adapted, literal)
+        manifest_digest = _require_manifest_digest(child_store.load().plan_manifest)
+        if not _historical_terminal_route_authorization_is_genuine(
+            adapted, historical_config, manifest_digest
+        ):
+            raise SystemExit(
+                "the retained v1 authorization does not reproduce under the retained "
+                "historical policy and manifest"
+            )
+        history = list(
+            stored_recovery.evidence.get("configured_route_authorization_history", [])
+        )
+        if not history:
+            raise SystemExit("the computed f446 authorization history was not retained")
+        if literal_history is not None:
+            literal_hist = json.loads(literal_history.read_text(encoding="utf-8"))
+            adapted_hist = _adapt_literal_record(literal_hist, history[0])
+            _assert_literal_identity(adapted_hist, literal_hist)
+            history = [adapted_hist, *history[1:]]
+        current_state = child_store.load()
+        current_slice = current_state.slices[OWNER_SLICE]
+        current_recovery = current_slice.recovery
+        assert current_recovery is not None
+        child_store.checkpoint(
+            current_state.fsm,
+            {
+                **current_state.slices,
+                OWNER_SLICE: replace(
+                    current_slice,
+                    recovery=replace(
+                        current_recovery,
+                        evidence={
+                            **current_recovery.evidence,
+                            "configured_route_authorization": adapted,
+                            "configured_route_authorization_history": history,
+                        },
+                    ),
+                ),
+            },
+            current_state.budgets,
+            current_state.events.last_consumed_offset,
+            current_order=current_state.current_order,
+            ordered_stages=current_state.ordered_stages,
+            integration=current_state.integration,
+            plan_manifest=current_state.plan_manifest,
+        )
+        stored = adapted
+        literal_check = {
+            "digest": adapted["digest"],
+            "configuration_fingerprint": adapted["configuration_fingerprint"],
+            "manifest_digest": adapted["manifest_digest"],
+            "historical_policy_reproduces_digest": True,
+        }
     output.write_text(
         json.dumps(
             {
@@ -393,6 +535,7 @@ def seed(repository: Path, baseline_path: Path, output: Path) -> None:
                 "branch": branch,
                 "worktree": str(worktree),
                 "stored_proof": stored,
+                "literal_check": literal_check,
             },
             sort_keys=True,
             indent=2,
@@ -400,10 +543,25 @@ def seed(repository: Path, baseline_path: Path, output: Path) -> None:
         + "\n",
         encoding="utf-8",
     )
-    print(json.dumps({"v1_digest": stored["digest"], "prior_invocation_id": successor_id}))
+    print(
+        json.dumps(
+            {
+                "v1_digest": stored["digest"],
+                "prior_invocation_id": successor_id,
+                "literal_check": literal_check,
+            }
+        )
+    )
 
 
-def expected(repository: Path, accepted: Path, output: Path) -> None:
+def expected(
+    repository: Path,
+    accepted: Path,
+    output: Path,
+    *,
+    run_id: str = "kani",
+    expected_supersedes: str | None = None,
+) -> None:
     """Compute, without persisting, the v2 proof the controller must create."""
     from tl_loop.loop.driver import _terminal_owner_recovery_proof
     from tl_loop.state.store import RunStore
@@ -413,15 +571,23 @@ def expected(repository: Path, accepted: Path, output: Path) -> None:
         repository,
         fingerprint=accepted_document["identity"],
         worker_effort=DIRECTED_WORKER_EFFORT,
+        run_id=run_id,
     )
-    plan = _plan(repository)
-    child_store = RunStore("kani", repository / ".exo/tl-loop/root")
+    plan = _plan(repository, run_id)
+    child_store = RunStore(run_id, repository / ".exo/tl-loop/root")
     proof, reason = _terminal_owner_recovery_proof(
         plan, child_store.load(), config, child_store
     )
     if proof is None:
         raise SystemExit(f"the corrected controller still holds: {reason}")
     authorization = proof.route_authorization
+    if (
+        expected_supersedes is not None
+        and authorization.get("supersedes_route_authorization_digest") != expected_supersedes
+    ):
+        raise SystemExit(
+            "the corrected proof does not link over the retained v1 authorization"
+        )
     output.write_text(
         json.dumps(
             {
@@ -444,10 +610,24 @@ def expected(repository: Path, accepted: Path, output: Path) -> None:
         + "\n",
         encoding="utf-8",
     )
-    print(json.dumps({"expected_digest": authorization["digest"]}))
+    print(
+        json.dumps(
+            {
+                "expected_digest": authorization["digest"],
+                "supersedes": authorization.get("supersedes_route_authorization_digest"),
+            }
+        )
+    )
 
 
-def refuse(repository: Path, baseline_path: Path, output: Path) -> None:
+def refuse(
+    repository: Path,
+    baseline_path: Path,
+    output: Path,
+    *,
+    run_id: str = "kani",
+    expected_route_fields: Path | None = None,
+) -> None:
     """Record the exact prelaunch configuration refusal the live run retained."""
     from tl_loop.client.effects import ToolResult
     from tl_loop.loop.driver import (
@@ -460,12 +640,13 @@ def refuse(repository: Path, baseline_path: Path, output: Path) -> None:
     from tl_loop.state.store import RunStore
 
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
-    plan = _plan(repository)
-    child_store = RunStore("kani", repository / ".exo/tl-loop/root")
+    plan = _plan(repository, run_id)
+    child_store = RunStore(run_id, repository / ".exo/tl-loop/root")
     historical_config = _config(
         repository,
         fingerprint=HISTORICAL_CONFIG_FINGERPRINT_V1,
         worker_effort=DIRECTED_WORKER_EFFORT,
+        run_id=run_id,
     )
     proof, reason = _terminal_owner_recovery_proof(
         plan, child_store.load(), historical_config, child_store
@@ -473,7 +654,30 @@ def refuse(repository: Path, baseline_path: Path, output: Path) -> None:
     if proof is None:
         raise SystemExit(f"could not rebuild the retained v1 action: {reason}")
     arguments = dict(_blocked_leaf_resume_action_arguments(proof.resume, child_store.load()))
-    journal = EffectJournal("kani", child_store.run_dir / "action-journal.json")
+    literal_route: dict[str, object] = {}
+    if expected_route_fields is not None:
+        retained = json.loads(expected_route_fields.read_text(encoding="utf-8"))
+        route_fields = (
+            "route_configuration_fingerprint",
+            "route_policy_fingerprint",
+            "route_manifest_digest",
+            "route_fingerprint",
+            "route_authorization_digest",
+            "desired_harness",
+            "desired_agent_type",
+            "desired_model",
+            "desired_effort",
+        )
+        mismatched = [
+            field for field in route_fields if arguments.get(field) != retained.get(field)
+        ]
+        if mismatched:
+            raise SystemExit(
+                "the retained historical route context was not reproduced: "
+                + ", ".join(mismatched)
+            )
+        literal_route = {field: arguments.get(field) for field in route_fields}
+    journal = EffectJournal(run_id, child_store.run_dir / "action-journal.json")
     intent = EffectIntent("resume_blocked_leaf", OWNER_SLICE, arguments, True)
     if journal.existing(intent) is not None:
         raise SystemExit("the prelaunch refusal is already recorded")
@@ -505,6 +709,7 @@ def refuse(repository: Path, baseline_path: Path, output: Path) -> None:
                 "error": entries[-1]["error"],
                 "journal_entries": [json.loads(json.dumps(entry)) for entry in entries],
                 "baseline_owner": baseline["owner_agent_name"],
+                "literal_route": literal_route,
             },
             sort_keys=True,
             indent=2,
@@ -522,21 +727,51 @@ def main() -> None:
     seed_parser.add_argument("--repo", required=True, type=Path)
     seed_parser.add_argument("--baseline", required=True, type=Path)
     seed_parser.add_argument("--output", required=True, type=Path)
+    seed_parser.add_argument("--run-id", default="kani")
+    seed_parser.add_argument("--literal-authorization", type=Path, default=None)
+    seed_parser.add_argument("--literal-history", type=Path, default=None)
+    seed_parser.add_argument("--expected-v1-digest", default=None)
+    seed_parser.add_argument("--expected-v1-fingerprint", default=None)
     expected_parser = sub.add_parser("expected")
     expected_parser.add_argument("--repo", required=True, type=Path)
     expected_parser.add_argument("--accepted", required=True, type=Path)
     expected_parser.add_argument("--output", required=True, type=Path)
+    expected_parser.add_argument("--run-id", default="kani")
+    expected_parser.add_argument("--expected-supersedes", default=None)
     refuse_parser = sub.add_parser("refuse")
     refuse_parser.add_argument("--repo", required=True, type=Path)
     refuse_parser.add_argument("--baseline", required=True, type=Path)
     refuse_parser.add_argument("--output", required=True, type=Path)
+    refuse_parser.add_argument("--run-id", default="kani")
+    refuse_parser.add_argument("--expected-route-fields", type=Path, default=None)
     args = parser.parse_args()
     if args.command == "seed":
-        seed(args.repo, args.baseline, args.output)
+        seed(
+            args.repo,
+            args.baseline,
+            args.output,
+            run_id=args.run_id,
+            literal_authorization=args.literal_authorization,
+            literal_history=args.literal_history,
+            expected_v1_digest=args.expected_v1_digest,
+            expected_v1_fingerprint=args.expected_v1_fingerprint,
+        )
     elif args.command == "expected":
-        expected(args.repo, args.accepted, args.output)
+        expected(
+            args.repo,
+            args.accepted,
+            args.output,
+            run_id=args.run_id,
+            expected_supersedes=args.expected_supersedes,
+        )
     else:
-        refuse(args.repo, args.baseline, args.output)
+        refuse(
+            args.repo,
+            args.baseline,
+            args.output,
+            run_id=args.run_id,
+            expected_route_fields=args.expected_route_fields,
+        )
 
 
 if __name__ == "__main__":

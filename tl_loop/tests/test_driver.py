@@ -33742,6 +33742,59 @@ def test_terminal_owner_holds_non_refusal_outcome_recorded_under_stored_v1_proof
     assert reason is not None
 
 
+def test_terminal_owner_holds_not_dispatched_non_refusal_over_stored_v1_proof(
+    tmp_path: Path,
+) -> None:
+    """A not-dispatched action is not the exact refusal retry contract.
+
+    Owner resolution already holds rejected, intended and unknown non-refusal
+    entries, and `_unresolved_historical_resume_effect` holds a different
+    configuration epoch. A not-dispatched entry reaches this proof, so the
+    exact-refusal recheck in `_historical_configuration_refusal_retry` is the
+    only place that keeps the documented "exact prelaunch refusal only" retry
+    from silently broadening to that state.
+    """
+    seed = _stored_proof_seed(tmp_path, confirmed_successor=False)
+    plan, config, store = seed["plan"], seed["config"], seed["store"]
+    journal = seed["journal"]
+    leaf = plan.leaves[0]
+    arguments = dict(seed["rejected_entry"]["arguments"])
+    intent = EffectIntent("resume_blocked_leaf", leaf.name, arguments, True)
+    journal.append(intent)
+    journal.mark_not_dispatched(intent)
+    entries = journal.entries_for("resume_blocked_leaf", leaf.name)
+    assert entries[-1]["status"] == "not_dispatched"
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+
+    assert proof is None
+    assert reason is not None and "conflicts with current evidence or configuration" in reason
+
+
+def test_terminal_owner_holds_stored_proof_without_a_current_gate_approval(
+    tmp_path: Path,
+) -> None:
+    """A stored v1 refusal may only be retried under an explicitly approved gate.
+
+    This isolates the final approved-gate recheck in
+    `_historical_configuration_refusal_retry`: the historical refusal and v1
+    proof are intact, but the recovery gate is pending, so no fresh attempt is
+    authorized.
+    """
+    seed = _stored_proof_seed(tmp_path, confirmed_successor=False)
+    plan, config, store = seed["plan"], seed["config"], seed["store"]
+    store.set_gate(seed["gate_name"], GateStatus.PENDING)
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+
+    assert proof is None
+    assert reason is not None and "conflicts with current evidence or configuration" in reason
+
+
 def test_terminal_owner_revalidates_prelaunch_refusal_without_confirmed_successor(
     tmp_path: Path,
 ) -> None:

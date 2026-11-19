@@ -1935,6 +1935,31 @@ if [[ "${E2E_ROLE_CONFIG_ONLY:-0}" == "1" ]]; then
     exit 0
 fi
 
+# Literal stored-proof acceptance (#1433 reopened): the ACTUAL retained v1
+# authorization (digest a8b9524b...), its historical policy and manifest
+# (4be5ddad...), the rejected prelaunch action and the approved #814 gate are
+# installed read-only, then the real init/serve path must reproduce the literal
+# v1 digest and link exactly one v2 successor without changing history.
+if [[ "${E2E_STORED_PROOF_LITERAL:-0}" == "1" ]]; then
+    [[ "${E2E_STORED_PROOF_ONLY:-0}" == "1" ]] \
+        || e2e_fail "E2E_STORED_PROOF_LITERAL=1 also requires E2E_STORED_PROOF_ONLY=1"
+    STORED_PROOF_RETAINED="${E2E_STORED_PROOF_RETAINED:-/home/goya/beast-workspace/workspace/.exo/tl-loop/repair-backups/controlled-plan-20261119T022328Z}"
+    [[ -d "$STORED_PROOF_RETAINED" ]] \
+        || e2e_fail "the retained stored-proof backup directory is missing: $STORED_PROOF_RETAINED"
+    AGGREGATE_TMUX_TMPDIR="$(mktemp -d "${E2E_TMUX_TMPDIR_ROOT:-${TMPDIR:-/tmp}}/exo1433-literal-tmux.XXXXXX")"
+    unset TMUX TMUX_PANE
+    export TMUX_TMPDIR="$AGGREGATE_TMUX_TMPDIR"
+    e2e_log "Literal stored-proof tmux server isolated to $TMUX_TMPDIR"
+    STORED_HOME="$WORK_DIR/stored-proof-literal-home"
+    mkdir -p "$STORED_HOME/.exo"
+    bash "$SCRIPT_DIR/stored-proof-literal-acceptance.sh" \
+        "$EXOMONAD_BIN" "$WORK_DIR/stored-proof-literal" "$STORED_HOME" "$CODEX_HOME" \
+        "$PROJECT_ROOT" "$WASM_ARTIFACT_DIR" "$STORED_PROOF_RETAINED"
+    printf 'LITERAL-ALL PASS\n'
+    e2e_log "PASS: LITERAL-ALL PASS"
+    exit 0
+fi
+
 # Stored-proof acceptance (#1433 reopened): the retained v1 terminal-owner
 # authorization, rejected prelaunch action and approved #814 gate reconciled to
 # the current accepted v2 snapshot through the real init/serve path. Reuses the

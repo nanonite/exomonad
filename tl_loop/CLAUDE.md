@@ -1084,7 +1084,15 @@ at authorization, intent, launch and adoption never duplicate an effect.
 `_unresolved_historical_resume_effect` keeps a dispatched-but-unresolved effect
 from an older epoch held. The compiled acceptance is
 `just e2e-stored-proof` (`E2E_STORED_PROOF_ONLY=1`), which prints
-`STOREDPROOF-1..6` and `STOREDPROOF-ALL PASS`.
+`STOREDPROOF-1..6` and `STOREDPROOF-ALL PASS`. Its literal counterpart is
+`just e2e-stored-proof-literal` (`E2E_STORED_PROOF_ONLY=1
+E2E_STORED_PROOF_LITERAL=1`), which installs the ACTUAL retained v1 proof
+(`a8b9524b...`) with its historical policy and manifest (`4be5ddad...`) and
+requires the shipped controller to reproduce that exact digest before linking
+one fresh v2 authorization; it prints `LITERAL-1..5` and `LITERAL-ALL PASS`.
+The literal mode rebinds only the assignment coordinates the v1 digest excludes
+(ledger sequence, dispatch intent id, terminal invocation digest, worktree
+fingerprint) to the disposable fixture.
 
 See [docs/guides/changing-routes-mid-run.md](../docs/guides/changing-routes-mid-run.md).
 

@@ -191,7 +191,11 @@ e2e-stored-proof`): the host acceptance checks are unchanged, and the compiled
 run proves that a retained `sha256:v1:` terminal-owner authorization is
 recomputed under its own semantics by the controller and superseded by one
 fresh `sha256:v2:` launch authorization, with the real server accepting exactly
-one generation-3 successor.
+one generation-3 successor. `just e2e-stored-proof-literal` adds the literal
+case: the actual retained v1 digest (`a8b9524b...`) is recomputed under its
+retained historical policy and manifest (`4be5ddad...`), not a scratch
+regeneration, and the compiled init/serve path still links exactly one v2
+successor; it prints `LITERAL-1..5` and `LITERAL-ALL PASS`.
 `route.configuration_fingerprint` still comes from this identity;
 `route_fingerprint` keeps its source-aware `sha256:v1:` route-receipt binding as
 audit evidence.

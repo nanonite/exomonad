@@ -179,6 +179,19 @@ standalone `serve`, and runs `init --continue` with identical explicit flags.
 It prints `STOREDPROOF-1..6` and `STOREDPROOF-ALL PASS`, and it re-runs the
 role-configuration acceptance to keep R1-R4 retained.
 
+The literal variant is
+`E2E_STORED_PROOF_ONLY=1 E2E_STORED_PROOF_LITERAL=1
+tests/e2e/init-recovery/run.sh` (`just e2e-stored-proof-literal`). It does not
+regenerate the proof: it copies the actual controlled-plan backup read-only and
+installs the retained historical policy and child manifest so the shipped
+controller must reproduce the literal digest `a8b9524b...` under its original
+v1 semantics before it links one fresh v2 authorization. It prints
+`LITERAL-1..5` then `LITERAL-ALL PASS`, and byte-compares the retained sources
+and historical journal/authorization bytes before and after. Only the
+assignment coordinates excluded from the v1 digest are rebound to the
+disposable fixture, because the retained values name the read-only Beast ledger
+and worktree.
+
 ## Operator actions
 
 | Goal | Change | Restart? | Approval flag? |
