@@ -5068,6 +5068,7 @@ class _TerminalOwnerRecoveryProof(NamedTuple):
     successor_adoption_authorization: Mapping[str, object] | None = None
     route_authorization_supersedes_digest: str | None = None
     historical_route_gaps: tuple[str, ...] = ()
+    historical_route_authorization_digest: str | None = None
 
 
 class _TerminalResumeHistory(NamedTuple):
@@ -7202,6 +7203,7 @@ def _terminal_owner_recovery_proof(
     # action journal and host lineage. Otherwise the current owner must still be
     # the terminal failed predecessor whose route the operator is changing.
     latest_resume_entry = uncheckpointed_entries[-1] if uncheckpointed_entries else None
+    history_latest_entry = latest_resume_entry
     existing_args = latest_resume_entry.get("arguments") if latest_resume_entry else None
     if uncheckpointed_entries and (
         not isinstance(existing_args, Mapping)
@@ -7431,6 +7433,7 @@ def _terminal_owner_recovery_proof(
         ),
     }
     fresh_gate_authorization = gate_authorization
+    historical_route_authorization_digest: str | None = None
     confirmed_resume = (
         latest_resume_entry is not None and latest_resume_entry.get("status") == "confirmed"
     )
@@ -7458,7 +7461,42 @@ def _terminal_owner_recovery_proof(
         and not (_fresh_terminal_gate_reauthorization(saved_authorization, route_authorization))
         and not _terminal_route_authorization_supersedes(saved_authorization, route_authorization)
     ):
-        if _terminal_route_authorization_replay_matches(
+        replayed = False
+        if _unresolved_historical_resume_effect(
+            history_latest_entry, resume_history, config
+        ):
+            return (
+                None,
+                "an unresolved terminal-owner resume effect prevents another launch",
+            )
+        reconciled = _terminal_route_authorization_historical_reconciliation(
+            saved_authorization,
+            route_authorization,
+            config,
+            manifest_digest,
+        )
+        if reconciled is None:
+            replayed = _terminal_route_authorization_reconciliation_replay_matches(
+                saved_authorization,
+                route_authorization,
+                evidence,
+                config,
+                manifest_digest,
+            )
+        if reconciled is not None:
+            # The saved proof keeps its own identity scheme and stays immutable
+            # history; the next effect is authorized by a fresh proof bound to
+            # the current accepted snapshot and linked over the old one.
+            assert isinstance(saved_authorization, Mapping)
+            historical_route_authorization_digest = cast(
+                str, saved_authorization.get("digest")
+            )
+            route_authorization = reconciled
+            route_digest = cast(str, reconciled["digest"])
+            route_authorization_supersedes_digest = cast(
+                str, reconciled["supersedes_route_authorization_digest"]
+            )
+        elif replayed or _terminal_route_authorization_replay_matches(
             saved_authorization,
             route_authorization,
             evidence,
@@ -7480,6 +7518,19 @@ def _terminal_owner_recovery_proof(
             if isinstance(supersedes_saved, str):
                 route_authorization_supersedes_digest = supersedes_saved
         else:
+            if (
+                isinstance(saved_authorization, Mapping)
+                and _saved_historical_route_authorization_shape(
+                    saved_authorization, route_authorization, config
+                )
+            ):
+                return (
+                    None,
+                    (
+                        "persisted terminal-owner route authorization does not match "
+                        "its recorded historical identity"
+                    ),
+                )
             authorization_changes = (
                 sorted(
                     key
@@ -7580,7 +7631,33 @@ def _terminal_owner_recovery_proof(
                     "configured_role",
                 }
             )
-            if not fresh_not_dispatched_retry and not fresh_legacy_refusal_retry:
+            fresh_configuration_identity_retry = (
+                set(conflicts)
+                <= {
+                    "route_authorization_digest",
+                    "recovery_gate_authorization",
+                    "route_configuration_fingerprint",
+                    "route_policy_fingerprint",
+                    "route_manifest_digest",
+                    "route_fingerprint",
+                }
+                and _historical_configuration_refusal_retry(
+                    saved_authorization,
+                    route_authorization,
+                    latest_resume_entry,
+                    gate_authorization,
+                    recovery_gate,
+                    gate_name,
+                    evidence,
+                    config,
+                    manifest_digest,
+                )
+            )
+            if (
+                not fresh_not_dispatched_retry
+                and not fresh_legacy_refusal_retry
+                and not fresh_configuration_identity_retry
+            ):
                 return (
                     None,
                     "journaled terminal-owner authorization conflicts with current evidence or configuration: "
@@ -7674,6 +7751,7 @@ def _terminal_owner_recovery_proof(
             successor_adoption_authorization,
             route_authorization_supersedes_digest,
             resume_history.route_gaps,
+            historical_route_authorization_digest,
         ),
         None,
     )
@@ -8193,6 +8271,14 @@ def _confirmed_successor_adoption_authorization(
     return authorization, None
 
 
+CONFIRMED_TERMINAL_SUCCESSOR_TRANSITION = (
+    "confirmed_terminal_successor_reconciled_to_current_route"
+)
+HISTORICAL_ROUTE_REVALIDATION_TRANSITION = (
+    "historical_route_authorization_revalidated_for_accepted_configuration"
+)
+
+
 def _terminal_route_authorization_digest(
     config: TLLoopConfig,
     harness: str,
@@ -8205,16 +8291,37 @@ def _terminal_route_authorization_digest(
     gate_authorization: Mapping[str, object] | None,
     manifest_digest: str,
     supersedes_digest: str | None = None,
+    *,
+    configuration_fingerprint: str | None = None,
+    transition: str | None = None,
 ) -> str:
-    """Fingerprint the exact role policy and route used for this scoped migration."""
+    """Fingerprint the exact role policy and route used for this scoped migration.
+
+    `configuration_fingerprint` defaults to the current accepted identity. A
+    caller may pass the identity recorded by a historical authorization to
+    recompute that proof under its own semantics instead of reinterpreting it
+    with the current scheme. `transition` defaults to the established
+    supersession marker; the historical-revalidation link has its own.
+    """
     if config.policy is None:
         raise ValueError("terminal route authorization requires a role policy")
     role = config.policy.roles.get(config.role)
     if role is None:
         raise ValueError("terminal route authorization role is missing")
+    fingerprint = (
+        config.role_route_configuration_fingerprint
+        if configuration_fingerprint is None
+        else configuration_fingerprint
+    )
+    if transition is None:
+        transition = (
+            CONFIRMED_TERMINAL_SUCCESSOR_TRANSITION
+            if supersedes_digest is not None
+            else None
+        )
     payload = {
         "authorization_source": "accepted_operator_role_configuration",
-        "configuration_fingerprint": config.role_route_configuration_fingerprint,
+        "configuration_fingerprint": fingerprint,
         "manifest_digest": manifest_digest,
         "role": config.role,
         "policy": {
@@ -8237,11 +8344,7 @@ def _terminal_route_authorization_digest(
         },
         "recovery_gate_authorization": dict(gate_authorization or {}),
         "supersedes_route_authorization_digest": supersedes_digest,
-        "transition": (
-            "confirmed_terminal_successor_reconciled_to_current_route"
-            if supersedes_digest is not None
-            else None
-        ),
+        "transition": transition,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -8265,6 +8368,8 @@ def _terminal_route_authorization_record(
     spawn_event_seq: int,
     blocker_event_seq: int,
     supersedes_digest: str | None = None,
+    *,
+    transition: str | None = None,
 ) -> Mapping[str, object]:
     """Bind operator route consent to this accepted assignment and its evidence."""
     record: dict[str, object] = {
@@ -8296,11 +8401,373 @@ def _terminal_route_authorization_record(
     if supersedes_digest is not None:
         record.update(
             {
-                "transition": "confirmed_terminal_successor_reconciled_to_current_route",
+                "transition": transition or CONFIRMED_TERMINAL_SUCCESSOR_TRANSITION,
                 "supersedes_route_authorization_digest": supersedes_digest,
             }
         )
     return record
+
+
+def _role_route_configuration_version(value: object) -> str | None:
+    """Return the identity scheme that recorded a versioned configuration hash."""
+    if not isinstance(value, str):
+        return None
+    for version in ("v1", "v2"):
+        prefix = f"sha256:{version}:"
+        if value.startswith(prefix) and _is_sha256_text(value[len(prefix) :]):
+            return version
+    return None
+
+
+_TERMINAL_ROUTE_AUTHORIZATION_BINDING_FIELDS = (
+    "source",
+    "role",
+    "harness",
+    "agent_type",
+    "model",
+    "effort",
+    "prior_runtime",
+    "prior_model",
+    "prior_effort",
+    "manifest_digest",
+    "slice_id",
+    "issue_id",
+    "owner_agent_id",
+    "prior_invocation_id",
+    "dispatch_intent_id",
+    "dispatch_generation",
+    "branch",
+    "worktree_fingerprint",
+    "accepted_spawn_event_seq",
+    "blocker_event_seq",
+    "terminal_invocation_digest",
+)
+
+
+def _terminal_route_authorization_binding_matches(
+    first: Mapping[str, object], second: Mapping[str, object]
+) -> bool:
+    """Compare every field that binds a proof to one assignment and effect."""
+    return all(
+        first.get(field) == second.get(field)
+        for field in _TERMINAL_ROUTE_AUTHORIZATION_BINDING_FIELDS
+    )
+
+
+def _terminal_gate_authorization_compatible(
+    saved: object, candidate: object
+) -> bool:
+    """Keep an existing consent binding unless a newer approval supersedes it."""
+    saved_gate = saved if isinstance(saved, Mapping) else {}
+    candidate_gate = candidate if isinstance(candidate, Mapping) else {}
+    if candidate_gate == saved_gate:
+        return True
+    if not candidate_gate:
+        return False
+    if not saved_gate:
+        return True
+    return (
+        candidate_gate.get("gate_name") == saved_gate.get("gate_name")
+        and candidate_gate.get("status") == GateStatus.APPROVED.value
+    )
+
+
+def _historical_terminal_route_authorization_is_genuine(
+    authorization: Mapping[str, object], config: TLLoopConfig, manifest_digest: str
+) -> bool:
+    """Recompute a saved proof under the identity scheme that recorded it.
+
+    A historical proof is valid only when its recorded digest reproduces from
+    its own versioned configuration identity, route, policy, manifest and gate.
+    This never reinterprets the old digest with the current scheme, and it
+    rejects forged, truncated or mismatched legacy values.
+    """
+    fingerprint = authorization.get("configuration_fingerprint")
+    if _role_route_configuration_version(fingerprint) != "v1":
+        return False
+    harness = authorization.get("harness")
+    agent_type = authorization.get("agent_type")
+    effort = authorization.get("effort")
+    if (
+        not isinstance(harness, str)
+        or not isinstance(agent_type, str)
+        or not isinstance(effort, str)
+        or not isinstance(fingerprint, str)
+    ):
+        return False
+    gate = authorization.get("recovery_gate_authorization")
+    if gate is not None and not isinstance(gate, Mapping):
+        return False
+    try:
+        expected = _terminal_route_authorization_digest(
+            config,
+            harness,
+            agent_type,
+            cast(str | None, authorization.get("model")),
+            effort,
+            authorization.get("prior_runtime"),
+            authorization.get("prior_model"),
+            authorization.get("prior_effort"),
+            gate if isinstance(gate, Mapping) else None,
+            manifest_digest,
+            cast(str | None, authorization.get("supersedes_route_authorization_digest")),
+            configuration_fingerprint=fingerprint,
+            transition=cast(str | None, authorization.get("transition")),
+        )
+    except ValueError:
+        return False
+    return authorization.get("digest") == expected
+
+
+def _saved_historical_route_authorization_shape(
+    saved: Mapping[str, object],
+    candidate: Mapping[str, object],
+    config: TLLoopConfig,
+) -> bool:
+    """True when only the configuration identity scheme separates two proofs."""
+    current_fingerprint = config.role_route_configuration_fingerprint
+    if (
+        _role_route_configuration_version(saved.get("configuration_fingerprint")) != "v1"
+        or _role_route_configuration_version(current_fingerprint) != "v2"
+    ):
+        return False
+    if not _terminal_route_authorization_binding_matches(saved, candidate):
+        return False
+    if not _terminal_gate_authorization_compatible(
+        saved.get("recovery_gate_authorization"),
+        candidate.get("recovery_gate_authorization"),
+    ):
+        return False
+    identity_fields = {
+        "digest",
+        "configuration_fingerprint",
+        "transition",
+        "supersedes_route_authorization_digest",
+    }
+    return not (
+        (set(saved) - identity_fields - set(candidate))
+        or (set(candidate) - identity_fields - set(saved))
+    )
+
+
+def _terminal_route_authorization_historical_reconciliation(
+    saved: object,
+    candidate: Mapping[str, object],
+    config: TLLoopConfig,
+    manifest_digest: str,
+) -> Mapping[str, object] | None:
+    """Create one current-scheme proof linked over a proven historical proof.
+
+    The saved authorization must reproduce its own digest under the identity
+    scheme that recorded it (`v1`) and describe the same assignment,
+    predecessor, policy, manifest, route and gate binding as the current
+    candidate. Only the versioned configuration identity may differ, so a
+    genuine route change or a forged record never becomes an upgrade.
+    """
+    if not isinstance(saved, Mapping):
+        return None
+    if not _saved_historical_route_authorization_shape(saved, candidate, config):
+        return None
+    if not _historical_terminal_route_authorization_is_genuine(
+        saved, config, manifest_digest
+    ):
+        return None
+    supersedes_digest = saved.get("digest")
+    if not _is_sha256_text(str(supersedes_digest or "")):
+        return None
+    transition = HISTORICAL_ROUTE_REVALIDATION_TRANSITION
+    try:
+        digest = _terminal_route_authorization_digest(
+            config,
+            cast(str, candidate["harness"]),
+            cast(str, candidate["agent_type"]),
+            cast(str | None, candidate.get("model")),
+            cast(str, candidate["effort"]),
+            candidate.get("prior_runtime"),
+            candidate.get("prior_model"),
+            candidate.get("prior_effort"),
+            cast(Mapping[str, object] | None, candidate.get("recovery_gate_authorization")),
+            manifest_digest,
+            cast(str, supersedes_digest),
+            transition=transition,
+        )
+    except (KeyError, ValueError):
+        return None
+    reconciled = dict(candidate)
+    reconciled["digest"] = digest
+    reconciled["supersedes_route_authorization_digest"] = supersedes_digest
+    reconciled["transition"] = transition
+    return reconciled
+
+
+def _historical_route_authorization_for_digest(
+    digest: object, evidence: Mapping[str, object], current_saved: object
+) -> Mapping[str, object] | None:
+    """Resolve a historical proof by its digest without reinterpreting it."""
+    if not _is_sha256_text(str(digest or "")):
+        return None
+    if isinstance(current_saved, Mapping) and current_saved.get("digest") == digest:
+        return current_saved
+    history = evidence.get("configured_route_authorization_history")
+    if not isinstance(history, list):
+        return None
+    for item in history:
+        if isinstance(item, Mapping) and item.get("digest") == digest:
+            return item
+    return None
+
+
+def _historical_route_authorization_revalidates(
+    historical: Mapping[str, object], authorization: Mapping[str, object]
+) -> bool:
+    """True when `authorization` is the fresh proof linked over `historical`."""
+    return (
+        _role_route_configuration_version(historical.get("configuration_fingerprint"))
+        == "v1"
+        and authorization.get("transition") == HISTORICAL_ROUTE_REVALIDATION_TRANSITION
+        and authorization.get("supersedes_route_authorization_digest")
+        == historical.get("digest")
+        and _terminal_route_authorization_binding_matches(historical, authorization)
+    )
+
+
+def _unresolved_historical_resume_effect(
+    latest_resume_entry: Mapping[str, object] | None,
+    resume_history: _TerminalResumeHistory,
+    config: TLLoopConfig,
+) -> bool:
+    """A dispatched-but-unresolved effect from an older configuration epoch.
+
+    A journal entry this round already owns under the current accepted
+    configuration is the established same-intent replay contract. An
+    unresolved effect recorded under a different configuration epoch may have
+    launched under the old scheme, so the historical proof never supersedes it.
+    """
+    if not resume_history.unresolved_latest or latest_resume_entry is None:
+        return False
+    arguments = latest_resume_entry.get("arguments")
+    if not isinstance(arguments, Mapping):
+        return True
+    return (
+        arguments.get("route_configuration_fingerprint")
+        != config.role_route_configuration_fingerprint
+    )
+
+
+def _terminal_route_authorization_reconciliation_replay_matches(
+    saved: object,
+    candidate: Mapping[str, object],
+    evidence: Mapping[str, object],
+    config: TLLoopConfig,
+    manifest_digest: str,
+) -> bool:
+    """Recognize the revalidation proof that is already persisted.
+
+    Repeating `init --continue` after the fresh linked authorization was
+    written must reuse that exact proof instead of relinking it or reporting a
+    conflict.
+    """
+    if not isinstance(saved, Mapping):
+        return False
+    if saved.get("transition") != HISTORICAL_ROUTE_REVALIDATION_TRANSITION:
+        return False
+    fingerprint = saved.get("configuration_fingerprint")
+    if (
+        _role_route_configuration_version(fingerprint) != "v2"
+        or fingerprint != config.role_route_configuration_fingerprint
+    ):
+        return False
+    if not _terminal_route_authorization_binding_matches(saved, candidate):
+        return False
+    supersedes_digest = saved.get("supersedes_route_authorization_digest")
+    historical = _historical_route_authorization_for_digest(
+        supersedes_digest, evidence, None
+    )
+    if historical is None or not _historical_route_authorization_revalidates(
+        historical, saved
+    ):
+        return False
+    if not _historical_terminal_route_authorization_is_genuine(
+        historical, config, manifest_digest
+    ):
+        return False
+    try:
+        expected = _terminal_route_authorization_digest(
+            config,
+            cast(str, saved.get("harness")),
+            cast(str, saved.get("agent_type")),
+            cast(str | None, saved.get("model")),
+            cast(str, saved.get("effort")),
+            saved.get("prior_runtime"),
+            saved.get("prior_model"),
+            saved.get("prior_effort"),
+            cast(Mapping[str, object] | None, saved.get("recovery_gate_authorization")),
+            manifest_digest,
+            cast(str, supersedes_digest),
+            transition=HISTORICAL_ROUTE_REVALIDATION_TRANSITION,
+        )
+    except ValueError:
+        return False
+    return saved.get("digest") == expected
+
+
+def _historical_configuration_refusal_retry(
+    saved_authorization: object,
+    route_authorization: Mapping[str, object],
+    latest_resume_entry: Mapping[str, object] | None,
+    gate_authorization: Mapping[str, object] | None,
+    recovery_gate: object | None,
+    gate_name: str,
+    evidence: Mapping[str, object],
+    config: TLLoopConfig,
+    manifest_digest: str,
+) -> bool:
+    """Allow one fresh linked attempt after a proven prelaunch configuration refusal.
+
+    The recorded action must carry the historical proof's own digest and route
+    receipt, the refusal must be the exact no-effect envelope, the historical
+    proof must reproduce under its v1 semantics, and the current recovery gate
+    must still be explicitly approved. Nothing else is retried.
+    """
+    if not isinstance(latest_resume_entry, Mapping):
+        return False
+    if not _is_prelaunch_role_configuration_refusal(latest_resume_entry):
+        return False
+    arguments = latest_resume_entry.get("arguments")
+    if not isinstance(arguments, Mapping):
+        return False
+    historical = _historical_route_authorization_for_digest(
+        arguments.get("route_authorization_digest"), evidence, saved_authorization
+    )
+    if historical is None:
+        return False
+    if not _historical_route_authorization_revalidates(historical, route_authorization):
+        return False
+    if arguments.get("route_configuration_fingerprint") != historical.get(
+        "configuration_fingerprint"
+    ):
+        return False
+    receipt_fields = (
+        ("desired_harness", "harness"),
+        ("desired_agent_type", "agent_type"),
+        ("desired_model", "model"),
+        ("desired_effort", "effort"),
+    )
+    if any(
+        arguments.get(argument) != historical.get(record)
+        for argument, record in receipt_fields
+    ):
+        return False
+    if not _historical_terminal_route_authorization_is_genuine(
+        historical, config, manifest_digest
+    ):
+        return False
+    approved = (
+        isinstance(gate_authorization, Mapping)
+        and gate_authorization.get("gate_name") == gate_name
+        and gate_authorization.get("status") == GateStatus.APPROVED.value
+    ) or getattr(recovery_gate, "status", None) is GateStatus.APPROVED
+    return approved
 
 
 def _is_role_route_configuration_fingerprint(value: object) -> bool:
@@ -8388,6 +8855,18 @@ def _persist_terminal_route_authorization(
             if not (
                 _fresh_terminal_gate_reauthorization(existing, terminal.route_authorization)
                 or _terminal_route_authorization_supersedes(existing, terminal.route_authorization)
+                or (
+                    terminal.historical_route_authorization_digest is not None
+                    and isinstance(existing, Mapping)
+                    and existing.get("digest")
+                    == terminal.historical_route_authorization_digest
+                    and terminal.route_authorization.get("transition")
+                    == HISTORICAL_ROUTE_REVALIDATION_TRANSITION
+                    and terminal.route_authorization.get(
+                        "supersedes_route_authorization_digest"
+                    )
+                    == existing.get("digest")
+                )
             ):
                 raise TLLoopError("persisted terminal-owner route authorization changed")
             history = evidence.get("configured_route_authorization_history", [])

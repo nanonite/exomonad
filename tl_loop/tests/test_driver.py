@@ -33114,3 +33114,901 @@ def test_exit_marker_matches_checkpoint_uses_child_store_load(tmp_path: Path) ->
         driver_module._exit_marker_matches_checkpoint(
             {"checkpoint_revision": checkpoint.revision}, store_without_load
         )
+
+
+# ---------------------------------------------------------------------------
+# Chainlink #1433 (reopened): the retained v1 proof from the live run must be
+# validated under its own identity scheme and superseded by exactly one fresh
+# proof for the current accepted snapshot. History is never rewritten.
+# ---------------------------------------------------------------------------
+
+CURRENT_CONFIG_FINGERPRINT_V2 = (
+    "sha256:v2:b4c93f8d86d2c164602b2275291b0f89dbefb4806579d8d8fc0074f2354f22d7"
+)
+DIRECTED_WORKER_MODEL = "opencode-go/deepseek-v4.1-flash"
+# Literal contract values, so the regression asserts recorded bytes rather than
+# importing the symbol it is meant to pin.
+CONFIRMED_TERMINAL_SUCCESSOR_TRANSITION_TEXT = (
+    "confirmed_terminal_successor_reconciled_to_current_route"
+)
+HISTORICAL_ROUTE_REVALIDATION_TRANSITION_TEXT = (
+    "historical_route_authorization_revalidated_for_accepted_configuration"
+)
+STORED_PROOF_BINDING_FIELDS = (
+    "source",
+    "role",
+    "harness",
+    "agent_type",
+    "model",
+    "effort",
+    "prior_runtime",
+    "prior_model",
+    "prior_effort",
+    "manifest_digest",
+    "slice_id",
+    "issue_id",
+    "owner_agent_id",
+    "prior_invocation_id",
+    "dispatch_intent_id",
+    "dispatch_generation",
+    "branch",
+    "worktree_fingerprint",
+    "accepted_spawn_event_seq",
+    "blocker_event_seq",
+    "terminal_invocation_digest",
+)
+
+
+def _stored_proof_route_config(
+    config: TLLoopConfig,
+    *,
+    fingerprint: str,
+    effort: str = "high",
+) -> TLLoopConfig:
+    return replace(
+        config,
+        role_route_configuration_fingerprint=fingerprint,
+        worker_effort_level=effort,
+    )
+
+
+def _record_confirmed_legacy_successor(
+    plan: WorkPlan,
+    proof: "_TerminalOwnerRecoveryProof",
+    store: RunStore,
+    journal: EffectJournal,
+    owner_dir: Path,
+    owner_name: str,
+    predecessor_id: str,
+    successor_id: str,
+    *,
+    runtime: str = "codex",
+    model: str = "gpt-6.1-sol",
+    effort: str = "xhigh",
+) -> Mapping[str, object]:
+    """Append the retained confirmed f285 result and rotate the owner record."""
+    leaf = plan.leaves[0]
+    arguments = dict(driver_module._blocked_leaf_resume_action_arguments(proof.resume, store.load()))
+    arguments.pop("route_fingerprint")
+    intent = EffectIntent("resume_blocked_leaf", leaf.name, arguments, True)
+    journal.append(intent)
+    journal.mark_result(
+        intent,
+        ToolResult.from_raw(
+            {
+                "success": True,
+                "result": {
+                    "chainlink_issue_id": 814,
+                    "agent": {
+                        "id": owner_name,
+                        "issue": leaf.name,
+                        "intent_id": proof.resume.intent_id,
+                        "agent_type": runtime,
+                        "branch_name": proof.resume.owner.branch,
+                        "worktree_path": str(proof.resume.owner.worktree),
+                    },
+                    "invocation": {
+                        "invocation_id": successor_id,
+                        "generation": 2,
+                        "trigger": "resume_blocked",
+                        "runtime": runtime,
+                        "model": model,
+                        "effort": effort,
+                        "ready": True,
+                        "fresh": True,
+                        "outcome": "started",
+                    },
+                },
+            }
+        ),
+    )
+    identity_path = owner_dir / "identity.json"
+    identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    identity.update({"agent_type": runtime, "model": model, "effort": effort})
+    identity_path.write_text(json.dumps(identity), encoding="utf-8")
+    (owner_dir / "invocation.json").write_text(
+        json.dumps(
+            {
+                "invocation_id": successor_id,
+                "generation": 2,
+                "status": "exited",
+                "runtime": runtime,
+                "model": model,
+                "effort": effort,
+                "trigger": "resume_blocked",
+                "branch": proof.resume.owner.branch,
+                "worktree": str(proof.resume.owner.worktree),
+                "slice_id": leaf.name,
+                "prior_invocation_id": predecessor_id,
+                "pr_number": None,
+                "head_sha": None,
+                "ended_at": 1792734800,
+                "exit_code": 0,
+                "exit_reason": "one_shot_complete",
+                "exit_classification": "one_shot_complete",
+                "one_shot_complete": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (owner_dir / "dispatch_intent").write_text(proof.resume.intent_id + "\n", encoding="utf-8")
+    (owner_dir / "routing.json").write_text(
+        json.dumps(
+            {
+                "owner_agent_id": owner_name,
+                "owner_invocation_id": successor_id,
+                "owner_generation": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return arguments
+
+
+def _seed_stored_v1_proof(
+    tmp_path: Path,
+    *,
+    record_refusal: bool = True,
+    confirmed_successor: bool = True,
+) -> dict[str, Any]:
+    """Reproduce the live stored-v1-proof state on the accepted f446/f285 chain."""
+    plan, config, store, owner_dir, owner_name, original_id = (
+        _seed_terminal_provider_failure_leaf(
+            tmp_path,
+            selected_harness="opencode/opencode-go/deepseek-v4.1-flash",
+            selected_model=DIRECTED_WORKER_MODEL,
+            selected_effort="high",
+        )
+    )
+    leaf = plan.leaves[0]
+    gate_name = driver_module._terminal_owner_recovery_gate_name(leaf.name)
+    store.set_gate(gate_name, GateStatus.PENDING)
+    historical_config = _stored_proof_route_config(
+        config, fingerprint=HISTORICAL_CONFIG_FINGERPRINT_V1
+    )
+    initial, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), historical_config, store
+    )
+    assert initial is not None, reason
+    state = driver_module._persist_terminal_route_authorization(initial, store.load(), store)
+    initial_recovery = state.slices[leaf.name].recovery
+    assert initial_recovery is not None
+    prior_authorization = _required_mapping(
+        initial_recovery.evidence.get("configured_route_authorization"),
+        "initial route authorization",
+    )
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    successor_id = "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d"
+    if confirmed_successor:
+        _record_confirmed_legacy_successor(
+            plan,
+            initial,
+            store,
+            journal,
+            owner_dir,
+            owner_name,
+            original_id,
+            successor_id,
+        )
+        current, reason = driver_module._terminal_owner_recovery_proof(
+            plan, store.load(), historical_config, store
+        )
+        assert current is not None, reason
+        assert (
+            current.route_authorization.get("transition")
+            == CONFIRMED_TERMINAL_SUCCESSOR_TRANSITION_TEXT
+        )
+        assert (
+            current.route_authorization.get("supersedes_route_authorization_digest")
+            == prior_authorization["digest"]
+        )
+        state = driver_module._persist_terminal_route_authorization(
+            current, store.load(), store
+        )
+    else:
+        current, reason = driver_module._terminal_owner_recovery_proof(
+            plan, store.load(), historical_config, store
+        )
+        assert current is not None, reason
+        state = driver_module._persist_terminal_route_authorization(
+            current, store.load(), store
+        )
+    saved_recovery = state.slices[leaf.name].recovery
+    assert saved_recovery is not None
+    saved_v1 = _required_mapping(
+        saved_recovery.evidence.get("configured_route_authorization"),
+        "stored v1 route authorization",
+    )
+    history_value = saved_recovery.evidence.get("configured_route_authorization_history", [])
+    history_v1 = list(history_value) if isinstance(history_value, list) else []
+    rejected_entry: Mapping[str, object] | None = None
+    if record_refusal:
+        rejected_arguments = dict(
+            driver_module._blocked_leaf_resume_action_arguments(current.resume, state)
+        )
+        rejected_arguments["route_authorization_digest"] = saved_v1["digest"]
+        rejected_arguments["recovery_gate_authorization"] = {}
+        rejected_intent = EffectIntent(
+            "resume_blocked_leaf", leaf.name, rejected_arguments, True
+        )
+        journal.append(rejected_intent)
+        journal.mark_result(
+            rejected_intent,
+            ToolResult.from_raw(
+                {
+                    "success": False,
+                    "result": None,
+                    "error": driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+                }
+            ),
+        )
+        rejected_entry = journal.entries_for("resume_blocked_leaf", leaf.name)[-1]
+    approved = store.answer_gate(gate_name, GateStatus.APPROVED)
+    accepted_config = _stored_proof_route_config(
+        config, fingerprint=CURRENT_CONFIG_FINGERPRINT_V2
+    )
+    return {
+        "plan": plan,
+        "config": accepted_config,
+        "historical_config": historical_config,
+        "store": store,
+        "state": approved,
+        "journal": journal,
+        "owner_dir": owner_dir,
+        "owner_name": owner_name,
+        "successor_id": successor_id,
+        "prior_authorization": prior_authorization,
+        "saved_v1": saved_v1,
+        "history_v1": history_v1,
+        "rejected_entry": rejected_entry,
+        "gate_name": gate_name,
+        "manifest_digest": _required_manifest_digest(approved),
+    }
+
+
+def _stored_proof_seed(tmp_path: Path, **kwargs: Any) -> dict[str, Any]:
+    return _seed_stored_v1_proof(tmp_path, **kwargs)
+
+
+def test_role_route_configuration_version_classifies_supported_schemes() -> None:
+    assert driver_module._role_route_configuration_version(HISTORICAL_CONFIG_FINGERPRINT_V1) == "v1"
+    assert driver_module._role_route_configuration_version(CURRENT_CONFIG_FINGERPRINT_V2) == "v2"
+    assert driver_module._role_route_configuration_version("sha256:v3:" + "a" * 64) is None
+    assert driver_module._role_route_configuration_version("sha256:v1:short") is None
+    assert driver_module._role_route_configuration_version(None) is None
+
+
+def test_stored_v1_proof_reproduces_only_under_its_recorded_identity(tmp_path: Path) -> None:
+    seed = _stored_proof_seed(tmp_path)
+    saved_v1 = seed["saved_v1"]
+    historical_config = seed["historical_config"]
+    manifest_digest = seed["manifest_digest"]
+
+    assert driver_module._historical_terminal_route_authorization_is_genuine(
+        saved_v1, historical_config, manifest_digest
+    )
+    current_identity = dict(saved_v1)
+    current_identity["configuration_fingerprint"] = CURRENT_CONFIG_FINGERPRINT_V2
+    assert not driver_module._historical_terminal_route_authorization_is_genuine(
+        current_identity, seed["config"], manifest_digest
+    )
+    changed_route = dict(saved_v1)
+    changed_route["model"] = "opencode-go/glm-5.3-flash"
+    assert not driver_module._historical_terminal_route_authorization_is_genuine(
+        changed_route, historical_config, manifest_digest
+    )
+    forged_digest = dict(saved_v1)
+    forged_digest["digest"] = "f" * 64
+    assert not driver_module._historical_terminal_route_authorization_is_genuine(
+        forged_digest, historical_config, manifest_digest
+    )
+    changed_manifest = dict(saved_v1)
+    assert not driver_module._historical_terminal_route_authorization_is_genuine(
+        changed_manifest, historical_config, "0" * 64
+    )
+
+
+def test_terminal_owner_revalidates_stored_v1_proof_for_current_snapshot(
+    tmp_path: Path,
+) -> None:
+    """The exact live finding: 7f0cced2 holds, the corrected host links a v2 proof."""
+    seed = _stored_proof_seed(tmp_path)
+    plan, config, store = seed["plan"], seed["config"], seed["store"]
+    saved_v1 = seed["saved_v1"]
+
+    assert saved_v1["configuration_fingerprint"] == HISTORICAL_CONFIG_FINGERPRINT_V1
+    assert (
+        saved_v1["transition"]
+        == CONFIRMED_TERMINAL_SUCCESSOR_TRANSITION_TEXT
+    )
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+
+    assert proof is not None, reason
+    authorization = proof.route_authorization
+    assert authorization["configuration_fingerprint"] == CURRENT_CONFIG_FINGERPRINT_V2
+    assert authorization["transition"] == HISTORICAL_ROUTE_REVALIDATION_TRANSITION_TEXT
+    assert authorization["supersedes_route_authorization_digest"] == saved_v1["digest"]
+    assert authorization["digest"] != saved_v1["digest"]
+    assert proof.historical_route_authorization_digest == saved_v1["digest"]
+    assert proof.resume.owner.prior_invocation_id == seed["successor_id"]
+    assert proof.resume.owner.generation == 2
+    assert proof.resume.desired_model == DIRECTED_WORKER_MODEL
+    assert proof.resume.desired_effort == "high"
+    for field in STORED_PROOF_BINDING_FIELDS:
+        assert authorization.get(field) == saved_v1.get(field), field
+
+
+def test_terminal_owner_preserves_stored_v1_proof_in_history(tmp_path: Path) -> None:
+    seed = _stored_proof_seed(tmp_path)
+    plan, config, store = seed["plan"], seed["config"], seed["store"]
+    leaf = plan.leaves[0]
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert proof is not None, reason
+    state = driver_module._persist_terminal_route_authorization(proof, store.load(), store)
+    recovery = state.slices[leaf.name].recovery
+    assert recovery is not None
+    history = recovery.evidence.get("configured_route_authorization_history")
+    assert isinstance(history, list)
+    assert seed["saved_v1"] in history
+    assert recovery.evidence["configured_route_authorization"] == proof.route_authorization
+    assert seed["saved_v1"] not in [
+        item
+        for item in history
+        if item.get("configuration_fingerprint") == CURRENT_CONFIG_FINGERPRINT_V2
+    ]
+
+
+def test_terminal_owner_reuses_revalidated_proof_before_launch(tmp_path: Path) -> None:
+    seed = _stored_proof_seed(tmp_path)
+    plan, config, store = seed["plan"], seed["config"], seed["store"]
+    leaf = plan.leaves[0]
+
+    first, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert first is not None, reason
+    state = driver_module._persist_terminal_route_authorization(first, store.load(), store)
+    second, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
+    assert second is not None, reason
+    assert second.route_authorization == first.route_authorization
+    assert second.route_authorization.get("digest") == first.route_authorization.get("digest")
+    recovery = state.slices[leaf.name].recovery
+    assert recovery is not None
+    history_value = recovery.evidence.get("configured_route_authorization_history", [])
+    assert isinstance(history_value, list)
+    assert len(history_value) == len(seed["history_v1"]) + 1
+
+
+def test_terminal_owner_reuses_revalidated_proof_after_response_loss(tmp_path: Path) -> None:
+    seed = _stored_proof_seed(tmp_path)
+    plan, config, store, journal = (
+        seed["plan"],
+        seed["config"],
+        seed["store"],
+        seed["journal"],
+    )
+    leaf = plan.leaves[0]
+    first, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert first is not None, reason
+    state = driver_module._persist_terminal_route_authorization(first, store.load(), store)
+    intended_arguments = dict(
+        driver_module._blocked_leaf_resume_action_arguments(first.resume, state)
+    )
+    intended = EffectIntent("resume_blocked_leaf", leaf.name, intended_arguments, True)
+    journal.append(intended)
+    journal.mark_not_dispatched(intended)
+
+    second, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert second is not None, reason
+    assert second.route_authorization == first.route_authorization
+    assert second.resume.route_authorization_digest == intended_arguments[
+        "route_authorization_digest"
+    ]
+    assert second.resume.intent_id == intended_arguments["dispatch_intent_id"]
+    assert second.resume.owner.prior_invocation_id == seed["successor_id"]
+    replay_journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    assert replay_journal.entries_for("resume_blocked_leaf", leaf.name)[-1]["status"] == (
+        "not_dispatched"
+    )
+
+
+def test_terminal_owner_rejects_forged_stored_v1_digest(tmp_path: Path) -> None:
+    seed = _stored_proof_seed(tmp_path)
+    plan, config, store = seed["plan"], seed["config"], seed["store"]
+    forged = dict(seed["saved_v1"])
+    forged["digest"] = "1" * 64
+    forged["configuration_fingerprint"] = HISTORICAL_CONFIG_FINGERPRINT_V1
+    _rewrite_stored_authorization(store, plan.leaves[0].name, forged)
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+
+    assert proof is None
+    assert reason == (
+        "persisted terminal-owner route authorization does not match "
+        "its recorded historical identity"
+    )
+    transport = RecordingTransport()
+    driver_module._resume_terminal_owner_failure(
+        plan,
+        store.load(),
+        config,
+        EffectClient(transport),
+        store,
+        seed["journal"],
+    )
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in transport.calls)
+
+
+def test_terminal_owner_rejects_malformed_stored_v1_digest(tmp_path: Path) -> None:
+    seed = _stored_proof_seed(tmp_path)
+    plan, config, store = seed["plan"], seed["config"], seed["store"]
+    malformed = dict(seed["saved_v1"])
+    malformed["digest"] = "not-a-digest"
+    _rewrite_stored_authorization(store, plan.leaves[0].name, malformed)
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+
+    assert proof is None
+    assert reason is not None and "does not match its recorded historical identity" in reason
+
+
+def test_terminal_owner_rejects_stored_proof_for_wrong_predecessor(tmp_path: Path) -> None:
+    seed = _stored_proof_seed(tmp_path)
+    plan, config, store = seed["plan"], seed["config"], seed["store"]
+    wrong = dict(seed["saved_v1"])
+    wrong["prior_invocation_id"] = "00000000-0000-0000-0000-000000000000"
+    _rewrite_stored_authorization(store, plan.leaves[0].name, wrong)
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+
+    assert proof is None
+    assert reason is not None and "conflicts with current configuration" in reason
+
+
+def test_terminal_owner_rejects_stored_proof_for_wrong_scope(tmp_path: Path) -> None:
+    seed = _stored_proof_seed(tmp_path)
+    plan, config, store = seed["plan"], seed["config"], seed["store"]
+    wrong = dict(seed["saved_v1"])
+    wrong["manifest_digest"] = "0" * 64
+    _rewrite_stored_authorization(store, plan.leaves[0].name, wrong)
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+
+    assert proof is None
+    assert reason is not None
+    assert "historical identity" in reason or "conflicts with current configuration" in reason
+
+
+def test_terminal_owner_rejects_genuine_route_change_with_stored_proof(tmp_path: Path) -> None:
+    seed = _stored_proof_seed(tmp_path)
+    plan, store = seed["plan"], seed["store"]
+    changed = replace(seed["config"], worker_effort_level="xhigh")
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), changed, store
+    )
+
+    assert proof is None
+    assert reason is not None and "conflicts with current configuration" in reason
+    transport = RecordingTransport()
+    driver_module._resume_terminal_owner_failure(
+        plan,
+        store.load(),
+        changed,
+        EffectClient(transport),
+        store,
+        seed["journal"],
+    )
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in transport.calls)
+
+
+def test_terminal_owner_rejects_unaccepted_current_identity_with_stored_proof(
+    tmp_path: Path,
+) -> None:
+    seed = _stored_proof_seed(tmp_path)
+    plan, store = seed["plan"], seed["store"]
+    missing = replace(seed["config"], role_route_configuration_fingerprint=None)
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), missing, store
+    )
+
+    assert proof is None
+    assert reason == (
+        "terminal-owner recovery requires the current accepted role-route configuration fingerprint"
+    )
+
+
+def test_terminal_owner_holds_unknown_prior_effect_with_stored_proof(tmp_path: Path) -> None:
+    seed = _stored_proof_seed(tmp_path)
+    plan, config, store, journal = (
+        seed["plan"],
+        seed["config"],
+        seed["store"],
+        seed["journal"],
+    )
+    leaf = plan.leaves[0]
+    latest = journal.entries_for("resume_blocked_leaf", leaf.name)[-1]
+    unknown = {**latest, "status": "unknown"}
+    entries = journal.entries_for("resume_blocked_leaf", leaf.name)
+    _replace_resume_journal_entries(store, leaf.name, [*entries[:-1], unknown])
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+
+    assert proof is None
+    assert reason == "an unresolved terminal-owner resume effect prevents another launch"
+
+
+def test_terminal_owner_holds_live_worker_with_stored_proof(tmp_path: Path) -> None:
+    seed = _stored_proof_seed(tmp_path)
+    plan, config, store, owner_dir = (
+        seed["plan"],
+        seed["config"],
+        seed["store"],
+        seed["owner_dir"],
+    )
+    invocation = json.loads((owner_dir / "invocation.json").read_text(encoding="utf-8"))
+    invocation.update({"status": "running", "ended_at": None})
+    (owner_dir / "invocation.json").write_text(json.dumps(invocation), encoding="utf-8")
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+
+    assert proof is None
+    assert reason is not None
+
+
+def test_terminal_owner_holds_independent_gate_rejection_with_stored_proof(
+    tmp_path: Path,
+) -> None:
+    seed = _stored_proof_seed(tmp_path, record_refusal=False, confirmed_successor=False)
+    plan, config, store = seed["plan"], seed["config"], seed["store"]
+    rejected = store.answer_gate(seed["gate_name"], GateStatus.REJECTED)
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, rejected, config, store
+    )
+
+    assert proof is None
+    assert reason == (
+        "operator rejected terminal-owner recovery; explicitly approve the recovery gate to retry"
+    )
+
+
+def test_terminal_owner_holds_non_refusal_outcome_recorded_under_stored_v1_proof(
+    tmp_path: Path,
+) -> None:
+    """Only the exact no-effect refusal may be retried over a stored v1 proof."""
+    seed = _stored_proof_seed(tmp_path, confirmed_successor=False)
+    plan, config, store = seed["plan"], seed["config"], seed["store"]
+    journal = seed["journal"]
+    leaf = plan.leaves[0]
+    arguments = dict(seed["rejected_entry"]["arguments"])
+    intent = EffectIntent("resume_blocked_leaf", leaf.name, arguments, True)
+    journal.append(intent)
+    journal.mark_result(
+        intent,
+        ToolResult.from_raw(
+            {"success": False, "result": None, "error": "some other host refusal"}
+        ),
+    )
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+
+    assert proof is None
+    assert reason is not None
+
+
+def test_terminal_owner_revalidates_prelaunch_refusal_without_confirmed_successor(
+    tmp_path: Path,
+) -> None:
+    """The owner is still the failed initial spawn and a refusal is recorded."""
+    seed = _stored_proof_seed(tmp_path, confirmed_successor=False)
+    plan, config, store = seed["plan"], seed["config"], seed["store"]
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+
+    assert proof is not None, reason
+    authorization = proof.route_authorization
+    assert authorization["configuration_fingerprint"] == CURRENT_CONFIG_FINGERPRINT_V2
+    assert authorization["supersedes_route_authorization_digest"] == seed["saved_v1"]["digest"]
+    arguments = driver_module._blocked_leaf_resume_action_arguments(proof.resume, store.load())
+    assert arguments["route_authorization_digest"] == authorization["digest"]
+    assert arguments["route_configuration_fingerprint"] == CURRENT_CONFIG_FINGERPRINT_V2
+
+
+def test_terminal_owner_refuses_second_identity_change_after_revalidation(
+    tmp_path: Path,
+) -> None:
+    seed = _stored_proof_seed(tmp_path)
+    plan, config, store = seed["plan"], seed["config"], seed["store"]
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert proof is not None, reason
+    driver_module._persist_terminal_route_authorization(proof, store.load(), store)
+    other_identity = replace(
+        config, role_route_configuration_fingerprint="sha256:v2:" + "7" * 64
+    )
+
+    held, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), other_identity, store
+    )
+
+    assert held is None
+    assert reason is not None and "conflicts with current configuration" in reason
+
+
+def test_terminal_owner_rejects_tampered_revalidation_history(tmp_path: Path) -> None:
+    seed = _stored_proof_seed(tmp_path)
+    plan, config, store = seed["plan"], seed["config"], seed["store"]
+    leaf = plan.leaves[0]
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert proof is not None, reason
+    state = driver_module._persist_terminal_route_authorization(proof, store.load(), store)
+    recovery = state.slices[leaf.name].recovery
+    assert recovery is not None
+    history_value = recovery.evidence.get("configured_route_authorization_history", [])
+    history = list(history_value) if isinstance(history_value, list) else []
+    tampered = [
+        {**item, "digest": "9" * 64}
+        if item.get("digest") == seed["saved_v1"]["digest"]
+        else item
+        for item in history
+    ]
+    current = state.slices[leaf.name]
+    store.checkpoint(
+        state.fsm,
+        {**state.slices, leaf.name: replace(current, recovery=replace(recovery, evidence={
+            **recovery.evidence,
+            "configured_route_authorization_history": tampered,
+        }))},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        plan_manifest=state.plan_manifest,
+    )
+
+    held, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+
+    assert held is None
+    assert reason is not None
+
+
+def test_terminal_owner_stored_proof_launches_one_generation_three_successor(
+    tmp_path: Path,
+) -> None:
+    seed = _stored_proof_seed(tmp_path)
+    plan, config, store, journal, owner_dir, owner_name = (
+        seed["plan"],
+        seed["config"],
+        seed["store"],
+        seed["journal"],
+        seed["owner_dir"],
+        seed["owner_name"],
+    )
+    leaf = plan.leaves[0]
+    rejected_entry = seed["rejected_entry"]
+    assert rejected_entry is not None
+    successor_id = "generation-three-opencode-successor"
+
+    class AcceptedV2Transport(RecordingTransport):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
+            if tool_name != "resume_blocked_leaf":
+                return super().call_tool(role, name, tool_name, arguments)
+            self.calls.append((tool_name, arguments))
+            route_receipt = _required_json_value_object(arguments["role_route"], "role_route")
+            identity_path = owner_dir / "identity.json"
+            identity = json.loads(identity_path.read_text(encoding="utf-8"))
+            identity.update(
+                {
+                    "agent_type": "opencode",
+                    "model": DIRECTED_WORKER_MODEL,
+                    "effort": "high",
+                    "role_route": route_receipt,
+                }
+            )
+            identity_path.write_text(json.dumps(identity), encoding="utf-8")
+            (owner_dir / "invocation.json").write_text(
+                json.dumps(
+                    {
+                        "invocation_id": successor_id,
+                        "generation": 3,
+                        "status": "running",
+                        "runtime": "opencode",
+                        "model": DIRECTED_WORKER_MODEL,
+                        "effort": "high",
+                        "trigger": "resume_blocked",
+                        "branch": identity["birth_branch"],
+                        "worktree": identity["working_dir"],
+                        "prior_invocation_id": seed["successor_id"],
+                        "pr_number": None,
+                        "head_sha": None,
+                        "role_route": route_receipt,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (owner_dir / "dispatch_intent").write_text(
+                f"{route_receipt['dispatch_intent_id']}\n", encoding="utf-8"
+            )
+            (owner_dir / "routing.json").write_text(
+                json.dumps(
+                    {
+                        "owner_agent_id": owner_name,
+                        "owner_invocation_id": successor_id,
+                        "owner_generation": 3,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return {
+                "success": True,
+                "result": {
+                    "chainlink_issue_id": 814,
+                    "agent": {
+                        "id": owner_name,
+                        "issue": leaf.name,
+                        "intent_id": route_receipt["dispatch_intent_id"],
+                        "agent_type": "opencode",
+                        "branch_name": identity["birth_branch"],
+                        "worktree_path": identity["working_dir"],
+                        "role_route": route_receipt,
+                    },
+                    "invocation": {
+                        "invocation_id": successor_id,
+                        "trigger": "resume_blocked",
+                        "runtime": "opencode",
+                        "model": DIRECTED_WORKER_MODEL,
+                        "effort": "high",
+                        "ready": True,
+                        "fresh": True,
+                        "outcome": "started",
+                        "role_route": route_receipt,
+                    },
+                },
+            }
+
+    authorized, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert authorized is not None, reason
+    state = driver_module._persist_terminal_route_authorization(
+        authorized, store.load(), store
+    )
+    recovery = state.slices[leaf.name].recovery
+    assert recovery is not None
+    saved_v2 = _required_mapping(
+        recovery.evidence.get("configured_route_authorization"),
+        "configured route authorization",
+    )
+    assert saved_v2 == authorized.route_authorization
+    assert saved_v2["supersedes_route_authorization_digest"] == seed["saved_v1"]["digest"]
+    history = recovery.evidence.get("configured_route_authorization_history")
+    assert isinstance(history, list) and seed["saved_v1"] in history
+
+    transport = AcceptedV2Transport()
+    resumed = driver_module._resume_terminal_owner_failure(
+        plan,
+        state,
+        config,
+        EffectClient(transport),
+        store,
+        journal,
+    )
+
+    assert sum(tool == "resume_blocked_leaf" for tool, _ in transport.calls) == 1
+    entries = journal.entries_for("resume_blocked_leaf", leaf.name)
+    assert len(entries) == 3
+    assert entries[0]["status"] == "confirmed"
+    assert entries[1] == rejected_entry
+    assert entries[1]["status"] == "rejected"
+    assert entries[2]["status"] == "confirmed"
+    launched_arguments = _required_mapping(entries[2]["arguments"], "launched arguments")
+    assert launched_arguments["route_configuration_fingerprint"] == (
+        CURRENT_CONFIG_FINGERPRINT_V2
+    )
+    assert launched_arguments["desired_model"] == DIRECTED_WORKER_MODEL
+    assert launched_arguments["desired_effort"] == "high"
+    assert resumed.slices[leaf.name].dispatch_invocation_id == successor_id
+    assert resumed.slices[leaf.name].attempts == seed["state"].slices[leaf.name].attempts + 1
+    assert launched_arguments["route_authorization_digest"] == saved_v2["digest"]
+    assert resumed.slices[leaf.name].status is SliceStatus.DISPATCH_UNCONFIRMED
+    assert resumed.slices[leaf.name].agent_type == "opencode"
+    assert resumed.slices[leaf.name].model == DIRECTED_WORKER_MODEL
+    assert resumed.slices[leaf.name].dispatch_effort == "high"
+    assert resumed.slices[leaf.name].dispatch_agent_id == owner_name
+
+
+def _rewrite_stored_authorization(
+    store: RunStore, slice_id: str, authorization: Mapping[str, object]
+) -> None:
+    state = store.load()
+    current = state.slices[slice_id]
+    assert current.recovery is not None
+    recovery = replace(
+        current.recovery,
+        evidence={
+            **current.recovery.evidence,
+            "configured_route_authorization": dict(authorization),
+        },
+    )
+    store.checkpoint(
+        state.fsm,
+        {**state.slices, slice_id: replace(current, recovery=recovery)},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        plan_manifest=state.plan_manifest,
+    )
+
+
+def _replace_resume_journal_entries(
+    store: RunStore, target: str, entries: Sequence[Mapping[str, object]]
+) -> None:
+    """Rewrite only one target's resume entries, keeping every other result intact."""
+    path = store.run_dir / "action-journal.json"
+    existing = json.loads(path.read_text(encoding="utf-8"))
+    kept = [
+        entry
+        for entry in existing
+        if not (entry.get("operation") == "resume_blocked_leaf" and entry.get("target") == target)
+    ]
+    path.write_text(
+        json.dumps([*kept, *entries], sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )

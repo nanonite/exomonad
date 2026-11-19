@@ -844,6 +844,7 @@ just e2e-slice-abandon-redispatch # Real-server closed-PR recovery acceptance
 just e2e-recreated-leaf-recovery # Recreated-leaf recovery acceptance (T1-T9)
 just e2e-typecheck-ci      # Real CI typecheck job in a disposable Forgejo (no network)
 just e2e-role-config       # #1433 role-configuration preflight acceptance (ROLECONFIG-1..5)
+just e2e-stored-proof      # #1433 retained v1 terminal-owner proof acceptance (STOREDPROOF-1..6)
 ```
 
 `just e2e-role-config` runs `tests/e2e/init-recovery/run.sh` with
@@ -859,6 +860,22 @@ no-identity (old-binary) server that must hold with
 `tests/e2e/init-recovery/check_role_config_preflight.py` plus the
 `init::tests::*preflight*` unit tests; the recorded red-on-old-code logs live in
 the run's evidence directory.
+
+`just e2e-stored-proof` runs `tests/e2e/init-recovery/run.sh` with
+`E2E_STORED_PROOF_ONLY=1`. It reuses the same Phase 0 build, fresh explicitly
+selected WASM, isolated Codex home and run-scoped tmux server, then runs
+`tests/e2e/init-recovery/stored-proof-acceptance.sh`: the retained
+`sha256:v1:` terminal-owner authorization, the rejected prelaunch configuration
+action, the approved #814 recovery gate and the historical f446/f285 receipts
+are seeded against a real standalone `serve`, and `init --continue` with
+identical explicit flags must derive one linked `sha256:v2:` authorization and
+launch exactly one generation-3 OpenCode DeepSeek/high successor. Repeat init
+before and after a supported server restart adds no duplicate launch, and
+`check-stored-proof-negatives.py` runs the shipped controller archive against
+every negative (forged/malformed digest, wrong owner/scope/manifest/predecessor,
+unaccepted identity, unknown prior effect, live worker, independent gate
+rejection, genuine model/effort change). It also re-runs the role-configuration
+acceptance and prints `STOREDPROOF-1..6` then `STOREDPROOF-ALL PASS`.
 
 `just e2e-recreated-leaf-recovery` is non-interactive like
 `just e2e-tl-loop-active`: it builds the binary and WASM from this worktree,

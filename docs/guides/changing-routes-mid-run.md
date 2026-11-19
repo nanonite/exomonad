@@ -126,12 +126,58 @@ The host's rejection is `Invalid input: role route configuration is stale or was
 not accepted by this server`. It occurs before any worker or model runs, so the
 action may be retried once the configuration actually agrees. The controller
 recognizes exactly that rejected shape (a rejected `resume_blocked_leaf`, no
-result payload, no launched invocation) and preserves it. After the current
-identity is accepted and the existing terminal-owner gate is freshly approved,
-the normal retry/gate machinery issues one new linked attempt with the current
-route fields. It does not rewrite the rejected action, reset a journal, or clear
-an independent gate, and it does not retry an unknown effect or a rejection with
-a different error.
+result payload, no launched invocation) and preserves it. Once the current
+identity is accepted and the existing terminal-owner gate is approved (a fresh
+approval is required only if the gate was previously rejected), the normal
+retry/gate machinery issues one new linked attempt with the current route
+fields. It does not rewrite the rejected action, reset a journal, or clear an
+independent gate, and it does not retry an unknown effect or a rejection with a
+different error.
+
+### Recovering a stored historical route authorization
+
+A terminal-owner route authorization (`configured_route_authorization`) is
+written under the configuration identity that was accepted when the operator
+approved that exact route. When the identity scheme later changes (the `v1` to
+`v2` migration in #1433), the saved proof is still valid *as history*: it proves
+what was approved then. It is not, by itself, authorization for the next launch,
+and it must not permanently block one either.
+
+`init --continue` separates the two questions:
+
+1. **Historical validity.** The saved record is recomputed with its own recorded
+   `configuration_fingerprint` (`sha256:v1:` for legacy proofs), its own route,
+   prior route, gate binding, role policy, and manifest. The recomputation must
+   reproduce the stored digest exactly. A forged, truncated, or mismatched
+   legacy digest is held with
+   `persisted terminal-owner route authorization does not match its recorded
+   historical identity`; it is never treated as an upgrade.
+2. **Authorization of the next effect.** Only when the saved proof reproduces
+   its own digest *and* every binding field matches the current candidate -
+   source, role, harness, agent, model, effort, prior route, manifest, slice,
+   issue, owner, prior invocation, dispatch intent/generation, branch, worktree
+   fingerprint, accepted spawn and blocker sequences, terminal invocation digest
+   - is one fresh authorization created under the current accepted identity.
+   The fresh proof records
+   `transition: historical_route_authorization_revalidated_for_accepted_configuration`
+   and `supersedes_route_authorization_digest` pointing at the saved proof. The
+   saved proof moves into `configured_route_authorization_history` unchanged.
+
+Only the versioned configuration identity may differ between the two proofs. A
+genuine harness, model, or effort change, a different owner, scope, manifest, or
+predecessor, an unaccepted current identity, an unknown prior effect, a live
+worker, or an independent gate rejection stays held. Repeat continuation reuses
+the already-written fresh proof instead of relinking it, so a crash or response
+loss at the authorization, intent, launch, or adoption boundary cannot create a
+second authorization or a duplicate launch.
+
+The compiled acceptance is
+`E2E_STORED_PROOF_ONLY=1 tests/e2e/init-recovery/run.sh` (or
+`just e2e-stored-proof`). It seeds the retained `sha256:v1:` proof, the rejected
+prelaunch action, the approved gate, and the f446/f285 history, starts a real
+standalone `serve`, and runs `init --continue` with identical explicit flags.
+It prints `STOREDPROOF-1..6` and `STOREDPROOF-ALL PASS`, and it re-runs the
+role-configuration acceptance to keep R1-R4 retained.
 
 ## Operator actions
 

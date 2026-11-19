@@ -842,13 +842,24 @@ e2e-init-recovery:
 e2e-role-config:
     E2E_ROLE_CONFIG_ONLY=1 ./tests/e2e/init-recovery/run.sh
 
+# Run the reopened #1433 stored-proof acceptance: the retained sha256:v1
+# terminal-owner authorization, rejected prelaunch action and approved #814
+# gate are reconciled to the current accepted v2 snapshot through standalone
+# serve + init --continue, yielding exactly one linked generation-3 OpenCode
+# DeepSeek/high successor with duplicate-free repeats, a supported restart,
+# negative controls and the retained R1-R4 role-configuration acceptance.
+# Harnesses are disposable shims; no provider is contacted.
+e2e-stored-proof:
+    E2E_STORED_PROOF_ONLY=1 ./tests/e2e/init-recovery/run.sh
+
 # Check the init-recovery E2E harness without launching tmux
 check-e2e-init-recovery:
     bash -n tests/e2e/init-recovery/run.sh
     bash -n tests/e2e/init-recovery/fake-codex.sh
     bash -n tests/e2e/init-recovery/fast-start-acceptance.sh
     bash -n tests/e2e/init-recovery/role-config-acceptance.sh
-    {{py}} -m py_compile tests/e2e/init-recovery/check_role_config_preflight.py
+    bash -n tests/e2e/init-recovery/stored-proof-acceptance.sh
+    {{py}} -m py_compile tests/e2e/init-recovery/check_role_config_preflight.py tests/e2e/init-recovery/seed-stored-proof.py tests/e2e/init-recovery/check-stored-proof-negatives.py
     bash -n tests/e2e/init-recovery/tl-window-state.sh
     bash -n tests/e2e/init-recovery/test-tl-window-state.sh
     tests/e2e/init-recovery/test-tl-window-state.sh

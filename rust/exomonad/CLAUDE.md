@@ -186,6 +186,12 @@ rejection. Unit tests cover the producer against a real UDS `/health` response
 sites; `tests/e2e/init-recovery/check_role_config_preflight.py` rejects textual
 bypasses. The compiled acceptance is
 `E2E_ROLE_CONFIG_ONLY=1 tests/e2e/init-recovery/run.sh` (`just e2e-role-config`).
+The stored-proof counterpart is `E2E_STORED_PROOF_ONLY=1` (`just
+e2e-stored-proof`): the host acceptance checks are unchanged, and the compiled
+run proves that a retained `sha256:v1:` terminal-owner authorization is
+recomputed under its own semantics by the controller and superseded by one
+fresh `sha256:v2:` launch authorization, with the real server accepting exactly
+one generation-3 successor.
 `route.configuration_fingerprint` still comes from this identity;
 `route_fingerprint` keeps its source-aware `sha256:v1:` route-receipt binding as
 audit evidence.

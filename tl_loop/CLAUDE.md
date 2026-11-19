@@ -1057,11 +1057,34 @@ A rejected pre-launch `resume_blocked_leaf` whose exact result is
 `Invalid input: role route configuration is stale or was not accepted by this
 server` (no result payload, no launched invocation) is recognized by
 `_is_prelaunch_role_configuration_refusal`. Its rejected action/result is
-preserved. After the current accepted identity agrees and a fresh human-gate
-approval exists, the existing `fresh_legacy_refusal_retry` path authorizes one
-new linked attempt with the current route fields; an unresolved/unknown effect,
-an independent rejection, or a missing fresh gate stays held. Old `v1` action
-arguments are never rewritten.
+preserved. After the current accepted identity agrees and the human-gate
+approval stands (a fresh approval is required only after an explicit
+rejection), `fresh_legacy_refusal_retry` or
+`_historical_configuration_refusal_retry` authorizes one new linked attempt with
+the current route fields; an unresolved/unknown effect, an independent
+rejection, or a missing fresh gate stays held. Old `v1` action arguments are
+never rewritten.
+
+A stored `configured_route_authorization` written under an older identity scheme
+is history, not current authority. `_terminal_owner_recovery_proof` separates
+the two: `_historical_terminal_route_authorization_is_genuine` recomputes the
+saved digest with the record's own `configuration_fingerprint`, route, prior
+route, gate binding, role policy and manifest, and
+`_terminal_route_authorization_historical_reconciliation` creates one fresh
+proof under the current accepted identity only when every binding field matches
+exactly and only the versioned identity differs. The fresh record carries
+`transition: historical_route_authorization_revalidated_for_accepted_configuration`
+and supersedes the saved digest; the saved proof is appended to
+`configured_route_authorization_history` unchanged. A forged or malformed legacy
+digest is refused with
+`persisted terminal-owner route authorization does not match its recorded
+historical identity`. `_terminal_route_authorization_reconciliation_replay_matches`
+reuses the fresh proof on repeat continuation, so crash/response-loss boundaries
+at authorization, intent, launch and adoption never duplicate an effect.
+`_unresolved_historical_resume_effect` keeps a dispatched-but-unresolved effect
+from an older epoch held. The compiled acceptance is
+`just e2e-stored-proof` (`E2E_STORED_PROOF_ONLY=1`), which prints
+`STOREDPROOF-1..6` and `STOREDPROOF-ALL PASS`.
 
 See [docs/guides/changing-routes-mid-run.md](../docs/guides/changing-routes-mid-run.md).
 

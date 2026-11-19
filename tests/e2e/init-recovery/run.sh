@@ -1825,9 +1825,9 @@ PY
 }
 
 e2e_phase "Phase 0" "Checking preconditions..."
-if [[ "${E2E_ROLE_CONFIG_ONLY:-0}" == "1" ]]; then
-    # The role-configuration phase never shells out to ripgrep, so the fixed
-    # `E2E_ROLE_CONFIG_ONLY=1 ./run.sh` contract also works from a host shell
+if [[ "${E2E_ROLE_CONFIG_ONLY:-0}" == "1" || "${E2E_STORED_PROOF_ONLY:-0}" == "1" ]]; then
+    # The role-configuration and stored-proof phases never shell out to
+    # ripgrep, so their fixed `./run.sh` contracts also work from a host shell
     # that does not have rg on PATH. The other modes still require it.
     e2e_require_commands nix tmux git curl chainlink python3
 else
@@ -1932,6 +1932,25 @@ if [[ "${E2E_ROLE_CONFIG_ONLY:-0}" == "1" ]]; then
         "$PROJECT_ROOT" "$WASM_ARTIFACT_DIR"
     printf 'ROLECONFIG-ALL PASS\n'
     e2e_log "PASS: ROLECONFIG-ALL PASS"
+    exit 0
+fi
+
+# Stored-proof acceptance (#1433 reopened): the retained v1 terminal-owner
+# authorization, rejected prelaunch action and approved #814 gate reconciled to
+# the current accepted v2 snapshot through the real init/serve path. Reuses the
+# same Phase 0 build, fresh WASM, isolated homes and a run-scoped tmux server;
+# it also re-runs the role-configuration acceptance so R1-R4 stay retained.
+if [[ "${E2E_STORED_PROOF_ONLY:-0}" == "1" ]]; then
+    AGGREGATE_TMUX_TMPDIR="$(mktemp -d "${E2E_TMUX_TMPDIR_ROOT:-${TMPDIR:-/tmp}}/exo1433-stored-tmux.XXXXXX")"
+    unset TMUX TMUX_PANE
+    export TMUX_TMPDIR="$AGGREGATE_TMUX_TMPDIR"
+    e2e_log "Stored-proof tmux server isolated to $TMUX_TMPDIR"
+    STORED_HOME="$WORK_DIR/stored-proof-home"
+    mkdir -p "$STORED_HOME/.exo"
+    bash "$SCRIPT_DIR/stored-proof-acceptance.sh" \
+        "$EXOMONAD_BIN" "$WORK_DIR/stored-proof" "$STORED_HOME" "$CODEX_HOME" \
+        "$PROJECT_ROOT" "$WASM_ARTIFACT_DIR"
+    e2e_log "PASS: STOREDPROOF-ALL PASS"
     exit 0
 fi
 
