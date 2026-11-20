@@ -164,6 +164,14 @@ impl<C: HasEventLog + 'static> TlEffects for TlHandler<C> {
             .append_with_seq(&req.event_type, ctx.agent_name.as_str(), &payload)
             .map_err(|error| EffectError::custom("tl_event_append_failed", error.to_string()))?;
 
+        // The compiled interruption acceptance stops the real server after the
+        // controller's request is durable but before any launch can follow.
+        if req.event_type == "tl.spawn_requested" {
+            if let Some(intent) = payload.get("intent_id").and_then(Value::as_str) {
+                crate::e2e_interrupt::interrupt_at("request_persisted", intent);
+            }
+        }
+
         Ok(EmitEventResponse { event_id, run_seq })
     }
 }

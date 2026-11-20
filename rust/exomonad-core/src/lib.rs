@@ -79,6 +79,8 @@ pub mod util;
 
 // === Handlers and services (requires runtime feature) ===
 #[cfg(feature = "runtime")]
+mod e2e_interrupt;
+#[cfg(feature = "runtime")]
 pub mod handlers;
 #[cfg(feature = "runtime")]
 pub mod services;

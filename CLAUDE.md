@@ -905,7 +905,13 @@ the exact prelaunch refusal is durable, then proves the reauthorized v2 retry
 selects one declaration, launches one real generation-3 OpenCode DeepSeek/high
 successor, adds no duplicate across repeat init, server restart, adoption and
 concurrent requests, holds every host negative control, and leaves historical
-bytes unchanged. Set `E2E_DISPATCH_RETAIN_ARTIFACTS` to retain and independently
+bytes unchanged. Before that retry it pauses the real compiled server after
+authorization persistence, after request persistence, after launch and after
+durable adoption, kills the controller and host at that exact window, then
+restarts and re-runs compiled `init --continue` at each boundary; see the
+interruption table in
+`docs/guides/changing-routes-mid-run.md`. Set
+`E2E_DISPATCH_RETAIN_ARTIFACTS` to retain and independently
 rehash the exact binary, WASM guests and controller archive consumed by the
 passing run. It
 prints `DISPATCH-1..6` then `DISPATCH-ALL PASS`. The resolver and its

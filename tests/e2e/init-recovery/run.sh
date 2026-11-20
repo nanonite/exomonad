@@ -1825,7 +1825,7 @@ PY
 }
 
 e2e_phase "Phase 0" "Checking preconditions..."
-if [[ "${E2E_ROLE_CONFIG_ONLY:-0}" == "1" || "${E2E_STORED_PROOF_ONLY:-0}" == "1" || "${E2E_DISPATCH_COLLISION_ONLY:-0}" == "1" ]]; then
+if [[ "${E2E_ROLE_CONFIG_ONLY:-0}" == "1" || "${E2E_STORED_PROOF_ONLY:-0}" == "1" || "${E2E_DISPATCH_COLLISION_ONLY:-0}" == "1" || "${E2E_DISPATCH_INTERRUPT_ONLY:-0}" == "1" ]]; then
     # The role-configuration, stored-proof and dispatch-collision phases never
     # shell out to ripgrep, so their fixed `./run.sh` contracts also work from a
     # host shell that does not have rg on PATH. The other modes still require it.
@@ -1959,6 +1959,37 @@ if [[ "${E2E_DISPATCH_COLLISION_ONLY:-0}" == "1" ]]; then
         "$PROJECT_ROOT" "$WASM_ARTIFACT_DIR" "$DISPATCH_RETAINED"
     printf 'DISPATCH-ALL PASS\n'
     e2e_log "PASS: DISPATCH-ALL PASS"
+    exit 0
+fi
+
+# Compiled interruption acceptance (#1544): each boundary gets its own fresh
+# disposable fixture so one interruption cannot contaminate the next. The real
+# compiled serve is paused after the durable boundary, the controller/init is
+# stopped through the supported workspace shutdown, the host is killed, and the
+# restart must reconcile exactly once.
+if [[ "${E2E_DISPATCH_INTERRUPT_ONLY:-0}" == "1" ]]; then
+    DISPATCH_RETAINED="${E2E_DISPATCH_RETAINED:-/home/goya/beast-workspace/workspace/.exo/tl-loop/repair-backups/controlled-plan-20261119T022328Z}"
+    [[ -d "$DISPATCH_RETAINED" ]] \
+        || e2e_fail "the retained dispatch evidence directory is missing: $DISPATCH_RETAINED"
+    AGGREGATE_TMUX_TMPDIR="$(mktemp -d "${E2E_TMUX_TMPDIR_ROOT:-${TMPDIR:-/tmp}}/exo1511-dispatch-tmux.XXXXXX")"
+    unset TMUX TMUX_PANE
+    export TMUX_TMPDIR="$AGGREGATE_TMUX_TMPDIR"
+    e2e_log "Dispatch-interruption tmux server isolated to $TMUX_TMPDIR"
+    for boundary in authorization_persisted request_persisted launch_before_adoption adoption_before_response; do
+        DISPATCH_HOME="$WORK_DIR/dispatch-interrupt-$boundary-home"
+        mkdir -p "$DISPATCH_HOME/.exo"
+        if [[ -n "${E2E_DISPATCH_RETAIN_ARTIFACTS:-}" ]]; then
+            export E2E_DISPATCH_RETAIN_ARTIFACTS="$E2E_DISPATCH_RETAIN_ARTIFACTS/$boundary"
+        fi
+        E2E_DISPATCH_INTERRUPT_BOUNDARY="$boundary" \
+            bash "$SCRIPT_DIR/dispatch-collision-acceptance.sh" \
+            "$EXOMONAD_BIN" "$WORK_DIR/dispatch-interrupt-$boundary" "$DISPATCH_HOME" \
+            "$CODEX_HOME" "$PROJECT_ROOT" "$WASM_ARTIFACT_DIR" "$DISPATCH_RETAINED"
+        printf 'DISPATCH-INTERRUPT-%s PASS\n' "$boundary"
+        e2e_log "PASS: DISPATCH-INTERRUPT-$boundary"
+    done
+    printf 'DISPATCH-INTERRUPT-ALL PASS\n'
+    e2e_log "PASS: DISPATCH-INTERRUPT-ALL PASS"
     exit 0
 fi
 

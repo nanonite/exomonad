@@ -7273,10 +7273,17 @@ def _terminal_owner_recovery_proof(
                 "owner invocation is not a proven terminal, incomplete assignment predecessor",
             )
         terminal_digest = _terminal_invocation_digest(invocation)
-        if is_checkpointed_resume or history_resume_predecessor:
+        if (
+            (is_checkpointed_resume or history_resume_predecessor)
+            and latest_resume_entry is not None
+            and latest_resume_entry.get("status") == "confirmed"
+        ):
             # The confirmed historical launch is now terminal. Keep its journal
             # result as immutable evidence, but build the next intent from this
             # actual predecessor's route rather than replaying its old request.
+            # A later unresolved entry belongs to the current recovery round and
+            # must be replayed, not discarded: discarding it would leave two
+            # unresolved resume actions and force a reconciliation hold.
             existing_args = None
             latest_resume_entry = None
     elif isinstance(existing_args, Mapping):
@@ -7585,7 +7592,26 @@ def _terminal_owner_recovery_proof(
         # them to the preceding result in the durable invocation chain.
         expected_arguments = (*expected_arguments, ("task", leaf.task))
         conflicts = [key for key, value in expected_arguments if existing_args.get(key) != value]
+        # A live controller checkpoint can advance the gate answer's
+        # state-version evidence between two observations of the same
+        # unresolved request. The route identity did not change, and the earlier
+        # declaration may already be on the ledger: replay the recorded action
+        # instead of minting a distinct started_at. Any route or ownership
+        # conflict still fails closed below.
+        replay_unresolved_same_route = (
+            bool(conflicts)
+            and latest_resume_entry is not None
+            and latest_resume_entry.get("status") in {"intended", "unknown"}
+            and set(conflicts) <= {"recovery_gate_authorization"}
+        )
         if conflicts:
+            LOGGER.warning(
+                "terminal-owner resume conflict keys=%s unresolved_status=%s replay=%s",
+                ",".join(conflicts),
+                latest_resume_entry.get("status") if latest_resume_entry is not None else None,
+                replay_unresolved_same_route,
+            )
+        if conflicts and not replay_unresolved_same_route:
             fresh_legacy_refusal_retry = (
                 latest_resume_entry is not None
                 and (
@@ -9096,6 +9122,21 @@ def _resume_approved_blocked_leaf(
         attempt = _blocked_leaf_dispatch_attempt(
             initial_arguments, proof.current, proof.route_fields
         )
+        # An unresolved action is the durable request: replay its recorded
+        # observation fields instead of minting a new started_at/attempt. A
+        # new observation under the same stable key would overwrite the journal
+        # entry while leaving two distinct ledger declarations for the host to
+        # reconcile.
+        if (
+            initial_entry is not None
+            and initial_entry.get("status") in {"intended", "unknown"}
+            and isinstance(initial_entry.get("arguments"), Mapping)
+        ):
+            recorded_arguments = cast(Mapping[str, object], initial_entry["arguments"])
+            initial_arguments = recorded_arguments
+            attempt = _blocked_leaf_dispatch_attempt(
+                recorded_arguments, proof.current, proof.route_fields
+            )
     except (ActionJournalError, KeyError, TypeError, ValueError, OSError) as error:
         return _hold_owner_resume(
             state,

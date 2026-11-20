@@ -24299,6 +24299,16 @@ def test_interruption_after_request_journaling_replays_exactly_once(
     current = json.loads((owner_dir / "invocation.json").read_text(encoding="utf-8"))
     assert current["invocation_id"] == prior_invocation_id
 
+    # The restart must replay that exact unresolved request instead of
+    # minting a second dispatch attempt. The terminal-owner proof still sees
+    # the historical confirmed launch, but the latest unresolved entry belongs
+    # to this recovery round and keeps its action arguments.
+    restarted_proof, proof_reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert restarted_proof is not None, proof_reason
+    assert restarted_proof.resume.action_arguments == entries[1]["arguments"]
+
     successor_id = "request-boundary-successor"
     restarted_transport = _accepted_configuration_transport(
         owner_dir, owner_name, prior_invocation_id, successor_id
@@ -24314,6 +24324,14 @@ def test_interruption_after_request_journaling_replays_exactly_once(
     assert sum(
         tool == "resume_blocked_leaf" for tool, _ in restarted_transport.calls
     ) == 1
+    spawn_requested = [
+        arguments["payload"]
+        for tool, arguments in restarted_transport.calls
+        if tool == "emit_controller_event"
+        and arguments.get("event_type") == "tl.spawn_requested"
+    ]
+    assert spawn_requested, restarted_transport.calls
+    assert spawn_requested[-1]["started_at"] == entries[1]["arguments"]["dispatch_started_at"]
     entries = journal.entries_for("resume_blocked_leaf", leaf.name)
     assert [entry["status"] for entry in entries] == ["rejected", "confirmed"]
     assert resumed.slices[leaf.name].dispatch_invocation_id == successor_id

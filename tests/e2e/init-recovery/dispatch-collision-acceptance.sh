@@ -53,6 +53,7 @@ RETAINED="$WORK/retained"
 RETAINED_HASHES_BEFORE="$WORK/retained-hashes-before.sha256"
 RETAINED_HASHES_AFTER="$WORK/retained-hashes-after.sha256"
 RETAINED_ARTIFACTS="${E2E_DISPATCH_RETAIN_ARTIFACTS:-}"
+INTERRUPT_DIR="$WORK/interrupt-evidence"
 ACCEPTANCE_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 MOCK_PID=""
 SERVER_PID=""
@@ -111,7 +112,7 @@ export E2E_REPO="$REPO"
 export CHAINLINK_DB="$REPO/.chainlink/issues.db"
 export EXOMONAD_TMUX_SESSION="$SESSION"
 
-mkdir -p "$WORK" "$REPO" "$STORED_HOME/.exo" "$(dirname "$REMOTE")" "$SHIM_DIR" "$RETAINED"
+mkdir -p "$WORK" "$REPO" "$STORED_HOME/.exo" "$(dirname "$REMOTE")" "$SHIM_DIR" "$RETAINED" "$INTERRUPT_DIR"
 if [[ -n "$RETAINED_ARTIFACTS" ]]; then
     mkdir -p "$RETAINED_ARTIFACTS"
     RETAINED_ARTIFACTS="$(cd "$RETAINED_ARTIFACTS" && pwd)"
@@ -471,6 +472,8 @@ run_env() {
 
 start_server() {
     local log="$1"
+    local interrupt_at="${2:-}"
+    local interrupt_action="${3:-}"
     (
         cd "$REPO" || exit 1
         export HOME="$STORED_HOME" CODEX_HOME="$CODEX_HOME"
@@ -485,6 +488,14 @@ start_server() {
         export FORGEJO_TOKEN="test-token-e2e" FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e"
         export CHAINLINK_DB="$REPO/.chainlink/issues.db"
         export EXOMONAD_TMUX_SESSION="$SESSION"
+        if [[ -n "$interrupt_at" ]]; then
+            export EXOMONAD_E2E_INTERRUPT_AT="$interrupt_at"
+            export EXOMONAD_E2E_INTERRUPT_SCOPE="$INTENT_ID"
+            export EXOMONAD_E2E_INTERRUPT_DIR="$INTERRUPT_DIR"
+            if [[ -n "$interrupt_action" ]]; then
+                export EXOMONAD_E2E_INTERRUPT_ACTION="$interrupt_action"
+            fi
+        fi
         exec "$EXOMONAD_BIN" serve
     ) > "$log" 2>&1 &
     SERVER_PID=$!
@@ -516,6 +527,122 @@ stop_server() {
         sleep 0.1
     done
     [[ ! -S "$REPO/.exo/server.sock" ]] || { cat "$log" 2>/dev/null || true; fail "server did not release its socket"; }
+}
+
+recover_crashed_server() {
+    # The barrier aborts the real server, so no shutdown handler removes the
+    # disposable socket inode or pid file. Reap the child and clear only those
+    # runtime files; no project, ledger or owner state is touched.
+    if [[ -n "$SERVER_PID" ]]; then
+        wait "$SERVER_PID" 2>/dev/null || true
+        SERVER_PID=""
+    fi
+    rm -f "$REPO/.exo/server.sock" "$REPO/.exo/server.pid"
+}
+
+wait_for_interrupt_marker() {
+    local boundary="$1"
+    local marker="$INTERRUPT_DIR/$boundary.json"
+    for _ in $(seq 1 2400); do
+        [[ -s "$marker" ]] && return 0
+        sleep 0.05
+    done
+    cat "$WORK/server-"*.log 2>/dev/null || true
+    fail "the compiled server never reached the $boundary interruption boundary"
+}
+
+kill_controller_process() {
+    # Fallback used only if the supported shutdown cannot reach the paused host.
+    local target="$REPO/.exo/tl-loop/root/controller-target.json"
+    local pane_id=""
+    if [[ -f "$target" ]]; then
+        pane_id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pane_id",""))' "$target" 2>/dev/null || true)"
+    fi
+    if [[ -n "$pane_id" ]]; then
+        local pane_pid=""
+        pane_pid="$(tmux_iso list-panes -a -F '#{pane_id} #{pane_pid}' 2>/dev/null \
+            | awk -v target="$pane_id" '$1 == target { print $2; exit }')"
+        if [[ -n "$pane_pid" ]]; then
+            local pane_pgid=""
+            pane_pgid="$(ps -o pgid= -p "$pane_pid" 2>/dev/null | tr -d ' ' || true)"
+            if [[ -n "$pane_pgid" ]]; then
+                kill -9 -- "-$pane_pgid" 2>/dev/null || true
+            fi
+            pkill -9 -P "$pane_pid" 2>/dev/null || true
+            kill -9 "$pane_pid" 2>/dev/null || true
+        fi
+        tmux_iso kill-pane -t "$pane_id" 2>/dev/null || true
+    else
+        tmux_iso kill-window -t "$SESSION:TL" 2>/dev/null || true
+    fi
+}
+
+run_init_at_boundary() {
+    local boundary="$1"
+    local log="$2"
+    local status=0
+    (
+        cd "$REPO"
+        run_env "$EXOMONAD_BIN" init --continue --session "$SESSION" "${ROLE_FLAGS[@]}"
+    ) > "$log" 2>&1 &
+    INIT_PID=$!
+    wait_for_interrupt_marker "$boundary"
+    local host_pid=""
+    if [[ -f "$REPO/.exo/server.pid" ]]; then
+        host_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",""))' "$REPO/.exo/server.pid" 2>/dev/null || true)"
+    fi
+    # The host has durably crossed the boundary and is paused before returning.
+    # Stop the still-live controller through the supported workspace shutdown
+    # while the host is paused, so the child invocation is cleanly marked
+    # killed instead of dying on an unreachable-socket checkpoint. Then crash
+    # the paused host process; the durable boundary state is already written.
+    local shutdown_log="$WORK/shutdown-after-interrupt-$boundary.log"
+    (
+        cd "$REPO"
+        HOME="$STORED_HOME" "$EXOMONAD_BIN" shutdown --workspace
+    ) > "$shutdown_log" 2>&1 &
+    local shutdown_pid=$!
+    local shutdown_exited=0
+    for _ in $(seq 1 600); do
+        if ! kill -0 "$shutdown_pid" 2>/dev/null; then
+            shutdown_exited=1
+            break
+        fi
+        sleep 0.05
+    done
+    if (( shutdown_exited == 0 )); then
+        kill -9 "$shutdown_pid" 2>/dev/null || true
+        kill_controller_process
+    fi
+    wait "$shutdown_pid" 2>/dev/null || true
+    # Stop the init wrapper before the host: a live init may otherwise start a
+    # replacement server while the boundary host is being killed.
+    if kill -0 "$INIT_PID" 2>/dev/null; then
+        kill -9 "$INIT_PID" 2>/dev/null || true
+        status=124
+    fi
+    wait "$INIT_PID" 2>/dev/null || true
+    INIT_PID=""
+    if [[ -n "$host_pid" ]]; then
+        kill -9 "$host_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$SERVER_PID" ]]; then
+        kill -9 "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+        SERVER_PID=""
+    fi
+    if [[ -n "$host_pid" ]]; then
+        for _ in $(seq 1 200); do
+            kill -0 "$host_pid" 2>/dev/null || break
+            sleep 0.05
+        done
+        if kill -0 "$host_pid" 2>/dev/null; then
+            fail "the paused compiled host did not exit at the $boundary interruption"
+        fi
+    fi
+    rm -f "$REPO/.exo/server.sock" "$REPO/.exo/server.pid"
+    printf 'interrupted boundary=%s init_status=%s marker=%s controller=shutdown-restart\n' \
+        "$boundary" "$status" "$INTERRUPT_DIR/$boundary.json"
 }
 
 export MOCK_URL
@@ -711,7 +838,9 @@ OLD_REFUSAL_SEQ="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]
 OLD_REFUSAL_ROUTE="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["configuration_fingerprint"], d["route_fingerprint"])' "$WORK/old-host-refusal.json")"
 [[ "$OLD_REFUSAL_ROUTE" == "$LITERAL_V1_FINGERPRINT sha256:v1:13236139e5e0a5aac217d2dac60e0b69c1dbc953a356618a97c8c1367f467724" ]] \
     || fail "the durable host refusal did not carry the retained v1 route: $OLD_REFUSAL_ROUTE"
-printf 'DISPATCH-1 host-recorded prelaunch refusal seq %s carries the old v1 dispatch authorization\n' "$OLD_REFUSAL_SEQ"
+INTENT_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["journal_entries"][-1]["arguments"]["dispatch_intent_id"])' "$WORK/refused-action.json")"
+[[ -n "$INTENT_ID" ]] || fail "the retained refused action has no logical resume intent"
+printf 'DISPATCH-1 host-recorded prelaunch refusal seq %s carries the old v1 dispatch authorization (intent %s)\n' "$OLD_REFUSAL_SEQ" "$INTENT_ID"
 
 say "proving the corrected controller links one fresh v2 authorization over the literal v1 proof"
 python3 "$SOURCE_ROOT/tests/e2e/init-recovery/seed-stored-proof.py" expected \
@@ -790,7 +919,118 @@ wait_for_launch() {
     fail "the corrected controller never launched the linked successor"
 }
 
+INTERRUPT_BOUNDARY="${E2E_DISPATCH_INTERRUPT_BOUNDARY:-}"
+case "$INTERRUPT_BOUNDARY" in
+    ""|authorization_persisted|request_persisted|launch_before_adoption|adoption_before_response) ;;
+    *) fail "unknown dispatch interruption boundary: $INTERRUPT_BOUNDARY" ;;
+esac
+say "stopping the reloaded server to exercise the selected interruption boundary '${INTERRUPT_BOUNDARY:-none}'"
+stop_server "$WORK/server-v2-reloaded.log"
+BEFORE_INTERRUPT="$(count_launches)"
+printf 'interruption baseline %s\n' "$BEFORE_INTERRUPT"
+assert_no_new_launch() {
+    local before="$1"
+    local after="$2"
+    local label="$3"
+    python3 - "$before" "$after" "$label" <<'PY' || fail "$label produced a launch effect"
+import json
+import sys
+
+before = json.loads(sys.argv[1])
+after = json.loads(sys.argv[2])
+label = sys.argv[3]
+for key in ("agent_spawned", "spawn_accepted", "dispatch_generation", "dispatch_invocation_id"):
+    if after[key] != before[key]:
+        raise SystemExit(f"{label}: {key} changed {before[key]!r} -> {after[key]!r}")
+PY
+}
+
+if [[ "$INTERRUPT_BOUNDARY" == "authorization_persisted" ]]; then
+    say "interrupting the compiled server after authorization persistence"
+    start_server "$WORK/server-interrupt-authorization.log" authorization_persisted pause
+    run_init_at_boundary authorization_persisted "$WORK/init-interrupt-authorization.log"
+    assert_no_new_launch "$BEFORE_INTERRUPT" "$(count_launches)" "the authorization interruption"
+    invocation="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["invocation_id"])' "$REPO/.exo/agents/issue-814-substitution-model-kani-opencode/invocation.json")"
+    [[ "$invocation" == "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d" ]] \
+        || fail "the authorization interruption changed the owner invocation: $invocation"
+fi
+
+if [[ "$INTERRUPT_BOUNDARY" == "request_persisted" ]]; then
+    say "interrupting the compiled server after the request is durable and before launch"
+    start_server "$WORK/server-interrupt-request.log" request_persisted pause
+    run_init_at_boundary request_persisted "$WORK/init-interrupt-request.log"
+    assert_no_new_launch "$BEFORE_INTERRUPT" "$(count_launches)" "the request interruption"
+    invocation="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["invocation_id"])' "$REPO/.exo/agents/issue-814-substitution-model-kani-opencode/invocation.json")"
+    [[ "$invocation" == "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d" ]] \
+        || fail "the request interruption changed the owner invocation: $invocation"
+fi
+
+AFTER_LAUNCH=""
+if [[ "$INTERRUPT_BOUNDARY" == "launch_before_adoption" || "$INTERRUPT_BOUNDARY" == "adoption_before_response" ]]; then
+    say "interrupting the compiled server after launch and before controller adoption"
+    start_server "$WORK/server-interrupt-launch.log" launch_before_adoption pause
+    run_init_at_boundary launch_before_adoption "$WORK/init-interrupt-launch.log"
+    AFTER_LAUNCH="$(count_launches)"
+    python3 - "$BEFORE_INTERRUPT" "$AFTER_LAUNCH" "$REPO" <<'PY' || fail "the launch interruption did not retain exactly one successor"
+import json
+import sys
+from pathlib import Path
+
+before = json.loads(sys.argv[1])
+after = json.loads(sys.argv[2])
+repo = Path(sys.argv[3])
+assert after["agent_spawned"] == before["agent_spawned"] + 1, (before, after)
+invocation = json.loads(
+    (repo / ".exo/agents/issue-814-substitution-model-kani-opencode/invocation.json").read_text(
+        encoding="utf-8"
+    )
+)
+assert invocation["generation"] == 3, invocation
+assert invocation["prior_invocation_id"] == "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d", invocation
+ledger = [
+    json.loads(line)
+    for segment in sorted((repo / ".exo/ledger/segments").glob("segment-*.jsonl"))
+    for line in segment.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+launches = [
+    row
+    for row in ledger
+    if row.get("type") == "agent.spawned"
+    and row.get("data", {}).get("invocation_id") == invocation["invocation_id"]
+]
+assert len(launches) == 1, [row.get("run_seq") for row in launches]
+print(json.dumps({"launch_interrupted": True, "after": after}))
+PY
+fi
+
+if [[ "$INTERRUPT_BOUNDARY" == "adoption_before_response" ]]; then
+    if [[ -z "$AFTER_LAUNCH" ]]; then
+        AFTER_LAUNCH="$BEFORE_INTERRUPT"
+    fi
+    say "interrupting the compiled server after durable adoption and before the response"
+    start_server "$WORK/server-interrupt-adoption.log" adoption_before_response pause
+    run_init_at_boundary adoption_before_response "$WORK/init-interrupt-adoption.log"
+    assert_no_new_launch "$AFTER_LAUNCH" "$(count_launches)" "the adoption interruption"
+    invocation="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["generation"])' "$REPO/.exo/agents/issue-814-substitution-model-kani-opencode/invocation.json")"
+    [[ "$invocation" == "3" ]] \
+        || fail "the adoption interruption changed the invocation generation: $invocation"
+fi
+
+if [[ -z "$INTERRUPT_BOUNDARY" ]]; then
+    say "no dispatch interruption boundary selected; running the uninterrupted acceptance"
+else
+    say "restarting the standalone server after the $INTERRUPT_BOUNDARY interruption"
+    # The boundary run's init-managed Server window is stale after the abrupt
+    # host kill. Remove only that window (never the TL or independent worker
+    # window) so the replacement external server and the continued init start
+    # from a clean control-plane pane.
+    tmux_iso kill-window -t "$SESSION:Server" 2>/dev/null || true
+    tmux_iso kill-window -t "$SESSION:Watcher" 2>/dev/null || true
+fi
+start_server "$WORK/server-after-interruptions.log"
 say "running init --continue with identical explicit role flags"
+
 (
     cd "$REPO"
     run_env "$EXOMONAD_BIN" init --continue --session "$SESSION" "${ROLE_FLAGS[@]}"
@@ -1070,7 +1310,7 @@ run_repeat() {
 
 run_repeat after-launch-and-adoption
 say "restarting only the standalone server from the same project configuration"
-stop_server "$WORK/server-v2-reloaded.log"
+stop_server "$WORK/server-after-interruptions.log"
 start_server "$WORK/server-restarted.log"
 [[ "$(health_identity)" == "$ACCEPTED_IDENTITY" ]] \
     || fail "the restarted standalone server accepted a different identity"
@@ -1297,6 +1537,16 @@ if [[ -n "$RETAINED_ARTIFACTS" ]]; then
     cp "$WORK/old-host-refusal.json" "$RETAINED_ARTIFACTS/evidence/old-host-refusal.json"
     cp "$WORK/dispatch-negatives.log" "$RETAINED_ARTIFACTS/evidence/dispatch-negatives.log"
     cp "$WORK/health.json" "$RETAINED_ARTIFACTS/evidence/health.json"
+    if [[ -n "$INTERRUPT_BOUNDARY" ]]; then
+        for marker in "$INTERRUPT_DIR"/*.json; do
+            [[ -s "$marker" ]] || fail "an interruption boundary marker is missing: $marker"
+            cp "$marker" "$RETAINED_ARTIFACTS/evidence/interrupt-$(basename "$marker")"
+        done
+        for interrupted in "$WORK"/init-interrupt-*.log; do
+            [[ -f "$interrupted" ]] || fail "an interruption init log is missing: $interrupted"
+            cp "$interrupted" "$RETAINED_ARTIFACTS/evidence/$(basename "$interrupted")"
+        done
+    fi
     python3 - "$RETAINED_ARTIFACTS" "$SOURCE_ROOT" "$EXOMONAD_BIN" "$WASM_DIR" \
         "$STORED_HOME/.exo/tl_loop.pyz" "$ACCEPTANCE_STARTED_AT" "$ACCEPTANCE_FINISHED_AT" \
         "$OLD_REFUSAL_SEQ" "$NEW_SELECTED" <<'PYRETAIN' \
@@ -1403,6 +1653,12 @@ if [[ -n "${E2E_DISPATCH_COLLISION_ARTIFACTS:-}" ]]; then
     for document in stored-proof.json refused-action.json expected-v2.json \
         health.json init-stored-proof.log mock.log seed.json; do
         [[ -f "$WORK/$document" ]] && cp "$WORK/$document" "$E2E_DISPATCH_COLLISION_ARTIFACTS/"
+    done
+    for marker in "$INTERRUPT_DIR"/*.json; do
+        [[ -s "$marker" ]] && cp "$marker" "$E2E_DISPATCH_COLLISION_ARTIFACTS/"
+    done
+    for interrupted in "$WORK"/init-interrupt-*.log; do
+        [[ -f "$interrupted" ]] && cp "$interrupted" "$E2E_DISPATCH_COLLISION_ARTIFACTS/"
     done
     cp "$RETAINED_HASHES_BEFORE" "$E2E_DISPATCH_COLLISION_ARTIFACTS/retained-hashes-before.sha256"
     cp "$RETAINED_HASHES_AFTER" "$E2E_DISPATCH_COLLISION_ARTIFACTS/retained-hashes-after.sha256"

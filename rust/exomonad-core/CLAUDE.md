@@ -549,7 +549,11 @@ name the ledger sequences and safe identity fields. One idempotent
 historical events and journals are only appended to, never rewritten. The wire
 contract is unchanged: no proto or Haskell type changes, because the full route
 tuple and the stable intent id already cross the boundary. Tests live in the
-module; the compiled acceptance is `just e2e-dispatch-collision`.
+module; the compiled acceptance is `just e2e-dispatch-collision`, which also
+pauses the real `serve` process at the authorization, request, launch and
+adoption boundaries through the inert-unless-configured
+`src/e2e_interrupt.rs` hook, kills the controller and host at that window, and
+proves each restart reconciles exactly once.
 
 The accepted configuration itself is one canonical `sha256:v2:` identity over
 each role's effective harness/model/effort, computed by the single

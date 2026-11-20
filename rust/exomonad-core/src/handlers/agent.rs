@@ -318,6 +318,10 @@ impl<
                 route,
                 &resolution,
             )?;
+            // The compiled interruption acceptance stops the real server after
+            // the supersession decision is durable but before the request can
+            // launch anything.
+            crate::e2e_interrupt::interrupt_at("authorization_persisted", dispatch_intent_id);
         }
         Ok(())
     }
@@ -4393,6 +4397,10 @@ impl<
                 }),
             );
         }
+        // The compiled interruption acceptance stops the real server after the
+        // successor is launched and its launch row is durable, but before the
+        // controller can observe and adopt it.
+        crate::e2e_interrupt::interrupt_at("launch_before_adoption", &intent_id);
         Ok(SpawnLeafSubtreeResponse {
             agent: Some(agent_info),
             invocation: Some(invocation_handoff),
@@ -4524,6 +4532,10 @@ impl<
                 req.expected_branch.as_str(),
             )?;
         }
+        // The compiled interruption acceptance stops the real server after the
+        // already-launched successor is durably adopted, but before the
+        // controller observes the adoption response.
+        crate::e2e_interrupt::interrupt_at("adoption_before_response", intent_id);
         Ok(SpawnLeafSubtreeResponse {
             agent: Some(agent_info),
             invocation: Some(invocation_handoff),

@@ -1102,7 +1102,13 @@ The dispatch fixture seeds the actual prior `tl.dispatch_intended` and
 `tl.spawn_requested` pair through the production `_dispatch_payload` producer,
 keeps the stable logical-resume intent id, replays the old v1 request through
 the production host path so the server durably records the exact prelaunch
-refusal, and then runs the reauthorized v2 retry. It prints `DISPATCH-1..6` and `DISPATCH-ALL PASS`; the host resolution
+refusal, and then runs the reauthorized v2 retry. Before the successful retry
+it pauses the real compiled server after authorization persistence, request
+persistence, launch and durable adoption, kills the controller and host at that
+exact window, then restarts and re-runs compiled `init --continue` at each
+boundary to prove the compiled crash windows, not only the Python controller
+state machine. It prints
+`DISPATCH-1..6` and `DISPATCH-ALL PASS`; the host resolution
 and its negative controls are described in
 `rust/exomonad-core/src/handlers/dispatch_authorization.rs` and
 `docs/guides/changing-routes-mid-run.md`. `tests/e2e/init-recovery/seed-stored-proof.py

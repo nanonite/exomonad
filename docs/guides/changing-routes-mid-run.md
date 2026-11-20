@@ -282,6 +282,45 @@ generation-3 successor, repeat/restart/adoption/concurrent idempotence, the
 host negative controls, and unchanged history. It prints `DISPATCH-1..6` then
 `DISPATCH-ALL PASS`.
 
+#### Interrupted compiled dispatch recovery
+
+Before the successful retry, the same compiled fixture stops the real
+standalone server at four exact durable boundaries by setting
+`EXOMONAD_E2E_INTERRUPT_AT`, `EXOMONAD_E2E_INTERRUPT_SCOPE`,
+`EXOMONAD_E2E_INTERRUPT_DIR` and `EXOMONAD_E2E_INTERRUPT_ACTION=pause` for
+`serve` only. The hook in `rust/exomonad-core/src/e2e_interrupt.rs` writes a
+boundary marker and pauses the handler before it can return; the harness then
+kills the real controller process and the compiled `init` wrapper at that exact
+window, kills the paused server, and restarts both. The hook never changes an
+authorization, gate, ledger row or launch decision, and it is inert unless all
+three routing variables are present. The restart therefore crosses the host
+boundary again from durable state:
+
+| marker | exact boundary | must be true after restart |
+|--------|----------------|----------------------------|
+| `authorization_persisted.json` | after `tl.dispatch_authorization_resolved` is durable, before any request can launch | no `agent.spawned`; the predecessor `f285` is unchanged |
+| `request_persisted.json` | after `tl.spawn_requested` is durable, before the host launch | no `agent.spawned`; the predecessor `f285` is unchanged |
+| `launch_before_adoption.json` | after the successor's launch row is durable, before the controller sees the response | exactly one `agent.spawned`; one generation-3 invocation linked to `f285` |
+| `adoption_before_response.json` | after the already-launched successor is durably adopted, before the controller sees the response | still exactly one `agent.spawned`; no second invocation or worker |
+
+The retry re-emits the same controller request, so `tl.dispatch_intended` and
+`tl.spawn_requested` may be observed more than once with the same intent,
+observation fields and route tuple. That is the deliberate equivalent-duplicate
+case: the resolver collapses it, the authorization audit row is idempotent by
+resolution id, and no duplicate launch, invocation, worker or owner change is
+allowed. The final clean run confirms controller adoption once. Python-only
+driver tests cannot establish these compiled host-process windows, so the
+acceptance keeps both: the unit tests prove the controller state machine, and
+the compiled run proves the real process death and restart.
+
+Current limitation (#1544): the host markers and the standard uninterrupted
+compiled acceptance pass, but a full disposable `init --continue` restart after
+an abrupt host kill is still blocked on its managed Server pane, and a request
+replay after a controller restart can mint a new observation instead of
+reusing the recorded one. Those two gaps are reported on #1544 and are not
+claimed as covered by a green run.
+
+
 ## Operator actions
 
 | Goal | Change | Restart? | Approval flag? |

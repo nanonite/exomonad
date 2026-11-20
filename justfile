@@ -873,6 +873,15 @@ e2e-stored-proof-literal:
 e2e-dispatch-collision:
     E2E_DISPATCH_COLLISION_ONLY=1 ./tests/e2e/init-recovery/run.sh
 
+# Exercise each compiled dispatch interruption boundary (authorization,
+# request, launch and adoption) in its own fresh fixture. The real compiled
+# serve is paused after the durable boundary, the controller/init is stopped
+# through the supported workspace shutdown, the host is killed, and the restart
+# must reconcile exactly once. Set E2E_DISPATCH_RETAIN_ARTIFACTS=<outside> to
+# retain per-boundary execution/rehash evidence.
+e2e-dispatch-interruptions:
+    E2E_DISPATCH_INTERRUPT_ONLY=1 ./tests/e2e/init-recovery/run.sh
+
 # Check the init-recovery E2E harness without launching tmux
 check-e2e-init-recovery:
     bash -n tests/e2e/init-recovery/run.sh
