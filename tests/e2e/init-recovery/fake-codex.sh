@@ -408,7 +408,9 @@ JSON
 fi
 
 case "$role" in
-    dev)
+    # A plan leaf's `dev` role is normalized to `worker` on the dispatch route;
+    # both names describe the same post-tidy leaf fixture.
+    dev|worker)
         [[ "$(basename "$0")" == "codex" && "$model" == "gpt-6-luna" && "$effort" == "xhigh" ]] || {
             printf 'unexpected worker model: %s\n' "$model" >&2
             exit 1

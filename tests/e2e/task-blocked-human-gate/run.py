@@ -9,6 +9,7 @@ the TL controller and CI watcher decision are covered by their focused tests.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import shutil
 import sqlite3
@@ -17,7 +18,9 @@ import sys
 import tempfile
 import time
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -154,6 +157,188 @@ def resume_blocked_leaf(
     return ToolResult.from_raw(
         client.call_tool("tl", "root", "resume_blocked_leaf", args)
     )
+
+
+def _ledger_helpers() -> Any:
+    """Load the fixture's production-shaped ledger writer helpers."""
+    path = (
+        PROJECT_ROOT
+        / "tests/e2e/init-recovery/configured-owner-resume.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "configured_owner_resume_fixture", path
+    )
+    if spec is None or spec.loader is None:
+        raise real.HarnessError("the production ledger fixture helpers are unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _highest_sequence(repo: Path) -> int:
+    highest = 0
+    for path in sorted((repo / ".exo/ledger/segments").glob("segment-*.jsonl")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            sequence = json.loads(line).get("run_seq")
+            if type(sequence) is int and sequence > highest:
+                highest = sequence
+    return highest
+
+
+def configured_resume_route(
+    client: real.TransportClient,
+    *,
+    repo: Path,
+    owner_dir: Path,
+    identity_record: Mapping[str, Any],
+    invocation_record: Mapping[str, Any],
+    branch: str,
+    worktree: Path,
+    worktree_fingerprint: str,
+    issue_id: int,
+) -> dict[str, str]:
+    """Build the accepted worker route and stable logical intent for a resume.
+
+    The host now requires the full accepted role route (and its durable
+    dispatch declaration) for every blocked-leaf resume. The route fingerprint
+    comes from the same production producer the controller uses; the logical
+    intent is the unchanged stable owner key.
+    """
+    from tl_loop.loop.blocked_leaf_resume import (
+        BlockedLeafOwner,
+        blocked_resume_intent_id,
+    )
+    from tl_loop.loop.driver import _dispatch_route_fields
+
+    health = client.get_json("/health")
+    if not isinstance(health, dict):
+        raise real.HarnessError(f"server health is not an object: {health!r}")
+    configuration = health.get("role_route_configuration")
+    if not isinstance(configuration, dict) or not isinstance(
+        configuration.get("identity"), str
+    ):
+        raise real.HarnessError(
+            f"server has no accepted role configuration: {health!r}"
+        )
+    route_fields = _dispatch_route_fields(
+        SimpleNamespace(
+            role="worker",
+            worker_effort_level="xhigh",
+            policy=None,
+            role_route_configuration_fingerprint=configuration["identity"],
+        ),
+        SimpleNamespace(plan_manifest=None),
+        harness="codex/gpt-6-luna",
+        agent_type="codex",
+        model="gpt-6-luna",
+        choice=None,
+    )
+    owner = BlockedLeafOwner(
+        directory=owner_dir,
+        agent_name=str(identity_record["agent_name"]),
+        slice_id=str(identity_record.get("slice_id") or identity_record["slug"]),
+        issue_id=issue_id,
+        prior_invocation_id=str(invocation_record["invocation_id"]),
+        generation=int(invocation_record.get("generation", 0)),
+        runtime=str(invocation_record.get("runtime", "")),
+        model=invocation_record.get("model"),
+        effort=invocation_record.get("effort"),
+        branch=branch,
+        parent_branch=str(identity_record.get("parent_branch") or "main"),
+        worktree=worktree,
+        worktree_recorded=str(identity_record["working_dir"]),
+        worktree_fingerprint=worktree_fingerprint,
+        invocation_record=invocation_record,
+    )
+    return {
+        "role": str(route_fields["role"]),
+        "harness": "codex/gpt-6-luna",
+        "agent_type": "codex",
+        "model": "gpt-6-luna",
+        "effort": str(route_fields["effort"]),
+        "configuration_fingerprint": str(
+            route_fields["route_configuration_fingerprint"]
+        ),
+        "policy_fingerprint": route_fields["route_policy_fingerprint"],
+        "manifest_digest": route_fields["route_manifest_digest"],
+        "route_fingerprint": str(route_fields["route_fingerprint"]),
+        "dispatch_intent_id": blocked_resume_intent_id(owner),
+        "scope_id": str(identity_record.get("slice_id") or identity_record["slug"]),
+    }
+
+
+def seed_resume_dispatch_declaration(
+    repo: Path, route: Mapping[str, str], *, caller: str = "root"
+) -> int:
+    """Seed the one producer-real declaration this resume authorizes."""
+    from tl_loop.loop.driver import DispatchAttempt, _dispatch_payload
+
+    helpers = _ledger_helpers()
+    attempt = DispatchAttempt(
+        intent_id=route["dispatch_intent_id"],
+        started_at=time.time(),
+        harness=route["harness"],
+        agent_type=route["agent_type"],
+        model=route["model"],
+        attempt=1,
+        role=route["role"],
+        effort=route["effort"],
+        route_configuration_fingerprint=route["configuration_fingerprint"],
+        route_policy_fingerprint=route["policy_fingerprint"],
+        route_manifest_digest=route["manifest_digest"],
+        route_fingerprint=route["route_fingerprint"],
+        controller_epoch="blocked-handoff-fixture",
+        dispatch_generation=1,
+    )
+    run_seq = _highest_sequence(repo) + 1
+    event_time = (
+        datetime.now(UTC)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+    row = helpers.ledger_event_row(
+        event_id=f"blocked-resume-declaration-{run_seq}",
+        event_time=event_time,
+        run_seq=run_seq,
+        event_type="tl.dispatch_intended",
+        agent_id=caller,
+        run_id=real.server_run_id(repo),
+        invocation_id=None,
+        generation=None,
+        source="rust",
+        session_id=None,
+        data=_dispatch_payload(
+            route["scope_id"], attempt, "dispatch_intended"
+        ),
+    )
+    helpers.append_seeded_ledger_rows(repo, [row])
+    return run_seq
+
+
+def resume_arguments(
+    base: Mapping[str, Any], route: Mapping[str, str]
+) -> dict[str, Any]:
+    arguments = dict(base)
+    arguments["role_route"] = {
+        key: value
+        for key, value in {
+            "role": route["role"],
+            "harness": route["harness"],
+            "agent_type": route["agent_type"],
+            "model": route["model"],
+            "effort": route["effort"],
+            "configuration_fingerprint": route["configuration_fingerprint"],
+            "policy_fingerprint": route["policy_fingerprint"],
+            "manifest_digest": route["manifest_digest"],
+            "route_fingerprint": route["route_fingerprint"],
+            "dispatch_intent_id": route["dispatch_intent_id"],
+            "scope_id": route["scope_id"],
+        }.items()
+        if isinstance(value, str) and value
+    }
+    return arguments
 
 
 def stop_server_and_session(process: subprocess.Popen[str], repo: Path) -> None:
@@ -383,16 +568,34 @@ def run_case(index: int) -> dict[str, Any]:
                     "restart did not retain the original human gate identity"
                 )
 
+            # The accepted route and its durable declaration are the
+            # authorization the controller would have written before retrying.
+            route = configured_resume_route(
+                restarted,
+                repo=repo,
+                owner_dir=owner_dir,
+                identity_record=identity(owner_dir),
+                invocation_record=initial,
+                branch=branch,
+                worktree=worktree,
+                worktree_fingerprint=fingerprint,
+                issue_id=blocked_issue_id,
+            )
+            seed_resume_dispatch_declaration(repo, route)
+
             stale = resume_blocked_leaf(
                 restarted,
-                {
-                    "chainlink_issue_id": blocked_issue_id,
-                    "expected_invocation_id": "stale-invocation",
-                    "expected_branch": branch,
-                    "expected_worktree_fingerprint": fingerprint,
-                    "task": "stale resume must fail closed",
-                    "human_approved": True,
-                },
+                resume_arguments(
+                    {
+                        "chainlink_issue_id": blocked_issue_id,
+                        "expected_invocation_id": "stale-invocation",
+                        "expected_branch": branch,
+                        "expected_worktree_fingerprint": fingerprint,
+                        "task": "stale resume must fail closed",
+                        "human_approved": True,
+                    },
+                    route,
+                ),
             )
             if stale.success is not False:
                 raise real.HarnessError(
@@ -400,14 +603,17 @@ def run_case(index: int) -> dict[str, Any]:
                 )
             resumed = resume_blocked_leaf(
                 restarted,
-                {
-                    "chainlink_issue_id": blocked_issue_id,
-                    "expected_invocation_id": initial["invocation_id"],
-                    "expected_branch": branch,
-                    "expected_worktree_fingerprint": fingerprint,
-                    "task": "Stabilize base CI, then continue the same leaf assignment.",
-                    "human_approved": True,
-                },
+                resume_arguments(
+                    {
+                        "chainlink_issue_id": blocked_issue_id,
+                        "expected_invocation_id": initial["invocation_id"],
+                        "expected_branch": branch,
+                        "expected_worktree_fingerprint": fingerprint,
+                        "task": "Stabilize base CI, then continue the same leaf assignment.",
+                        "human_approved": True,
+                    },
+                    route,
+                ),
             )
             if not resumed.success:
                 raise real.HarnessError(f"same-owner resume failed: {resumed.raw!r}")
@@ -497,14 +703,17 @@ def run_case(index: int) -> dict[str, Any]:
                 )
             repeated = resume_blocked_leaf(
                 restarted,
-                {
-                    "chainlink_issue_id": blocked_issue_id,
-                    "expected_invocation_id": initial["invocation_id"],
-                    "expected_branch": branch,
-                    "expected_worktree_fingerprint": fingerprint,
-                    "task": "Stabilize base CI, then continue the same leaf assignment.",
-                    "human_approved": True,
-                },
+                resume_arguments(
+                    {
+                        "chainlink_issue_id": blocked_issue_id,
+                        "expected_invocation_id": initial["invocation_id"],
+                        "expected_branch": branch,
+                        "expected_worktree_fingerprint": fingerprint,
+                        "task": "Stabilize base CI, then continue the same leaf assignment.",
+                        "human_approved": True,
+                    },
+                    route,
+                ),
             )
             if (
                 not repeated.success

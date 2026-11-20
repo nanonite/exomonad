@@ -23,6 +23,7 @@ fixture's own policy and manifest.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import sys
 import time
@@ -620,6 +621,97 @@ def expected(
     )
 
 
+def _ledger_helpers() -> Any:
+    """Load the fixture's production-shaped ledger row helpers by path."""
+    path = Path(__file__).with_name("configured-owner-resume.py")
+    spec = importlib.util.spec_from_file_location("configured_owner_resume", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit("the production ledger fixture helpers are unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _highest_ledger_sequence(repository: Path) -> int:
+    highest = 0
+    segments = repository / ".exo/ledger/segments"
+    for path in sorted(segments.glob("segment-*.jsonl")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            sequence = json.loads(line).get("run_seq")
+            if type(sequence) is int and sequence > highest:
+                highest = sequence
+    return highest
+
+
+def _seed_refused_dispatch_history(
+    repository: Path,
+    arguments: Mapping[str, object],
+    *,
+    run_id: str,
+) -> list[int]:
+    """Seed the exact prior dispatch pair the live refusal left in the ledger.
+
+    The two rows are built by the production `_dispatch_payload` producer and
+    appended through the ledger writer's own segment layout. They are the
+    history the literal fixture used to omit: the stable logical-resume intent
+    already had a `tl.dispatch_intended` and `tl.spawn_requested` pair under the
+    historical configuration identity before the reauthorized retry.
+    """
+    from datetime import UTC, datetime
+
+    from tl_loop.loop.driver import DispatchAttempt, _dispatch_payload
+
+    helpers = _ledger_helpers()
+    attempt = DispatchAttempt(
+        intent_id=str(arguments["dispatch_intent_id"]),
+        started_at=float(arguments["dispatch_started_at"]),
+        harness=str(arguments["harness"]),
+        agent_type=str(arguments["agent_type"]),
+        model=cast_optional_text(arguments.get("model")),
+        attempt=int(arguments["dispatch_attempt"]),
+        role=cast_optional_text(arguments.get("role")),
+        effort=cast_optional_text(arguments.get("effort")),
+        route_configuration_fingerprint=str(arguments["route_configuration_fingerprint"]),
+        route_policy_fingerprint=cast_optional_text(arguments.get("route_policy_fingerprint")),
+        route_manifest_digest=cast_optional_text(arguments.get("route_manifest_digest")),
+        route_fingerprint=cast_optional_text(arguments.get("route_fingerprint")),
+        controller_epoch=cast_optional_text(arguments.get("controller_epoch")),
+        dispatch_generation=int(arguments["dispatch_generation"]),
+    )
+    base = _highest_ledger_sequence(repository)
+    event_time = (
+        datetime.fromtimestamp(attempt.started_at, UTC)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+    rows = []
+    for offset, boundary in ((1, "dispatch_intended"), (2, "spawn_requested")):
+        payload = _dispatch_payload(OWNER_SLICE, attempt, boundary)
+        rows.append(
+            helpers.ledger_event_row(
+                event_id=f"1511-{boundary}-{base + offset}",
+                event_time=event_time,
+                run_seq=base + offset,
+                event_type=f"tl.{boundary}",
+                agent_id=run_id,
+                run_id=run_id,
+                invocation_id=None,
+                generation=None,
+                source="rust",
+                session_id=None,
+                data=payload,
+            )
+        )
+    helpers.append_seeded_ledger_rows(repository, rows)
+    return [row["run_seq"] for row in rows]
+
+
+def cast_optional_text(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
 def refuse(
     repository: Path,
     baseline_path: Path,
@@ -627,6 +719,7 @@ def refuse(
     *,
     run_id: str = "kani",
     expected_route_fields: Path | None = None,
+    seed_dispatch_history: bool = False,
 ) -> None:
     """Record the exact prelaunch configuration refusal the live run retained."""
     from tl_loop.client.effects import ToolResult
@@ -695,6 +788,11 @@ def refuse(
     entries = journal.entries_for("resume_blocked_leaf", OWNER_SLICE)
     if len(entries) != 2 or entries[-1].get("status") != "rejected":
         raise SystemExit("the retained prelaunch refusal was not recorded exactly")
+    seeded_sequences: list[int] = []
+    if seed_dispatch_history:
+        seeded_sequences = _seed_refused_dispatch_history(
+            repository, arguments, run_id=run_id
+        )
     output.write_text(
         json.dumps(
             {
@@ -710,6 +808,7 @@ def refuse(
                 "journal_entries": [json.loads(json.dumps(entry)) for entry in entries],
                 "baseline_owner": baseline["owner_agent_name"],
                 "literal_route": literal_route,
+                "dispatch_history_run_seqs": seeded_sequences,
             },
             sort_keys=True,
             indent=2,
@@ -744,6 +843,7 @@ def main() -> None:
     refuse_parser.add_argument("--output", required=True, type=Path)
     refuse_parser.add_argument("--run-id", default="kani")
     refuse_parser.add_argument("--expected-route-fields", type=Path, default=None)
+    refuse_parser.add_argument("--seed-dispatch-history", action="store_true")
     args = parser.parse_args()
     if args.command == "seed":
         seed(
@@ -771,6 +871,7 @@ def main() -> None:
             args.output,
             run_id=args.run_id,
             expected_route_fields=args.expected_route_fields,
+            seed_dispatch_history=args.seed_dispatch_history,
         )
 
 

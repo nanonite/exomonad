@@ -516,6 +516,28 @@ transition; it is never reported as an owner, scope, or worktree conflict. Owner
 scope, worktree, predecessor-invocation, epoch, and process-identity checks are
 unchanged.
 
+### Repeated dispatch declarations under one logical resume
+
+`handlers/dispatch_authorization.rs` resolves the `tl.dispatch_intended`
+declaration for a caller's full authorization tuple (caller, scope, role,
+harness, agent type, model, effort, configuration/policy/manifest/route
+fingerprints). It is used by `resume_blocked_leaf`, which passes the owner
+invocation as durable no-effect evidence. A reauthorized retry keeps the stable
+`blocked-resume:` intent id, so the historical declaration and the new one share
+an id; the resolver accepts the new tuple only after proving from the ledger and
+owner registry that the older declaration did not launch (the predecessor is
+still current and no `agent.spawned` row exists for the intent), or that the
+current invocation is the single linked successor whose stored `role_route` is
+this authorization. Equivalent repeated observations collapse; conflicting
+observations, later competing declarations, wrong-caller declarations, live or
+unknown owner outcomes, and prior launch rows hold before launch. Diagnostics
+name the ledger sequences and safe identity fields. One idempotent
+`tl.dispatch_authorization_resolved` audit row records an accepted supersession;
+historical events and journals are only appended to, never rewritten. The wire
+contract is unchanged: no proto or Haskell type changes, because the full route
+tuple and the stable intent id already cross the boundary. Tests live in the
+module; the compiled acceptance is `just e2e-dispatch-collision`.
+
 The accepted configuration itself is one canonical `sha256:v2:` identity over
 each role's effective harness/model/effort, computed by the single
 `exomonad::config::Config::routing_configuration_fingerprint`. Source provenance

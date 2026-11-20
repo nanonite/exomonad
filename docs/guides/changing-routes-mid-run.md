@@ -192,6 +192,73 @@ assignment coordinates excluded from the v1 digest are rebound to the
 disposable fixture, because the retained values name the read-only Beast ledger
 and worktree.
 
+### Reauthorized resumes with repeated dispatch declarations
+
+A blocked-leaf resume has two identities, and they must not be conflated:
+
+- the **logical resume identity** is the controller's stable
+  `blocked-resume:<sha256>` intent id over owner, issue, predecessor, branch,
+  worktree and worktree fingerprint. It stays the same when a refused attempt is
+  reauthorized, because the logical owner did not change;
+- the **dispatch authorization** is the full route tuple on the request: caller,
+  scope, role, harness, agent type, model, effort, configuration, policy,
+  manifest and route fingerprints.
+
+A pre-launch configuration refusal happened *after* the controller recorded
+`tl.dispatch_intended` and `tl.spawn_requested`, so the new authorization
+produces a second declaration under the same logical intent id. The host must
+select the declaration that matches the request's complete authorization tuple;
+searching by intent id alone is ambiguous. Selecting by full tuple is also not
+enough: every other declaration under that intent must be proven to have had no
+launch effect.
+
+`rust/exomonad-core/src/handlers/dispatch_authorization.rs` owns that
+resolution. It accepts the reauthorized declaration only when durable evidence
+shows the older declaration was no-effect:
+
+- the owner invocation is still the exact predecessor named by the request,
+  it is not live, it has no PR context, and the ledger has no `agent.spawned`
+  row for the intent; or
+- the owner invocation is the single linked blocked-resume successor of that
+  predecessor, its stored `role_route` is this authorization, and exactly one
+  `agent.spawned` row names that successor (the response-loss/adoption case).
+
+Anything else holds before launch: a missing declaration, a declaration that
+matches no durable tuple, a later distinct declaration after the selected one,
+a declaration attributed to another caller, a live predecessor, an unknown
+owner outcome, a second launch row, or a prior launched effect. Equivalent
+repeated observations of one authorization (same identity and same observation
+fields) are idempotent and collapse to one declaration; a conflicting
+observation of the same authorization is a competing declaration and is
+refused. Diagnostics name the matching ledger sequences and safe identity
+fields, never credentials.
+
+A successful supersession appends one
+`tl.dispatch_authorization_resolved` audit row (idempotent by resolution id)
+carrying the intent, selected sequence, superseded sequences, configuration and
+route fingerprints, and the reason
+`superseded_declaration_proven_no_launch_effect`. Historical
+`tl.dispatch_intended`/`tl.spawn_requested`, journal, proof and receipt bytes
+are never rewritten; only legitimate records append. The audit row is the only
+new record class.
+
+The wire contract is unchanged. No proto field, Haskell guest type or generated
+code changes: the stable intent id remains the idempotency key, and the
+authorization tuple is already the `RoleRoute` message. The host derives the
+no-effect proof from its own ledger and owner registry, so historical
+same-intent declarations already present in a live workspace are interpreted
+without state edits. A future change that wants an explicit supersession field
+on the wire must add it on both sides and regenerate protocol code.
+
+The compiled acceptance is
+`E2E_DISPATCH_COLLISION_ONLY=1 tests/e2e/init-recovery/run.sh`
+(`just e2e-dispatch-collision`). It seeds both old dispatch rows from the
+production `_dispatch_payload` producer, the exact rejected prelaunch journal
+entry and the literal retained `a8b9524b...` proof, then proves one
+generation-3 successor, repeat/restart/adoption/concurrent idempotence, the
+host negative controls, and unchanged history. It prints `DISPATCH-1..6` then
+`DISPATCH-ALL PASS`.
+
 ## Operator actions
 
 | Goal | Change | Restart? | Approval flag? |

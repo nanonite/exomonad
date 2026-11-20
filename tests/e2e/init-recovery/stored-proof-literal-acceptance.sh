@@ -570,6 +570,7 @@ python3 "$SOURCE_ROOT/tests/e2e/init-recovery/seed-stored-proof.py" refuse \
     --repo "$REPO" --baseline "$WORK/preexisting-opencode-owner.json" \
     --output "$WORK/refused-action.json" --run-id "$STAGE" \
     --expected-route-fields "$RETAINED/literal-rejected-route.json" \
+    --seed-dispatch-history \
     > "$WORK/refused-action-seed.log" 2>&1 \
     || { cat "$WORK/refused-action-seed.log"; fail "the retained historical route context did not reproduce"; }
 python3 - "$WORK/refused-action.json" "$LITERAL_V1_DIGEST" "$RETAINED/literal-rejected-route.json" <<'PY' || fail "the retained rejected action envelope is not exact"
@@ -582,6 +583,7 @@ retained = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
 assert refused["route_authorization_digest"] == sys.argv[2]
 assert refused["status"] == "rejected"
 assert refused["error"] == "Invalid input: role route configuration is stale or was not accepted by this server"
+assert len(refused["dispatch_history_run_seqs"]) == 2, refused["dispatch_history_run_seqs"]
 for key, value in refused["literal_route"].items():
     assert value == retained[key], (key, value, retained[key])
 print(json.dumps({"literal_route_fields": len(refused["literal_route"])}))

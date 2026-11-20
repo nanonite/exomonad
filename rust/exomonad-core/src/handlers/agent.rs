@@ -11,6 +11,11 @@ use crate::effects::{
     ResultExtPreserve,
 };
 
+use super::dispatch_authorization::{
+    dispatch_authorization_resolution_id, resolve_dispatch_declaration,
+    DispatchAuthorizationResolution, DispatchDeclaration, DispatchNoEffectProof,
+    ExpectedDispatchAuthorization,
+};
 use super::non_empty;
 use crate::services::agent_control::{
     finish_invocation_and_tombstone, read_invocation, slugify, AgentControlService, AgentIdentity,
@@ -84,6 +89,9 @@ struct RoleRouteValidation<'a> {
     requested_role: Option<&'a str>,
     host_intent_id: Option<&'a str>,
     caller: &'a AgentName,
+    /// Durable owner evidence used only by a blocked-leaf resume to release a
+    /// reauthorized declaration over a proven no-effect predecessor.
+    dispatch_supersession: Option<&'a DispatchNoEffectProof<'a>>,
 }
 
 impl<
@@ -119,6 +127,7 @@ impl<
             requested_role,
             host_intent_id,
             caller,
+            dispatch_supersession,
         } = validation;
         let Some(route) = request else {
             if host_intent_id.is_some_and(|intent| !intent.trim().is_empty())
@@ -173,6 +182,11 @@ impl<
                 "role route dispatch intent does not match the launch intent",
             ));
         }
+        // The host-derived intent is authoritative whenever the caller provides
+        // one. Resolving the declaration and recording its launch history under
+        // the request-supplied id would let a populated foreign intent select a
+        // declaration that does not belong to this logical resume.
+        let dispatch_intent_id = host_intent_id.unwrap_or(route.dispatch_intent_id.as_str());
         if self
             .service
             .role_route_configuration_fingerprint()
@@ -182,8 +196,13 @@ impl<
                 "role route configuration is stale or was not accepted by this server",
             ));
         }
-        self.validate_role_route_dispatch_event(route, caller)
-            .await?;
+        self.validate_role_route_dispatch_event(
+            route,
+            dispatch_intent_id,
+            caller,
+            dispatch_supersession,
+        )
+        .await?;
         Ok(Some(RoleRouteProvenance {
             role: route.role.clone(),
             harness: route.harness.clone(),
@@ -194,7 +213,7 @@ impl<
             policy_fingerprint: non_empty(route.policy_fingerprint.clone()),
             manifest_digest: non_empty(route.manifest_digest.clone()),
             route_fingerprint: route.route_fingerprint.clone(),
-            dispatch_intent_id: route.dispatch_intent_id.clone(),
+            dispatch_intent_id: dispatch_intent_id.to_string(),
             scope_id: route.scope_id.clone(),
         }))
     }
@@ -202,29 +221,14 @@ impl<
     async fn validate_role_route_dispatch_event(
         &self,
         route: &RoleRoute,
+        dispatch_intent_id: &str,
         caller: &AgentName,
+        supersession: Option<&DispatchNoEffectProof<'_>>,
     ) -> EffectResult<()> {
         let log = self.ctx.event_log().ok_or_else(|| {
             EffectError::invalid_input("role route requires durable dispatch history")
         })?;
-        let matching = log
-            .ledger()
-            .read_events()
-            .effect_err("agent")?
-            .into_iter()
-            .filter(|record| {
-                record.event.event_type == "tl.dispatch_intended"
-                    && record.event.data["intent_id"].as_str()
-                        == Some(route.dispatch_intent_id.as_str())
-            })
-            .collect::<Vec<_>>();
-        let [record] = matching.as_slice() else {
-            return Err(EffectError::invalid_input(
-                "role route dispatch authorization is missing or ambiguous",
-            ));
-        };
-        let data = &record.event.data;
-        let event_text = |key: &str| data.get(key).and_then(serde_json::Value::as_str);
+        let records = log.ledger().read_events().effect_err("agent")?;
         let route_type = AgentType::try_from(route.agent_type)
             .map_err(|_| EffectError::invalid_input("role route has an unknown agent type"))?;
         let route_model = (!route.model.is_empty()).then_some(route.model.as_str());
@@ -233,23 +237,54 @@ impl<
             (!route.policy_fingerprint.is_empty()).then_some(route.policy_fingerprint.as_str());
         let route_manifest =
             (!route.manifest_digest.is_empty()).then_some(route.manifest_digest.as_str());
-        if record.event.agent_id.as_deref() != Some(caller.as_str())
-            || event_text("boundary") != Some("dispatch_intended")
-            || event_text("slice_id") != Some(route.scope_id.as_str())
-            || event_text("role") != Some(route.role.as_str())
-            || event_text("harness") != Some(route.harness.as_str())
-            || event_text("agent_type") != Some(proto_agent_type_label(route_type))
-            || event_text("model") != route_model
-            || event_text("effort") != route_effort
-            || event_text("route_configuration_fingerprint")
-                != Some(route.configuration_fingerprint.as_str())
-            || event_text("route_policy_fingerprint") != route_policy
-            || event_text("route_manifest_digest") != route_manifest
-            || event_text("route_fingerprint") != Some(route.route_fingerprint.as_str())
-        {
-            return Err(EffectError::invalid_input(
-                "role route conflicts with its durable dispatch authorization",
-            ));
+        let declarations = records
+            .iter()
+            .filter(|record| {
+                record.event.event_type == "tl.dispatch_intended"
+                    && record.event.data["intent_id"].as_str() == Some(dispatch_intent_id)
+            })
+            .map(|record| DispatchDeclaration {
+                run_seq: record.event.run_seq,
+                agent_id: record.event.agent_id.as_deref(),
+                data: &record.event.data,
+            })
+            .collect::<Vec<_>>();
+        let launch_rows = records
+            .iter()
+            .filter(|record| {
+                record.event.event_type == "agent.spawned"
+                    && record.event.data["intent_id"].as_str() == Some(dispatch_intent_id)
+            })
+            .map(|record| DispatchDeclaration {
+                run_seq: record.event.run_seq,
+                agent_id: record.event.agent_id.as_deref(),
+                data: &record.event.data,
+            })
+            .collect::<Vec<_>>();
+        let expected = ExpectedDispatchAuthorization {
+            intent_id: dispatch_intent_id,
+            caller: caller.as_str(),
+            scope_id: route.scope_id.as_str(),
+            role: route.role.as_str(),
+            harness: route.harness.as_str(),
+            agent_type: proto_agent_type_label(route_type),
+            model: route_model,
+            effort: route_effort,
+            configuration_fingerprint: route.configuration_fingerprint.as_str(),
+            policy_fingerprint: route_policy,
+            manifest_digest: route_manifest,
+            route_fingerprint: route.route_fingerprint.as_str(),
+        };
+        let resolution =
+            resolve_dispatch_declaration(&declarations, &launch_rows, expected, supersession)?;
+        if !resolution.superseded_run_seqs.is_empty() {
+            record_dispatch_authorization_resolution(
+                log,
+                caller,
+                dispatch_intent_id,
+                route,
+                &resolution,
+            )?;
         }
         Ok(())
     }
@@ -1406,6 +1441,7 @@ impl<
                     requested_role: None,
                     host_intent_id: Some(req.intent_id.as_str()),
                     caller: &ctx.agent_name,
+                    dispatch_supersession: None,
                 },
             )
             .await?;
@@ -2618,6 +2654,7 @@ impl<
                     requested_role: requested_role.as_deref(),
                     host_intent_id: Some(req.intent_id.as_str()),
                     caller: &ctx.agent_name,
+                    dispatch_supersession: None,
                 },
             )
             .await?;
@@ -3965,6 +4002,32 @@ impl<
             ));
         }
         let parked_slice_id = owner.slice_id.as_deref().unwrap_or(owner.slug.as_str());
+        let invocation = read_invocation(owner_dir)
+            .await
+            .effect_err("agent")?
+            .ok_or_else(|| {
+                EffectError::invalid_input(
+                    "blocked owner has no invocation record; refusing resume",
+                )
+            })?;
+        // Bind the controller's route identity to the host-derived logical
+        // resume intent before any authorization resolution. The expected
+        // predecessor/branch/worktree are verified against the durable owner
+        // below; the same identity is then used for adoption and fresh launch.
+        let intent_id = blocked_resume_intent_id(
+            owner,
+            req.blocked_issue_id,
+            &req.expected_invocation_id,
+            &req.expected_branch,
+            &req.expected_worktree_fingerprint,
+        );
+        // The request's full route tuple is the authorization-specific dispatch
+        // identity. The owner invocation is the durable no-effect boundary for
+        // every earlier declaration under the same logical resume intent.
+        let dispatch_supersession = DispatchNoEffectProof {
+            expected_invocation_id: req.expected_invocation_id.as_str(),
+            invocation: &invocation,
+        };
         let role_route = self
             .accepted_role_route(
                 req.role_route.as_ref(),
@@ -3974,8 +4037,9 @@ impl<
                     requested_type: AgentType::Unspecified,
                     requested_model: None,
                     requested_role: None,
-                    host_intent_id: None,
+                    host_intent_id: Some(&intent_id),
                     caller: &ctx.agent_name,
+                    dispatch_supersession: Some(&dispatch_supersession),
                 },
             )
             .await?;
@@ -4043,22 +4107,7 @@ impl<
                 "blocked owner has no authoritative parked event for slice {parked_slice_id:?}"
             )));
         }
-        let invocation = read_invocation(owner_dir)
-            .await
-            .effect_err("agent")?
-            .ok_or_else(|| {
-                EffectError::invalid_input(
-                    "blocked owner has no invocation record; refusing resume",
-                )
-            })?;
         if invocation.invocation_id != req.expected_invocation_id {
-            let intent_id = blocked_resume_intent_id(
-                owner,
-                req.blocked_issue_id,
-                &req.expected_invocation_id,
-                &req.expected_branch,
-                &req.expected_worktree_fingerprint,
-            );
             return self
                 .adopt_blocked_resume_successor(BlockedResumeAdoption {
                     owner,
@@ -4118,13 +4167,6 @@ impl<
             ));
         }
 
-        let intent_id = blocked_resume_intent_id(
-            owner,
-            req.blocked_issue_id,
-            &invocation.invocation_id,
-            &req.expected_branch,
-            &fingerprint,
-        );
         let next_generation = invocation.generation.checked_add(1).ok_or_else(|| {
             EffectError::invalid_input("blocked owner invocation generation is exhausted")
         })?;
@@ -5154,6 +5196,60 @@ fn record_configured_route_transition(
     log.append("agent.harness_switch", actor, data)
         .map_err(|error| {
             EffectError::invalid_input(format!("cannot persist runtime-route transition: {error}"))
+        })?;
+    Ok(())
+}
+
+fn record_dispatch_authorization_resolution(
+    log: &crate::services::EventLog,
+    caller: &AgentName,
+    dispatch_intent_id: &str,
+    route: &RoleRoute,
+    resolution: &DispatchAuthorizationResolution,
+) -> EffectResult<()> {
+    let resolution_id = dispatch_authorization_resolution_id(
+        dispatch_intent_id,
+        resolution.selected_run_seq,
+        &resolution.superseded_run_seqs,
+    );
+    let data = serde_json::json!({
+        "resolution_id": resolution_id,
+        "intent_id": dispatch_intent_id,
+        "scope_id": route.scope_id.as_str(),
+        "role": route.role.as_str(),
+        "harness": route.harness.as_str(),
+        "configuration_fingerprint": route.configuration_fingerprint.as_str(),
+        "route_fingerprint": route.route_fingerprint.as_str(),
+        "selected_run_seq": resolution.selected_run_seq,
+        "superseded_run_seqs": resolution.superseded_run_seqs,
+        "reason": "superseded_declaration_proven_no_launch_effect",
+    });
+    let records = log.ledger().read_events().map_err(|error| {
+        EffectError::invalid_input(format!(
+            "cannot verify dispatch authorization resolution history: {error}"
+        ))
+    })?;
+    if let Some(existing) = records.iter().find(|record| {
+        record.event.event_type == "tl.dispatch_authorization_resolved"
+            && record
+                .event
+                .data
+                .get("resolution_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(resolution_id.as_str())
+    }) {
+        if existing.event.data != data {
+            return Err(EffectError::invalid_input(
+                "dispatch authorization resolution conflicts with its durable audit record",
+            ));
+        }
+        return Ok(());
+    }
+    log.append("tl.dispatch_authorization_resolved", caller.as_str(), &data)
+        .map_err(|error| {
+            EffectError::invalid_input(format!(
+                "cannot persist dispatch authorization resolution: {error}"
+            ))
         })?;
     Ok(())
 }

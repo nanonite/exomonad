@@ -196,6 +196,12 @@ case: the actual retained v1 digest (`a8b9524b...`) is recomputed under its
 retained historical policy and manifest (`4be5ddad...`), not a scratch
 regeneration, and the compiled init/serve path still links exactly one v2
 successor; it prints `LITERAL-1..5` and `LITERAL-ALL PASS`.
+`just e2e-dispatch-collision` adds the production-shaped replay that the
+literal mode used to omit: both historical dispatch rows, the rejected
+prelaunch journal, the literal proof and the approved gate, followed by one
+reauthorized generation-3 launch. It prints `DISPATCH-1..6` and
+`DISPATCH-ALL PASS`; the host resolution is in
+`rust/exomonad-core/src/handlers/dispatch_authorization.rs`.
 `route.configuration_fingerprint` still comes from this identity;
 `route_fingerprint` keeps its source-aware `sha256:v1:` route-receipt binding as
 audit evidence.

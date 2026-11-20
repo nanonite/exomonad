@@ -861,6 +861,15 @@ e2e-stored-proof:
 e2e-stored-proof-literal:
     E2E_STORED_PROOF_ONLY=1 E2E_STORED_PROOF_LITERAL=1 ./tests/e2e/init-recovery/run.sh
 
+# Run the #1511 dispatch-collision acceptance: both historical dispatch rows,
+# the exact rejected prelaunch journal, the literal a8b9524b proof and approved
+# gate, then the reauthorized v2 retry must select one declaration, launch one
+# real generation-3 successor, stay duplicate-free across repeat init, restart,
+# adoption and concurrent requests, and hold every host negative control.
+# Harnesses are disposable shims; no provider is contacted.
+e2e-dispatch-collision:
+    E2E_DISPATCH_COLLISION_ONLY=1 ./tests/e2e/init-recovery/run.sh
+
 # Check the init-recovery E2E harness without launching tmux
 check-e2e-init-recovery:
     bash -n tests/e2e/init-recovery/run.sh
@@ -869,7 +878,8 @@ check-e2e-init-recovery:
     bash -n tests/e2e/init-recovery/role-config-acceptance.sh
     bash -n tests/e2e/init-recovery/stored-proof-acceptance.sh
     bash -n tests/e2e/init-recovery/stored-proof-literal-acceptance.sh
-    {{py}} -m py_compile tests/e2e/init-recovery/check_role_config_preflight.py tests/e2e/init-recovery/seed-stored-proof.py tests/e2e/init-recovery/check-stored-proof-negatives.py
+    bash -n tests/e2e/init-recovery/dispatch-collision-acceptance.sh
+    {{py}} -m py_compile tests/e2e/init-recovery/check_role_config_preflight.py tests/e2e/init-recovery/seed-stored-proof.py tests/e2e/init-recovery/check-stored-proof-negatives.py tests/e2e/init-recovery/check-dispatch-negatives.py
     bash -n tests/e2e/init-recovery/tl-window-state.sh
     bash -n tests/e2e/init-recovery/test-tl-window-state.sh
     tests/e2e/init-recovery/test-tl-window-state.sh

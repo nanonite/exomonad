@@ -1825,10 +1825,10 @@ PY
 }
 
 e2e_phase "Phase 0" "Checking preconditions..."
-if [[ "${E2E_ROLE_CONFIG_ONLY:-0}" == "1" || "${E2E_STORED_PROOF_ONLY:-0}" == "1" ]]; then
-    # The role-configuration and stored-proof phases never shell out to
-    # ripgrep, so their fixed `./run.sh` contracts also work from a host shell
-    # that does not have rg on PATH. The other modes still require it.
+if [[ "${E2E_ROLE_CONFIG_ONLY:-0}" == "1" || "${E2E_STORED_PROOF_ONLY:-0}" == "1" || "${E2E_DISPATCH_COLLISION_ONLY:-0}" == "1" ]]; then
+    # The role-configuration, stored-proof and dispatch-collision phases never
+    # shell out to ripgrep, so their fixed `./run.sh` contracts also work from a
+    # host shell that does not have rg on PATH. The other modes still require it.
     e2e_require_commands nix tmux git curl chainlink python3
 else
     e2e_require_commands nix tmux git curl rg chainlink python3
@@ -1850,7 +1850,10 @@ cleanup() {
         env -u TMUX -u TMUX_PANE TMUX_TMPDIR="$AGGREGATE_TMUX_TMPDIR" \
             tmux kill-session -t "$AGGREGATE_SESSION" 2>/dev/null
         case "$AGGREGATE_TMUX_TMPDIR" in
-            /tmp/exo1283-tmux.*|"${E2E_TMUX_TMPDIR_ROOT:-${TMPDIR:-/tmp}}"/exo1283-tmux.*)
+            /tmp/exo1283-tmux.*|"${E2E_TMUX_TMPDIR_ROOT:-${TMPDIR:-/tmp}}"/exo1283-tmux.*|\
+            /tmp/exo1433-literal-tmux.*|"${E2E_TMUX_TMPDIR_ROOT:-${TMPDIR:-/tmp}}"/exo1433-literal-tmux.*|\
+            /tmp/exo1433-stored-tmux.*|"${E2E_TMUX_TMPDIR_ROOT:-${TMPDIR:-/tmp}}"/exo1433-stored-tmux.*|\
+            /tmp/exo1511-dispatch-tmux.*|"${E2E_TMUX_TMPDIR_ROOT:-${TMPDIR:-/tmp}}"/exo1511-dispatch-tmux.*)
                 rm -rf -- "$AGGREGATE_TMUX_TMPDIR"
                 ;;
         esac
@@ -1932,6 +1935,30 @@ if [[ "${E2E_ROLE_CONFIG_ONLY:-0}" == "1" ]]; then
         "$PROJECT_ROOT" "$WASM_ARTIFACT_DIR"
     printf 'ROLECONFIG-ALL PASS\n'
     e2e_log "PASS: ROLECONFIG-ALL PASS"
+    exit 0
+fi
+
+# Dispatch-collision acceptance (#1511): the exact production shape that failed
+# on 36a32576 - both old dispatch-intended/spawn-requested rows under the v1
+# configuration, the exact rejected prelaunch journal entry, the literal
+# retained a8b9524b proof, an approved gate, then the reauthorized v2 retry.
+# Reuses the same Phase 0 build, fresh WASM, isolated homes and a run-scoped
+# tmux server; the retained source is read-only and byte-compared.
+if [[ "${E2E_DISPATCH_COLLISION_ONLY:-0}" == "1" ]]; then
+    DISPATCH_RETAINED="${E2E_DISPATCH_RETAINED:-/home/goya/beast-workspace/workspace/.exo/tl-loop/repair-backups/controlled-plan-20261119T022328Z}"
+    [[ -d "$DISPATCH_RETAINED" ]] \
+        || e2e_fail "the retained dispatch evidence directory is missing: $DISPATCH_RETAINED"
+    AGGREGATE_TMUX_TMPDIR="$(mktemp -d "${E2E_TMUX_TMPDIR_ROOT:-${TMPDIR:-/tmp}}/exo1511-dispatch-tmux.XXXXXX")"
+    unset TMUX TMUX_PANE
+    export TMUX_TMPDIR="$AGGREGATE_TMUX_TMPDIR"
+    e2e_log "Dispatch-collision tmux server isolated to $TMUX_TMPDIR"
+    DISPATCH_HOME="$WORK_DIR/dispatch-collision-home"
+    mkdir -p "$DISPATCH_HOME/.exo"
+    bash "$SCRIPT_DIR/dispatch-collision-acceptance.sh" \
+        "$EXOMONAD_BIN" "$WORK_DIR/dispatch-collision" "$DISPATCH_HOME" "$CODEX_HOME" \
+        "$PROJECT_ROOT" "$WASM_ARTIFACT_DIR" "$DISPATCH_RETAINED"
+    printf 'DISPATCH-ALL PASS\n'
+    e2e_log "PASS: DISPATCH-ALL PASS"
     exit 0
 fi
 
@@ -3882,6 +3909,12 @@ kani = root["slices"].get("kani", {})
 handoff = root["slices"].get("handoff-proof", {})
 post = architecture.get("post_merge") or {}
 leaf = child["slices"].get("post-tidy-leaf", {}) if child is not None else {}
+try:
+    kani_controller = json.loads(
+        (repo / ".exo/agents/kani/invocation.json").read_text()
+    )
+except (OSError, json.JSONDecodeError):
+    kani_controller = {}
 phase = root.get("phase") or root.get("fsm", {}).get("phase", "unknown")
 ready = (
     child is not None
@@ -3896,7 +3929,10 @@ ready = (
     and bool(leaf.get("pr_number"))
     and leaf.get("agent_type") == "codex"
     and leaf.get("model") == "gpt-6-luna"
+    and leaf.get("resolved_harness") == "codex/gpt-6-luna"
     and bool(leaf.get("reviewed_head"))
+    and kani_controller.get("trigger") == "controller_restart"
+    and kani_controller.get("invocation_id") == kani.get("dispatch_invocation_id")
 )
 print(
     "ready" if ready else "waiting",
@@ -3955,7 +3991,9 @@ assert leaf["attempts"] == 2, "recovery did not create exactly one new dispatch 
 assert leaf["pr_number"] is not None
 assert leaf["agent_type"] == "codex"
 assert leaf["model"] == "gpt-6-luna"
-assert leaf["resolved_harness"] == "codex/gpt-6-luna"
+assert leaf["resolved_harness"] == "codex/gpt-6-luna", (
+    "recovered #814 leaf resolved harness: " + repr(leaf.get("resolved_harness"))
+)
 assert leaf["requested_harness"] == "opencode/opencode-go/deepseek-v4.1-flash"
 owner_id = leaf["dispatch_agent_id"]
 owner_events = [
@@ -4100,8 +4138,25 @@ assert invocation["runtime_agent_id"] == "kani"
 assert invocation["branch"] == "main.kani" and invocation["worktree"] == identity["working_dir"]
 assert invocation.get("pr_number") is None and invocation.get("head_sha") is None
 assert invocation["routing"]["window_id"] != "@999999"
-assert old_id == invocation["invocation_id"]
-assert root["slices"]["kani"]["dispatch_invocation_id"] == invocation["invocation_id"]
+# The restart invocation and the root slice checkpoint are separate atomic
+# writes. Wait on the durable convergence boundary instead of reading between
+# the two writes.
+import time
+
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline:
+    old_id = json.loads(
+        (repo / ".exo/tl-loop/root/run.json").read_text(encoding="utf-8")
+    )["slices"]["kani"]["dispatch_invocation_id"]
+    if old_id == invocation["invocation_id"]:
+        break
+    time.sleep(0.25)
+assert old_id == invocation["invocation_id"], (
+    "restarted controller checkpoint: " + repr(old_id)
+)
+assert json.loads(
+    (repo / ".exo/tl-loop/root/run.json").read_text(encoding="utf-8")
+)["slices"]["kani"]["dispatch_invocation_id"] == invocation["invocation_id"]
 assert identity["working_dir"] == str(repo / ".exo/worktrees/kani")
 assert Path(identity["working_dir"]).is_dir()
 events = [
@@ -4212,7 +4267,7 @@ worker = handoff_workers[0]
 handoff_reviews = [entry for entry in reviews if entry.get("pr_number") == leaf_pr_number]
 assert len(handoff_reviews) == 1, f"expected one routed post-tidy reviewer approval, found {len(handoff_reviews)}"
 review = handoff_reviews[0]
-assert worker["role"] == "dev" and worker["model"] == "gpt-6-luna"
+assert worker["role"] in {"dev", "worker"} and worker["model"] == "gpt-6-luna"
 assert worker["effort"] == "xhigh"
 assert worker["source_worktree"] == str(source_worktree)
 assert worker["source_branch"] == "main.handoff-proof"

@@ -18,6 +18,7 @@
 
 pub mod agent;
 pub mod coordination;
+mod dispatch_authorization;
 pub mod events;
 pub mod file_pr;
 pub mod forgejo_as_github;

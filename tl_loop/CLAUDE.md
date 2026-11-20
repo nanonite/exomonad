@@ -1094,6 +1094,20 @@ The literal mode rebinds only the assignment coordinates the v1 digest excludes
 (ledger sequence, dispatch intent id, terminal invocation digest, worktree
 fingerprint) to the disposable fixture.
 
+The compiled dispatch-collision acceptance is
+`just e2e-dispatch-collision` (`E2E_DISPATCH_COLLISION_ONLY=1`). It fixes the
+fixture gap that the literal mode used to have: the literal fixture seeded only
+the rejected action journal, so the compiled host saw one dispatch declaration.
+The dispatch fixture seeds the actual prior `tl.dispatch_intended` and
+`tl.spawn_requested` pair through the production `_dispatch_payload` producer,
+keeps the stable logical-resume intent id, and then runs the reauthorized v2
+retry. It prints `DISPATCH-1..6` and `DISPATCH-ALL PASS`; the host resolution
+and its negative controls are described in
+`rust/exomonad-core/src/handlers/dispatch_authorization.rs` and
+`docs/guides/changing-routes-mid-run.md`. `tests/e2e/init-recovery/seed-stored-proof.py
+refuse --seed-dispatch-history` also seeds the pair for the literal mode, so the
+literal acceptance now exercises the same production-shaped replay.
+
 See [docs/guides/changing-routes-mid-run.md](../docs/guides/changing-routes-mid-run.md).
 
 The controller reads `.exo/harness_policy.toml` once at controller start

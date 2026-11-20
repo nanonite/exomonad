@@ -846,6 +846,7 @@ just e2e-typecheck-ci      # Real CI typecheck job in a disposable Forgejo (no n
 just e2e-role-config       # #1433 role-configuration preflight acceptance (ROLECONFIG-1..5)
 just e2e-stored-proof      # #1433 retained v1 terminal-owner proof acceptance (STOREDPROOF-1..6)
 just e2e-stored-proof-literal  # #1433 literal retained v1 proof acceptance (LITERAL-1..5)
+just e2e-dispatch-collision    # #1511 reauthorized dispatch-declaration acceptance (DISPATCH-1..6)
 ```
 
 `just e2e-role-config` runs `tests/e2e/init-recovery/run.sh` with
@@ -893,6 +894,20 @@ the assignment coordinates (ledger sequence, dispatch intent id, terminal
 invocation digest, worktree fingerprint), so those alone are rebound to the
 disposable ledger and worktree; the retained values name the read-only Beast
 filesystem. Set `E2E_STORED_PROOF_RETAINED` to point at another backup copy.
+
+`just e2e-dispatch-collision` runs the same Phase 0 build, fresh explicit WASM,
+isolated Codex home, run-scoped tmux server and standalone `serve` as the
+stored-proof modes. It seeds the production-shaped history the literal fixture
+used to omit (both old `tl.dispatch_intended`/`tl.spawn_requested` rows, the
+exact rejected prelaunch journal, the literal `a8b9524b...` proof and the
+approved gate), then proves the reauthorized v2 retry selects one declaration,
+launches one real generation-3 OpenCode DeepSeek/high successor, adds no
+duplicate across repeat init, server restart, adoption and concurrent requests,
+holds every host negative control, and leaves historical bytes unchanged. It
+prints `DISPATCH-1..6` then `DISPATCH-ALL PASS`. The resolver and its
+backward-compatibility contract are described in
+`docs/guides/changing-routes-mid-run.md`; the Docker-free syntax/compile checks
+are part of `just check-e2e-init-recovery`.
 
 `just e2e-recreated-leaf-recovery` is non-interactive like
 `just e2e-tl-loop-active`: it builds the binary and WASM from this worktree,

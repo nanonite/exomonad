@@ -51,7 +51,12 @@ mkdir -p "$FAST_REPO" "$FAST_HOME/.exo" "$(dirname "$REMOTE_DIR")" "$SOURCE_ROOT
 FAST_EXEC_DIR="$(mktemp -d "$SOURCE_ROOT/target/exomonad-fast-start.XXXXXX")"
 FAST_FAKE_BIN="$FAST_EXEC_DIR/bin"
 FAST_SHELL="$FAST_FAKE_BIN/fast-start-shell"
-FAST_TEST_PATH="$FAST_FAKE_BIN:/usr/bin:/bin"
+FAST_TMUX_BIN="$(command -v tmux || true)"
+[[ -n "$FAST_TMUX_BIN" ]] || fail "tmux is required for the fast-start acceptance"
+# The fixture deliberately narrows PATH for spawned agents. Keep the real
+# tmux next to the fake harness binaries: under `nix develop` tmux is not in
+# /usr/bin, and the acceptance still drives its own isolated server.
+FAST_TEST_PATH="$FAST_FAKE_BIN:$(dirname "$FAST_TMUX_BIN"):/usr/bin:/bin"
 mkdir -p "$FAST_FAKE_BIN"
 cp "$SOURCE_ROOT/tests/e2e/init-recovery/fake-codex.sh" "$FAST_FAKE_BIN/codex"
 cp "$SOURCE_ROOT/tests/e2e/init-recovery/fake-codex.sh" "$FAST_FAKE_BIN/opencode"
@@ -210,6 +215,8 @@ run_init() {
     fi
     (cd "$FAST_REPO" && HOME="$FAST_HOME" CODEX_HOME="$CODEX_HOME" \
         PATH="$FAST_TEST_PATH" \
+        EXOMONAD_ROOT_AGENT_TYPE=codex EXOMONAD_SPAWN_AGENT_TYPE=codex \
+        EXOMONAD_REVIEWER_AGENT_TYPE=codex EXOMONAD_CODEX_MODEL=gpt-6-luna \
         E2E_FAST_START=1 E2E_FAST_REPO="$FAST_REPO" E2E_AGENT_LOG="$FAST_AGENT_LOG" \
         GIT_SSH_COMMAND="$FAST_DIR/git-ssh" FORGEJO_TOKEN="test-token-e2e" \
         FORGEJO_REVIEWER_TOKEN="reviewer-token-e2e" \
