@@ -16,13 +16,28 @@
 //! declaration as history.
 //!
 //! Full-tuple matching is not enough on its own. Every other declaration under
-//! the same intent id must be proven to have had no launch effect by durable
-//! evidence: either the owner invocation is still the exact predecessor named by
-//! the request and no launch row exists for the intent, or the owner invocation
-//! is the single linked successor of that predecessor, its stored role route is
-//! this authorization, and exactly one launch row names that successor. The
-//! proof is derived from the ledger and the owner registry, never from the
-//! caller's claim about why an earlier attempt failed.
+//! the same intent id must be bound to durable evidence of the exact permitted
+//! prelaunch configuration refusal: a host-recorded `tool.called` row for
+//! `resume_blocked_leaf` that carries the superseded declaration's full route
+//! tuple, the exact configuration-not-accepted error envelope, and no result.
+//! The refusal must appear after that declaration and before the next distinct
+//! observation. Declarations are grouped by route tuple *and* observation
+//! fields (`started_at`, `attempt`, `dispatch_generation`, `controller_epoch`),
+//! so a single refusal after two distinct observations cannot release both.
+//!
+//! The caller-supplied `human_approved` boolean is not durable approval either.
+//! The host requires the authoritative `tl.gate_answered` rows for this slice's
+//! recovery gate to show an approved decision before the selected declaration,
+//! with no later rejection.
+//!
+//! The refusal proof is combined with owner evidence: either the owner
+//! invocation is still the exact predecessor named by the request and no launch
+//! row exists for the intent, or the owner invocation is the single linked
+//! successor of that predecessor, its stored role route is this authorization,
+//! and exactly one launch row names that successor. The proof is derived from
+//! the ledger and the owner registry, never from the caller's claim about why an
+//! earlier attempt failed. A missing launch row, a generic failed request, a
+//! non-live predecessor, or an unrelated refusal is never sufficient.
 
 use crate::effects::{EffectError, EffectResult};
 use crate::services::agent_control::{InvocationRecord, InvocationTrigger, RoleRouteProvenance};
@@ -57,11 +72,42 @@ pub(crate) struct ExpectedDispatchAuthorization<'a> {
 pub(crate) struct DispatchAuthorizationResolution {
     pub selected_run_seq: Option<u64>,
     pub superseded_run_seqs: Vec<u64>,
+    pub superseded_refusal_run_seqs: Vec<u64>,
+    pub supersession_approval_run_seq: Option<u64>,
 }
+
+/// One durable `tl.gate_answered` row for the leaf's recovery boundary.
+///
+/// The host cannot trust the request's caller-supplied `human_approved` flag as
+/// proof that an operator approved this supersession. The controller records
+/// every gate decision in the authoritative ledger, so the exact per-slice
+/// recovery gate and its latest decision are the durable approval proof.
+pub(crate) struct DispatchGateAnswer<'a> {
+    pub run_seq: Option<u64>,
+    pub data: &'a Value,
+}
+
+/// One host-recorded `tool.called` row for `resume_blocked_leaf`.
+///
+/// The row is written by the standalone server after the handler returns, so it
+/// is durable evidence that the named authorization was refused before any
+/// launch. Callers cannot manufacture this row through the request.
+pub(crate) struct DispatchPrelaunchRefusal<'a> {
+    pub run_seq: Option<u64>,
+    pub caller: Option<&'a str>,
+    pub data: &'a Value,
+}
+
+/// The exact permitted prelaunch refusal emitted before a launch.
+pub(crate) const ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED: &str =
+    "Invalid input: role route configuration is stale or was not accepted by this server";
 
 /// Durable owner evidence that bounds which declaration could have launched.
 pub(crate) struct DispatchNoEffectProof<'a> {
     pub expected_invocation_id: &'a str,
+    pub expected_issue_id: u64,
+    pub expected_branch: &'a str,
+    pub expected_worktree_fingerprint: &'a str,
     pub invocation: &'a InvocationRecord,
 }
 
@@ -168,9 +214,16 @@ fn sequence_list(sequences: impl IntoIterator<Item = Option<u64>>) -> String {
 /// `launch_rows` are `agent.spawned` rows that name this intent id. They are
 /// read from the same ledger snapshot as the declarations and are what make the
 /// no-effect proof durable rather than a caller assertion.
+///
+/// `refusals` are host-recorded `tool.called` rows for `resume_blocked_leaf`.
+/// Every superseded declaration must be bound to its own exact permitted
+/// prelaunch refusal; absence, an unrelated refusal, contradictory evidence or a
+/// wrong-declaration refusal holds the retry before launch.
 pub(crate) fn resolve_dispatch_declaration(
     declarations: &[DispatchDeclaration<'_>],
     launch_rows: &[DispatchDeclaration<'_>],
+    refusals: &[DispatchPrelaunchRefusal<'_>],
+    gate_answers: &[DispatchGateAnswer<'_>],
     expected: ExpectedDispatchAuthorization<'_>,
     no_effect: Option<&DispatchNoEffectProof<'_>>,
 ) -> EffectResult<DispatchAuthorizationResolution> {
@@ -198,10 +251,13 @@ pub(crate) fn resolve_dispatch_declaration(
         )));
     }
     let selected = select_single_observation(&matching, &wanted)?;
+    verify_refusal_ledger(declarations, refusals, &expected)?;
     if others.is_empty() {
         return Ok(DispatchAuthorizationResolution {
             selected_run_seq: selected.run_seq,
             superseded_run_seqs: Vec::new(),
+            superseded_refusal_run_seqs: Vec::new(),
+            supersession_approval_run_seq: None,
         });
     }
     let proof = no_effect.ok_or_else(|| {
@@ -217,7 +273,54 @@ pub(crate) fn resolve_dispatch_declaration(
         )
     })?;
     let launch_state = launch_state(proof, &expected, launch_rows)?;
+    let approval_seq = verify_supersession_approval(gate_answers, selected_seq, &expected)?;
+    let groups = group_historical_observations(&others, selected_seq)?;
+    for declaration in others.iter().copied() {
+        verify_no_launch_effect(declaration, launch_state, proof, launch_rows, &expected)?;
+    }
+    verify_refusal_windows(&groups, selected_seq, refusals, &expected)?;
     let mut superseded = Vec::new();
+    let mut superseded_refusals = Vec::new();
+    for (index, group) in groups.iter().enumerate() {
+        for declaration in group.iter().copied() {
+            superseded.push(declaration.run_seq.ok_or_else(|| {
+                EffectError::invalid_input(
+                    "a historical dispatch declaration has no durable ledger sequence",
+                )
+            })?);
+        }
+        let window_end = groups
+            .get(index + 1)
+            .and_then(|next| next.first())
+            .and_then(|declaration| declaration.run_seq)
+            .unwrap_or(selected_seq);
+        superseded_refusals.extend(verify_group_prelaunch_refusal(
+            group, window_end, refusals, proof, &expected,
+        )?);
+    }
+    superseded.sort_unstable();
+    superseded_refusals.sort_unstable();
+    Ok(DispatchAuthorizationResolution {
+        selected_run_seq: selected.run_seq,
+        superseded_run_seqs: superseded,
+        superseded_refusal_run_seqs: superseded_refusals,
+        supersession_approval_run_seq: Some(approval_seq),
+    })
+}
+
+/// Group historical declarations into distinct observations.
+///
+/// `ObservedIdentity` deliberately omits the observation fields (start time,
+/// attempt, dispatch generation and controller epoch), because the current
+/// request does not carry them. Historical declarations must not be grouped by
+/// that route tuple alone: two attempts that share a route but differ in any of
+/// those fields are distinct declarations, and one refusal cannot prove both.
+/// Equivalent re-observations of the same declaration stay in one group.
+fn group_historical_observations<'a>(
+    others: &[&'a DispatchDeclaration<'a>],
+    selected_seq: u64,
+) -> EffectResult<Vec<Vec<&'a DispatchDeclaration<'a>>>> {
+    let mut groups: Vec<Vec<&DispatchDeclaration>> = Vec::new();
     for declaration in others.iter().copied() {
         let seq = declaration.run_seq.ok_or_else(|| {
             EffectError::invalid_input(
@@ -231,14 +334,185 @@ pub(crate) fn resolve_dispatch_declaration(
                 sequence_list(others.iter().map(|declaration| declaration.run_seq))
             )));
         }
-        verify_no_launch_effect(declaration, launch_state, proof, launch_rows, &expected)?;
-        superseded.push(seq);
+        if let Some(group) = groups.iter_mut().find(|group| {
+            same_observation(group[0], declaration)
+                && ObservedIdentity::read(group[0]) == ObservedIdentity::read(declaration)
+        }) {
+            group.push(declaration);
+        } else {
+            groups.push(vec![declaration]);
+        }
     }
-    superseded.sort_unstable();
-    Ok(DispatchAuthorizationResolution {
-        selected_run_seq: selected.run_seq,
-        superseded_run_seqs: superseded,
-    })
+    for group in &mut groups {
+        group.sort_by_key(|declaration| declaration.run_seq.unwrap_or(u64::MAX));
+    }
+    groups.sort_by_key(|group| group[0].run_seq.unwrap_or(u64::MAX));
+    Ok(groups)
+}
+
+/// Reject refusals that cannot belong to any historical observation window.
+fn verify_refusal_windows(
+    groups: &[Vec<&DispatchDeclaration<'_>>],
+    selected_seq: u64,
+    refusals: &[DispatchPrelaunchRefusal<'_>],
+    expected: &ExpectedDispatchAuthorization<'_>,
+) -> EffectResult<()> {
+    let Some(first) = groups.first() else {
+        return Ok(());
+    };
+    let first_observation = ObservedIdentity::read(first[0]);
+    let first_sequence = first
+        .last()
+        .and_then(|declaration| declaration.run_seq)
+        .ok_or_else(|| {
+            EffectError::invalid_input(
+                "a historical dispatch declaration has no durable ledger sequence",
+            )
+        })?;
+    for refusal in refusals {
+        let Some(identity) = refusal_identity(refusal) else {
+            continue;
+        };
+        if identity.intent_id != expected.intent_id
+            || !groups
+                .iter()
+                .any(|group| ObservedIdentity::read(group[0]) == identity)
+        {
+            continue;
+        }
+        let sequence = refusal.run_seq.ok_or_else(|| {
+            EffectError::invalid_input("a durable prelaunch refusal has no durable ledger sequence")
+        })?;
+        if sequence <= first_sequence {
+            return Err(EffectError::invalid_input(format!(
+                "durable prelaunch refusal at run_seq {sequence} does not follow the \
+                 superseded declaration at run_seq {first_sequence} for intent {}",
+                first_observation.intent_id
+            )));
+        }
+        if sequence >= selected_seq {
+            return Err(EffectError::invalid_input(format!(
+                "durable prelaunch refusal at run_seq {sequence} is not a superseded refusal \
+                 before the selected declaration at run_seq {selected_seq}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Require one exact durable refusal inside each distinct observation's window.
+///
+/// A window runs from the last declaration of an observation group to the first
+/// declaration of the next group (or the selected declaration). Because the
+/// windows are disjoint, a single refusal can only ever be bound to one group;
+/// a refusal positioned after two distinct observations cannot release both.
+fn verify_group_prelaunch_refusal(
+    group: &[&DispatchDeclaration<'_>],
+    window_end: u64,
+    refusals: &[DispatchPrelaunchRefusal<'_>],
+    proof: &DispatchNoEffectProof<'_>,
+    expected: &ExpectedDispatchAuthorization<'_>,
+) -> EffectResult<Vec<u64>> {
+    let wanted = ObservedIdentity::read(group[0]);
+    let start = group
+        .last()
+        .and_then(|declaration| declaration.run_seq)
+        .ok_or_else(|| {
+            EffectError::invalid_input(
+                "a historical dispatch declaration has no durable ledger sequence",
+            )
+        })?;
+    let mut accepted = Vec::new();
+    for refusal in refusals {
+        let Some(identity) = refusal_identity(refusal) else {
+            continue;
+        };
+        if identity != wanted {
+            continue;
+        }
+        let sequence = refusal.run_seq.ok_or_else(|| {
+            EffectError::invalid_input("a durable prelaunch refusal has no durable ledger sequence")
+        })?;
+        if sequence <= start || sequence >= window_end {
+            continue;
+        }
+        verify_refusal_envelope(refusal, proof, expected)?;
+        accepted.push(sequence);
+    }
+    if accepted.is_empty() {
+        return Err(EffectError::invalid_input(format!(
+            "superseded dispatch declaration at run_seq {} has no durable verified prelaunch \
+             configuration refusal bound to that exact observation",
+            sequence_list(group.iter().map(|declaration| declaration.run_seq))
+        )));
+    }
+    Ok(accepted)
+}
+
+/// Require a durable operator approval for the current per-slice recovery gate.
+///
+/// `human_approved` in the request is caller-supplied and cannot prove anything.
+/// The host therefore reads the authoritative `tl.gate_answered` rows: the most
+/// recent decision for one of this slice's recovery gates must be `approved` and
+/// must precede the selected declaration. A later rejection or the absence of
+/// any durable decision holds the supersession before launch.
+fn verify_supersession_approval(
+    gate_answers: &[DispatchGateAnswer<'_>],
+    selected_seq: u64,
+    expected: &ExpectedDispatchAuthorization<'_>,
+) -> EffectResult<u64> {
+    let gate_names = slice_recovery_gate_names(expected.scope_id);
+    let mut decisions = Vec::new();
+    for answer in gate_answers {
+        let Some(name) = answer.data.get("gate_name").and_then(Value::as_str) else {
+            continue;
+        };
+        if !gate_names.iter().any(|gate| gate == name) {
+            continue;
+        }
+        let sequence = answer.run_seq.ok_or_else(|| {
+            EffectError::invalid_input("a durable gate answer has no durable ledger sequence")
+        })?;
+        let decision = answer
+            .data
+            .get("decision")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                EffectError::invalid_input(format!(
+                    "durable gate answer at run_seq {sequence} has no decision"
+                ))
+            })?;
+        decisions.push((sequence, decision));
+    }
+    decisions.sort_by_key(|(sequence, _)| *sequence);
+    let Some((sequence, decision)) = decisions.last().copied() else {
+        return Err(EffectError::invalid_input(format!(
+            "supersession of historical dispatch declarations requires a durable approved \
+             operator decision for the recovery gate of scope {:?}",
+            expected.scope_id
+        )));
+    };
+    if decision != "approved" {
+        return Err(EffectError::invalid_input(format!(
+            "the latest durable recovery gate decision at run_seq {sequence} is {decision:?}; \
+             an approved current supersession is required"
+        )));
+    }
+    if sequence >= selected_seq {
+        return Err(EffectError::invalid_input(format!(
+            "durable recovery gate approval at run_seq {sequence} does not precede the selected \
+             declaration at run_seq {selected_seq}"
+        )));
+    }
+    Ok(sequence)
+}
+
+fn slice_recovery_gate_names(scope_id: &str) -> [String; 3] {
+    [
+        format!("tl-terminal-owner-recovery-{scope_id}"),
+        format!("tl-dispatch-failed-{scope_id}"),
+        format!("tl-dispatch-ownership-conflict-{scope_id}"),
+    ]
 }
 
 /// Choose one observation among declarations that match the authorization.
@@ -335,6 +609,129 @@ fn launch_state(
     Ok(LaunchState::SingleLaunch)
 }
 
+/// Reject a same-intent refusal row that no durable declaration can explain.
+fn verify_refusal_ledger(
+    declarations: &[DispatchDeclaration<'_>],
+    refusals: &[DispatchPrelaunchRefusal<'_>],
+    expected: &ExpectedDispatchAuthorization<'_>,
+) -> EffectResult<()> {
+    let declared = declarations
+        .iter()
+        .map(ObservedIdentity::read)
+        .collect::<Vec<_>>();
+    for refusal in refusals {
+        let sequence = sequence_label(refusal.run_seq);
+        let Some(arguments) = refusal.data.get("arguments") else {
+            continue;
+        };
+        let top_level_intent = arguments.get("dispatch_intent_id").and_then(Value::as_str);
+        let route_intent = arguments
+            .get("role_route")
+            .and_then(|route| route.get("dispatch_intent_id"))
+            .and_then(Value::as_str);
+        if top_level_intent != Some(expected.intent_id) && route_intent != Some(expected.intent_id)
+        {
+            continue;
+        }
+        if refusal.data.get("tool_name").and_then(Value::as_str) != Some("resume_blocked_leaf") {
+            return Err(EffectError::invalid_input(format!(
+                "durable refusal at run_seq {sequence} is not attributed to resume_blocked_leaf"
+            )));
+        }
+        let Some(identity) = refusal_identity(refusal) else {
+            return Err(EffectError::invalid_input(format!(
+                "durable prelaunch refusal at run_seq {sequence} is malformed or missing its \
+                 dispatch authorization"
+            )));
+        };
+        if identity.intent_id != expected.intent_id {
+            return Err(EffectError::invalid_input(format!(
+                "durable prelaunch refusal at run_seq {sequence} names a different dispatch intent"
+            )));
+        }
+        if !declared.contains(&identity) {
+            return Err(EffectError::invalid_input(format!(
+                "durable prelaunch refusal at run_seq {sequence} is not bound to any durable \
+                 dispatch declaration for this intent"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn refusal_identity(refusal: &DispatchPrelaunchRefusal<'_>) -> Option<ObservedIdentity> {
+    let arguments = refusal.data.get("arguments")?;
+    let route = arguments.get("role_route")?;
+    if !route.is_object() {
+        return None;
+    }
+    let text = |key: &str| route.get(key).and_then(Value::as_str).map(str::to_string);
+    Some(ObservedIdentity {
+        intent_id: text("dispatch_intent_id").unwrap_or_default(),
+        agent_id: refusal.caller.map(str::to_string),
+        boundary: Some("dispatch_intended".to_string()),
+        scope_id: text("scope_id"),
+        role: text("role"),
+        harness: text("harness"),
+        agent_type: text("agent_type"),
+        model: text("model"),
+        effort: text("effort"),
+        configuration_fingerprint: text("configuration_fingerprint"),
+        policy_fingerprint: text("policy_fingerprint"),
+        manifest_digest: text("manifest_digest"),
+        route_fingerprint: text("route_fingerprint"),
+    })
+}
+
+fn verify_refusal_envelope(
+    refusal: &DispatchPrelaunchRefusal<'_>,
+    proof: &DispatchNoEffectProof<'_>,
+    expected: &ExpectedDispatchAuthorization<'_>,
+) -> EffectResult<()> {
+    let sequence = sequence_label(refusal.run_seq);
+    let data = refusal.data;
+    if refusal.caller != Some(expected.caller) {
+        return Err(EffectError::invalid_input(format!(
+            "durable prelaunch refusal at run_seq {sequence} is not attributed to the requesting \
+             caller"
+        )));
+    }
+    if data.get("tool_name").and_then(Value::as_str) != Some("resume_blocked_leaf")
+        || data.get("success") != Some(&Value::Bool(false))
+        || data.get("error").and_then(Value::as_str) != Some(ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED)
+        || data.get("result").is_some_and(|result| !result.is_null())
+    {
+        return Err(EffectError::invalid_input(format!(
+            "durable refusal at run_seq {sequence} is not the exact permitted prelaunch \
+             configuration refusal"
+        )));
+    }
+    let arguments = data.get("arguments").ok_or_else(|| {
+        EffectError::invalid_input(format!(
+            "durable prelaunch refusal at run_seq {sequence} has no request arguments"
+        ))
+    })?;
+    if arguments.get("human_approved") != Some(&Value::Bool(true))
+        || arguments.get("chainlink_issue_id").and_then(Value::as_u64)
+            != Some(proof.expected_issue_id)
+        || arguments
+            .get("expected_invocation_id")
+            .and_then(Value::as_str)
+            != Some(proof.expected_invocation_id)
+        || arguments.get("expected_branch").and_then(Value::as_str) != Some(proof.expected_branch)
+        || arguments
+            .get("expected_worktree_fingerprint")
+            .and_then(Value::as_str)
+            != Some(proof.expected_worktree_fingerprint)
+    {
+        return Err(EffectError::invalid_input(format!(
+            "durable prelaunch refusal at run_seq {sequence} does not prove this exact owner \
+             resume was refused"
+        )));
+    }
+    Ok(())
+}
+
 fn verify_no_launch_effect(
     declaration: &DispatchDeclaration<'_>,
     state: LaunchState,
@@ -394,14 +791,22 @@ pub(crate) fn dispatch_authorization_resolution_id(
     intent_id: &str,
     selected_run_seq: Option<u64>,
     superseded_run_seqs: &[u64],
+    superseded_refusal_run_seqs: &[u64],
+    supersession_approval_run_seq: Option<u64>,
 ) -> String {
     let superseded = superseded_run_seqs
         .iter()
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(",");
+    let refusals = superseded_refusal_run_seqs
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let approval = sequence_label(supersession_approval_run_seq);
     let input = format!(
-        "dispatch-authorization-resolution-v1\0{intent_id}\0{}\0{superseded}",
+        "dispatch-authorization-resolution-v3\0{intent_id}\0{}\0{superseded}\0{refusals}\0{approval}",
         sequence_label(selected_run_seq)
     );
     format!(
@@ -554,6 +959,11 @@ mod tests {
         successor
     }
 
+    const PREDECESSOR: &str = "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d";
+    const BRANCH: &str = "main.kani.issue-814-substitution-model-kani";
+    const FINGERPRINT: &str =
+        "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
     fn old_and_new<'a>(
         old: &'a Value,
         new: &'a Value,
@@ -564,12 +974,86 @@ mod tests {
         )
     }
 
+    fn no_effect<'a>(invocation: &'a InvocationRecord) -> DispatchNoEffectProof<'a> {
+        DispatchNoEffectProof {
+            expected_invocation_id: PREDECESSOR,
+            expected_issue_id: 814,
+            expected_branch: BRANCH,
+            expected_worktree_fingerprint: FINGERPRINT,
+            invocation,
+        }
+    }
+
+    fn refusal_data(declaration: &Value) -> Value {
+        json!({
+            "tool_name": "resume_blocked_leaf",
+            "role": "tl",
+            "arguments": {
+                "chainlink_issue_id": 814,
+                "expected_invocation_id": PREDECESSOR,
+                "expected_branch": BRANCH,
+                "expected_worktree_fingerprint": FINGERPRINT,
+                "task": "resume the blocked leaf",
+                "human_approved": true,
+                "role_route": {
+                    "dispatch_intent_id": declaration["intent_id"],
+                    "scope_id": declaration["slice_id"],
+                    "role": declaration["role"],
+                    "harness": declaration["harness"],
+                    "agent_type": declaration["agent_type"],
+                    "model": declaration["model"],
+                    "effort": declaration["effort"],
+                    "configuration_fingerprint": declaration["route_configuration_fingerprint"],
+                    "policy_fingerprint": declaration["route_policy_fingerprint"],
+                    "manifest_digest": declaration["route_manifest_digest"],
+                    "route_fingerprint": declaration["route_fingerprint"],
+                },
+            },
+            "success": false,
+            "error": ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+        })
+    }
+
+    fn refusal_row<'a>(
+        data: &'a Value,
+        run_seq: u64,
+        caller: &'a str,
+    ) -> DispatchPrelaunchRefusal<'a> {
+        DispatchPrelaunchRefusal {
+            run_seq: Some(run_seq),
+            caller: Some(caller),
+            data,
+        }
+    }
+
+    fn approval_data(gate: &str, decision: &str) -> Value {
+        json!({
+            "gate_name": gate,
+            "decision": decision,
+            "source": "cli",
+        })
+    }
+
+    fn approval_row<'a>(data: &'a Value, run_seq: u64) -> DispatchGateAnswer<'a> {
+        DispatchGateAnswer {
+            run_seq: Some(run_seq),
+            data,
+        }
+    }
+
+    fn approved_answers() -> Vec<DispatchGateAnswer<'static>> {
+        let gate = format!("tl-terminal-owner-recovery-{SLICE}");
+        let data = approval_data(&gate, "approved");
+        vec![approval_row(Box::leak(Box::new(data)), 188_600)]
+    }
+
     #[test]
     fn missing_declaration_is_refused_with_the_exact_message() {
-        let error = resolve_dispatch_declaration(&[], &[], expected(), None)
-            .err()
-            .expect("missing declaration must be refused")
-            .to_string();
+        let error =
+            resolve_dispatch_declaration(&[], &[], &[], &approved_answers(), expected(), None)
+                .err()
+                .expect("missing declaration must be refused")
+                .to_string();
         assert_eq!(
             error,
             "Invalid input: role route dispatch authorization is missing or ambiguous"
@@ -580,29 +1064,250 @@ mod tests {
     fn reauthorized_resume_resolves_the_current_declaration_over_a_proven_no_effect_predecessor() {
         let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
         let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let old_refusal = refusal_data(&old);
         let (old_row, new_row) = old_and_new(&old, &new);
         let owner = predecessor();
-        let proof = DispatchNoEffectProof {
-            expected_invocation_id: "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d",
-            invocation: &owner,
-        };
-        let resolution =
-            resolve_dispatch_declaration(&[old_row, new_row], &[], expected(), Some(&proof))
-                .expect("the reauthorized declaration is the only live authorization");
+        let proof = no_effect(&owner);
+        let resolution = resolve_dispatch_declaration(
+            &[old_row, new_row],
+            &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &approved_answers(),
+            expected(),
+            Some(&proof),
+        )
+        .expect("the reauthorized declaration is the only live authorization");
         assert_eq!(resolution.selected_run_seq, Some(188_878));
         assert_eq!(resolution.superseded_run_seqs, vec![188_678]);
+        assert_eq!(resolution.superseded_refusal_run_seqs, vec![188_693]);
+        assert_eq!(resolution.supersession_approval_run_seq, Some(188_600));
     }
 
     #[test]
     fn ambiguity_without_no_effect_evidence_is_refused() {
         let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
         let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let old_refusal = refusal_data(&old);
         let (old_row, new_row) = old_and_new(&old, &new);
-        let error = resolve_dispatch_declaration(&[old_row, new_row], &[], expected(), None)
-            .err()
-            .expect("unproven supersession must be refused")
-            .to_string();
+        let error = resolve_dispatch_declaration(
+            &[old_row, new_row],
+            &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &approved_answers(),
+            expected(),
+            None,
+        )
+        .err()
+        .expect("unproven supersession must be refused")
+        .to_string();
         assert!(error.contains("verified no-effect evidence"), "{error}");
+    }
+
+    #[test]
+    fn missing_prelaunch_refusal_is_refused() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let (old_row, new_row) = old_and_new(&old, &new);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let error = resolve_dispatch_declaration(
+            &[old_row, new_row],
+            &[],
+            &[],
+            &approved_answers(),
+            expected(),
+            Some(&proof),
+        )
+        .err()
+        .expect("a non-live predecessor and an empty launch history are not refusal proof")
+        .to_string();
+        assert!(
+            error.contains("has no durable verified prelaunch configuration refusal"),
+            "{error}"
+        );
+        assert!(error.contains("188678"), "{error}");
+    }
+
+    #[test]
+    fn unrelated_refusal_is_not_proof() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let unrelated = declaration(
+            188_670,
+            "blocked-resume:unrelated",
+            CALLER,
+            SLICE,
+            OLD_CONFIG,
+            OLD_ROUTE,
+            1.0,
+        );
+        let unrelated_refusal = refusal_data(&unrelated);
+        let (old_row, new_row) = old_and_new(&old, &new);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let error = resolve_dispatch_declaration(
+            &[old_row, new_row],
+            &[],
+            &[refusal_row(&unrelated_refusal, 188_690, CALLER)],
+            &approved_answers(),
+            expected(),
+            Some(&proof),
+        )
+        .err()
+        .expect("an unrelated refusal does not prove the superseded declaration was refused")
+        .to_string();
+        assert!(
+            error.contains("has no durable verified prelaunch configuration refusal"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn refusal_for_a_wrong_declaration_is_refused() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let wrong = declaration(188_680, INTENT, CALLER, SLICE, OLD_CONFIG, NEW_ROUTE, 1.0);
+        let wrong_refusal = refusal_data(&wrong);
+        let (old_row, new_row) = old_and_new(&old, &new);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let error = resolve_dispatch_declaration(
+            &[old_row, new_row],
+            &[],
+            &[refusal_row(&wrong_refusal, 188_693, CALLER)],
+            &approved_answers(),
+            expected(),
+            Some(&proof),
+        )
+        .err()
+        .expect("a refusal for another declaration must not release this one")
+        .to_string();
+        assert!(
+            error.contains("not bound to any durable dispatch declaration")
+                || error.contains("has no durable verified prelaunch configuration refusal"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn contradictory_refusal_envelope_is_refused() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let mut old_refusal = refusal_data(&old);
+        old_refusal["success"] = json!(true);
+        let (old_row, new_row) = old_and_new(&old, &new);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let error = resolve_dispatch_declaration(
+            &[old_row, new_row],
+            &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &approved_answers(),
+            expected(),
+            Some(&proof),
+        )
+        .err()
+        .expect("a successful request is not a refusal")
+        .to_string();
+        assert!(
+            error.contains("not the exact permitted prelaunch configuration refusal"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn refusal_before_the_declaration_is_refused() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let old_refusal = refusal_data(&old);
+        let (old_row, new_row) = old_and_new(&old, &new);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let error = resolve_dispatch_declaration(
+            &[old_row, new_row],
+            &[],
+            &[refusal_row(&old_refusal, 188_670, CALLER)],
+            &approved_answers(),
+            expected(),
+            Some(&proof),
+        )
+        .err()
+        .expect("a refusal cannot predate the declaration it is said to refuse")
+        .to_string();
+        assert!(error.contains("does not follow"), "{error}");
+    }
+
+    #[test]
+    fn refusal_after_the_selected_declaration_is_refused() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let old_refusal = refusal_data(&old);
+        let (old_row, new_row) = old_and_new(&old, &new);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let error = resolve_dispatch_declaration(
+            &[old_row, new_row],
+            &[],
+            &[refusal_row(&old_refusal, 188_900, CALLER)],
+            &approved_answers(),
+            expected(),
+            Some(&proof),
+        )
+        .err()
+        .expect("the refusal must precede the selected supersession")
+        .to_string();
+        assert!(
+            error.contains("not a superseded refusal before the selected declaration"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn refusal_attributed_to_another_caller_is_refused() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let old_refusal = refusal_data(&old);
+        let (old_row, new_row) = old_and_new(&old, &new);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let error = resolve_dispatch_declaration(
+            &[old_row, new_row],
+            &[],
+            &[refusal_row(&old_refusal, 188_693, "foreign-stage")],
+            &approved_answers(),
+            expected(),
+            Some(&proof),
+        )
+        .err()
+        .expect("a refusal recorded for another caller is not this resume's proof")
+        .to_string();
+        assert!(
+            error.contains("has no durable verified prelaunch configuration refusal")
+                || error.contains("not bound to any durable dispatch declaration"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unrelated_same_intent_refusal_without_supersession_is_refused() {
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let orphan = declaration(188_680, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let orphan_refusal = refusal_data(&orphan);
+        let error = resolve_dispatch_declaration(
+            &[row(&new, CALLER, Some(188_878))],
+            &[],
+            &[refusal_row(&orphan_refusal, 188_693, CALLER)],
+            &approved_answers(),
+            expected(),
+            None,
+        )
+        .err()
+        .expect("a same-intent refusal for no durable declaration is contradictory history")
+        .to_string();
+        assert!(
+            error.contains("not bound to any durable dispatch declaration"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -615,6 +1320,8 @@ mod tests {
                 row(&second, CALLER, Some(188_879)),
             ],
             &[],
+            &[],
+            &approved_answers(),
             expected(),
             None,
         )
@@ -633,6 +1340,8 @@ mod tests {
                 row(&second, CALLER, Some(188_879)),
             ],
             &[],
+            &[],
+            &approved_answers(),
             expected(),
             None,
         )
@@ -648,16 +1357,15 @@ mod tests {
         let old = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
         let later = declaration(188_900, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 3.0);
         let owner = predecessor();
-        let proof = DispatchNoEffectProof {
-            expected_invocation_id: "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d",
-            invocation: &owner,
-        };
+        let proof = no_effect(&owner);
         let error = resolve_dispatch_declaration(
             &[
                 row(&old, CALLER, Some(188_878)),
                 row(&later, CALLER, Some(188_900)),
             ],
             &[],
+            &[],
+            &approved_answers(),
             expected(),
             Some(&proof),
         )
@@ -675,16 +1383,15 @@ mod tests {
         let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
         let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
         let owner = predecessor();
-        let proof = DispatchNoEffectProof {
-            expected_invocation_id: "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d",
-            invocation: &owner,
-        };
+        let proof = no_effect(&owner);
         let error = resolve_dispatch_declaration(
             &[
                 row(&old, "foreign-stage", Some(188_678)),
                 row(&new, CALLER, Some(188_878)),
             ],
             &[],
+            &[],
+            &approved_answers(),
             expected(),
             Some(&proof),
         )
@@ -715,6 +1422,8 @@ mod tests {
                 row(&new, CALLER, Some(188_878)),
             ],
             &[],
+            &[],
+            &approved_answers(),
             expected(),
             None,
         )
@@ -737,15 +1446,14 @@ mod tests {
                 row(&new, CALLER, Some(188_878)),
             ],
             &[],
+            &[],
+            &approved_answers(),
             ExpectedDispatchAuthorization {
                 configuration_fingerprint: OLD_CONFIG,
                 route_fingerprint: OLD_ROUTE,
                 ..expected()
             },
-            Some(&DispatchNoEffectProof {
-                expected_invocation_id: "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d",
-                invocation: &predecessor(),
-            }),
+            Some(&no_effect(&predecessor())),
         )
         .err()
         .expect("a stale accepted configuration cannot authorize the old declaration")
@@ -762,6 +1470,8 @@ mod tests {
         let error = resolve_dispatch_declaration(
             &[row(&new, CALLER, Some(188_878))],
             &[],
+            &[],
+            &approved_answers(),
             ExpectedDispatchAuthorization {
                 route_fingerprint: "sha256:v1:forged",
                 ..expected()
@@ -778,14 +1488,12 @@ mod tests {
     }
 
     #[test]
-    fn prior_launch_row_blocks_supersession() {
+    fn prior_launch_row_blocks_supersession_even_with_an_exact_refusal() {
         let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
         let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let old_refusal = refusal_data(&old);
         let owner = predecessor();
-        let proof = DispatchNoEffectProof {
-            expected_invocation_id: "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d",
-            invocation: &owner,
-        };
+        let proof = no_effect(&owner);
         let launch = json!({"intent_id": INTENT, "invocation_id": "someone-else"});
         let error = resolve_dispatch_declaration(
             &[
@@ -793,6 +1501,8 @@ mod tests {
                 row(&new, CALLER, Some(188_878)),
             ],
             &[row(&launch, CALLER, Some(188_700))],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &approved_answers(),
             expected(),
             Some(&proof),
         )
@@ -809,17 +1519,17 @@ mod tests {
     fn live_predecessor_blocks_supersession() {
         let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
         let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
-        let owner = invocation("f285efc5-4b0d-4a42-bcf8-c50a329f4a1d", 2);
-        let proof = DispatchNoEffectProof {
-            expected_invocation_id: "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d",
-            invocation: &owner,
-        };
+        let old_refusal = refusal_data(&old);
+        let owner = invocation(PREDECESSOR, 2);
+        let proof = no_effect(&owner);
         let error = resolve_dispatch_declaration(
             &[
                 row(&old, CALLER, Some(188_678)),
                 row(&new, CALLER, Some(188_878)),
             ],
             &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &approved_answers(),
             expected(),
             Some(&proof),
         )
@@ -833,19 +1543,19 @@ mod tests {
     fn unknown_owner_invocation_outcome_blocks_supersession() {
         let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
         let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let old_refusal = refusal_data(&old);
         let mut owner = invocation("some-other-invocation", 2);
         owner.status = InvocationStatus::Failed;
         owner.prior_invocation_id = Some("different-predecessor".to_string());
-        let proof = DispatchNoEffectProof {
-            expected_invocation_id: "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d",
-            invocation: &owner,
-        };
+        let proof = no_effect(&owner);
         let error = resolve_dispatch_declaration(
             &[
                 row(&old, CALLER, Some(188_678)),
                 row(&new, CALLER, Some(188_878)),
             ],
             &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &approved_answers(),
             expected(),
             Some(&proof),
         )
@@ -859,11 +1569,9 @@ mod tests {
     fn linked_successor_after_response_loss_resolves_adoption() {
         let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
         let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
-        let successor = linked_successor("f285efc5-4b0d-4a42-bcf8-c50a329f4a1d");
-        let proof = DispatchNoEffectProof {
-            expected_invocation_id: "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d",
-            invocation: &successor,
-        };
+        let old_refusal = refusal_data(&old);
+        let successor = linked_successor(PREDECESSOR);
+        let proof = no_effect(&successor);
         let launch = json!({"intent_id": INTENT, "invocation_id": "generation-3"});
         let resolution = resolve_dispatch_declaration(
             &[
@@ -871,23 +1579,51 @@ mod tests {
                 row(&new, CALLER, Some(188_878)),
             ],
             &[row(&launch, CALLER, Some(188_900))],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &approved_answers(),
             expected(),
             Some(&proof),
         )
         .expect("a single linked successor proves the older declaration had no launch");
         assert_eq!(resolution.selected_run_seq, Some(188_878));
         assert_eq!(resolution.superseded_run_seqs, vec![188_678]);
+        assert_eq!(resolution.superseded_refusal_run_seqs, vec![188_693]);
+    }
+
+    #[test]
+    fn adoption_without_the_exact_refusal_is_held() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let successor = linked_successor(PREDECESSOR);
+        let proof = no_effect(&successor);
+        let launch = json!({"intent_id": INTENT, "invocation_id": "generation-3"});
+        let error = resolve_dispatch_declaration(
+            &[
+                row(&old, CALLER, Some(188_678)),
+                row(&new, CALLER, Some(188_878)),
+            ],
+            &[row(&launch, CALLER, Some(188_900))],
+            &[],
+            &approved_answers(),
+            expected(),
+            Some(&proof),
+        )
+        .err()
+        .expect("adoption cannot release an unproven historical declaration")
+        .to_string();
+        assert!(
+            error.contains("has no durable verified prelaunch configuration refusal"),
+            "{error}"
+        );
     }
 
     #[test]
     fn a_second_launch_row_blocks_adoption() {
         let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
         let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
-        let successor = linked_successor("f285efc5-4b0d-4a42-bcf8-c50a329f4a1d");
-        let proof = DispatchNoEffectProof {
-            expected_invocation_id: "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d",
-            invocation: &successor,
-        };
+        let old_refusal = refusal_data(&old);
+        let successor = linked_successor(PREDECESSOR);
+        let proof = no_effect(&successor);
         let first = json!({"intent_id": INTENT, "invocation_id": "generation-3"});
         let second = json!({"intent_id": INTENT, "invocation_id": "generation-4"});
         let error = resolve_dispatch_declaration(
@@ -899,6 +1635,8 @@ mod tests {
                 row(&first, CALLER, Some(188_900)),
                 row(&second, CALLER, Some(188_901)),
             ],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &approved_answers(),
             expected(),
             Some(&proof),
         )
@@ -909,17 +1647,217 @@ mod tests {
     }
 
     #[test]
+    fn two_distinct_historical_observations_cannot_share_one_refusal() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let distinct = declaration(188_680, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 2.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 3.0);
+        let old_refusal = refusal_data(&old);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let error = resolve_dispatch_declaration(
+            &[
+                row(&old, CALLER, Some(188_678)),
+                row(&distinct, CALLER, Some(188_680)),
+                row(&new, CALLER, Some(188_878)),
+            ],
+            &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &approved_answers(),
+            expected(),
+            Some(&proof),
+        )
+        .err()
+        .expect("one refusal after two distinct observations cannot prove both")
+        .to_string();
+        assert!(error.contains("bound to that exact observation"), "{error}");
+        assert!(error.contains("188678"), "{error}");
+    }
+
+    #[test]
+    fn separately_bound_refusals_release_each_distinct_historical_observation() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let distinct = declaration(188_680, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.5);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 3.0);
+        let old_refusal = refusal_data(&old);
+        let distinct_refusal = refusal_data(&distinct);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let resolution = resolve_dispatch_declaration(
+            &[
+                row(&old, CALLER, Some(188_678)),
+                row(&distinct, CALLER, Some(188_680)),
+                row(&new, CALLER, Some(188_878)),
+            ],
+            &[],
+            &[
+                refusal_row(&old_refusal, 188_679, CALLER),
+                refusal_row(&distinct_refusal, 188_681, CALLER),
+            ],
+            &approved_answers(),
+            expected(),
+            Some(&proof),
+        )
+        .expect("each distinct historical observation has its own exact refusal");
+        assert_eq!(resolution.superseded_run_seqs, vec![188_678, 188_680]);
+        assert_eq!(
+            resolution.superseded_refusal_run_seqs,
+            vec![188_679, 188_681]
+        );
+    }
+
+    #[test]
+    fn equivalent_historical_duplicates_share_one_refusal() {
+        let first = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let duplicate = declaration(188_679, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let old_refusal = refusal_data(&first);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let resolution = resolve_dispatch_declaration(
+            &[
+                row(&first, CALLER, Some(188_678)),
+                row(&duplicate, CALLER, Some(188_679)),
+                row(&new, CALLER, Some(188_878)),
+            ],
+            &[],
+            &[refusal_row(&old_refusal, 188_680, CALLER)],
+            &approved_answers(),
+            expected(),
+            Some(&proof),
+        )
+        .expect("an equivalent re-observation is the same refused declaration");
+        assert_eq!(resolution.superseded_run_seqs, vec![188_678, 188_679]);
+        assert_eq!(resolution.superseded_refusal_run_seqs, vec![188_680]);
+    }
+
+    #[test]
+    fn supersession_without_durable_approval_is_refused() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let old_refusal = refusal_data(&old);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let error = resolve_dispatch_declaration(
+            &[
+                row(&old, CALLER, Some(188_678)),
+                row(&new, CALLER, Some(188_878)),
+            ],
+            &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &[],
+            expected(),
+            Some(&proof),
+        )
+        .err()
+        .expect("a caller-supplied human_approved flag is not durable approval")
+        .to_string();
+        assert!(
+            error.contains("requires a durable approved operator decision"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_later_rejected_gate_decision_blocks_supersession() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let old_refusal = refusal_data(&old);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let gate = format!("tl-terminal-owner-recovery-{SLICE}");
+        let approved = approval_data(&gate, "approved");
+        let rejected = approval_data(&gate, "rejected");
+        let error = resolve_dispatch_declaration(
+            &[
+                row(&old, CALLER, Some(188_678)),
+                row(&new, CALLER, Some(188_878)),
+            ],
+            &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &[
+                approval_row(&approved, 188_600),
+                approval_row(&rejected, 188_650),
+            ],
+            expected(),
+            Some(&proof),
+        )
+        .err()
+        .expect("a later rejection revokes the approval")
+        .to_string();
+        assert!(
+            error.contains("approved current supersession is required"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn approval_after_the_selected_declaration_is_refused() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let old_refusal = refusal_data(&old);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let gate = format!("tl-terminal-owner-recovery-{SLICE}");
+        let approved = approval_data(&gate, "approved");
+        let error = resolve_dispatch_declaration(
+            &[
+                row(&old, CALLER, Some(188_678)),
+                row(&new, CALLER, Some(188_878)),
+            ],
+            &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &[approval_row(&approved, 188_900)],
+            expected(),
+            Some(&proof),
+        )
+        .err()
+        .expect("approval cannot postdate the declaration it authorizes")
+        .to_string();
+        assert!(
+            error.contains("does not precede the selected declaration"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn approval_for_another_slice_is_not_proof() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let old_refusal = refusal_data(&old);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let foreign = approval_data("tl-terminal-owner-recovery-other-slice", "approved");
+        let error = resolve_dispatch_declaration(
+            &[
+                row(&old, CALLER, Some(188_678)),
+                row(&new, CALLER, Some(188_878)),
+            ],
+            &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &[approval_row(&foreign, 188_600)],
+            expected(),
+            Some(&proof),
+        )
+        .err()
+        .expect("another slice's approval does not authorize this supersession")
+        .to_string();
+        assert!(
+            error.contains("requires a durable approved operator decision"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn unsequenced_declarations_are_refused() {
         let old = declaration(0, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
         let new = declaration(0, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
         let owner = predecessor();
-        let proof = DispatchNoEffectProof {
-            expected_invocation_id: "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d",
-            invocation: &owner,
-        };
+        let proof = no_effect(&owner);
         let error = resolve_dispatch_declaration(
             &[row(&old, CALLER, None), row(&new, CALLER, None)],
             &[],
+            &[],
+            &approved_answers(),
             expected(),
             Some(&proof),
         )
@@ -931,18 +1869,62 @@ mod tests {
 
     #[test]
     fn resolution_identity_is_stable_and_sequence_specific() {
-        let first = dispatch_authorization_resolution_id(INTENT, Some(188_878), &[188_678]);
+        let first = dispatch_authorization_resolution_id(
+            INTENT,
+            Some(188_878),
+            &[188_678],
+            &[188_693],
+            Some(188_600),
+        );
         assert_eq!(
             first,
-            dispatch_authorization_resolution_id(INTENT, Some(188_878), &[188_678])
+            dispatch_authorization_resolution_id(
+                INTENT,
+                Some(188_878),
+                &[188_678],
+                &[188_693],
+                Some(188_600)
+            )
         );
         assert_ne!(
             first,
-            dispatch_authorization_resolution_id(INTENT, Some(188_879), &[188_678])
+            dispatch_authorization_resolution_id(
+                INTENT,
+                Some(188_879),
+                &[188_678],
+                &[188_693],
+                Some(188_600)
+            )
         );
         assert_ne!(
             first,
-            dispatch_authorization_resolution_id(INTENT, Some(188_878), &[188_679])
+            dispatch_authorization_resolution_id(
+                INTENT,
+                Some(188_878),
+                &[188_679],
+                &[188_693],
+                Some(188_600)
+            )
+        );
+        assert_ne!(
+            first,
+            dispatch_authorization_resolution_id(
+                INTENT,
+                Some(188_878),
+                &[188_678],
+                &[188_694],
+                Some(188_600)
+            )
+        );
+        assert_ne!(
+            first,
+            dispatch_authorization_resolution_id(
+                INTENT,
+                Some(188_878),
+                &[188_678],
+                &[188_693],
+                Some(188_601)
+            )
         );
     }
 }

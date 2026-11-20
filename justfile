@@ -866,6 +866,9 @@ e2e-stored-proof-literal:
 # gate, then the reauthorized v2 retry must select one declaration, launch one
 # real generation-3 successor, stay duplicate-free across repeat init, restart,
 # adoption and concurrent requests, and hold every host negative control.
+# The host-recorded prelaunch refusal is produced through the production path,
+# not seeded. Set E2E_DISPATCH_RETAIN_ARTIFACTS=<outside-work-dir> to retain and
+# independently rehash the exact binary, WASM guests and controller archive.
 # Harnesses are disposable shims; no provider is contacted.
 e2e-dispatch-collision:
     E2E_DISPATCH_COLLISION_ONLY=1 ./tests/e2e/init-recovery/run.sh
@@ -879,7 +882,7 @@ check-e2e-init-recovery:
     bash -n tests/e2e/init-recovery/stored-proof-acceptance.sh
     bash -n tests/e2e/init-recovery/stored-proof-literal-acceptance.sh
     bash -n tests/e2e/init-recovery/dispatch-collision-acceptance.sh
-    {{py}} -m py_compile tests/e2e/init-recovery/check_role_config_preflight.py tests/e2e/init-recovery/seed-stored-proof.py tests/e2e/init-recovery/check-stored-proof-negatives.py tests/e2e/init-recovery/check-dispatch-negatives.py
+    {{py}} -m py_compile tests/e2e/init-recovery/check_role_config_preflight.py tests/e2e/init-recovery/seed-stored-proof.py tests/e2e/init-recovery/check-stored-proof-negatives.py tests/e2e/init-recovery/check-dispatch-negatives.py tests/e2e/init-recovery/drive-refused-dispatch.py tests/e2e/init-recovery/rehash-dispatch-artifacts.py
     bash -n tests/e2e/init-recovery/tl-window-state.sh
     bash -n tests/e2e/init-recovery/test-tl-window-state.sh
     tests/e2e/init-recovery/test-tl-window-state.sh

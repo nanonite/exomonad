@@ -626,6 +626,14 @@ start_server "$WORK/server-v2-reloaded.log"
     || fail "the reloaded standalone server accepted a different identity"
 say "reloaded the standalone server with the historical owner in place"
 
+say "replaying the retained v1 dispatch through the production host path"
+python3 "$SOURCE_ROOT/tests/e2e/init-recovery/drive-refused-dispatch.py" \
+    --repo "$REPO" --refused-action "$WORK/refused-action.json" --run-id "$STAGE" \
+    > "$WORK/old-host-refusal.json" 2> "$WORK/old-host-refusal.err" \
+    || { cat "$WORK/old-host-refusal.err"; fail "the retained v1 dispatch was not refused by the production host path"; }
+OLD_REFUSAL_SEQ="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["refusal_run_seq"])' "$WORK/old-host-refusal.json")"
+printf 'LITERAL-2 host-recorded prelaunch refusal seq %s carries the old v1 dispatch authorization\n' "$OLD_REFUSAL_SEQ"
+
 say "proving the corrected controller links one fresh v2 authorization over the literal v1 proof"
 python3 "$SOURCE_ROOT/tests/e2e/init-recovery/seed-stored-proof.py" expected \
     --repo "$REPO" --run-id "$STAGE" \

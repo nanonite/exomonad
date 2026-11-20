@@ -223,21 +223,44 @@ shows the older declaration was no-effect:
   predecessor, its stored `role_route` is this authorization, and exactly one
   `agent.spawned` row names that successor (the response-loss/adoption case).
 
-Anything else holds before launch: a missing declaration, a declaration that
-matches no durable tuple, a later distinct declaration after the selected one,
-a declaration attributed to another caller, a live predecessor, an unknown
-owner outcome, a second launch row, or a prior launched effect. Equivalent
-repeated observations of one authorization (same identity and same observation
-fields) are idempotent and collapse to one declaration; a conflicting
-observation of the same authorization is a competing declaration and is
-refused. Diagnostics name the matching ledger sequences and safe identity
-fields, never credentials.
+Every older declaration must also be bound to a durable host-recorded
+`tool.called` refusal row: the exact `resume_blocked_leaf` request with that
+declaration's full route tuple, `success=false`, the exact
+configuration-not-accepted error, no result payload, and a ledger sequence after
+that observation and before the next distinct observation (or the selected
+declaration). Historical declarations are grouped by their full observation
+identity: the route tuple plus `started_at`, `attempt`, `dispatch_generation`
+and `controller_epoch`. Equivalent repeated observations (the same fields) are
+one declaration and may share one refusal; two observations that differ in any
+of those fields are distinct declarations and each needs its own refusal in its
+own ledger window. One refusal after two distinct observations cannot release
+both. Anything else holds before launch: a missing declaration, a declaration
+that matches no durable tuple, a missing, unrelated, wrong-declaration or
+contradictory refusal, a refusal outside that observation's window, a later
+distinct declaration after the selected one, a declaration attributed to
+another caller, a live predecessor, an unknown owner outcome, a second launch
+row, or a prior launched effect. Diagnostics name the matching ledger sequences
+and safe identity fields, never credentials.
+
+The request's `human_approved` flag is caller-supplied and is not proof of
+operator approval. A supersession also requires the authoritative
+`tl.gate_answered` rows for the slice's per-slice recovery gate to show an
+`approved` decision before the selected declaration, with no later `rejected`
+decision. That durable gate answer is the host-visible approval boundary; the
+controller's run checkpoint and the caller's boolean are not accepted as
+substitutes. Missing, foreign-slice, stale-after-rejection or post-dated
+approval holds the supersession before launch. The trust boundary is therefore:
+the ledger supplies declarations, refusals, launch rows and gate decisions; the
+owner registry supplies the current invocation; the caller supplies only the
+request it wants authorized.
 
 A successful supersession appends one
 `tl.dispatch_authorization_resolved` audit row (idempotent by resolution id)
-carrying the intent, selected sequence, superseded sequences, configuration and
-route fingerprints, and the reason
-`superseded_declaration_proven_no_launch_effect`. Historical
+carrying the intent, selected sequence, superseded sequences, their refusal
+sequences, the durable approval sequence, configuration and route
+fingerprints, and the reason
+`superseded_declaration_proven_prelaunch_refusal_with_current_approval`.
+Historical
 `tl.dispatch_intended`/`tl.spawn_requested`, journal, proof and receipt bytes
 are never rewritten; only legitimate records append. The audit row is the only
 new record class.

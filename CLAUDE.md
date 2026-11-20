@@ -900,10 +900,14 @@ isolated Codex home, run-scoped tmux server and standalone `serve` as the
 stored-proof modes. It seeds the production-shaped history the literal fixture
 used to omit (both old `tl.dispatch_intended`/`tl.spawn_requested` rows, the
 exact rejected prelaunch journal, the literal `a8b9524b...` proof and the
-approved gate), then proves the reauthorized v2 retry selects one declaration,
-launches one real generation-3 OpenCode DeepSeek/high successor, adds no
-duplicate across repeat init, server restart, adoption and concurrent requests,
-holds every host negative control, and leaves historical bytes unchanged. It
+approved gate), replays the old v1 request through the production host path so
+the exact prelaunch refusal is durable, then proves the reauthorized v2 retry
+selects one declaration, launches one real generation-3 OpenCode DeepSeek/high
+successor, adds no duplicate across repeat init, server restart, adoption and
+concurrent requests, holds every host negative control, and leaves historical
+bytes unchanged. Set `E2E_DISPATCH_RETAIN_ARTIFACTS` to retain and independently
+rehash the exact binary, WASM guests and controller archive consumed by the
+passing run. It
 prints `DISPATCH-1..6` then `DISPATCH-ALL PASS`. The resolver and its
 backward-compatibility contract are described in
 `docs/guides/changing-routes-mid-run.md`; the Docker-free syntax/compile checks

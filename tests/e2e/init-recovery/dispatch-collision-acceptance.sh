@@ -5,8 +5,9 @@
 #
 #   logical resume   blocked-resume:31a609e6...b187b
 #   old declaration  run_seq 188678/188680, sha256:v1:0381301c... configuration
-#   rejection        the exact "role route configuration is stale or was not
-#                    accepted by this server" envelope, no result, no launch
+#   refusal          a durable host-recorded tool.called row for the exact
+#                    "role route configuration is stale or was not accepted by
+#                    this server" envelope, no result, no launch
 #   new attempt      sha256:v2:b4c93f8d... configuration, same owner/predecessor
 #
 # It seeds BOTH the old tl.dispatch_intended and tl.spawn_requested rows (built
@@ -51,6 +52,8 @@ WORKER_EXIT_FILE="$WORK/worker-exit-requested"
 RETAINED="$WORK/retained"
 RETAINED_HASHES_BEFORE="$WORK/retained-hashes-before.sha256"
 RETAINED_HASHES_AFTER="$WORK/retained-hashes-after.sha256"
+RETAINED_ARTIFACTS="${E2E_DISPATCH_RETAIN_ARTIFACTS:-}"
+ACCEPTANCE_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 MOCK_PID=""
 SERVER_PID=""
 INIT_PID=""
@@ -109,6 +112,15 @@ export CHAINLINK_DB="$REPO/.chainlink/issues.db"
 export EXOMONAD_TMUX_SESSION="$SESSION"
 
 mkdir -p "$WORK" "$REPO" "$STORED_HOME/.exo" "$(dirname "$REMOTE")" "$SHIM_DIR" "$RETAINED"
+if [[ -n "$RETAINED_ARTIFACTS" ]]; then
+    mkdir -p "$RETAINED_ARTIFACTS"
+    RETAINED_ARTIFACTS="$(cd "$RETAINED_ARTIFACTS" && pwd)"
+    case "$RETAINED_ARTIFACTS/" in
+        "$WORK"/*)
+            fail "retained artifacts must live outside the disposable work directory: $RETAINED_ARTIFACTS"
+            ;;
+    esac
+fi
 cd "$REPO"
 
 # ---------------------------------------------------------------------------
@@ -690,6 +702,17 @@ start_server "$WORK/server-v2-reloaded.log"
     || fail "the reloaded standalone server accepted a different identity"
 say "reloaded the standalone server with the historical owner in place"
 
+say "replaying the retained v1 dispatch through the production host path"
+python3 "$SOURCE_ROOT/tests/e2e/init-recovery/drive-refused-dispatch.py" \
+    --repo "$REPO" --refused-action "$WORK/refused-action.json" --run-id "$STAGE" \
+    > "$WORK/old-host-refusal.json" 2> "$WORK/old-host-refusal.err" \
+    || { cat "$WORK/old-host-refusal.err"; fail "the retained v1 dispatch was not refused by the production host path"; }
+OLD_REFUSAL_SEQ="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["refusal_run_seq"])' "$WORK/old-host-refusal.json")"
+OLD_REFUSAL_ROUTE="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["configuration_fingerprint"], d["route_fingerprint"])' "$WORK/old-host-refusal.json")"
+[[ "$OLD_REFUSAL_ROUTE" == "$LITERAL_V1_FINGERPRINT sha256:v1:13236139e5e0a5aac217d2dac60e0b69c1dbc953a356618a97c8c1367f467724" ]] \
+    || fail "the durable host refusal did not carry the retained v1 route: $OLD_REFUSAL_ROUTE"
+printf 'DISPATCH-1 host-recorded prelaunch refusal seq %s carries the old v1 dispatch authorization\n' "$OLD_REFUSAL_SEQ"
+
 say "proving the corrected controller links one fresh v2 authorization over the literal v1 proof"
 python3 "$SOURCE_ROOT/tests/e2e/init-recovery/seed-stored-proof.py" expected \
     --repo "$REPO" --run-id "$STAGE" \
@@ -899,7 +922,7 @@ assert (result_agent.get("id") or result_agent.get("agent_id")) == (
 ), result_agent
 print(json.dumps({"journal_entries": len(resume), "generation": invocation["generation"]}))
 PY
-AUDIT_RESULT="$(python3 - "$REPO" "$STAGE" "$OLD_SEQ1" "$OLD_SEQ2" "$WORK/refused-action.json" <<'PYAUDIT'
+AUDIT_RESULT="$(python3 - "$REPO" "$STAGE" "$OLD_SEQ1" "$OLD_SEQ2" "$WORK/refused-action.json" "$OLD_REFUSAL_SEQ" <<'PYAUDIT'
 import json
 import sys
 from pathlib import Path
@@ -907,6 +930,7 @@ from pathlib import Path
 repo, stage = Path(sys.argv[1]), sys.argv[2]
 old_seqs = [int(sys.argv[3]), int(sys.argv[4])]
 refused = json.loads(Path(sys.argv[5]).read_text(encoding="utf-8"))
+old_refusal_seq = int(sys.argv[6])
 ledger = []
 for segment in sorted((repo / ".exo/ledger/segments").glob("segment-*.jsonl")):
     ledger.extend(
@@ -942,19 +966,74 @@ resolutions = [
     if row.get("type") == "tl.dispatch_authorization_resolved"
     and row.get("data", {}).get("intent_id") == intent
 ]
+refusals = [
+    row
+    for row in ledger
+    if row.get("type") == "tool.called"
+    and row.get("data", {}).get("tool_name") == "resume_blocked_leaf"
+    and row.get("data", {}).get("success") is False
+    and (row.get("data", {}).get("arguments", {}).get("role_route", {}) or {}).get(
+        "dispatch_intent_id"
+    )
+    == intent
+]
+assert len(refusals) == 1, [row.get("run_seq") for row in refusals]
+refusal = refusals[0]
+assert refusal["run_seq"] == old_refusal_seq, (refusal["run_seq"], old_refusal_seq)
+assert min(old_seqs) < refusal["run_seq"] < new_row["run_seq"], (
+    old_seqs,
+    refusal["run_seq"],
+    new_row["run_seq"],
+)
+assert refusal["data"]["success"] is False, refusal["data"]
+assert refusal["data"]["error"] == (
+    "Invalid input: role route configuration is stale or was not accepted by this server"
+), refusal["data"]["error"]
+assert refusal["data"]["arguments"]["role_route"]["configuration_fingerprint"] == (
+    old_rows[0]["data"]["route_configuration_fingerprint"]
+)
+assert refusal["data"]["arguments"]["role_route"]["route_fingerprint"] == (
+    old_rows[0]["data"]["route_fingerprint"]
+)
+assert not any(
+    row.get("type") == "agent.spawned"
+    and row.get("data", {}).get("intent_id") == intent
+    and row["run_seq"] < new_row["run_seq"]
+    for row in ledger
+)
 assert len(resolutions) == 1, len(resolutions)
 resolution = resolutions[0]["data"]
 assert resolution["selected_run_seq"] == new_row["run_seq"], resolution
 assert sorted(resolution["superseded_run_seqs"]) == [min(old_seqs)], resolution
-assert resolution["reason"] == "superseded_declaration_proven_no_launch_effect", resolution
+assert resolution["superseded_refusal_run_seqs"] == [refusal["run_seq"]], resolution
+assert resolution["reason"] == (
+    "superseded_declaration_proven_prelaunch_refusal_with_current_approval"
+), resolution
+assert type(resolution["supersession_approval_run_seq"]) is int, resolution
+assert resolution["supersession_approval_run_seq"] < new_row["run_seq"], resolution
+approval_rows = [
+    row
+    for row in ledger
+    if row.get("type") == "tl.gate_answered"
+    and row.get("data", {}).get("gate_name") == (
+        "tl-terminal-owner-recovery-issue-814-substitution-model-kani"
+    )
+    and row.get("data", {}).get("decision") == "approved"
+    and row.get("run_seq") == resolution["supersession_approval_run_seq"]
+]
+assert len(approval_rows) == 1, resolution
 assert resolution["configuration_fingerprint"] == new_row["data"]["route_configuration_fingerprint"]
 assert resolution["route_fingerprint"] == new_row["data"]["route_fingerprint"]
-print(json.dumps({"selected": new_row["run_seq"], "superseded": old_seqs}))
+print(json.dumps({
+    "selected": new_row["run_seq"],
+    "superseded": old_seqs,
+    "refusal": refusal["run_seq"],
+}))
 PYAUDIT
 )" || fail "the reauthorized declaration was not selected as the only live authorization"
 NEW_SELECTED="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["selected"])' "$AUDIT_RESULT")"
 AUDIT_JSON="$AUDIT_RESULT"
-printf 'DISPATCH-2 the historical v1 declaration at seq %s is superseded only by the verified no-effect refusal (spawn request %s retained); the v2 declaration at seq %s is selected once\n' "$OLD_SEQ1" "$OLD_SEQ2" "$NEW_SELECTED"
+printf 'DISPATCH-2 the historical v1 declaration at seq %s is superseded only by the exact host-recorded prelaunch refusal at seq %s (spawn request %s retained); the v2 declaration at seq %s is selected once\n' "$OLD_SEQ1" "$OLD_REFUSAL_SEQ" "$OLD_SEQ2" "$NEW_SELECTED"
 printf 'DISPATCH-3 one fresh v2 authorization, one real generation-3 OpenCode DeepSeek/high successor in the shim process, linked to f285\n'
 say "PASS: DISPATCH-2"
 say "PASS: DISPATCH-3"
@@ -1072,7 +1151,7 @@ say "PASS: DISPATCH-4"
 grep -Fq 'DISPATCH-5 PASS' "$NEGATIVES_LOG" \
     || { cat "$NEGATIVES_LOG"; fail "the compiled host negative controls did not all hold"; }
 sed -n 's/^/  /p' "$NEGATIVES_LOG"
-printf 'DISPATCH-5 host negatives held: missing authorization, populated foreign intent with durable declaration, conflicting duplicates, wrong caller/scope/predecessor/worktree, forged/stale route or config, unrelated refusal, pending/rejected gate, unknown outcome, prior launched effect; independent workers untouched\n'
+printf 'DISPATCH-5 host negatives held: missing authorization, populated foreign intent with durable declaration, conflicting duplicates and distinct historical observations sharing one refusal, wrong caller/scope/predecessor/worktree, forged/stale route or config, missing/unrelated/wrong-declaration/contradictory refusal proof, missing/foreign/rejected durable approval, pending/rejected controller gate, unknown outcome, prior launched effect; independent workers untouched\n'
 say "PASS: DISPATCH-5"
 
 # ---------------------------------------------------------------------------
@@ -1201,6 +1280,123 @@ assert resume[0] == before["resume_entries"][0]
 assert resume[1] == before["resume_entries"][1]
 print(json.dumps({"shutdown_history": "unchanged"}))
 PY
+
+if [[ -n "$RETAINED_ARTIFACTS" ]]; then
+    ACCEPTANCE_FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    mkdir -p "$RETAINED_ARTIFACTS/host" "$RETAINED_ARTIFACTS/wasm" \
+        "$RETAINED_ARTIFACTS/controller" "$RETAINED_ARTIFACTS/evidence"
+    cp "$EXOMONAD_BIN" "$RETAINED_ARTIFACTS/host/exomonad"
+    chmod 0755 "$RETAINED_ARTIFACTS/host/exomonad"
+    for artifact in "$WASM_DIR"/wasm-guest-*.wasm; do
+        [[ -s "$artifact" ]] || fail "cannot retain a missing WASM artifact: $artifact"
+        cp "$artifact" "$RETAINED_ARTIFACTS/wasm/$(basename "$artifact")"
+    done
+    [[ -f "$STORED_HOME/.exo/tl_loop.pyz" ]] \
+        || fail "the controller archive consumed by the acceptance is missing"
+    cp "$STORED_HOME/.exo/tl_loop.pyz" "$RETAINED_ARTIFACTS/controller/tl_loop.pyz"
+    cp "$WORK/old-host-refusal.json" "$RETAINED_ARTIFACTS/evidence/old-host-refusal.json"
+    cp "$WORK/dispatch-negatives.log" "$RETAINED_ARTIFACTS/evidence/dispatch-negatives.log"
+    cp "$WORK/health.json" "$RETAINED_ARTIFACTS/evidence/health.json"
+    python3 - "$RETAINED_ARTIFACTS" "$SOURCE_ROOT" "$EXOMONAD_BIN" "$WASM_DIR" \
+        "$STORED_HOME/.exo/tl_loop.pyz" "$ACCEPTANCE_STARTED_AT" "$ACCEPTANCE_FINISHED_AT" \
+        "$OLD_REFUSAL_SEQ" "$NEW_SELECTED" <<'PYRETAIN' \
+        || fail "the retained acceptance artifacts did not rehash to their execution bytes"
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+retained, source_root = Path(sys.argv[1]), Path(sys.argv[2])
+binary, wasm_dir, archive = Path(sys.argv[3]), Path(sys.argv[4]), Path(sys.argv[5])
+started_at, finished_at, refusal_seq, selected_seq = sys.argv[6:]
+source_root = source_root.resolve()
+
+def digest(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            hasher.update(block)
+    return hasher.hexdigest()
+
+def git(*arguments: str) -> bytes:
+    return subprocess.run(
+        ["git", "-C", str(source_root), *arguments],
+        check=True,
+        capture_output=True,
+    ).stdout
+
+artifacts = [
+    ("host_binary", "$EXOMONAD_BIN", binary, retained / "host/exomonad"),
+    ("controller_archive", "$HOME/.exo/tl_loop.pyz", archive, retained / "controller/tl_loop.pyz"),
+]
+wasm_paths = sorted(wasm_dir.glob("wasm-guest-*.wasm"))
+if not wasm_paths:
+    raise SystemExit("no WASM artifacts were consumed by the acceptance")
+for path in wasm_paths:
+    artifacts.append(
+        (
+            "wasm_guest",
+            f"$WASM_DIR/{path.name}",
+            path,
+            retained / "wasm" / path.name,
+        )
+    )
+
+records = []
+for kind, source_label, execution_path, retained_path in artifacts:
+    execution_hash = digest(execution_path)
+    retained_hash = digest(retained_path)
+    if execution_hash != retained_hash:
+        raise SystemExit(f"retained {kind} bytes differ from their execution bytes: {source_label}")
+    records.append(
+        {
+            "kind": kind,
+            "execution_path": source_label,
+            "execution_absolute_path": str(execution_path.resolve()),
+            "retained_path": retained_path.relative_to(retained).as_posix(),
+            "sha256": execution_hash,
+            "retained_sha256": retained_hash,
+        }
+    )
+
+status_digest = hashlib.sha256(git("status", "--porcelain=v1", "-z")).hexdigest()
+manifest = {
+    "acceptance": "DISPATCH-ALL PASS",
+    "started_at": started_at,
+    "finished_at": finished_at,
+    "source_fingerprint": {
+        "commit": git("rev-parse", "HEAD").decode().strip(),
+        "root": str(source_root),
+        "dirty_status_sha256": status_digest,
+        "dirty": bool(git("status", "--porcelain=v1", "-z")),
+    },
+    "refusal_run_seq": int(refusal_seq),
+    "selected_run_seq": int(selected_seq),
+    "artifacts": records,
+    "notes": [
+        "These are the exact contaminant-free binary, WASM guests and controller archive "
+        "consumed by the passing dispatch-collision acceptance run.",
+        "Hashes were recorded at execution time and independently rehashed from the "
+        "retained copies in the same run.",
+        "No live Beast state, installed binary or paid provider was used.",
+    ],
+}
+(retained / "manifest.json").write_text(
+    json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+with (retained / "SHA256SUMS").open("w", encoding="utf-8") as stream:
+    for record in records:
+        stream.write(f"{record['sha256']}  {record['retained_path']}\n")
+print(json.dumps({
+    "retained_artifacts": len(records),
+    "manifest": str(retained / "manifest.json"),
+}))
+PYRETAIN
+    python3 "$SOURCE_ROOT/tests/e2e/init-recovery/rehash-dispatch-artifacts.py" "$RETAINED_ARTIFACTS" \
+        || fail "independent rehash of the retained acceptance artifacts failed"
+    say "retained exact runtime artifacts with execution and independent rehash evidence in $RETAINED_ARTIFACTS"
+fi
 
 if [[ -n "${E2E_DISPATCH_COLLISION_ARTIFACTS:-}" ]]; then
     mkdir -p "$E2E_DISPATCH_COLLISION_ARTIFACTS"

@@ -24027,6 +24027,340 @@ def test_terminal_owner_retries_prelaunch_configuration_refusal_after_fresh_gate
     assert resumed.slices[leaf.name].dispatch_invocation_id == successor_id
 
 
+def _seed_approved_prelaunch_configuration_refusal(
+    tmp_path: Path,
+) -> tuple[
+    WorkPlan,
+    object,
+    RunStore,
+    Path,
+    str,
+    str,
+    object,
+    EffectJournal,
+    object,
+    dict[str, object],
+]:
+    """Seed the accepted v1 refusal and the approved current recovery gate."""
+    plan, config, store, owner_dir, owner_name, prior_invocation_id = (
+        _seed_terminal_provider_failure_leaf(tmp_path)
+    )
+    leaf = plan.leaves[0]
+    gate_name = driver_module._terminal_owner_recovery_gate_name(leaf.name)
+    store.set_gate(gate_name, GateStatus.PENDING)
+    state = store.load()
+    terminal, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
+    assert terminal is not None and reason is None, reason
+    historical_config = replace(
+        config, role_route_configuration_fingerprint=HISTORICAL_CONFIG_FINGERPRINT_V1
+    )
+    historical_route = driver_module._dispatch_route_fields(
+        historical_config,
+        state,
+        harness=terminal.resume.desired_harness,
+        agent_type=terminal.resume.desired_agent_type,
+        model=terminal.resume.desired_model,
+        choice=None,
+    )
+    manifest_digest = _required_manifest_digest(state)
+    historical_digest = driver_module._terminal_route_authorization_digest(
+        historical_config,
+        terminal.resume.desired_harness,
+        terminal.resume.desired_agent_type,
+        terminal.resume.desired_model,
+        terminal.resume.desired_effort,
+        _required_object_string(terminal.route_authorization, "prior_runtime"),
+        terminal.route_authorization["prior_model"],
+        terminal.route_authorization["prior_effort"],
+        None,
+        manifest_digest,
+    )
+    historical_authorization = dict(terminal.route_authorization)
+    historical_authorization["configuration_fingerprint"] = HISTORICAL_CONFIG_FINGERPRINT_V1
+    historical_authorization["digest"] = historical_digest
+    historical_authorization["recovery_gate_authorization"] = {}
+    current = state.slices[leaf.name]
+    assert current.recovery is not None
+    recovery = replace(
+        current.recovery,
+        evidence={
+            **current.recovery.evidence,
+            "configured_route_authorization": historical_authorization,
+        },
+    )
+    store.checkpoint(
+        state.fsm,
+        {**state.slices, leaf.name: replace(current, recovery=recovery)},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        plan_manifest=state.plan_manifest,
+    )
+    historical_arguments = dict(
+        driver_module._blocked_leaf_resume_action_arguments(terminal.resume, state)
+    )
+    historical_arguments.update(historical_route)
+    historical_arguments["route_authorization_digest"] = historical_digest
+    historical_arguments["recovery_gate_authorization"] = {}
+    old_intent = EffectIntent("resume_blocked_leaf", leaf.name, historical_arguments, True)
+    journal = EffectJournal(store.run_id, store.run_dir / "action-journal.json")
+    journal.append(old_intent)
+    journal.mark_result(
+        old_intent,
+        ToolResult.from_raw(
+            {
+                "success": False,
+                "error": driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+            }
+        ),
+    )
+    assert journal.entries_for("resume_blocked_leaf", leaf.name)[0]["status"] == "rejected"
+    rejected = store.answer_gate(gate_name, GateStatus.REJECTED)
+    driver_module._resume_terminal_owner_failure(
+        plan,
+        rejected,
+        config,
+        EffectClient(RecordingTransport()),
+        store,
+        journal,
+    )
+    approved = store.answer_gate(gate_name, GateStatus.APPROVED)
+    return (
+        plan,
+        config,
+        store,
+        owner_dir,
+        owner_name,
+        prior_invocation_id,
+        leaf,
+        journal,
+        approved,
+        historical_arguments,
+    )
+
+
+def _accepted_configuration_transport(
+    owner_dir: Path,
+    owner_name: str,
+    prior_invocation_id: str,
+    successor_id: str,
+    *,
+    raise_after_launch: bool = False,
+) -> RecordingTransport:
+    class AcceptedConfigurationTransport(RecordingTransport):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
+            if tool_name != "resume_blocked_leaf":
+                return super().call_tool(role, name, tool_name, arguments)
+            self.calls.append((tool_name, arguments))
+            route_receipt = _required_json_value_object(arguments["role_route"], "role_route")
+            identity_path = owner_dir / "identity.json"
+            identity = json.loads(identity_path.read_text(encoding="utf-8"))
+            identity.update(
+                {
+                    "agent_type": route_receipt["agent_type"],
+                    "model": route_receipt["model"],
+                    "effort": route_receipt["effort"],
+                    "role_route": route_receipt,
+                }
+            )
+            identity_path.write_text(json.dumps(identity), encoding="utf-8")
+            invocation = {
+                "invocation_id": successor_id,
+                "generation": 2,
+                "status": "running",
+                "runtime": identity["agent_type"],
+                "model": identity["model"],
+                "effort": identity["effort"],
+                "trigger": "resume_blocked",
+                "branch": identity["birth_branch"],
+                "worktree": identity["working_dir"],
+                "prior_invocation_id": prior_invocation_id,
+                "pr_number": None,
+                "head_sha": None,
+                "role_route": route_receipt,
+            }
+            (owner_dir / "invocation.json").write_text(json.dumps(invocation), encoding="utf-8")
+            (owner_dir / "dispatch_intent").write_text(
+                f"{route_receipt['dispatch_intent_id']}\n", encoding="utf-8"
+            )
+            (owner_dir / "routing.json").write_text(
+                json.dumps(
+                    {
+                        "owner_agent_id": owner_name,
+                        "owner_invocation_id": successor_id,
+                        "owner_generation": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            if raise_after_launch:
+                raise SystemExit("simulated interruption after the host launched the successor")
+            return {
+                "success": True,
+                "result": {
+                    "chainlink_issue_id": 814,
+                    "agent": {
+                        "id": owner_name,
+                        "issue": "issue-814-substitution-model-kani",
+                        "intent_id": route_receipt["dispatch_intent_id"],
+                        "agent_type": identity["agent_type"],
+                        "branch_name": identity["birth_branch"],
+                        "worktree_path": identity["working_dir"],
+                        "role_route": route_receipt,
+                    },
+                    "invocation": {
+                        "invocation_id": successor_id,
+                        "trigger": "resume_blocked",
+                        "runtime": identity["agent_type"],
+                        "ready": True,
+                        "fresh": True,
+                        "outcome": "started",
+                        "role_route": route_receipt,
+                    },
+                },
+            }
+
+    return AcceptedConfigurationTransport()
+
+
+def test_restart_after_authorization_persistence_launches_one_successor(
+    tmp_path: Path,
+) -> None:
+    (
+        plan,
+        config,
+        store,
+        owner_dir,
+        owner_name,
+        prior_invocation_id,
+        leaf,
+        journal,
+        approved,
+        _historical_arguments,
+    ) = _seed_approved_prelaunch_configuration_refusal(tmp_path)
+    state = approved
+    proof, reason = driver_module._terminal_owner_recovery_proof(plan, state, config, store)
+    assert proof is not None and reason is None, reason
+    # The authorization boundary: the accepted route proof is durable, then the
+    # process is replaced before it records or sends the request.
+    driver_module._persist_terminal_route_authorization(proof, state, store)
+    restarted = store.load()
+
+    successor_id = "authorization-boundary-successor"
+    transport = _accepted_configuration_transport(
+        owner_dir, owner_name, prior_invocation_id, successor_id
+    )
+    resumed = driver_module._resume_terminal_owner_failure(
+        plan, restarted, config, EffectClient(transport), store, journal
+    )
+    assert sum(tool == "resume_blocked_leaf" for tool, _ in transport.calls) == 1
+    entries = journal.entries_for("resume_blocked_leaf", leaf.name)
+    assert [entry["status"] for entry in entries] == ["rejected", "confirmed"]
+    assert resumed.slices[leaf.name].dispatch_invocation_id == successor_id
+
+
+def test_interruption_after_request_journaling_replays_exactly_once(
+    tmp_path: Path,
+) -> None:
+    (
+        plan,
+        config,
+        store,
+        owner_dir,
+        owner_name,
+        prior_invocation_id,
+        leaf,
+        journal,
+        approved,
+        _historical_arguments,
+    ) = _seed_approved_prelaunch_configuration_refusal(tmp_path)
+
+    class InterruptedBeforeLaunch(RecordingTransport):
+        def call_tool(
+            self, role: str, name: str, tool_name: str, arguments: JsonObject
+        ) -> JsonObject:
+            if tool_name != "resume_blocked_leaf":
+                return super().call_tool(role, name, tool_name, arguments)
+            self.calls.append((tool_name, arguments))
+            raise SystemExit("simulated interruption after journaling the request")
+
+    interrupted = InterruptedBeforeLaunch()
+    with pytest.raises(SystemExit, match="interruption after journaling"):
+        driver_module._resume_terminal_owner_failure(
+            plan, approved, config, EffectClient(interrupted), store, journal
+        )
+    entries = journal.entries_for("resume_blocked_leaf", leaf.name)
+    assert entries[0]["status"] == "rejected"
+    assert entries[1]["status"] == "intended"
+    current = json.loads((owner_dir / "invocation.json").read_text(encoding="utf-8"))
+    assert current["invocation_id"] == prior_invocation_id
+
+    successor_id = "request-boundary-successor"
+    restarted_transport = _accepted_configuration_transport(
+        owner_dir, owner_name, prior_invocation_id, successor_id
+    )
+    resumed = driver_module._resume_terminal_owner_failure(
+        plan,
+        store.load(),
+        config,
+        EffectClient(restarted_transport),
+        store,
+        journal,
+    )
+    assert sum(
+        tool == "resume_blocked_leaf" for tool, _ in restarted_transport.calls
+    ) == 1
+    entries = journal.entries_for("resume_blocked_leaf", leaf.name)
+    assert [entry["status"] for entry in entries] == ["rejected", "confirmed"]
+    assert resumed.slices[leaf.name].dispatch_invocation_id == successor_id
+
+
+def test_restart_after_adoption_replays_without_a_new_launch(tmp_path: Path) -> None:
+    (
+        plan,
+        config,
+        store,
+        owner_dir,
+        owner_name,
+        prior_invocation_id,
+        leaf,
+        journal,
+        approved,
+        _historical_arguments,
+    ) = _seed_approved_prelaunch_configuration_refusal(tmp_path)
+    successor_id = "adoption-boundary-successor"
+    first_transport = _accepted_configuration_transport(
+        owner_dir, owner_name, prior_invocation_id, successor_id
+    )
+    resumed = driver_module._resume_terminal_owner_failure(
+        plan, approved, config, EffectClient(first_transport), store, journal
+    )
+    assert resumed.slices[leaf.name].dispatch_invocation_id == successor_id
+    assert sum(tool == "resume_blocked_leaf" for tool, _ in first_transport.calls) == 1
+
+    # The adoption boundary: restart from durable state after the confirmed
+    # result and prove the replay performs no second launch or invocation change.
+    replay_transport = RecordingTransport()
+    replayed = driver_module._resume_terminal_owner_failure(
+        plan,
+        store.load(),
+        config,
+        EffectClient(replay_transport),
+        store,
+        journal,
+    )
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in replay_transport.calls)
+    entries = journal.entries_for("resume_blocked_leaf", leaf.name)
+    assert [entry["status"] for entry in entries] == ["rejected", "confirmed"]
+    assert replayed.slices[leaf.name].dispatch_invocation_id == successor_id
+    invocation = json.loads((owner_dir / "invocation.json").read_text(encoding="utf-8"))
+    assert invocation["invocation_id"] == successor_id
+
+
 def test_terminal_owner_holds_an_independent_rejection_beside_config_refusal_history(
     tmp_path: Path,
 ) -> None:

@@ -9,8 +9,11 @@ launched anything and the later real init still sees only the historical pair.
 The cases pin: missing authorization, a fully populated foreign intent with a
 durable declaration, conflicting duplicate rows, wrong
 caller/scope/predecessor/worktree, a stale accepted configuration, a forged
-route fingerprint, an unrelated refusal, a rejected gate, an unknown live
-outcome, a prior launched effect, and untouched independent workers.
+route fingerprint, missing/unrelated/wrong-declaration/contradictory prelaunch
+refusal proof, two distinct historical observations sharing one refusal,
+missing/foreign/rejected durable approval, a rejected controller gate, an
+unknown live outcome, a prior launched effect, and untouched independent
+workers.
 """
 
 from __future__ import annotations
@@ -20,8 +23,9 @@ import hashlib
 import importlib.util
 import json
 import sys
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -40,6 +44,9 @@ V1_CONFIGURATION = (
 V1_ROUTE = "sha256:v1:13236139e5e0a5aac217d2dac60e0b69c1dbc953a356618a97c8c1367f467724"
 WORKER_MODEL = "opencode-go/deepseek-v4.1-flash"
 GATE_NAME = "tl-terminal-owner-recovery-issue-814-substitution-model-kani"
+EXACT_CONFIGURATION_REFUSAL = (
+    "Invalid input: role route configuration is stale or was not accepted by this server"
+)
 
 
 def _fixture_helpers() -> Any:
@@ -221,6 +228,118 @@ class Harness:
         self.helpers.append_seeded_ledger_rows(self.repository, rows)
         return [row["run_seq"] for row in rows]
 
+    def seed_refusal(
+        self,
+        arguments: Mapping[str, object],
+        *,
+        caller: str | None = None,
+        scope: str = OWNER_SLICE,
+        configuration: str | None = None,
+        route: str | None = None,
+        intent: str | None = None,
+        success: bool = False,
+        error: str = EXACT_CONFIGURATION_REFUSAL,
+    ) -> int:
+        """Append one host-recorded `tool.called` refusal row.
+
+        The standalone server writes this shape after the handler returns. The
+        row carries the exact request arguments and error envelope, so the host
+        can bind a superseded declaration to a durable prelaunch refusal.
+        """
+        base = self._highest_sequence()
+        run_seq = base + 1
+        role_route = {
+            "dispatch_intent_id": intent or str(arguments["dispatch_intent_id"]),
+            "scope_id": scope,
+            "role": str(arguments["role"]),
+            "harness": str(arguments["harness"]),
+            "agent_type": str(arguments["agent_type"]),
+            "model": str(arguments["model"]),
+            "effort": str(arguments["effort"]),
+            "configuration_fingerprint": configuration
+            or str(arguments["route_configuration_fingerprint"]),
+            "policy_fingerprint": str(arguments["route_policy_fingerprint"]),
+            "manifest_digest": str(arguments["route_manifest_digest"]),
+            "route_fingerprint": route or str(arguments["route_fingerprint"]),
+        }
+        refusal_arguments = {
+            "chainlink_issue_id": int(arguments["chainlink_issue_id"]),
+            "expected_invocation_id": str(arguments["expected_invocation_id"]),
+            "expected_branch": str(arguments["expected_branch"]),
+            "expected_worktree_fingerprint": str(
+                arguments["expected_worktree_fingerprint"]
+            ),
+            "task": str(arguments["task"]),
+            "human_approved": True,
+            "role_route": role_route,
+        }
+        row = self.helpers.ledger_event_row(
+            event_id=f"1511-negative-refusal-{run_seq}",
+            event_time="2026-11-20T01:12:00.000Z",
+            run_seq=run_seq,
+            event_type="tool.called",
+            agent_id=caller or self.run_id,
+            run_id=self.run_id,
+            invocation_id=None,
+            generation=None,
+            source="rust",
+            session_id=None,
+            data={
+                "tool_name": "resume_blocked_leaf",
+                "role": "tl",
+                "arguments": refusal_arguments,
+                "duration_ms": 4,
+                "success": success,
+                "error": error,
+            },
+        )
+        self.helpers.append_seeded_ledger_rows(self.repository, [row])
+        return run_seq
+
+    def seed_gate_answer(self, gate_name: str, decision: str) -> int:
+        """Append one durable `tl.gate_answered` row for the recovery gate."""
+        base = self._highest_sequence()
+        row = self.helpers.ledger_event_row(
+            event_id=f"1511-negative-gate-{base + 1}",
+            event_time="2026-11-20T01:12:30.000Z",
+            run_seq=base + 1,
+            event_type="tl.gate_answered",
+            agent_id="controller",
+            run_id=self.run_id,
+            invocation_id=None,
+            generation=None,
+            source="rust",
+            session_id=None,
+            data={
+                "gate_name": gate_name,
+                "decision": decision,
+                "source": "cli",
+            },
+        )
+        self.helpers.append_seeded_ledger_rows(self.repository, [row])
+        return row["run_seq"]
+
+    def remove_gate_answers(self) -> None:
+        """Temporarily remove durable recovery-gate decisions; restored by the snapshot."""
+        for path in sorted((self.repository / ".exo/ledger/segments").glob("segment-*.jsonl")):
+            kept = []
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                event = json.loads(line)
+                data = event.get("data") or {}
+                if (
+                    event.get("type") == "tl.gate_answered"
+                    and data.get("gate_name") in {
+                        GATE_NAME,
+                        f"tl-dispatch-failed-{OWNER_SLICE}",
+                        f"tl-dispatch-ownership-conflict-{OWNER_SLICE}",
+                    }
+                ):
+                    continue
+                kept.append(line)
+            path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+
     def seed_launch_row(self, arguments: Mapping[str, object], invocation_id: str) -> int:
         base = self._highest_sequence()
         row = self.helpers.ledger_event_row(
@@ -292,6 +411,25 @@ class Harness:
                     event.get("type")
                     in {"tl.dispatch_intended", "tl.spawn_requested", "agent.spawned"}
                     and event.get("data", {}).get("intent_id") == intent
+                ):
+                    continue
+                kept.append(line)
+            path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+
+    def remove_refusal_history(self, intent: str) -> None:
+        """Temporarily remove host refusal rows for one intent; the snapshot restores them."""
+        for path in sorted((self.repository / ".exo/ledger/segments").glob("segment-*.jsonl")):
+            kept = []
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                event = json.loads(line)
+                data = event.get("data") or {}
+                route = (data.get("arguments") or {}).get("role_route") or {}
+                if (
+                    event.get("type") == "tool.called"
+                    and data.get("tool_name") == "resume_blocked_leaf"
+                    and route.get("dispatch_intent_id") == intent
                 ):
                     continue
                 kept.append(line)
@@ -519,6 +657,120 @@ def main() -> None:
             harness.call({"route_fingerprint": "sha256:v1:forged"}),
         )[-1],
     )
+    def missing_refusal_proof() -> Any:
+        harness.remove_refusal_history(intent)
+        harness.seed_declaration_pair(arguments)
+        return harness.call({})
+
+    case(
+        "missing-refusal-proof",
+        "has no durable verified prelaunch configuration refusal",
+        missing_refusal_proof,
+    )
+
+    def unrelated_refusal_proof() -> Any:
+        harness.remove_refusal_history(intent)
+        harness.seed_refusal(
+            arguments,
+            intent=f"{FOREIGN_INTENT}:unrelated",
+            configuration=V1_CONFIGURATION,
+            route=V1_ROUTE,
+        )
+        harness.seed_declaration_pair(arguments)
+        return harness.call({})
+
+    case(
+        "unrelated-refusal-proof",
+        "has no durable verified prelaunch configuration refusal",
+        unrelated_refusal_proof,
+    )
+
+    def wrong_declaration_refusal() -> Any:
+        harness.remove_refusal_history(intent)
+        harness.seed_refusal(
+            arguments,
+            scope="other-slice",
+            configuration=V1_CONFIGURATION,
+            route=V1_ROUTE,
+        )
+        harness.seed_declaration_pair(arguments)
+        return harness.call({})
+
+    case(
+        "wrong-declaration-refusal",
+        "not bound to any durable dispatch declaration",
+        wrong_declaration_refusal,
+    )
+
+    def contradictory_refusal() -> Any:
+        harness.remove_refusal_history(intent)
+        harness.seed_refusal(
+            arguments,
+            configuration=V1_CONFIGURATION,
+            route=V1_ROUTE,
+            success=True,
+            error="Invalid input: unrelated host refusal",
+        )
+        harness.seed_declaration_pair(arguments)
+        return harness.call({})
+
+    case(
+        "contradictory-refusal",
+        "not the exact permitted prelaunch configuration refusal",
+        contradictory_refusal,
+    )
+
+    def two_distinct_observations_one_refusal() -> Any:
+        # The retained v1 declaration already precedes the host refusal. Append a
+        # second, distinct v1 observation after the refusal, then the current v2
+        # declaration. One refusal between the two old observations can bind
+        # only the first; the second has no refusal in its own window.
+        harness.seed_declaration_pair(
+            arguments, configuration=V1_CONFIGURATION, route=V1_ROUTE
+        )
+        harness.seed_declaration_pair(arguments)
+        return harness.call({})
+
+    case(
+        "two-observations-one-refusal",
+        "bound to that exact observation",
+        two_distinct_observations_one_refusal,
+    )
+
+    def missing_approval() -> Any:
+        harness.remove_gate_answers()
+        harness.seed_declaration_pair(arguments)
+        return harness.call({})
+
+    case(
+        "missing-durable-approval",
+        "requires a durable approved operator decision",
+        missing_approval,
+    )
+
+    def foreign_approval() -> Any:
+        harness.remove_gate_answers()
+        harness.seed_gate_answer("tl-terminal-owner-recovery-other-slice", "approved")
+        harness.seed_declaration_pair(arguments)
+        return harness.call({})
+
+    case(
+        "foreign-durable-approval",
+        "requires a durable approved operator decision",
+        foreign_approval,
+    )
+
+    def rejected_approval() -> Any:
+        harness.seed_gate_answer(GATE_NAME, "rejected")
+        harness.seed_declaration_pair(arguments)
+        return harness.call({})
+
+    case(
+        "rejected-durable-approval",
+        "approved current supersession is required",
+        rejected_approval,
+    )
+
     def wrong_predecessor() -> Any:
         predecessor = "foreign-predecessor"
         foreign_intent = harness.host_intent(
@@ -531,6 +783,9 @@ def main() -> None:
         # host reaches its durable no-effect/owner evidence check instead of
         # stopping at the earlier intent-binding guard.
         harness.seed_declaration_pair(
+            foreign, configuration=V1_CONFIGURATION, route=V1_ROUTE
+        )
+        harness.seed_refusal(
             foreign, configuration=V1_CONFIGURATION, route=V1_ROUTE
         )
         harness.seed_declaration_pair(foreign)

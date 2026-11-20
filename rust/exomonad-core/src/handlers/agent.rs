@@ -13,8 +13,8 @@ use crate::effects::{
 
 use super::dispatch_authorization::{
     dispatch_authorization_resolution_id, resolve_dispatch_declaration,
-    DispatchAuthorizationResolution, DispatchDeclaration, DispatchNoEffectProof,
-    ExpectedDispatchAuthorization,
+    DispatchAuthorizationResolution, DispatchDeclaration, DispatchGateAnswer,
+    DispatchNoEffectProof, DispatchPrelaunchRefusal, ExpectedDispatchAuthorization,
 };
 use super::non_empty;
 use crate::services::agent_control::{
@@ -261,6 +261,33 @@ impl<
                 data: &record.event.data,
             })
             .collect::<Vec<_>>();
+        // The standalone server records every tool call, including a refused
+        // blocked-leaf resume. Those rows carry the exact request arguments and
+        // error envelope, so they are the durable proof that a superseded
+        // declaration was refused before launch.
+        let refusals = records
+            .iter()
+            .filter(|record| {
+                record.event.event_type == "tool.called"
+                    && record.event.data["tool_name"].as_str() == Some("resume_blocked_leaf")
+            })
+            .map(|record| DispatchPrelaunchRefusal {
+                run_seq: record.event.run_seq,
+                caller: record.event.agent_id.as_deref(),
+                data: &record.event.data,
+            })
+            .collect::<Vec<_>>();
+        // A caller-supplied `human_approved` flag is not durable approval. The
+        // controller records every operator gate decision in this ledger, so
+        // the host verifies the current per-slice recovery gate from these rows.
+        let gate_answers = records
+            .iter()
+            .filter(|record| record.event.event_type == "tl.gate_answered")
+            .map(|record| DispatchGateAnswer {
+                run_seq: record.event.run_seq,
+                data: &record.event.data,
+            })
+            .collect::<Vec<_>>();
         let expected = ExpectedDispatchAuthorization {
             intent_id: dispatch_intent_id,
             caller: caller.as_str(),
@@ -275,8 +302,14 @@ impl<
             manifest_digest: route_manifest,
             route_fingerprint: route.route_fingerprint.as_str(),
         };
-        let resolution =
-            resolve_dispatch_declaration(&declarations, &launch_rows, expected, supersession)?;
+        let resolution = resolve_dispatch_declaration(
+            &declarations,
+            &launch_rows,
+            &refusals,
+            &gate_answers,
+            expected,
+            supersession,
+        )?;
         if !resolution.superseded_run_seqs.is_empty() {
             record_dispatch_authorization_resolution(
                 log,
@@ -4026,6 +4059,9 @@ impl<
         // every earlier declaration under the same logical resume intent.
         let dispatch_supersession = DispatchNoEffectProof {
             expected_invocation_id: req.expected_invocation_id.as_str(),
+            expected_issue_id: req.blocked_issue_id,
+            expected_branch: req.expected_branch.as_str(),
+            expected_worktree_fingerprint: req.expected_worktree_fingerprint.as_str(),
             invocation: &invocation,
         };
         let role_route = self
@@ -5211,6 +5247,8 @@ fn record_dispatch_authorization_resolution(
         dispatch_intent_id,
         resolution.selected_run_seq,
         &resolution.superseded_run_seqs,
+        &resolution.superseded_refusal_run_seqs,
+        resolution.supersession_approval_run_seq,
     );
     let data = serde_json::json!({
         "resolution_id": resolution_id,
@@ -5222,7 +5260,9 @@ fn record_dispatch_authorization_resolution(
         "route_fingerprint": route.route_fingerprint.as_str(),
         "selected_run_seq": resolution.selected_run_seq,
         "superseded_run_seqs": resolution.superseded_run_seqs,
-        "reason": "superseded_declaration_proven_no_launch_effect",
+        "superseded_refusal_run_seqs": resolution.superseded_refusal_run_seqs,
+        "supersession_approval_run_seq": resolution.supersession_approval_run_seq,
+        "reason": "superseded_declaration_proven_prelaunch_refusal_with_current_approval",
     });
     let records = log.ledger().read_events().map_err(|error| {
         EffectError::invalid_input(format!(

@@ -524,13 +524,26 @@ harness, agent type, model, effort, configuration/policy/manifest/route
 fingerprints). It is used by `resume_blocked_leaf`, which passes the owner
 invocation as durable no-effect evidence. A reauthorized retry keeps the stable
 `blocked-resume:` intent id, so the historical declaration and the new one share
-an id; the resolver accepts the new tuple only after proving from the ledger and
-owner registry that the older declaration did not launch (the predecessor is
-still current and no `agent.spawned` row exists for the intent), or that the
-current invocation is the single linked successor whose stored `role_route` is
-this authorization. Equivalent repeated observations collapse; conflicting
-observations, later competing declarations, wrong-caller declarations, live or
-unknown owner outcomes, and prior launch rows hold before launch. Diagnostics
+an id. The resolver groups historical declarations by route tuple plus their
+observation fields (`started_at`, `attempt`, `dispatch_generation`,
+`controller_epoch`) and binds each distinct observation to its own host-recorded
+`tool.called` row for `resume_blocked_leaf` carrying that observation's exact
+route tuple, `success=false`, the exact configuration-not-accepted error, no
+result, and a sequence inside that observation's window. Equivalent repeated
+observations may share one refusal; one refusal after two distinct observations
+cannot release both. A missing launch row, a non-live predecessor, or a generic
+failure is not enough. The caller-supplied `human_approved` flag is not proof:
+the latest `tl.gate_answered` row for the slice's recovery gate must be
+`approved` and precede the selected declaration, so a missing, foreign,
+post-dated or later-rejected approval holds before launch.
+It then proves from the ledger and owner registry that the older declaration did
+not launch (the predecessor is still current and no `agent.spawned` row exists
+for the intent), or that the current invocation is the single linked successor
+whose stored `role_route` is this authorization. Equivalent repeated
+observations collapse; missing, unrelated, wrong-declaration or contradictory
+refusal proof, conflicting observations, later competing declarations,
+wrong-caller declarations, live or unknown owner outcomes, and prior launch rows
+hold before launch. Diagnostics
 name the ledger sequences and safe identity fields. One idempotent
 `tl.dispatch_authorization_resolved` audit row records an accepted supersession;
 historical events and journals are only appended to, never rewritten. The wire
