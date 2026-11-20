@@ -701,6 +701,47 @@ PYTHONPATH="$SOURCE_ROOT" python3 -m tl_loop gate \
     --name "$GATE_NAME" --approve > "$WORK/approve-terminal-gate.log" 2>&1 \
     || { cat "$WORK/approve-terminal-gate.log"; fail "could not approve the disposable terminal-owner gate"; }
 
+# Real #1511 has an approved durable checkpoint and no matching
+# `tl.gate_answered` event: the controller persists the gate before its
+# best-effort emission. Remove the fixture's event so the compiled host must
+# prove the supersession from the exact checkpoint-only shape.
+say "removing the emitted gate answer to reproduce the retained checkpoint-only approval"
+python3 - "$REPO" "$GATE_NAME" <<'PY' || fail "could not reproduce the retained gate-answer absence"
+import json
+import sys
+from pathlib import Path
+
+repo, gate = Path(sys.argv[1]), sys.argv[2]
+removed = 0
+for segment in sorted((repo / ".exo/ledger/segments").glob("segment-*.jsonl")):
+    kept = []
+    for line in segment.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if (
+            event.get("type") == "tl.gate_answered"
+            and (event.get("data") or {}).get("gate_name") == gate
+        ):
+            removed += 1
+            continue
+        kept.append(line)
+    segment.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+if removed < 1:
+    raise SystemExit("the fixture did not emit the gate answer it was meant to remove")
+remaining = sum(
+    1
+    for segment in sorted((repo / ".exo/ledger/segments").glob("segment-*.jsonl"))
+    for line in segment.read_text(encoding="utf-8").splitlines()
+    if line.strip()
+    and (json.loads(line).get("data") or {}).get("gate_name") == gate
+    and json.loads(line).get("type") == "tl.gate_answered"
+)
+if remaining:
+    raise SystemExit(f"{remaining} matching gate answers remain in the ledger")
+print(json.dumps({"removed_gate_answers": removed}))
+PY
+
 say "recording the retained prelaunch configuration refusal under the literal v1 proof"
 python3 "$SOURCE_ROOT/tests/e2e/init-recovery/seed-stored-proof.py" refuse \
     --repo "$REPO" --baseline "$WORK/preexisting-opencode-owner.json" \
@@ -1249,19 +1290,30 @@ assert resolution["superseded_refusal_run_seqs"] == [refusal["run_seq"]], resolu
 assert resolution["reason"] == (
     "superseded_declaration_proven_prelaunch_refusal_with_current_approval"
 ), resolution
-assert type(resolution["supersession_approval_run_seq"]) is int, resolution
-assert resolution["supersession_approval_run_seq"] < new_row["run_seq"], resolution
-approval_rows = [
-    row
+approval = resolution["supersession_approval"]
+assert isinstance(approval, dict), resolution
+assert approval["gate_name"] == (
+    "tl-terminal-owner-recovery-issue-814-substitution-model-kani"
+), approval
+assert approval["run_id"] == stage, approval
+assert approval["controller_epoch"] == new_row["data"]["controller_epoch"], approval
+assert approval["source"] == "checkpoint", approval
+assert approval["ledger_answer_run_seq"] is None, approval
+assert resolution["supersession_approval_run_seq"] is None, resolution
+assert not any(
+    row.get("type") == "tl.gate_answered"
+    and (row.get("data") or {}).get("gate_name") == approval["gate_name"]
     for row in ledger
-    if row.get("type") == "tl.gate_answered"
-    and row.get("data", {}).get("gate_name") == (
-        "tl-terminal-owner-recovery-issue-814-substitution-model-kani"
-    )
-    and row.get("data", {}).get("decision") == "approved"
-    and row.get("run_seq") == resolution["supersession_approval_run_seq"]
-]
-assert len(approval_rows) == 1, resolution
+), "the acceptance must exercise the exact absence of a gate-answer event"
+checkpoint = json.loads(
+    (repo / f".exo/tl-loop/root/{stage}/run.json").read_text(encoding="utf-8")
+)
+gate = next(
+    row for row in checkpoint["gates"] if row.get("name") == approval["gate_name"]
+)
+assert gate["status"] == "approved", gate
+assert checkpoint["controller_epoch"] == approval["controller_epoch"], checkpoint
+assert checkpoint["run_id"] == approval["run_id"], checkpoint
 assert resolution["configuration_fingerprint"] == new_row["data"]["route_configuration_fingerprint"]
 assert resolution["route_fingerprint"] == new_row["data"]["route_fingerprint"]
 print(json.dumps({

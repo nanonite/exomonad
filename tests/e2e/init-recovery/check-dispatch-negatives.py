@@ -10,10 +10,13 @@ The cases pin: missing authorization, a fully populated foreign intent with a
 durable declaration, conflicting duplicate rows, wrong
 caller/scope/predecessor/worktree, a stale accepted configuration, a forged
 route fingerprint, missing/unrelated/wrong-declaration/contradictory prelaunch
-refusal proof, two distinct historical observations sharing one refusal,
-missing/foreign/rejected durable approval, a rejected controller gate, an
-unknown live outcome, a prior launched effect, and untouched independent
-workers.
+refusal proof, two distinct historical observations sharing one refusal, a
+missing/foreign/stale/reopened/rejected current checkpoint gate, another
+same-slice pending recovery gate, a contradictory ledger answer, a rejected
+controller gate, an unknown live outcome, a prior launched effect, and
+untouched independent workers. The real historical #1511 shape - an approved
+checkpoint with no `tl.gate_answered` row - is exercised by the positive
+acceptance, not refused here.
 """
 
 from __future__ import annotations
@@ -319,27 +322,6 @@ class Harness:
         self.helpers.append_seeded_ledger_rows(self.repository, [row])
         return row["run_seq"]
 
-    def remove_gate_answers(self) -> None:
-        """Temporarily remove durable recovery-gate decisions; restored by the snapshot."""
-        for path in sorted((self.repository / ".exo/ledger/segments").glob("segment-*.jsonl")):
-            kept = []
-            for line in path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                event = json.loads(line)
-                data = event.get("data") or {}
-                if (
-                    event.get("type") == "tl.gate_answered"
-                    and data.get("gate_name") in {
-                        GATE_NAME,
-                        f"tl-dispatch-failed-{OWNER_SLICE}",
-                        f"tl-dispatch-ownership-conflict-{OWNER_SLICE}",
-                    }
-                ):
-                    continue
-                kept.append(line)
-            path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
-
     def seed_launch_row(self, arguments: Mapping[str, object], invocation_id: str) -> int:
         base = self._highest_sequence()
         row = self.helpers.ledger_event_row(
@@ -489,15 +471,46 @@ class Harness:
         mutate(invocation)
         path.write_text(json.dumps(invocation) + "\n", encoding="utf-8")
 
-    def replace_gate(self, status: str) -> None:
+    def mutate_run_state(self, mutate: Callable[[dict[str, Any]], None]) -> None:
+        """Apply one disposable controller-checkpoint mutation for a negative case."""
         path = self.journal.parent / "run.json"
         document = json.loads(path.read_text(encoding="utf-8"))
-        gates = [
-            {**gate, "status": status} if gate.get("name") == GATE_NAME else gate
-            for gate in document["gates"]
-        ]
-        document["gates"] = gates
+        mutate(document)
         path.write_text(json.dumps(document) + "\n", encoding="utf-8")
+
+    def replace_gate(self, status: str) -> None:
+        def mutate(document: dict[str, Any]) -> None:
+            document["gates"] = [
+                {**gate, "status": status} if gate.get("name") == GATE_NAME else gate
+                for gate in document["gates"]
+            ]
+
+        self.mutate_run_state(mutate)
+
+    def remove_recovery_gates(self) -> None:
+        def mutate(document: dict[str, Any]) -> None:
+            names = {
+                GATE_NAME,
+                f"tl-dispatch-failed-{OWNER_SLICE}",
+                f"tl-dispatch-ownership-conflict-{OWNER_SLICE}",
+            }
+            document["gates"] = [
+                gate for gate in document["gates"] if gate.get("name") not in names
+            ]
+
+        self.mutate_run_state(mutate)
+
+    def add_recovery_gate(self, name: str, status: str) -> None:
+        def mutate(document: dict[str, Any]) -> None:
+            document["gates"] = [
+                gate for gate in document["gates"] if gate.get("name") != name
+            ]
+            document["gates"].append({"name": name, "status": status})
+
+        self.mutate_run_state(mutate)
+
+    def replace_checkpoint_field(self, field: str, value: object) -> None:
+        self.mutate_run_state(lambda document: document.__setitem__(field, value))
 
     def replace_journal_error(self, error: str) -> None:
         journal = json.loads(self.journal.read_text(encoding="utf-8"))
@@ -737,27 +750,83 @@ def main() -> None:
         two_distinct_observations_one_refusal,
     )
 
-    def missing_approval() -> Any:
-        harness.remove_gate_answers()
+    def missing_current_gate() -> Any:
+        harness.remove_recovery_gates()
         harness.seed_declaration_pair(arguments)
         return harness.call({})
 
     case(
-        "missing-durable-approval",
+        "missing-current-gate",
         "requires a durable approved operator decision",
-        missing_approval,
+        missing_current_gate,
     )
 
-    def foreign_approval() -> Any:
-        harness.remove_gate_answers()
-        harness.seed_gate_answer("tl-terminal-owner-recovery-other-slice", "approved")
+    def reopened_pending_gate() -> Any:
+        harness.replace_gate("pending")
         harness.seed_declaration_pair(arguments)
         return harness.call({})
 
     case(
-        "foreign-durable-approval",
-        "requires a durable approved operator decision",
-        foreign_approval,
+        "reopened-pending-gate",
+        ("is pending", "approved current supersession is required"),
+        reopened_pending_gate,
+    )
+
+    def rejected_checkpoint_gate() -> Any:
+        # The rejection is durable in the checkpoint but has no successful
+        # `tl.gate_answered` emission, the exact real historical failure mode.
+        harness.replace_gate("rejected")
+        harness.seed_declaration_pair(arguments)
+        return harness.call({})
+
+    case(
+        "rejected-checkpoint-without-emission",
+        ("rejected", "approved current supersession is required"),
+        rejected_checkpoint_gate,
+    )
+
+    def other_same_slice_gate_pending() -> Any:
+        harness.add_recovery_gate(f"tl-dispatch-failed-{OWNER_SLICE}", "pending")
+        harness.seed_declaration_pair(arguments)
+        return harness.call({})
+
+    case(
+        "other-same-slice-gate-pending",
+        ("another same-slice recovery gate", "is pending"),
+        other_same_slice_gate_pending,
+    )
+
+    def stale_controller_epoch() -> Any:
+        harness.replace_checkpoint_field("controller_epoch", "epoch-stale")
+        harness.seed_declaration_pair(arguments)
+        return harness.call({})
+
+    case(
+        "stale-controller-epoch",
+        "controller epoch",
+        stale_controller_epoch,
+    )
+
+    def foreign_gate_run() -> Any:
+        harness.replace_checkpoint_field("run_id", "foreign-run")
+        harness.seed_declaration_pair(arguments)
+        return harness.call({})
+
+    case(
+        "foreign-gate-run",
+        "not attributed to the run",
+        foreign_gate_run,
+    )
+
+    def other_gate_answer() -> Any:
+        harness.seed_gate_answer(f"tl-dispatch-failed-{OWNER_SLICE}", "approved")
+        harness.seed_declaration_pair(arguments)
+        return harness.call({})
+
+    case(
+        "other-gate-durable-answer",
+        "not the current gate",
+        other_gate_answer,
     )
 
     def rejected_approval() -> Any:
@@ -767,7 +836,10 @@ def main() -> None:
 
     case(
         "rejected-durable-approval",
-        "approved current supersession is required",
+        (
+            "conflicts with the current durable checkpoint",
+            "approved current supersession is required",
+        ),
         rejected_approval,
     )
 

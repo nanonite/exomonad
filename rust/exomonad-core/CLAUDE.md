@@ -531,11 +531,20 @@ observation fields (`started_at`, `attempt`, `dispatch_generation`,
 route tuple, `success=false`, the exact configuration-not-accepted error, no
 result, and a sequence inside that observation's window. Equivalent repeated
 observations may share one refusal; one refusal after two distinct observations
-cannot release both. A missing launch row, a non-live predecessor, or a generic
-failure is not enough. The caller-supplied `human_approved` flag is not proof:
-the latest `tl.gate_answered` row for the slice's recovery gate must be
-`approved` and precede the selected declaration, so a missing, foreign,
-post-dated or later-rejected approval holds before launch.
+cannot release both. A missing or malformed observation field is never
+equivalent evidence: observations only collapse when every one of those fields
+is present and equal on both sides. A missing launch row, a non-live
+predecessor, or a generic failure is not enough. The caller-supplied
+`human_approved` flag is not proof: the authoritative controller checkpoint must
+show exactly one current recovery gate for the slice, still `approved`, owned by
+the same `run_id` and `controller_epoch` that emitted the selected declaration,
+and it must own the declared scope. Any pending/reopened gate, rejected gate,
+additional same-slice recovery gate, stale epoch, foreign run or missing
+checkpoint holds before launch. `tl.gate_answered` rows are corroboration only:
+the controller persists the checkpoint before its best-effort emission, so a
+real approved checkpoint with no matching event (the #1511 shape) is accepted
+without fabricating history, while a ledger rejection that contradicts the
+checkpoint fails closed.
 It then proves from the ledger and owner registry that the older declaration did
 not launch (the predecessor is still current and no `agent.spawned` row exists
 for the intent), or that the current invocation is the single linked successor

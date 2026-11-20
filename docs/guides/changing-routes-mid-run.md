@@ -243,21 +243,28 @@ row, or a prior launched effect. Diagnostics name the matching ledger sequences
 and safe identity fields, never credentials.
 
 The request's `human_approved` flag is caller-supplied and is not proof of
-operator approval. A supersession also requires the authoritative
-`tl.gate_answered` rows for the slice's per-slice recovery gate to show an
-`approved` decision before the selected declaration, with no later `rejected`
-decision. That durable gate answer is the host-visible approval boundary; the
-controller's run checkpoint and the caller's boolean are not accepted as
-substitutes. Missing, foreign-slice, stale-after-rejection or post-dated
-approval holds the supersession before launch. The trust boundary is therefore:
-the ledger supplies declarations, refusals, launch rows and gate decisions; the
-owner registry supplies the current invocation; the caller supplies only the
-request it wants authorized.
+operator approval. A supersession requires the authoritative controller
+checkpoint to show exactly one current recovery gate for the slice, still
+`approved`, owned by the same `run_id` and `controller_epoch` that emitted the
+selected declaration, and owning the declared scope. Any pending/reopened gate,
+rejected gate, additional same-slice recovery gate, stale controller epoch,
+foreign run or missing checkpoint holds the supersession before launch.
+`tl.gate_answered` rows are corroboration only: the controller persists the
+checkpoint before its best-effort event emission, so the real #1511 approved
+checkpoint with no matching event is accepted without fabricating history,
+while a ledger rejection contradicting the checkpoint fails closed. Missing or
+malformed observation fields (`started_at`, `attempt`, `dispatch_generation`,
+`controller_epoch`) are never treated as equivalent observations. The trust
+boundary is therefore: the ledger supplies declarations, refusals, launch rows
+and corroborating gate answers; the controller checkpoint supplies the current
+gate and its run/epoch provenance; the owner registry supplies the current
+invocation; the caller supplies only the request it wants authorized.
 
 A successful supersession appends one
 `tl.dispatch_authorization_resolved` audit row (idempotent by resolution id)
 carrying the intent, selected sequence, superseded sequences, their refusal
-sequences, the durable approval sequence, configuration and route
+sequences, the approval gate name, run id, controller epoch and source plus the
+corroborating ledger sequence when one exists, configuration and route
 fingerprints, and the reason
 `superseded_declaration_proven_prelaunch_refusal_with_current_approval`.
 Historical

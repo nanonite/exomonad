@@ -12,7 +12,7 @@ use crate::effects::{
 };
 
 use super::dispatch_authorization::{
-    dispatch_authorization_resolution_id, resolve_dispatch_declaration,
+    dispatch_authorization_resolution_id, read_current_recovery_gate, resolve_dispatch_declaration,
     DispatchAuthorizationResolution, DispatchDeclaration, DispatchGateAnswer,
     DispatchNoEffectProof, DispatchPrelaunchRefusal, ExpectedDispatchAuthorization,
 };
@@ -288,6 +288,16 @@ impl<
                 data: &record.event.data,
             })
             .collect::<Vec<_>>();
+        // The checkpoint is authoritative for the *current* recovery gate. It
+        // is persisted before the best-effort `tl.gate_answered` emission, so a
+        // ledger-only read can accept a stale approval after a later rejection
+        // or reopen. A missing/unreadable checkpoint stays `None`; the resolver
+        // then fails closed if any historical declaration actually needs release.
+        let current_gate = if supersession.is_some() {
+            read_current_recovery_gate(self.ctx.project_dir(), route.scope_id.as_str()).ok()
+        } else {
+            None
+        };
         let expected = ExpectedDispatchAuthorization {
             intent_id: dispatch_intent_id,
             caller: caller.as_str(),
@@ -307,6 +317,7 @@ impl<
             &launch_rows,
             &refusals,
             &gate_answers,
+            current_gate.as_ref(),
             expected,
             supersession,
         )?;
@@ -5255,12 +5266,13 @@ fn record_dispatch_authorization_resolution(
     route: &RoleRoute,
     resolution: &DispatchAuthorizationResolution,
 ) -> EffectResult<()> {
+    let approval = resolution.supersession_approval.as_ref();
     let resolution_id = dispatch_authorization_resolution_id(
         dispatch_intent_id,
         resolution.selected_run_seq,
         &resolution.superseded_run_seqs,
         &resolution.superseded_refusal_run_seqs,
-        resolution.supersession_approval_run_seq,
+        approval,
     );
     let data = serde_json::json!({
         "resolution_id": resolution_id,
@@ -5273,7 +5285,14 @@ fn record_dispatch_authorization_resolution(
         "selected_run_seq": resolution.selected_run_seq,
         "superseded_run_seqs": resolution.superseded_run_seqs,
         "superseded_refusal_run_seqs": resolution.superseded_refusal_run_seqs,
-        "supersession_approval_run_seq": resolution.supersession_approval_run_seq,
+        "supersession_approval_run_seq": approval.and_then(|value| value.ledger_answer_run_seq),
+        "supersession_approval": approval.map(|value| serde_json::json!({
+            "gate_name": value.gate_name,
+            "run_id": value.run_id,
+            "controller_epoch": value.controller_epoch,
+            "source": value.source,
+            "ledger_answer_run_seq": value.ledger_answer_run_seq,
+        })),
         "reason": "superseded_declaration_proven_prelaunch_refusal_with_current_approval",
     });
     let records = log.ledger().read_events().map_err(|error| {
