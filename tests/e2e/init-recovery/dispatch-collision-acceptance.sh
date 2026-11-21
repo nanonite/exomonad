@@ -1733,6 +1733,10 @@ manifest = {
         "consumed by the passing dispatch-collision acceptance run.",
         "Hashes were recorded at execution time and independently rehashed from the "
         "retained copies in the same run.",
+        "Integrity limit: these hashes prove the retained bytes equal the bytes executed; "
+        "they do not prove a hermetic rebuild from source. The WASM guests are copied from "
+        "the caller-provided Cabal build directory after the current project build is "
+        "confirmed up to date, and the host/controller hashes cover the exact built files.",
         "No live Beast state, installed binary or paid provider was used.",
     ],
 }
