@@ -608,14 +608,22 @@ def main() -> None:
         "role route dispatch intent does not match the launch intent",
         populated_foreign_intent,
     )
+    def conflicting_attempt_generations() -> Any:
+        # A distinct attempt/generation with the same route is genuinely
+        # competing; only a restart re-declaration of the same attempt may be
+        # collapsed (and then only with verified no-effect evidence).
+        competing = {
+            **arguments,
+            "dispatch_generation": int(arguments["dispatch_generation"]) + 1,
+        }
+        harness.seed_declaration_pair(arguments)
+        harness.seed_declaration_pair(competing, duplicate_offset=1.0)
+        return harness.call({})
+
     case(
         "conflicting-duplicate-rows",
         ("competing declarations", "missing or ambiguous"),
-        lambda: (
-            harness.seed_declaration_pair(arguments),
-            harness.seed_declaration_pair(arguments, duplicate_offset=1.0),
-            harness.call({}),
-        )[-1],
+        conflicting_attempt_generations,
     )
     case(
         "wrong-caller",
