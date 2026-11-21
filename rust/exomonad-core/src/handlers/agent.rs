@@ -14,7 +14,8 @@ use crate::effects::{
 use super::dispatch_authorization::{
     dispatch_authorization_resolution_id, read_current_recovery_gate, resolve_dispatch_declaration,
     DispatchAuthorizationResolution, DispatchDeclaration, DispatchGateAnswer,
-    DispatchNoEffectProof, DispatchPrelaunchRefusal, ExpectedDispatchAuthorization,
+    DispatchNoEffectProof, DispatchPrelaunchRefusal, DispatchResolutionRecord,
+    ExpectedDispatchAuthorization,
 };
 use super::non_empty;
 use crate::services::agent_control::{
@@ -288,6 +289,17 @@ impl<
                 data: &record.event.data,
             })
             .collect::<Vec<_>>();
+        // A successful launch consumes the recovery gate. A repeat or
+        // response-loss adoption then reuses the exact durable resolution the
+        // host wrote when it accepted this declaration set.
+        let resolutions = records
+            .iter()
+            .filter(|record| record.event.event_type == "tl.dispatch_authorization_resolved")
+            .map(|record| DispatchResolutionRecord {
+                run_seq: record.event.run_seq,
+                data: &record.event.data,
+            })
+            .collect::<Vec<_>>();
         // The checkpoint is authoritative for the *current* recovery gate. It
         // is persisted before the best-effort `tl.gate_answered` emission, so a
         // ledger-only read can accept a stale approval after a later rejection
@@ -318,6 +330,7 @@ impl<
             &refusals,
             &gate_answers,
             current_gate.as_ref(),
+            &resolutions,
             expected,
             supersession,
         )?;

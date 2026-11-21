@@ -544,7 +544,12 @@ checkpoint holds before launch. `tl.gate_answered` rows are corroboration only:
 the controller persists the checkpoint before its best-effort emission, so a
 real approved checkpoint with no matching event (the #1511 shape) is accepted
 without fabricating history, while a ledger rejection that contradicts the
-checkpoint fails closed.
+checkpoint fails closed. Once a launch consumes and clears the gate, an exact
+repeat or response-loss adoption reuses the host's durable
+`tl.dispatch_authorization_resolved` row for the same intent, selected
+declaration, superseded declarations and refusal proof; a pending or rejected
+current gate still blocks, and a changed declaration set must prove a fresh
+current gate.
 It then proves from the ledger and owner registry that the older declaration did
 not launch (the predecessor is still current and no `agent.spawned` row exists
 for the intent), or that the current invocation is the single linked successor

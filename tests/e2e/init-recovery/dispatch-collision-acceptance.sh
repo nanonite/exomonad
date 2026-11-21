@@ -695,26 +695,36 @@ print(json.dumps({"literal_v1_digest": sys.argv[2], "manifest_digest": sys.argv[
 PY
 say "literal v1 proof $LITERAL_V1_DIGEST reproduces under the retained policy and manifest"
 
-say "approving the named terminal-owner recovery gate through the supported CLI"
-PYTHONPATH="$SOURCE_ROOT" python3 -m tl_loop gate \
-    --project-root "$REPO" --run-id "$STAGE" --parent-run-id root \
-    --name "$GATE_NAME" --approve > "$WORK/approve-terminal-gate.log" 2>&1 \
-    || { cat "$WORK/approve-terminal-gate.log"; fail "could not approve the disposable terminal-owner gate"; }
-
 # Real #1511 has an approved durable checkpoint and no matching
 # `tl.gate_answered` event: the controller persists the gate before its
-# best-effort emission. Remove the fixture's event so the compiled host must
-# prove the supersession from the exact checkpoint-only shape.
-say "removing the emitted gate answer to reproduce the retained checkpoint-only approval"
-python3 - "$REPO" "$GATE_NAME" <<'PY' || fail "could not reproduce the retained gate-answer absence"
+# best-effort emission and the emission was lost. Answer the gate through the
+# same durable store API so the fixture has the exact absence, never a removed
+# row that would leave a ledger sequence gap.
+say "approving the named terminal-owner recovery gate without a gate-answer emission"
+PYTHONPATH="$SOURCE_ROOT" python3 - "$REPO" "$STAGE" "$GATE_NAME" \
+    "$WORK/approval-observation.json" <<'PY' \
+    > "$WORK/approve-terminal-gate.log" 2>&1 \
+    || { cat "$WORK/approve-terminal-gate.log"; fail "could not approve the disposable terminal-owner gate"; }
 import json
 import sys
 from pathlib import Path
 
-repo, gate = Path(sys.argv[1]), sys.argv[2]
-removed = 0
+from tl_loop.state.schema import GateStatus
+from tl_loop.state.store import RunStore
+
+repo, stage, gate, output = (
+    Path(sys.argv[1]),
+    sys.argv[2],
+    sys.argv[3],
+    Path(sys.argv[4]),
+)
+store = RunStore(stage, repo / ".exo/tl-loop/root")
+state = store.answer_gate(gate, GateStatus.APPROVED)
+current = next((row for row in state.gates if row.name == gate), None)
+if current is None or current.status is not GateStatus.APPROVED:
+    raise SystemExit("the durable checkpoint did not record the approved gate")
+remaining = 0
 for segment in sorted((repo / ".exo/ledger/segments").glob("segment-*.jsonl")):
-    kept = []
     for line in segment.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -723,23 +733,18 @@ for segment in sorted((repo / ".exo/ledger/segments").glob("segment-*.jsonl")):
             event.get("type") == "tl.gate_answered"
             and (event.get("data") or {}).get("gate_name") == gate
         ):
-            removed += 1
-            continue
-        kept.append(line)
-    segment.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
-if removed < 1:
-    raise SystemExit("the fixture did not emit the gate answer it was meant to remove")
-remaining = sum(
-    1
-    for segment in sorted((repo / ".exo/ledger/segments").glob("segment-*.jsonl"))
-    for line in segment.read_text(encoding="utf-8").splitlines()
-    if line.strip()
-    and (json.loads(line).get("data") or {}).get("gate_name") == gate
-    and json.loads(line).get("type") == "tl.gate_answered"
-)
+            remaining += 1
 if remaining:
-    raise SystemExit(f"{remaining} matching gate answers remain in the ledger")
-print(json.dumps({"removed_gate_answers": removed}))
+    raise SystemExit(f"{remaining} gate answers were emitted; the fixture must have none")
+observation = {
+    "gate_name": gate,
+    "status": current.status.value,
+    "run_id": state.run_id,
+    "controller_epoch": state.controller_epoch,
+    "gate_answer_events": remaining,
+}
+output.write_text(json.dumps(observation, sort_keys=True) + "\n", encoding="utf-8")
+print(json.dumps(observation, sort_keys=True))
 PY
 
 say "recording the retained prelaunch configuration refusal under the literal v1 proof"
@@ -869,6 +874,54 @@ start_server "$WORK/server-v2-reloaded.log"
 [[ "$(health_identity)" == "$ACCEPTED_IDENTITY" ]] \
     || fail "the reloaded standalone server accepted a different identity"
 say "reloaded the standalone server with the historical owner in place"
+
+# Capture the durable current gate exactly as the host will read it immediately
+# before the supersession decision. Rows seeded earlier in the fixture can
+# reconcile the controller epoch, so this must be the pre-replay state.
+say "capturing the current approved checkpoint provenance before the host replay"
+PYTHONPATH="$SOURCE_ROOT" python3 - "$REPO" "$STAGE" "$GATE_NAME" \
+    "$WORK/approval-observation.json" <<'PY' \
+    || fail "the pre-replay current gate observation is not approved and answer-free"
+import json
+import sys
+from pathlib import Path
+
+from tl_loop.state.schema import GateStatus
+from tl_loop.state.store import RunStore
+
+repo, stage, gate, output = (
+    Path(sys.argv[1]),
+    sys.argv[2],
+    sys.argv[3],
+    Path(sys.argv[4]),
+)
+state = RunStore(stage, repo / ".exo/tl-loop/root").load()
+current = next((row for row in state.gates if row.name == gate), None)
+if current is None or current.status is not GateStatus.APPROVED:
+    raise SystemExit("the current checkpoint gate is not approved before the host replay")
+remaining = 0
+for segment in sorted((repo / ".exo/ledger/segments").glob("segment-*.jsonl")):
+    for line in segment.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if (
+            event.get("type") == "tl.gate_answered"
+            and (event.get("data") or {}).get("gate_name") == gate
+        ):
+            remaining += 1
+if remaining:
+    raise SystemExit(f"{remaining} gate answers exist before the host replay")
+observation = {
+    "gate_name": gate,
+    "status": current.status.value,
+    "run_id": state.run_id,
+    "controller_epoch": state.controller_epoch,
+    "gate_answer_events": remaining,
+}
+output.write_text(json.dumps(observation, sort_keys=True) + "\n", encoding="utf-8")
+print(json.dumps(observation, sort_keys=True))
+PY
 
 say "replaying the retained v1 dispatch through the production host path"
 python3 "$SOURCE_ROOT/tests/e2e/init-recovery/drive-refused-dispatch.py" \
@@ -1203,7 +1256,9 @@ assert (result_agent.get("id") or result_agent.get("agent_id")) == (
 ), result_agent
 print(json.dumps({"journal_entries": len(resume), "generation": invocation["generation"]}))
 PY
-AUDIT_RESULT="$(python3 - "$REPO" "$STAGE" "$OLD_SEQ1" "$OLD_SEQ2" "$WORK/refused-action.json" "$OLD_REFUSAL_SEQ" <<'PYAUDIT'
+AUDIT_RESULT="$(python3 - "$REPO" "$STAGE" "$OLD_SEQ1" "$OLD_SEQ2" \
+    "$WORK/refused-action.json" "$OLD_REFUSAL_SEQ" \
+    "$WORK/approval-observation.json" <<'PYAUDIT'
 import json
 import sys
 from pathlib import Path
@@ -1292,11 +1347,17 @@ assert resolution["reason"] == (
 ), resolution
 approval = resolution["supersession_approval"]
 assert isinstance(approval, dict), resolution
-assert approval["gate_name"] == (
+observation = json.loads(Path(sys.argv[7]).read_text(encoding="utf-8"))
+assert observation["gate_name"] == (
     "tl-terminal-owner-recovery-issue-814-substitution-model-kani"
-), approval
+), observation
+assert observation["status"] == "approved", observation
+assert observation["gate_answer_events"] == 0, observation
+assert approval["gate_name"] == observation["gate_name"], approval
+assert approval["run_id"] == observation["run_id"], approval
 assert approval["run_id"] == stage, approval
-assert approval["controller_epoch"] == new_row["data"]["controller_epoch"], approval
+assert approval["controller_epoch"] == observation["controller_epoch"], approval
+assert observation["controller_epoch"] == new_row["data"]["controller_epoch"], observation
 assert approval["source"] == "checkpoint", approval
 assert approval["ledger_answer_run_seq"] is None, approval
 assert resolution["supersession_approval_run_seq"] is None, resolution
@@ -1305,15 +1366,6 @@ assert not any(
     and (row.get("data") or {}).get("gate_name") == approval["gate_name"]
     for row in ledger
 ), "the acceptance must exercise the exact absence of a gate-answer event"
-checkpoint = json.loads(
-    (repo / f".exo/tl-loop/root/{stage}/run.json").read_text(encoding="utf-8")
-)
-gate = next(
-    row for row in checkpoint["gates"] if row.get("name") == approval["gate_name"]
-)
-assert gate["status"] == "approved", gate
-assert checkpoint["controller_epoch"] == approval["controller_epoch"], checkpoint
-assert checkpoint["run_id"] == approval["run_id"], checkpoint
 assert resolution["configuration_fingerprint"] == new_row["data"]["route_configuration_fingerprint"]
 assert resolution["route_fingerprint"] == new_row["data"]["route_fingerprint"]
 print(json.dumps({

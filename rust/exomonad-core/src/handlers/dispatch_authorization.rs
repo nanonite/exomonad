@@ -121,6 +121,19 @@ pub(crate) struct DispatchGateAnswer<'a> {
     pub data: &'a Value,
 }
 
+/// One durable `tl.dispatch_authorization_resolved` audit row.
+///
+/// A repeat or adoption request after the launch has consumed (and therefore
+/// cleared) the recovery gate must not need a second operator approval. The
+/// exact prior resolution is durable host evidence that this declaration set
+/// was already released by an approved current gate; it is reused only when the
+/// intent, selected declaration, superseded declarations and refusal proof all
+/// match exactly.
+pub(crate) struct DispatchResolutionRecord<'a> {
+    pub run_seq: Option<u64>,
+    pub data: &'a Value,
+}
+
 /// One host-recorded `tool.called` row for `resume_blocked_leaf`.
 ///
 /// The row is written by the standalone server after the handler returns, so it
@@ -259,6 +272,7 @@ pub(crate) fn resolve_dispatch_declaration(
     refusals: &[DispatchPrelaunchRefusal<'_>],
     gate_answers: &[DispatchGateAnswer<'_>],
     current_gate: Option<&DispatchCurrentGate>,
+    resolutions: &[DispatchResolutionRecord<'_>],
     expected: ExpectedDispatchAuthorization<'_>,
     no_effect: Option<&DispatchNoEffectProof<'_>>,
 ) -> EffectResult<DispatchAuthorizationResolution> {
@@ -308,7 +322,6 @@ pub(crate) fn resolve_dispatch_declaration(
         )
     })?;
     let launch_state = launch_state(proof, &expected, launch_rows)?;
-    let approval = verify_supersession_approval(gate_answers, current_gate, selected, &expected)?;
     let groups = group_historical_observations(&others, selected_seq)?;
     for declaration in others.iter().copied() {
         verify_no_launch_effect(declaration, launch_state, proof, launch_rows, &expected)?;
@@ -335,6 +348,16 @@ pub(crate) fn resolve_dispatch_declaration(
     }
     superseded.sort_unstable();
     superseded_refusals.sort_unstable();
+    let approval = verify_supersession_approval(
+        gate_answers,
+        current_gate,
+        resolutions,
+        selected,
+        selected_seq,
+        &superseded,
+        &superseded_refusals,
+        &expected,
+    )?;
     Ok(DispatchAuthorizationResolution {
         selected_run_seq: selected.run_seq,
         superseded_run_seqs: superseded,
@@ -504,16 +527,23 @@ fn verify_group_prelaunch_refusal(
 fn verify_supersession_approval(
     gate_answers: &[DispatchGateAnswer<'_>],
     current_gate: Option<&DispatchCurrentGate>,
+    resolutions: &[DispatchResolutionRecord<'_>],
     selected: &DispatchDeclaration<'_>,
+    selected_seq: u64,
+    superseded_run_seqs: &[u64],
+    superseded_refusal_run_seqs: &[u64],
     expected: &ExpectedDispatchAuthorization<'_>,
 ) -> EffectResult<DispatchApprovalIdentity> {
-    let gate = current_gate.ok_or_else(|| {
-        EffectError::invalid_input(format!(
-            "supersession of historical dispatch declarations requires a durable approved \
-             operator decision from the current recovery gate of scope {:?}",
-            expected.scope_id
-        ))
-    })?;
+    let Some(gate) = current_gate else {
+        return verify_prior_resolution(
+            resolutions,
+            selected,
+            selected_seq,
+            superseded_run_seqs,
+            superseded_refusal_run_seqs,
+            expected,
+        );
+    };
     let gate_names = slice_recovery_gate_names(expected.scope_id);
     if gate.scope_id != expected.scope_id || !gate_names.iter().any(|name| name == &gate.gate_name)
     {
@@ -666,6 +696,115 @@ fn verify_supersession_approval(
             "checkpoint"
         },
         ledger_answer_run_seq,
+    })
+}
+
+/// Reuse an exact durable prior resolution when the launch consumed the gate.
+///
+/// A successful blocked-leaf resume clears the recovery gate when the controller
+/// consumes it, so a later repeat or response-loss adoption has no current gate
+/// left to prove. The host's own `tl.dispatch_authorization_resolved` row is the
+/// durable proof that this exact declaration set was already released by an
+/// approved current gate. Reuse requires every identity to match exactly; a new
+/// declaration, different refusal proof or different approval provenance is not
+/// a repeat and must prove a current gate again.
+fn verify_prior_resolution(
+    resolutions: &[DispatchResolutionRecord<'_>],
+    selected: &DispatchDeclaration<'_>,
+    selected_seq: u64,
+    superseded_run_seqs: &[u64],
+    superseded_refusal_run_seqs: &[u64],
+    expected: &ExpectedDispatchAuthorization<'_>,
+) -> EffectResult<DispatchApprovalIdentity> {
+    let gate_names = slice_recovery_gate_names(expected.scope_id);
+    let declaration_epoch = selected
+        .data
+        .get("controller_epoch")
+        .and_then(Value::as_str)
+        .filter(|epoch| !epoch.is_empty());
+    let mut matched: Option<DispatchApprovalIdentity> = None;
+    for resolution in resolutions {
+        let data = resolution.data;
+        let sequence = resolution.run_seq.ok_or_else(|| {
+            EffectError::invalid_input("a dispatch resolution audit row has no ledger sequence")
+        })?;
+        if sequence <= selected_seq
+            || data.get("intent_id").and_then(Value::as_str) != Some(expected.intent_id)
+            || data.get("selected_run_seq").and_then(Value::as_u64) != Some(selected_seq)
+            || data.get("superseded_run_seqs") != Some(&serde_json::json!(superseded_run_seqs))
+            || data.get("superseded_refusal_run_seqs")
+                != Some(&serde_json::json!(superseded_refusal_run_seqs))
+        {
+            continue;
+        }
+        let approval = data.get("supersession_approval").ok_or_else(|| {
+            EffectError::invalid_input(format!(
+                "dispatch resolution at run_seq {sequence} has no approval provenance"
+            ))
+        })?;
+        let gate_name = approval
+            .get("gate_name")
+            .and_then(Value::as_str)
+            .filter(|name| gate_names.iter().any(|gate| gate == name))
+            .ok_or_else(|| {
+                EffectError::invalid_input(format!(
+                    "dispatch resolution at run_seq {sequence} names no recovery gate for the \
+                     declared scope"
+                ))
+            })?;
+        let run_id = approval
+            .get("run_id")
+            .and_then(Value::as_str)
+            .filter(|run| selected.agent_id == Some(*run))
+            .ok_or_else(|| {
+                EffectError::invalid_input(format!(
+                    "dispatch resolution at run_seq {sequence} is not bound to the selected \
+                     declaration's run"
+                ))
+            })?;
+        let controller_epoch = approval
+            .get("controller_epoch")
+            .and_then(Value::as_str)
+            .filter(|epoch| declaration_epoch == Some(*epoch))
+            .ok_or_else(|| {
+                EffectError::invalid_input(format!(
+                    "dispatch resolution at run_seq {sequence} does not match the selected \
+                     declaration controller epoch"
+                ))
+            })?;
+        let source = match approval.get("source").and_then(Value::as_str) {
+            Some("checkpoint") => "checkpoint",
+            Some("checkpoint_and_ledger") => "checkpoint_and_ledger",
+            _ => {
+                return Err(EffectError::invalid_input(format!(
+                    "dispatch resolution at run_seq {sequence} has unknown approval provenance"
+                )));
+            }
+        };
+        let ledger_answer_run_seq = approval
+            .get("ledger_answer_run_seq")
+            .and_then(Value::as_u64);
+        let identity = DispatchApprovalIdentity {
+            gate_name: gate_name.to_string(),
+            run_id: run_id.to_string(),
+            controller_epoch: controller_epoch.to_string(),
+            source,
+            ledger_answer_run_seq,
+        };
+        if matched.as_ref().is_some_and(|prior| prior != &identity) {
+            return Err(EffectError::invalid_input(format!(
+                "multiple durable dispatch resolutions disagree about the approval for this \
+                 declaration set (run_seq {sequence})"
+            )));
+        }
+        matched = Some(identity);
+    }
+    matched.ok_or_else(|| {
+        EffectError::invalid_input(format!(
+            "supersession of historical dispatch declarations requires a durable approved \
+             operator decision from the current recovery gate of scope {:?}",
+            expected.scope_id
+        ))
     })
 }
 
@@ -1466,6 +1605,7 @@ mod tests {
             refusals,
             gate_answers,
             Some(&gate),
+            &[],
             expected,
             no_effect,
         )
@@ -2178,6 +2318,7 @@ mod tests {
             &[refusal_row(&old_refusal, 188_693, CALLER)],
             &approved_answers(),
             None,
+            &[],
             expected(),
             Some(&proof),
         )
@@ -2274,6 +2415,7 @@ mod tests {
             &[refusal_row(&old_refusal, 188_693, CALLER)],
             &[],
             Some(&gate),
+            &[],
             expected(),
             Some(&proof),
         )
@@ -2452,6 +2594,7 @@ mod tests {
             &[refusal_row(&old_refusal, 188_693, CALLER)],
             &[],
             None,
+            &[],
             expected(),
             Some(&proof),
         )
@@ -2484,6 +2627,7 @@ mod tests {
             &[refusal_row(&old_refusal, 188_693, CALLER)],
             &approved_answers(),
             Some(&gate),
+            &[],
             expected(),
             Some(&proof),
         )
@@ -2513,6 +2657,7 @@ mod tests {
             &[refusal_row(&old_refusal, 188_693, CALLER)],
             &approved_answers(),
             Some(&gate),
+            &[],
             expected(),
             Some(&proof),
         )
@@ -2548,6 +2693,7 @@ mod tests {
             &[refusal_row(&old_refusal, 188_693, CALLER)],
             &approved_answers(),
             Some(&gate),
+            &[],
             expected(),
             Some(&proof),
         )
@@ -2610,6 +2756,7 @@ mod tests {
             &[refusal_row(&old_refusal, 188_693, CALLER)],
             &approved_answers(),
             Some(&gate),
+            &[],
             expected(),
             Some(&proof),
         )
@@ -2639,6 +2786,7 @@ mod tests {
             &[refusal_row(&old_refusal, 188_693, CALLER)],
             &approved_answers(),
             Some(&gate),
+            &[],
             expected(),
             Some(&proof),
         )
@@ -2646,6 +2794,123 @@ mod tests {
         .expect("a gate owned by another run cannot authorize this declaration")
         .to_string();
         assert!(error.contains("not attributed to the run"), "{error}");
+    }
+
+    fn resolution_data(selected: u64, superseded: &[u64], refusals: &[u64], epoch: &str) -> Value {
+        json!({
+            "intent_id": INTENT,
+            "selected_run_seq": selected,
+            "superseded_run_seqs": superseded,
+            "superseded_refusal_run_seqs": refusals,
+            "supersession_approval": {
+                "gate_name": format!("tl-terminal-owner-recovery-{SLICE}"),
+                "run_id": CALLER,
+                "controller_epoch": epoch,
+                "source": "checkpoint",
+                "ledger_answer_run_seq": null,
+            },
+        })
+    }
+
+    fn resolution_row<'a>(data: &'a Value, run_seq: u64) -> DispatchResolutionRecord<'a> {
+        DispatchResolutionRecord {
+            run_seq: Some(run_seq),
+            data,
+        }
+    }
+
+    #[test]
+    fn an_exact_prior_resolution_releases_a_repeat_without_the_consumed_gate() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let old_refusal = refusal_data(&old);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let prior = resolution_data(188_878, &[188_678], &[188_693], EPOCH);
+        let resolution = resolve_dispatch_declaration(
+            &[
+                row(&old, CALLER, Some(188_678)),
+                row(&new, CALLER, Some(188_878)),
+            ],
+            &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &[],
+            None,
+            &[resolution_row(&prior, 188_900)],
+            expected(),
+            Some(&proof),
+        )
+        .expect("the exact prior resolution is durable approval for a repeat or adoption");
+        assert_eq!(
+            resolution.supersession_approval,
+            Some(approval_identity(None))
+        );
+    }
+
+    #[test]
+    fn a_prior_resolution_cannot_override_a_reopened_or_rejected_gate() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let old_refusal = refusal_data(&old);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let prior = resolution_data(188_878, &[188_678], &[188_693], EPOCH);
+        for status in ["pending", "rejected"] {
+            let gate = DispatchCurrentGate {
+                status: status.to_string(),
+                ..current_gate()
+            };
+            let error = resolve_dispatch_declaration(
+                &[
+                    row(&old, CALLER, Some(188_678)),
+                    row(&new, CALLER, Some(188_878)),
+                ],
+                &[],
+                &[refusal_row(&old_refusal, 188_693, CALLER)],
+                &[],
+                Some(&gate),
+                &[resolution_row(&prior, 188_900)],
+                expected(),
+                Some(&proof),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("a {status} gate must block even a prior resolution"))
+            .to_string();
+            assert!(
+                error.contains("approved current supersession is required"),
+                "{status}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prior_resolution_for_a_different_declaration_set_is_not_reused() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let old_refusal = refusal_data(&old);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let prior = resolution_data(188_878, &[188_679], &[188_693], EPOCH);
+        let error = resolve_dispatch_declaration(
+            &[
+                row(&old, CALLER, Some(188_678)),
+                row(&new, CALLER, Some(188_878)),
+            ],
+            &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &[],
+            None,
+            &[resolution_row(&prior, 188_900)],
+            expected(),
+            Some(&proof),
+        )
+        .err()
+        .expect("a prior resolution for another declaration set is not this approval")
+        .to_string();
+        assert!(
+            error.contains("requires a durable approved operator decision"),
+            "{error}"
+        );
     }
 
     fn write_checkpoint(root: &Path, run_id: &str, document: Value) {

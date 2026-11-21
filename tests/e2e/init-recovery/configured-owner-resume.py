@@ -483,6 +483,11 @@ def seed_terminal_provider_failure(
     }
     spawn_intent = EffectIntent("spawn_leaf", OWNER_SLICE, arguments, True)
     child_store = RunStore(run_id, repository / ".exo/tl-loop/root")
+    # The retained #1511 checkpoint and its declarations carry a controller
+    # epoch. Bind the disposable production shape to the same provenance so the
+    # host can prove the current gate belongs to the run that emitted the
+    # selected declaration.
+    child_store.set_controller_epoch("98d3fa2d86b97841a3f571fed96251b2")
     journal = EffectJournal(run_id, child_store.run_dir / "action-journal.json")
     journal.append(spawn_intent)
     journal.mark_result(

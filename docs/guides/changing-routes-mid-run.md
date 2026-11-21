@@ -252,8 +252,13 @@ foreign run or missing checkpoint holds the supersession before launch.
 `tl.gate_answered` rows are corroboration only: the controller persists the
 checkpoint before its best-effort event emission, so the real #1511 approved
 checkpoint with no matching event is accepted without fabricating history,
-while a ledger rejection contradicting the checkpoint fails closed. Missing or
-malformed observation fields (`started_at`, `attempt`, `dispatch_generation`,
+while a ledger rejection contradicting the checkpoint fails closed. Once a
+launch consumes and clears the gate, an exact repeat or response-loss adoption
+reuses the host's durable `tl.dispatch_authorization_resolved` row only when the
+intent, selected declaration, superseded declarations and refusal proof all
+match exactly; a pending or rejected current gate still blocks and a changed
+declaration set must prove a fresh current gate. Missing or malformed
+observation fields (`started_at`, `attempt`, `dispatch_generation`,
 `controller_epoch`) are never treated as equivalent observations. The trust
 boundary is therefore: the ledger supplies declarations, refusals, launch rows
 and corroborating gate answers; the controller checkpoint supplies the current
