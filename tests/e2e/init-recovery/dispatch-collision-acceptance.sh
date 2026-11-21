@@ -543,7 +543,7 @@ recover_crashed_server() {
 wait_for_interrupt_marker() {
     local boundary="$1"
     local marker="$INTERRUPT_DIR/$boundary.json"
-    for _ in $(seq 1 2400); do
+    for _ in $(seq 1 12000); do
         [[ -s "$marker" ]] && return 0
         sleep 0.05
     done
@@ -583,7 +583,11 @@ run_init_at_boundary() {
     local status=0
     (
         cd "$REPO"
-        run_env "$EXOMONAD_BIN" init --continue --session "$SESSION" "${ROLE_FLAGS[@]}"
+        run_env EXOMONAD_E2E_INTERRUPT_AT="$boundary" \
+            EXOMONAD_E2E_INTERRUPT_SCOPE="$INTENT_ID" \
+            EXOMONAD_E2E_INTERRUPT_DIR="$INTERRUPT_DIR" \
+            EXOMONAD_E2E_INTERRUPT_ACTION=pause \
+            "$EXOMONAD_BIN" init --continue --session "$SESSION" "${ROLE_FLAGS[@]}"
     ) > "$log" 2>&1 &
     INIT_PID=$!
     wait_for_interrupt_marker "$boundary"
@@ -592,10 +596,12 @@ run_init_at_boundary() {
         host_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",""))' "$REPO/.exo/server.pid" 2>/dev/null || true)"
     fi
     # The host has durably crossed the boundary and is paused before returning.
-    # Stop the still-live controller through the supported workspace shutdown
-    # while the host is paused, so the child invocation is cleanly marked
-    # killed instead of dying on an unreachable-socket checkpoint. Then crash
-    # the paused host process; the durable boundary state is already written.
+    # Kill the controller at this exact boundary before its in-flight resume
+    # request can time out and mark the slice failed; the restart must replay
+    # the durable intended/unknown action. Then make one bounded attempt at the
+    # supported workspace shutdown for evidence, and crash the paused host; the
+    # durable boundary state is already written.
+    kill_controller_process
     local shutdown_log="$WORK/shutdown-after-interrupt-$boundary.log"
     (
         cd "$REPO"
@@ -603,7 +609,7 @@ run_init_at_boundary() {
     ) > "$shutdown_log" 2>&1 &
     local shutdown_pid=$!
     local shutdown_exited=0
-    for _ in $(seq 1 600); do
+    for _ in $(seq 1 200); do
         if ! kill -0 "$shutdown_pid" 2>/dev/null; then
             shutdown_exited=1
             break
@@ -612,7 +618,6 @@ run_init_at_boundary() {
     done
     if (( shutdown_exited == 0 )); then
         kill -9 "$shutdown_pid" 2>/dev/null || true
-        kill_controller_process
     fi
     wait "$shutdown_pid" 2>/dev/null || true
     # Stop the init wrapper before the host: a live init may otherwise start a
@@ -1113,6 +1118,7 @@ fi
 
 if [[ -z "$INTERRUPT_BOUNDARY" ]]; then
     say "no dispatch interruption boundary selected; running the uninterrupted acceptance"
+    start_server "$WORK/server-after-interruptions.log"
 else
     say "restarting the standalone server after the $INTERRUPT_BOUNDARY interruption"
     # The boundary run's init-managed Server window is stale after the abrupt
@@ -1121,8 +1127,8 @@ else
     # from a clean control-plane pane.
     tmux_iso kill-window -t "$SESSION:Server" 2>/dev/null || true
     tmux_iso kill-window -t "$SESSION:Watcher" 2>/dev/null || true
+    start_server "$WORK/server-after-interruptions.log"
 fi
-start_server "$WORK/server-after-interruptions.log"
 say "running init --continue with identical explicit role flags"
 
 (
@@ -1130,9 +1136,29 @@ say "running init --continue with identical explicit role flags"
     run_env "$EXOMONAD_BIN" init --continue --session "$SESSION" "${ROLE_FLAGS[@]}"
 ) > "$WORK/init-stored-proof.log" 2>&1 &
 INIT_PID=$!
-wait_for_launch
+if [[ "$INTERRUPT_BOUNDARY" == "launch_before_adoption" || "$INTERRUPT_BOUNDARY" == "adoption_before_response" ]]; then
+    # The successor was already launched before the interruption. The restart
+    # must adopt that exact invocation, not produce another
+    # `role_config_worker_started` event; wait for init itself to finish, then
+    # let the generation/adoption checks below observe the durable state.
+    :
+else
+    wait_for_launch
+fi
 wait "$INIT_PID" 2>/dev/null || true
 INIT_PID=""
+if [[ -z "$SERVER_PID" ]] || ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    # init may complete a supported shutdown handoff and replace the server in
+    # its own Server window. Adopt that exact pid so later stop/restart checks
+    # manage the server that is actually serving this workspace.
+    for _ in $(seq 1 900); do
+        [[ -S "$REPO/.exo/server.sock" ]] && break
+        sleep 0.1
+    done
+    if [[ -f "$REPO/.exo/server.pid" ]]; then
+        SERVER_PID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid", ""))' "$REPO/.exo/server.pid" 2>/dev/null || true)"
+    fi
+fi
 if grep -q 'ERROR.*exomonad init failed' "$WORK/init-stored-proof.log"; then
     cat "$WORK/init-stored-proof.log"
     fail "init failed before the linked successor was launched"

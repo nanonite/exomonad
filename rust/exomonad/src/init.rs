@@ -5732,6 +5732,24 @@ fn server_command(session: &str, config: &Config, verbose: bool) -> Result<Strin
     } else {
         ""
     };
+    // The compiled interruption acceptance pauses the real standalone server at
+    // exact durable boundaries. `init` can replace that external server with the
+    // one it starts in the Server window; carry the harness-only barrier
+    // variables across that replacement so the boundary is still reached. In
+    // production these variables are unset and this is empty.
+    let interrupt_env = [
+        "EXOMONAD_E2E_INTERRUPT_AT",
+        "EXOMONAD_E2E_INTERRUPT_SCOPE",
+        "EXOMONAD_E2E_INTERRUPT_DIR",
+        "EXOMONAD_E2E_INTERRUPT_ACTION",
+    ]
+    .iter()
+    .filter_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| format!("{name}={} ", shell_escape::escape(value.as_str().into())))
+    })
+    .collect::<String>();
     let binary = shell_escape::escape(
         exomonad_core::find_exomonad_binary()
             .display()
@@ -5739,7 +5757,7 @@ fn server_command(session: &str, config: &Config, verbose: bool) -> Result<Strin
             .into(),
     );
     Ok(format!(
-        "{}EXOMONAD_TMUX_SESSION={} EXOMONAD_ROOT_AGENT_TYPE={} EXOMONAD_ROOT_AGENT_TYPE_SOURCE={} EXOMONAD_SPAWN_AGENT_TYPE={} EXOMONAD_SPAWN_AGENT_TYPE_SOURCE={} EXOMONAD_REVIEWER_AGENT_TYPE={} EXOMONAD_REVIEWER_AGENT_TYPE_SOURCE={}{} {} serve",
+        "{}EXOMONAD_TMUX_SESSION={} EXOMONAD_ROOT_AGENT_TYPE={} EXOMONAD_ROOT_AGENT_TYPE_SOURCE={} EXOMONAD_SPAWN_AGENT_TYPE={} EXOMONAD_SPAWN_AGENT_TYPE_SOURCE={} EXOMONAD_REVIEWER_AGENT_TYPE={} EXOMONAD_REVIEWER_AGENT_TYPE_SOURCE={}{}{} {} serve",
         verbose_prefix,
         session,
         agent_type_str(config.root_agent_type),
@@ -5749,6 +5767,7 @@ fn server_command(session: &str, config: &Config, verbose: bool) -> Result<Strin
         agent_type_str(config.reviewer.agent_type),
         config.reviewer_agent_type_source.as_str(),
         model_env,
+        interrupt_env,
         binary,
     ))
 }
@@ -7324,6 +7343,13 @@ async fn shutdown_and_restart_server(
     {
         ipc.kill_window(&server.window_id).await?;
     }
+    // Killing the window or completing the shutdown request does not mean the
+    // old server process has released its pid record and socket yet. Starting
+    // the replacement while the old pid is still alive leaves
+    // `prepare_server_socket_for_start` believing a server owns the artifacts,
+    // so the replacement can exit before it ever binds. Wait for the exact
+    // recorded process to be gone before launching the new server.
+    wait_for_server_process_exit(project_dir).await?;
     launch_server_recovery(ipc, project_dir, shell, session, config, verbose).await?;
     ensure_watcher_dashboard_window(ipc, project_dir, shell).await?;
     Ok(())
@@ -7334,6 +7360,26 @@ async fn wait_for_server_socket_shutdown(project_dir: &Path) -> Result<()> {
     while server_socket_is_healthy(project_dir).await {
         if Instant::now() >= deadline {
             anyhow::bail!("server did not stop after the completed workspace controller shutdown");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+/// Wait for the recorded server process to release its artifacts before a restart.
+///
+/// The socket can stop answering before the process has fully exited (and a
+/// killed tmux window can leave the process finishing its own cleanup). Starting
+/// a replacement in that window makes `prepare_server_socket_for_start` treat
+/// the dying pid as a live owner and the replacement exits before binding.
+async fn wait_for_server_process_exit(project_dir: &Path) -> Result<()> {
+    let pid_path = project_dir.join(".exo/server.pid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while server_pid_is_alive(&pid_path) {
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "recorded server process did not exit before the replacement server started"
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

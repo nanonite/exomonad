@@ -6404,11 +6404,27 @@ def _terminal_resume_history_proof(
             )
             if competing_claims > 1:
                 return None, "multiple confirmed resume actions claim one successor invocation"
-            following_entry = entries[index + 1] if index + 1 < len(entries) else None
+            # A restart can leave the next resume action as the durable
+            # intended/unknown request (the host crossed the launch boundary and
+            # died before the controller could persist its receipt). Its
+            # arguments are still the controller-written lineage for the
+            # preceding confirmed successor; the unresolved request itself is
+            # replayed separately. Refusals are not lineage, so scan past them
+            # to the next durable action.
+            following_entry = next(
+                (
+                    candidate
+                    for candidate in entries[index + 1 :]
+                    if isinstance(candidate, Mapping)
+                    and candidate.get("status") in {"confirmed", "intended", "unknown"}
+                ),
+                None,
+            )
             following_arguments = (
                 following_entry.get("arguments")
                 if isinstance(following_entry, Mapping)
-                and following_entry.get("status") == "confirmed"
+                and following_entry.get("status")
+                in {"confirmed", "intended", "unknown"}
                 else None
             )
             receipt, receipt_error = _legacy_terminal_resume_receipt(
@@ -6578,7 +6594,13 @@ def _terminal_resume_history_proof(
         or not _optional_route_agrees(owner.effort, invocation.get("effort"))
     ):
         return None, "terminal owner runtime and model records disagree"
-    if latest_result is not None and latest_confirmed_entry is not None:
+    # When the next action is the durable unresolved request, the persisted
+    # owner invocation has already rotated to that request's launched successor.
+    # The historical confirmed result is validated by its own lineage and the
+    # following action arguments above; comparing it to the newly launched
+    # invocation would confuse history with the retry that is about to be
+    # replayed. The replay path validates the current invocation exactly.
+    if latest_result is not None and latest_confirmed_entry is not None and not unresolved_latest:
         payload = latest_result.result
         result_agent = payload.get("agent") if isinstance(payload, Mapping) else None
         result_invocation = payload.get("invocation") if isinstance(payload, Mapping) else None
