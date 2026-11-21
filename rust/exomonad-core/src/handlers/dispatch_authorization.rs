@@ -266,6 +266,7 @@ fn sequence_list(sequences: impl IntoIterator<Item = Option<u64>>) -> String {
 /// Every superseded declaration must be bound to its own exact permitted
 /// prelaunch refusal; absence, an unrelated refusal, contradictory evidence or a
 /// wrong-declaration refusal holds the retry before launch.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_dispatch_declaration(
     declarations: &[DispatchDeclaration<'_>],
     launch_rows: &[DispatchDeclaration<'_>],
@@ -524,6 +525,7 @@ fn verify_group_prelaunch_refusal(
 /// accepts the real historical #1511 shape: an approved checkpoint with no
 /// matching `tl.gate_answered` row and a selected declaration that predates any
 /// new event.
+#[allow(clippy::too_many_arguments)]
 fn verify_supersession_approval(
     gate_answers: &[DispatchGateAnswer<'_>],
     current_gate: Option<&DispatchCurrentGate>,
@@ -605,37 +607,25 @@ fn verify_supersession_approval(
             )));
         }
     }
-    for (name, status) in &gate.other_recovery_gates {
-        match status.as_str() {
-            "pending" => {
-                return Err(EffectError::invalid_input(format!(
-                    "another same-slice recovery gate {:?} is pending; an approved current \
-                     supersession is required",
-                    name
-                )));
-            }
-            "rejected" => {
-                return Err(EffectError::invalid_input(format!(
-                    "another same-slice recovery gate {:?} was rejected; an approved current \
-                     supersession is required",
-                    name
-                )));
-            }
-            "approved" => {
-                return Err(EffectError::invalid_input(format!(
-                    "multiple same-slice recovery gates are approved ({:?} and {:?}); the \
-                     current approval is ambiguous",
-                    gate.gate_name, name
-                )));
-            }
+    // Any additional same-slice recovery gate makes the current approval
+    // ambiguous: a pending/rejected one may be the real current question, and a
+    // second approved one cannot both be the authorizing decision.
+    if let Some((name, status)) = gate.other_recovery_gates.first() {
+        let detail = match status.as_str() {
+            "pending" => "is pending",
+            "rejected" => "was rejected",
+            "approved" => "is also approved",
             other => {
                 return Err(EffectError::invalid_input(format!(
-                    "another same-slice recovery gate {:?} has unknown status {other:?}; the \
-                     current approval is ambiguous",
-                    name
-                )));
+                    "another same-slice recovery gate {name:?} has unknown status {other:?}; the \
+                 current approval is ambiguous"
+                )))
             }
-        }
+        };
+        return Err(EffectError::invalid_input(format!(
+            "another same-slice recovery gate {name:?} {detail}; an approved current \
+             supersession is required"
+        )));
     }
 
     let mut decisions = Vec::new();
@@ -825,18 +815,15 @@ fn slice_recovery_gate_names(scope_id: &str) -> [String; 3] {
 ///
 /// The scan is bounded and refuses symlinks. A checkpoint is a candidate only
 /// when it names one of this slice's recovery gates, and it must also declare
-/// the slice itself. Exactly one candidate checkpoint may exist; otherwise the
-/// current state is ambiguous and the caller must fail closed.
+/// the slice itself. No candidate means the gate was never opened or was
+/// consumed and cleared; more than one candidate is ambiguous and fails closed.
 pub(crate) fn read_current_recovery_gate(
     project_dir: &Path,
     scope_id: &str,
-) -> EffectResult<DispatchCurrentGate> {
+) -> EffectResult<Option<DispatchCurrentGate>> {
     let loop_root = project_dir.join(".exo/tl-loop");
     if !loop_root.is_dir() {
-        return Err(EffectError::invalid_input(format!(
-            "no durable controller checkpoint is available for the recovery gate of scope \
-             {scope_id:?}"
-        )));
+        return Ok(None);
     }
     let gate_names = slice_recovery_gate_names(scope_id);
     let mut candidates = Vec::new();
@@ -878,12 +865,16 @@ pub(crate) fn read_current_recovery_gate(
             }
         }
     }
-    let [candidate] = candidates.as_slice() else {
-        return Err(EffectError::invalid_input(format!(
-            "expected exactly one durable controller checkpoint naming a recovery gate for scope \
-             {scope_id:?}, found {}",
-            candidates.len()
-        )));
+    let candidate = match candidates.as_slice() {
+        [] => return Ok(None),
+        [candidate] => candidate,
+        _ => {
+            return Err(EffectError::invalid_input(format!(
+                "expected at most one durable controller checkpoint naming a recovery gate for \
+                 scope {scope_id:?}, found {}",
+                candidates.len()
+            )));
+        }
     };
     let matching = candidate
         .gates
@@ -906,14 +897,14 @@ pub(crate) fn read_current_recovery_gate(
         .filter(|(name, _)| name != &primary.0)
         .map(|(name, status)| (name.clone(), status.clone()))
         .collect();
-    Ok(DispatchCurrentGate {
+    Ok(Some(DispatchCurrentGate {
         run_id: candidate.run_id.clone(),
         controller_epoch: candidate.controller_epoch.clone(),
         scope_id: scope_id.to_string(),
         gate_name: primary.0.clone(),
         status: primary.1.clone(),
         other_recovery_gates: others,
-    })
+    }))
 }
 
 struct RecoveryGateCheckpoint {
@@ -2946,6 +2937,7 @@ mod tests {
             ),
         );
         let gate = read_current_recovery_gate(temporary.path(), SLICE)
+            .expect("the checkpoint scan")
             .expect("the approved checkpoint is current");
         assert_eq!(gate.run_id, CALLER);
         assert_eq!(gate.controller_epoch, EPOCH);
@@ -2971,7 +2963,9 @@ mod tests {
                 ]),
             ),
         );
-        let gate = read_current_recovery_gate(temporary.path(), SLICE).expect("checkpoint");
+        let gate = read_current_recovery_gate(temporary.path(), SLICE)
+            .expect("checkpoint scan")
+            .expect("checkpoint");
         assert_eq!(gate.status, "approved");
         assert_eq!(
             gate.other_recovery_gates,
@@ -2992,7 +2986,7 @@ mod tests {
             .err()
             .expect("two checkpoints cannot both own the current gate")
             .to_string();
-        assert!(error.contains("expected exactly one"), "{error}");
+        assert!(error.contains("expected at most one"), "{error}");
     }
 
     #[test]
@@ -3016,16 +3010,11 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_missing_checkpoint() {
+    fn reports_no_current_gate_when_no_checkpoint_exists() {
         let temporary = tempfile::tempdir().expect("temp dir");
-        let error = read_current_recovery_gate(temporary.path(), SLICE)
-            .err()
-            .expect("no checkpoint means no current gate")
-            .to_string();
-        assert!(
-            error.contains("no durable controller checkpoint"),
-            "{error}"
-        );
+        assert!(read_current_recovery_gate(temporary.path(), SLICE)
+            .expect("absence of a checkpoint is not a malformed checkpoint")
+            .is_none());
     }
 
     #[test]

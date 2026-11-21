@@ -306,7 +306,7 @@ impl<
         // or reopen. A missing/unreadable checkpoint stays `None`; the resolver
         // then fails closed if any historical declaration actually needs release.
         let current_gate = if supersession.is_some() {
-            read_current_recovery_gate(self.ctx.project_dir(), route.scope_id.as_str()).ok()
+            read_current_recovery_gate(self.ctx.project_dir(), route.scope_id.as_str())?
         } else {
             None
         };
