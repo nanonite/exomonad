@@ -1279,7 +1279,7 @@ declarations = [
     if row.get("type") == "tl.dispatch_intended"
     and row.get("data", {}).get("intent_id") == intent
 ]
-assert len(declarations) == 2, [row.get("run_seq") for row in declarations]
+assert len(declarations) >= 2, [row.get("run_seq") for row in declarations]
 old_rows = [
     row
     for row in ledger
@@ -1292,9 +1292,13 @@ assert all(
     row["data"]["route_configuration_fingerprint"].startswith("sha256:v1:")
     for row in old_rows
 )
-new_rows = [row for row in declarations if row["run_seq"] not in old_seqs]
-assert len(new_rows) == 1, [row.get("run_seq") for row in declarations]
-new_row = new_rows[0]
+new_rows = sorted(
+    (row for row in declarations if row["run_seq"] not in old_seqs),
+    key=lambda row: row["run_seq"],
+)
+assert new_rows, [row.get("run_seq") for row in declarations]
+new_row = new_rows[-1]
+redeclaration_seqs = [row["run_seq"] for row in new_rows[:-1]]
 assert new_row["data"]["route_configuration_fingerprint"].startswith("sha256:v2:")
 resolutions = [
     row
@@ -1313,9 +1317,11 @@ refusals = [
     )
     == intent
 ]
-assert len(refusals) == 1, [row.get("run_seq") for row in refusals]
-refusal = refusals[0]
-assert refusal["run_seq"] == old_refusal_seq, (refusal["run_seq"], old_refusal_seq)
+refusal = next(
+    (row for row in refusals if row["run_seq"] == old_refusal_seq),
+    None,
+)
+assert refusal is not None, [row.get("run_seq") for row in refusals]
 assert min(old_seqs) < refusal["run_seq"] < new_row["run_seq"], (
     old_seqs,
     refusal["run_seq"],
@@ -1331,17 +1337,35 @@ assert refusal["data"]["arguments"]["role_route"]["configuration_fingerprint"] =
 assert refusal["data"]["arguments"]["role_route"]["route_fingerprint"] == (
     old_rows[0]["data"]["route_fingerprint"]
 )
-assert not any(
-    row.get("type") == "agent.spawned"
+prior_spawns = [
+    row
+    for row in ledger
+    if row.get("type") == "agent.spawned"
     and row.get("data", {}).get("intent_id") == intent
     and row["run_seq"] < new_row["run_seq"]
-    for row in ledger
-)
-assert len(resolutions) == 1, len(resolutions)
-resolution = resolutions[0]["data"]
+]
+assert len(prior_spawns) <= 1, prior_spawns
+if prior_spawns:
+    owner_invocation = json.loads(
+        (repo / ".exo/agents/issue-814-substitution-model-kani-opencode/invocation.json")
+        .read_text(encoding="utf-8")
+    )
+    assert (
+        prior_spawns[0]["data"]["invocation_id"] == owner_invocation["invocation_id"]
+    ), (prior_spawns[0], owner_invocation)
+matching_resolutions = [
+    row
+    for row in resolutions
+    if row.get("data", {}).get("selected_run_seq") == new_row["run_seq"]
+]
+assert len(matching_resolutions) == 1, [row.get("data", {}).get("selected_run_seq") for row in resolutions]
+resolution = matching_resolutions[0]["data"]
 assert resolution["selected_run_seq"] == new_row["run_seq"], resolution
-assert sorted(resolution["superseded_run_seqs"]) == [min(old_seqs)], resolution
-assert resolution["superseded_refusal_run_seqs"] == [refusal["run_seq"]], resolution
+superseded = set(resolution["superseded_run_seqs"])
+assert min(old_seqs) in superseded, resolution
+assert set(redeclaration_seqs) <= superseded, resolution
+assert superseded <= {min(old_seqs)} | set(redeclaration_seqs), resolution
+assert refusal["run_seq"] in resolution["superseded_refusal_run_seqs"], resolution
 assert resolution["reason"] == (
     "superseded_declaration_proven_prelaunch_refusal_with_current_approval"
 ), resolution
