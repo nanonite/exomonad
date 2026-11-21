@@ -300,9 +300,9 @@ pub(crate) fn resolve_dispatch_declaration(
             wanted.safe_fields()
         )));
     }
-    let selected = select_single_observation(&matching, &wanted)?;
+    let (selected, redeclarations) = select_single_observation(&matching, &wanted)?;
     verify_refusal_ledger(declarations, refusals, &expected)?;
-    if others.is_empty() {
+    if others.is_empty() && redeclarations.is_empty() {
         return Ok(DispatchAuthorizationResolution {
             selected_run_seq: selected.run_seq,
             superseded_run_seqs: Vec::new(),
@@ -314,7 +314,12 @@ pub(crate) fn resolve_dispatch_declaration(
         EffectError::invalid_input(format!(
             "earlier dispatch declarations at run_seq {} cannot be released without \
              verified no-effect evidence",
-            sequence_list(others.iter().map(|declaration| declaration.run_seq))
+            sequence_list(
+                others
+                    .iter()
+                    .chain(redeclarations.iter())
+                    .map(|declaration| declaration.run_seq)
+            )
         ))
     })?;
     let selected_seq = selected.run_seq.ok_or_else(|| {
@@ -330,6 +335,14 @@ pub(crate) fn resolve_dispatch_declaration(
     verify_refusal_windows(&groups, selected_seq, refusals, &expected)?;
     let mut superseded = Vec::new();
     let mut superseded_refusals = Vec::new();
+    for declaration in redeclarations.iter().copied() {
+        verify_no_launch_effect(declaration, launch_state, proof, launch_rows, &expected)?;
+        superseded.push(declaration.run_seq.ok_or_else(|| {
+            EffectError::invalid_input(
+                "a re-declared dispatch observation has no durable ledger sequence",
+            )
+        })?);
+    }
     for (index, group) in groups.iter().enumerate() {
         for declaration in group.iter().copied() {
             superseded.push(declaration.run_seq.ok_or_else(|| {
@@ -718,12 +731,40 @@ fn verify_prior_resolution(
         let sequence = resolution.run_seq.ok_or_else(|| {
             EffectError::invalid_input("a dispatch resolution audit row has no ledger sequence")
         })?;
-        if sequence <= selected_seq
+        let prior_selected = data.get("selected_run_seq").and_then(Value::as_u64);
+        let prior_superseded = data
+            .get("superseded_run_seqs")
+            .and_then(Value::as_array)
+            .map(|values| values.iter().filter_map(Value::as_u64).collect::<Vec<_>>());
+        let prior_refusals = data
+            .get("superseded_refusal_run_seqs")
+            .and_then(Value::as_array)
+            .map(|values| values.iter().filter_map(Value::as_u64).collect::<Vec<_>>());
+        let same_authorization = data
+            .get("configuration_fingerprint")
+            .and_then(Value::as_str)
+            == Some(expected.configuration_fingerprint)
+            && data.get("route_fingerprint").and_then(Value::as_str)
+                == Some(expected.route_fingerprint)
+            && data.get("role").and_then(Value::as_str) == Some(expected.role)
+            && data.get("harness").and_then(Value::as_str) == Some(expected.harness);
+        // A prior resolution remains authoritative for the same attempt when a
+        // restart re-declared it: the prior selected declaration is now one of
+        // the re-declarations, and the prior non-matching superseded set is a
+        // subset of the current one. The refusal proof must be unchanged.
+        let covers_attempt = prior_selected == Some(selected_seq)
+            || prior_selected.is_some_and(|prior| superseded_run_seqs.contains(&prior));
+        let superseded_is_subset = prior_superseded.as_ref().is_some_and(|prior| {
+            prior
+                .iter()
+                .all(|sequence| superseded_run_seqs.contains(sequence))
+        });
+        if prior_selected.is_none_or(|prior| sequence <= prior)
             || data.get("intent_id").and_then(Value::as_str) != Some(expected.intent_id)
-            || data.get("selected_run_seq").and_then(Value::as_u64) != Some(selected_seq)
-            || data.get("superseded_run_seqs") != Some(&serde_json::json!(superseded_run_seqs))
-            || data.get("superseded_refusal_run_seqs")
-                != Some(&serde_json::json!(superseded_refusal_run_seqs))
+            || !same_authorization
+            || !covers_attempt
+            || !superseded_is_subset
+            || prior_refusals.as_deref() != Some(superseded_refusal_run_seqs)
         {
             continue;
         }
@@ -1024,25 +1065,74 @@ fn read_recovery_gate_checkpoint(
 fn select_single_observation<'a>(
     matching: &[&'a DispatchDeclaration<'a>],
     wanted: &ObservedIdentity,
-) -> EffectResult<&'a DispatchDeclaration<'a>> {
+) -> EffectResult<(
+    &'a DispatchDeclaration<'a>,
+    Vec<&'a DispatchDeclaration<'a>>,
+)> {
     let first = matching[0];
     if matching.len() == 1 {
-        return Ok(first);
+        return Ok((first, Vec::new()));
     }
-    let equivalent = matching.iter().all(|candidate| {
-        same_observation(first, candidate) && ObservedIdentity::read(candidate) == *wanted
-    });
-    if !equivalent {
-        return Err(EffectError::invalid_input(format!(
+    let competing = || {
+        EffectError::invalid_input(format!(
             "role route dispatch authorization has competing declarations at run_seq {}",
             sequence_list(matching.iter().map(|declaration| declaration.run_seq))
-        )));
-    }
-    Ok(matching
+        ))
+    };
+    if matching
         .iter()
-        .min_by_key(|declaration| declaration.run_seq.unwrap_or(u64::MAX))
-        .copied()
-        .unwrap_or(first))
+        .any(|candidate| ObservedIdentity::read(candidate) != *wanted)
+        || !matching
+            .iter()
+            .all(|candidate| same_attempt(first, candidate))
+    {
+        return Err(competing());
+    }
+    if matching
+        .iter()
+        .all(|candidate| same_observation(first, candidate))
+    {
+        return Ok((
+            matching
+                .iter()
+                .min_by_key(|declaration| declaration.run_seq.unwrap_or(u64::MAX))
+                .copied()
+                .unwrap_or(first),
+            Vec::new(),
+        ));
+    }
+    // A controller restart after an interruption re-emits the same attempt,
+    // generation and controller epoch with a fresh `started_at` before the
+    // interrupted request can launch. That later declaration is the current
+    // observation; the earlier ones are re-declarations of the same
+    // authorization, not a competing configuration. They still need durable
+    // no-effect/launch evidence, which the caller verifies below. A missing
+    // observation field is not evidence of a retry and stays competing.
+    if matching
+        .iter()
+        .any(|candidate| candidate.data.get("started_at").is_none())
+    {
+        return Err(competing());
+    }
+    let mut ordered = matching.to_vec();
+    if ordered.iter().any(|candidate| candidate.run_seq.is_none()) {
+        return Err(EffectError::invalid_input(
+            "a re-declared dispatch observation has no durable ledger sequence",
+        ));
+    }
+    ordered.sort_by_key(|declaration| declaration.run_seq.unwrap_or(u64::MAX));
+    let selected = ordered.pop().unwrap_or(first);
+    Ok((selected, ordered))
+}
+
+/// Whether two declarations belong to the same dispatch attempt.
+fn same_attempt(left: &DispatchDeclaration<'_>, right: &DispatchDeclaration<'_>) -> bool {
+    const FIELDS: [&str; 3] = ["attempt", "dispatch_generation", "controller_epoch"];
+    FIELDS.iter().all(|field| {
+        let left_value = left.data.get(*field);
+        let right_value = right.data.get(*field);
+        left_value.is_some() && left_value == right_value
+    })
 }
 
 /// Whether two declarations are provably the same observation.
@@ -1909,10 +1999,36 @@ mod tests {
             None,
         )
         .err()
-        .expect("distinct declarations under one authorization must not collapse")
+        .expect("a re-declaration without no-effect evidence must not release")
         .to_string();
-        assert!(error.contains("competing declarations"), "{error}");
-        assert!(error.contains("188878, 188879"), "{error}");
+        assert!(error.contains("verified no-effect evidence"), "{error}");
+        assert!(error.contains("188878"), "{error}");
+    }
+
+    #[test]
+    fn a_restart_redeclaration_of_the_same_attempt_resolves_once() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let first = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let second = declaration(188_879, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 9.0);
+        let old_refusal = refusal_data(&old);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let resolution = resolve(
+            &[
+                row(&old, CALLER, Some(188_678)),
+                row(&first, CALLER, Some(188_878)),
+                row(&second, CALLER, Some(188_879)),
+            ],
+            &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &approved_answers(),
+            expected(),
+            Some(&proof),
+        )
+        .expect("the restarted attempt re-declaration is the current observation");
+        assert_eq!(resolution.selected_run_seq, Some(188_879));
+        assert_eq!(resolution.superseded_run_seqs, vec![188_678, 188_878]);
+        assert_eq!(resolution.superseded_refusal_run_seqs, vec![188_693]);
     }
 
     #[test]
@@ -2790,6 +2906,10 @@ mod tests {
     fn resolution_data(selected: u64, superseded: &[u64], refusals: &[u64], epoch: &str) -> Value {
         json!({
             "intent_id": INTENT,
+            "role": "worker",
+            "harness": "opencode/opencode-go/deepseek-v4.1-flash",
+            "configuration_fingerprint": NEW_CONFIG,
+            "route_fingerprint": NEW_ROUTE,
             "selected_run_seq": selected,
             "superseded_run_seqs": superseded,
             "superseded_refusal_run_seqs": refusals,
@@ -2835,6 +2955,72 @@ mod tests {
         assert_eq!(
             resolution.supersession_approval,
             Some(approval_identity(None))
+        );
+    }
+
+    #[test]
+    fn a_prior_resolution_covers_the_restart_redeclaration_of_the_same_attempt() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let first = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let second = declaration(188_879, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 9.0);
+        let old_refusal = refusal_data(&old);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let prior = resolution_data(188_878, &[188_678], &[188_693], EPOCH);
+        let resolution = resolve_dispatch_declaration(
+            &[
+                row(&old, CALLER, Some(188_678)),
+                row(&first, CALLER, Some(188_878)),
+                row(&second, CALLER, Some(188_879)),
+            ],
+            &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &[],
+            None,
+            &[resolution_row(&prior, 188_900)],
+            expected(),
+            Some(&proof),
+        )
+        .expect("the prior authorization covers the same attempt's restart re-declaration");
+        assert_eq!(resolution.selected_run_seq, Some(188_879));
+        assert_eq!(resolution.superseded_run_seqs, vec![188_678, 188_878]);
+        assert_eq!(
+            resolution.supersession_approval,
+            Some(approval_identity(None))
+        );
+    }
+
+    #[test]
+    fn a_prior_resolution_for_another_authorization_is_not_reused() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let first = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let second = declaration(188_879, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 9.0);
+        let old_refusal = refusal_data(&old);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let mut prior = resolution_data(188_878, &[188_678], &[188_693], EPOCH);
+        prior["configuration_fingerprint"] = json!(OLD_CONFIG);
+        prior["route_fingerprint"] = json!(OLD_ROUTE);
+        let error = resolve_dispatch_declaration(
+            &[
+                row(&old, CALLER, Some(188_678)),
+                row(&first, CALLER, Some(188_878)),
+                row(&second, CALLER, Some(188_879)),
+            ],
+            &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &[],
+            None,
+            &[resolution_row(&prior, 188_900)],
+            expected(),
+            Some(&proof),
+        )
+        .err()
+        .expect("a prior resolution for another route cannot authorize this attempt")
+        .to_string();
+        assert!(
+            error.contains("requires a durable approved operator decision"),
+            "{error}"
         );
     }
 
