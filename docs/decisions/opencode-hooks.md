@@ -79,3 +79,36 @@ This logic lives in Haskell WASM role handlers, not the TypeScript plugin. The p
 ## Tested Against
 
 OpenCode 1.14.48
+
+## OpenCode v2.3.2 status (2026-11-22)
+
+The bridge above was written against OpenCode 1.14.48. On the current system
+CLI, `opencode v2.3.2`, the launch command still works and the config still
+parses, but the plugin no longer loads:
+
+```
+level=WARN message="failed to load plugin"
+cause="Plugin must export a default definition with an id and an effect or setup function."
+```
+
+The v2 plugin loader expects a default definition with `id` plus `setup` (or
+`effect`), and v2 plugins register hooks through the setup context, for example
+`ctx.tool.hook("execute.before", ...)`, `ctx.tool.hook("execute.after", ...)`,
+and `ctx.event.subscribe(...)` (the shape the bundled `context-mode` v2 plugin
+uses). `OPENCODE_PLUGIN_TS` still exports only the legacy `server` function, so
+on v2.3.2 `tool.execute.before`, `tool.execute.after`, and the
+`session.stopped` event never fire. `opencode debug config` and
+`opencode debug agents` still accept the generated `opencode.json`, and
+`opencode plugin list` still lists the local package; only the module load
+fails.
+
+Not fixed in #1583 (its scope is the committed model table). Follow-up: rewrite
+`OPENCODE_PLUGIN_TS` for the v2 `{ id, setup }` API and add a launch test that
+asserts the generated plugin actually invokes `exomonad hook ... --runtime
+opencode` under v2.3.2, rather than only that the package is listed.
+
+The task-less interactive companion command
+`opencode --model ... --agent exomonad-<role>` is also rejected by v2.3.2:
+the top level no longer accepts `--model` or `--agent` (they are `opencode run`
+flags), so that path exits 1 with help text. Companion tasks that use
+`opencode run --standalone ...` are unaffected.

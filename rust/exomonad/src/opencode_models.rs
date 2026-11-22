@@ -33,8 +33,10 @@ pub const TABLE_DIRECTORY: &str = "rust/exomonad/data/opencode";
 /// `opencode --version` (an optional leading `v` is accepted). One table per
 /// key; [`parse_table`] refuses a table whose recorded `version` differs from
 /// the key it is registered under.
-pub const EMBEDDED_OPENCODE_TABLES: &[(&str, &str)] =
-    &[("v2.0.22", include_str!("../data/opencode/v2.0.22.json"))];
+pub const EMBEDDED_OPENCODE_TABLES: &[(&str, &str)] = &[
+    ("v2.0.22", include_str!("../data/opencode/v2.0.22.json")),
+    ("v2.3.2", include_str!("../data/opencode/v2.3.2.json")),
+];
 
 /// An effort variant OpenCode accepts as `--variant`.
 ///
@@ -397,6 +399,62 @@ mod tests {
             table_ids, fixture_ids,
             "the committed table and `opencode models` fixture must list the same models"
         );
+    }
+
+    fn table_for(version: &str) -> &'static OpencodeModelTable {
+        tables()
+            .expect("the shipped OpenCode tables parse")
+            .iter()
+            .find(|table| table.version == version)
+            .unwrap_or_else(|| panic!("{version} is committed"))
+    }
+
+    #[test]
+    fn v232_table_parses_with_fifty_nine_unique_models() {
+        let table = table_for("v2.3.2");
+        assert_eq!(table.version, "v2.3.2");
+        assert_eq!(table.models.len(), 59);
+        let ids = table.models.keys().collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), table.models.len(), "model ids must be unique");
+    }
+
+    #[test]
+    fn v232_table_ids_equal_the_committed_models_fixture() {
+        let fixture = include_str!("../data/opencode/v2.3.2.models.txt");
+        let fixture_ids = fixture
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<BTreeSet<_>>();
+        let table = table_for("v2.3.2");
+        let table_ids = table
+            .models
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            table_ids, fixture_ids,
+            "the committed v2.3.2 table and `opencode models` fixture must list the same models"
+        );
+    }
+
+    #[test]
+    fn v232_policy_routes_are_in_the_table_with_their_recorded_efforts() {
+        let table = table_for("v2.3.2");
+        for effort in ["low", "high", "max"] {
+            validate_model(table, "opencode-go/deepseek-v4.1-flash", Some(effort)).unwrap_or_else(
+                |error| panic!("deepseek-v4.1-flash must accept effort `{effort}`: {error:#}"),
+            );
+        }
+        validate_model(table, "opencode-go/glm-5.3-flash", None).expect("glm-5.3-flash is listed");
+        validate_model(table, "opencode-go/glm-5.3-flash", Some("high"))
+            .expect("glm-5.3-flash records the high effort");
+        validate_model(table, "opencode-go/deepseek-v4-pro", None)
+            .expect("deepseek-v4-pro is listed");
+        validate_model(table, "opencode-go/deepseek-v4-pro", Some("high"))
+            .expect("deepseek-v4-pro records the high effort");
+        validate_model(table, "opencode-go/deepseek-v4-pro", Some("max"))
+            .expect("deepseek-v4-pro records the max effort");
     }
 
     #[test]

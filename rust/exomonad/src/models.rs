@@ -191,14 +191,27 @@ mod tests {
     }
 
     #[test]
-    fn opencode_listing_has_no_duplicate_ids_across_tables() {
+    fn opencode_listing_has_no_duplicate_ids_within_each_table() {
         let lines = opencode_model_listing(None).unwrap();
-        let ids = lines
-            .iter()
-            .filter(|line| !line.starts_with("# "))
-            .collect::<Vec<_>>();
-        let unique = ids.iter().copied().collect::<BTreeSet<_>>();
-        assert_eq!(ids.len(), unique.len());
+        let mut current = Vec::new();
+        let mut per_table = Vec::new();
+        for line in &lines {
+            if line.starts_with("# opencode ") {
+                if !current.is_empty() {
+                    per_table.push(std::mem::take(&mut current));
+                }
+            } else {
+                current.push(line.as_str());
+            }
+        }
+        if !current.is_empty() {
+            per_table.push(current);
+        }
+        assert_eq!(per_table.len(), opencode_models::tables().unwrap().len());
+        for ids in per_table {
+            let unique = ids.iter().copied().collect::<BTreeSet<_>>();
+            assert_eq!(ids.len(), unique.len());
+        }
     }
 
     #[test]

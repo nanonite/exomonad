@@ -17254,6 +17254,104 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn opencode_v232_table_validates_the_policy_routes() {
+        let _fixture = lock_opencode_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode v2.3.2", false),
+        );
+        let cases = [
+            ("opencode-go/deepseek-v4.1-flash", Some("low")),
+            ("opencode-go/deepseek-v4.1-flash", Some("high")),
+            ("opencode-go/deepseek-v4.1-flash", Some("max")),
+            ("opencode-go/glm-5.3-flash", None),
+            ("opencode-go/glm-5.3-flash", Some("high")),
+            ("opencode-go/deepseek-v4-pro", None),
+            ("opencode-go/deepseek-v4-pro", Some("high")),
+            ("opencode-go/deepseek-v4-pro", Some("max")),
+        ];
+        for (model, effort) in cases {
+            validate_fixture(&binary, Duration::from_secs(2), model, effort)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "v2.3.2 rejected the policy route `{model}` effort {effort:?}: {error:#}"
+                    )
+                });
+        }
+        assert!(
+            !marker.exists(),
+            "init invoked `opencode` for something other than `--version`"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_v232_unknown_model_names_the_v232_table_file() {
+        let _fixture = lock_opencode_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode v2.3.2", false),
+        );
+
+        let error = validate_fixture(
+            &binary,
+            Duration::from_secs(2),
+            "opencode-go/gone-in-v232",
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Unknown OpenCode model `opencode-go/gone-in-v232`"));
+        assert!(error.contains("v2.3.2"));
+        assert!(error.contains("rust/exomonad/data/opencode/v2.3.2.json"));
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opencode_v232_route_reaches_the_same_table_validator_as_the_dispatcher() {
+        let _fixture = lock_opencode_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("catalog-called");
+        let binary = write_opencode_shim(
+            directory.path(),
+            &opencode_version_only_shim(&marker, "opencode v2.3.2", false),
+        );
+
+        let direct = validate_fixture(
+            &binary,
+            Duration::from_secs(2),
+            "opencode-go/not-a-model",
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        let dispatched = validate_harness_model_with(
+            AgentType::OpenCode,
+            Some("opencode-go/not-a-model"),
+            None,
+            &binary,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert_eq!(direct, dispatched);
+        assert!(dispatched.contains("v2.3.2"));
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn opencode_table_does_not_depend_on_models_output() {
         let _fixture = lock_opencode_fixture().await;
         let directory = tempfile::tempdir().unwrap();
@@ -17583,6 +17681,20 @@ mod tests {
             .expect("v2.0.22 is committed");
         assert_eq!(table.version, "v2.0.22");
         assert!(table.model("opencode-go/deepseek-v4.1-flash").is_some());
+    }
+
+    #[test]
+    fn opencode_table_registry_resolves_v232_and_keeps_v022() {
+        for version in ["v2.0.22", "v2.3.2"] {
+            let table = opencode_models::table_for_version(version)
+                .expect("the registry parses")
+                .unwrap_or_else(|| panic!("{version} is committed"));
+            assert_eq!(table.version, version);
+            assert!(table.model("opencode-go/deepseek-v4.1-flash").is_some());
+        }
+        let known = opencode_models::known_versions().expect("the registry parses");
+        assert!(known.contains(&"v2.0.22"));
+        assert!(known.contains(&"v2.3.2"));
     }
 
     #[test]

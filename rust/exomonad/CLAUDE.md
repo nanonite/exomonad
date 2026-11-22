@@ -237,6 +237,16 @@ table entry a new version needs; there is no nearest-version fallback. There is
 no bypass flag or silent skip, and no ETXTBSY retry loop in production; test
 fixtures create their executable atomically instead.
 
+**Committed OpenCode versions:** `v2.0.22` and `v2.3.2` (the current system
+CLI). Each has a committed `rust/exomonad/data/opencode/<version>.json` plus a
+plain `opencode models` capture in the matching `.models.txt`. `v2.3.2`'s
+`opencode run` accepts every flag `init` passes (`--standalone`, `--auto`,
+`--model provider/model#variant`, `--agent`, `--session`, `--fork`), but two
+v2.3.2 changes are not handled yet: the interactive top-level command no longer
+accepts `--model`/`--agent` (the task-less companion path), and the TypeScript
+plugin loader requires a default `{ id, setup }` definition instead of the old
+`server` export. See `docs/decisions/opencode-hooks.md` for the plugin status.
+
 **Configured harness-policy check:** before any controller side effect, `init`
 validates the worker and reviewer routes it resolved from `config.toml` (and any
 CLI/environment override) against the same roles' `allow` lists in
