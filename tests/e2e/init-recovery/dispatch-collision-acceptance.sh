@@ -540,6 +540,18 @@ recover_crashed_server() {
     rm -f "$REPO/.exo/server.sock" "$REPO/.exo/server.pid"
 }
 
+process_exited() {
+    # A tmux pane started with remain-on-exit can keep a SIGKILLed process as a
+    # zombie until the pane is reaped. `kill -0` still succeeds for a zombie, so
+    # process death must also accept the zombie state.
+    local pid="$1"
+    [[ -n "$pid" ]] || return 0
+    [[ -r "/proc/$pid/stat" ]] || return 0
+    local state
+    state="$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)"
+    [[ "$state" == "Z" || "$state" == "X" ]]
+}
+
 wait_for_interrupt_marker() {
     local boundary="$1"
     local marker="$INTERRUPT_DIR/$boundary.json"
@@ -549,6 +561,112 @@ wait_for_interrupt_marker() {
     done
     cat "$WORK/server-"*.log 2>/dev/null || true
     fail "the compiled server never reached the $boundary interruption boundary"
+}
+
+assert_interrupt_marker() {
+    # The marker is the boundary-specific proof. Require its exact boundary,
+    # dispatch scope and paused-host pid, and prove that pid is the server that
+    # owns the recorded runtime artifacts and is still alive at the window.
+    local boundary="$1"
+    local marker="$INTERRUPT_DIR/$boundary.json"
+    python3 - "$marker" "$boundary" "$INTENT_ID" "$REPO/.exo/server.pid" <<'PY' \
+        || fail "the $boundary marker is missing, malformed or not the paused host"
+import json
+import sys
+from pathlib import Path
+
+marker_path, boundary, intent, pid_path = sys.argv[1], sys.argv[2], sys.argv[3], Path(sys.argv[4])
+payload = json.loads(Path(marker_path).read_text(encoding="utf-8"))
+assert payload["boundary"] == boundary, payload
+assert payload["scope"] == intent, payload
+pid = payload["pid"]
+assert isinstance(pid, int) and pid > 0, payload
+assert float(payload["recorded_at"]) > 0, payload
+record = json.loads(pid_path.read_text(encoding="utf-8"))
+assert record.get("pid") == pid, (record, payload)
+cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").split()
+assert any(part.endswith(b"exomonad") or part == b"exomonad" for part in cmdline), cmdline
+assert b"serve" in cmdline, cmdline
+print(json.dumps({
+    "marker": boundary,
+    "scope": intent,
+    "paused_host_pid": pid,
+    "recorded_at": payload["recorded_at"],
+    "host_command": "exomonad serve",
+}))
+PY
+}
+
+assert_adoption_boundary_evidence() {
+    # Called while the host is paused after durable adoption and before its
+    # response. Prove that the adoption receipt and the one launch row are
+    # durable and older than the marker, and that the controller's action is
+    # still unresolved (the response was not returned).
+    python3 - "$REPO" "$STAGE" "$INTENT_ID" "$INTERRUPT_DIR/adoption_before_response.json" <<'PY' \
+        || fail "the adoption boundary lacks before-response durable evidence"
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+repo, stage, intent = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+marker = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
+marker_at = float(marker["recorded_at"])
+
+owner_dir = repo / ".exo/agents/issue-814-substitution-model-kani-opencode"
+invocation = json.loads((owner_dir / "invocation.json").read_text(encoding="utf-8"))
+assert invocation["generation"] == 3, invocation
+assert invocation["trigger"] == "resume_blocked", invocation
+assert invocation["prior_invocation_id"] == "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d", invocation
+assert invocation["status"] == "running", invocation
+
+receipt = json.loads((owner_dir / "adoption.json").read_text(encoding="utf-8"))
+assert receipt["invocation_id"] == invocation["invocation_id"], receipt
+assert receipt["intent_id"] == intent, receipt
+assert receipt["prior_invocation_id"] == invocation["prior_invocation_id"], receipt
+assert receipt["adopted_at"] <= marker_at, (receipt, marker_at)
+
+def utc_seconds(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+rows = []
+for segment in sorted((repo / ".exo/ledger/segments").glob("segment-*.jsonl")):
+    rows.extend(
+        json.loads(line)
+        for line in segment.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    )
+launches = [
+    row
+    for row in rows
+    if row.get("type") == "agent.spawned"
+    and row.get("data", {}).get("intent_id") == intent
+    and row.get("data", {}).get("invocation_id") == invocation["invocation_id"]
+]
+assert len(launches) == 1, [row.get("run_seq") for row in launches]
+assert utc_seconds(launches[0]["event_time"]) <= marker_at, launches[0]["event_time"]
+
+journal = json.loads(
+    (repo / f".exo/tl-loop/root/{stage}/action-journal.json").read_text(encoding="utf-8")
+)
+replays = [
+    entry
+    for entry in journal
+    if entry.get("operation") == "resume_blocked_leaf"
+    and (entry.get("arguments") or {}).get("dispatch_intent_id") == intent
+]
+assert replays, "no journaled resume action for the adoption intent"
+pending = replays[-1]
+assert pending["status"] in {"intended", "unknown"}, pending["status"]
+assert not pending.get("result"), "the adoption response was already returned"
+assert not pending.get("error"), "the adoption action already failed"
+print(json.dumps({
+    "adoption_receipt": receipt["adopted_at"],
+    "marker_recorded_at": marker_at,
+    "launch_run_seq": launches[0].get("run_seq"),
+    "journal_status_before_response": pending["status"],
+}))
+PY
 }
 
 kill_controller_process() {
@@ -591,6 +709,10 @@ run_init_at_boundary() {
     ) > "$log" 2>&1 &
     INIT_PID=$!
     wait_for_interrupt_marker "$boundary"
+    assert_interrupt_marker "$boundary"
+    if [[ "$boundary" == "adoption_before_response" ]]; then
+        assert_adoption_boundary_evidence
+    fi
     local host_pid=""
     if [[ -f "$REPO/.exo/server.pid" ]]; then
         host_pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",""))' "$REPO/.exo/server.pid" 2>/dev/null || true)"
@@ -638,10 +760,10 @@ run_init_at_boundary() {
     fi
     if [[ -n "$host_pid" ]]; then
         for _ in $(seq 1 200); do
-            kill -0 "$host_pid" 2>/dev/null || break
+            process_exited "$host_pid" && break
             sleep 0.05
         done
-        if kill -0 "$host_pid" 2>/dev/null; then
+        if ! process_exited "$host_pid"; then
             fail "the paused compiled host did not exit at the $boundary interruption"
         fi
     fi
@@ -1108,12 +1230,30 @@ if [[ "$INTERRUPT_BOUNDARY" == "adoption_before_response" ]]; then
         AFTER_LAUNCH="$BEFORE_INTERRUPT"
     fi
     say "interrupting the compiled server after durable adoption and before the response"
+    # The replacement server init starts in its Server window carries the
+    # harness-only boundary variables, so the controller's restart replay of the
+    # journaled resume request pauses inside adopt_blocked_resume_successor.
     start_server "$WORK/server-interrupt-adoption.log" adoption_before_response pause
     run_init_at_boundary adoption_before_response "$WORK/init-interrupt-adoption.log"
     assert_no_new_launch "$AFTER_LAUNCH" "$(count_launches)" "the adoption interruption"
-    invocation="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["generation"])' "$REPO/.exo/agents/issue-814-substitution-model-kani-opencode/invocation.json")"
-    [[ "$invocation" == "3" ]] \
-        || fail "the adoption interruption changed the invocation generation: $invocation"
+    python3 - "$REPO" <<'PY' || fail "the adoption interruption did not retain exactly one adopted generation"
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+owner = repo / ".exo/agents/issue-814-substitution-model-kani-opencode"
+invocation = json.loads((owner / "invocation.json").read_text(encoding="utf-8"))
+assert invocation["generation"] == 3, invocation
+assert invocation["invocation_id"] != "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d"
+receipt = json.loads((owner / "adoption.json").read_text(encoding="utf-8"))
+assert receipt["invocation_id"] == invocation["invocation_id"], receipt
+assert receipt["prior_invocation_id"] == "f285efc5-4b0d-4a42-bcf8-c50a329f4a1d", receipt
+print(json.dumps({"generation": invocation["generation"], "adoption_receipt": receipt["adopted_at"]}))
+PY
+    starts_count="$(grep -c '"event": *"role_config_worker_started"' "$AGENT_LOG" 2>/dev/null || true)"
+    [[ "$starts_count" == "1" ]] \
+        || fail "the adoption interruption produced ${starts_count:-0} worker starts instead of one"
 fi
 
 if [[ -z "$INTERRUPT_BOUNDARY" ]]; then

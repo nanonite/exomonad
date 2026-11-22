@@ -315,6 +315,28 @@ boundary again from durable state:
 | `launch_before_adoption.json` | after the successor's launch row is durable, before the controller sees the response | exactly one `agent.spawned`; one generation-3 invocation linked to `f285` |
 | `adoption_before_response.json` | after the already-launched successor is durably adopted, before the controller sees the response | still exactly one `agent.spawned`; no second invocation or worker |
 
+`init` can replace the external fixture server with the one it starts in its own
+Server window, so the four variables must cross that replacement. The carrier
+uses `env -u <name>` before the assignments: the tmux server's inherited
+environment can still hold an earlier boundary value, and `std::env::var` reads
+the last duplicate. The carrier also inserts its own leading separator because
+the model-route block it follows does not end with one. Without both, the
+replacement server either inherits the previous boundary or loses the first
+assignment into the preceding value, and the adoption hook is silently never
+reached. The markers are checked for their exact boundary, dispatch scope,
+paused-host pid and live `exomonad serve` command at the window.
+
+Adoption is read-only on the ledger: it re-validates and returns the existing
+successor without appending a second `agent.spawned`. To make the pre-response
+adoption durable and assertable, the host writes
+`.exo/agents/<owner>/adoption.json` with the invocation id, dispatch intent id,
+prior invocation id and `adopted_at` immediately before the boundary. It is
+idempotent for that invocation and intent, keeps the first receipt, and is
+retired when a new invocation generation starts. The acceptance asserts that
+this receipt and exactly one launch row are older than the marker and that the
+controller's journaled resume action is still `intended` with no result, so the
+response cannot already have been returned.
+
 The retry re-emits the same controller request, so `tl.dispatch_intended` and
 `tl.spawn_requested` may be observed more than once with the same intent,
 observation fields and route tuple. That is the deliberate equivalent-duplicate
@@ -325,12 +347,13 @@ driver tests cannot establish these compiled host-process windows, so the
 acceptance keeps both: the unit tests prove the controller state machine, and
 the compiled run proves the real process death and restart.
 
-Current limitation (#1544): the host markers and the standard uninterrupted
-compiled acceptance pass, but a full disposable `init --continue` restart after
-an abrupt host kill is still blocked on its managed Server pane, and a request
-replay after a controller restart can mint a new observation instead of
-reusing the recorded one. Those two gaps are reported on #1544 and are not
-claimed as covered by a green run.
+What a green run does not claim: the fixture harnesses are disposable shims, so
+no provider is contacted and no real model completion is exercised; the
+retained hashes prove the exact bytes executed, not a hermetic rebuild from
+source; and the acceptance runs on Linux because it observes the paused host
+through `/proc` and treats a `Z` state as exited after `SIGKILL`. A host crash
+that also destroys the tmux server, the 600-second pause timeout path, and a
+controller that survives the host death are not exercised.
 
 
 ## Operator actions

@@ -5737,19 +5737,11 @@ fn server_command(session: &str, config: &Config, verbose: bool) -> Result<Strin
     // one it starts in the Server window; carry the harness-only barrier
     // variables across that replacement so the boundary is still reached. In
     // production these variables are unset and this is empty.
-    let interrupt_env = [
-        "EXOMONAD_E2E_INTERRUPT_AT",
-        "EXOMONAD_E2E_INTERRUPT_SCOPE",
-        "EXOMONAD_E2E_INTERRUPT_DIR",
-        "EXOMONAD_E2E_INTERRUPT_ACTION",
-    ]
-    .iter()
-    .filter_map(|name| {
-        std::env::var(name)
-            .ok()
-            .map(|value| format!("{name}={} ", shell_escape::escape(value.as_str().into())))
-    })
-    .collect::<String>();
+    let interrupt: Vec<(&str, String)> = E2E_INTERRUPT_ENV_NAMES
+        .iter()
+        .filter_map(|name| std::env::var(name).ok().map(|value| (*name, value)))
+        .collect();
+    let (interrupt_guard, interrupt_env) = interrupt_env_block(&interrupt);
     let binary = shell_escape::escape(
         exomonad_core::find_exomonad_binary()
             .display()
@@ -5757,7 +5749,8 @@ fn server_command(session: &str, config: &Config, verbose: bool) -> Result<Strin
             .into(),
     );
     Ok(format!(
-        "{}EXOMONAD_TMUX_SESSION={} EXOMONAD_ROOT_AGENT_TYPE={} EXOMONAD_ROOT_AGENT_TYPE_SOURCE={} EXOMONAD_SPAWN_AGENT_TYPE={} EXOMONAD_SPAWN_AGENT_TYPE_SOURCE={} EXOMONAD_REVIEWER_AGENT_TYPE={} EXOMONAD_REVIEWER_AGENT_TYPE_SOURCE={}{}{} {} serve",
+        "{}{}EXOMONAD_TMUX_SESSION={} EXOMONAD_ROOT_AGENT_TYPE={} EXOMONAD_ROOT_AGENT_TYPE_SOURCE={} EXOMONAD_SPAWN_AGENT_TYPE={} EXOMONAD_SPAWN_AGENT_TYPE_SOURCE={} EXOMONAD_REVIEWER_AGENT_TYPE={} EXOMONAD_REVIEWER_AGENT_TYPE_SOURCE={}{}{} {} serve",
+        interrupt_guard,
         verbose_prefix,
         session,
         agent_type_str(config.root_agent_type),
@@ -5770,6 +5763,41 @@ fn server_command(session: &str, config: &Config, verbose: bool) -> Result<Strin
         interrupt_env,
         binary,
     ))
+}
+
+/// Harness-only interruption variables carried into an `init`-started server.
+const E2E_INTERRUPT_ENV_NAMES: [&str; 4] = [
+    "EXOMONAD_E2E_INTERRUPT_AT",
+    "EXOMONAD_E2E_INTERRUPT_SCOPE",
+    "EXOMONAD_E2E_INTERRUPT_DIR",
+    "EXOMONAD_E2E_INTERRUPT_ACTION",
+];
+
+/// Render the `env -u ...` guard and the assignment block for the harness-only
+/// interruption variables.
+///
+/// The guard is needed because the tmux server's inherited environment can
+/// still hold an earlier boundary value, and `std::env::var` reads the last
+/// duplicate. The assignment block starts with a space because
+/// `agent_configuration_environment` starts with a space but does not end with
+/// one; without it the first assignment would merge into the preceding
+/// fingerprint value.
+fn interrupt_env_block(interrupt: &[(&str, String)]) -> (String, String) {
+    if interrupt.is_empty() {
+        return (String::new(), String::new());
+    }
+    let assignments = interrupt
+        .iter()
+        .map(|(name, value)| format!("{name}={} ", shell_escape::escape(value.as_str().into())))
+        .collect::<String>();
+    let guard = E2E_INTERRUPT_ENV_NAMES
+        .iter()
+        .map(|name| format!("-u {name} "))
+        .fold("env ".to_string(), |mut guard, clear| {
+            guard.push_str(&clear);
+            guard
+        });
+    (guard, format!(" {assignments}"))
 }
 
 fn root_has_approved_ordered_recovery(value: &Value) -> bool {
@@ -16325,6 +16353,44 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_env_block_separates_and_shadows_inherited_values() {
+        assert_eq!(interrupt_env_block(&[]), (String::new(), String::new()));
+
+        let interrupt = vec![
+            (
+                "EXOMONAD_E2E_INTERRUPT_AT",
+                "adoption_before_response".to_string(),
+            ),
+            (
+                "EXOMONAD_E2E_INTERRUPT_SCOPE",
+                "blocked-resume-abc".to_string(),
+            ),
+            ("EXOMONAD_E2E_INTERRUPT_DIR", "/tmp/interrupt".to_string()),
+            ("EXOMONAD_E2E_INTERRUPT_ACTION", "pause".to_string()),
+        ];
+        let (guard, env) = interrupt_env_block(&interrupt);
+        assert_eq!(
+            guard,
+            "env -u EXOMONAD_E2E_INTERRUPT_AT -u EXOMONAD_E2E_INTERRUPT_SCOPE \
+             -u EXOMONAD_E2E_INTERRUPT_DIR -u EXOMONAD_E2E_INTERRUPT_ACTION "
+        );
+        assert!(
+            env.starts_with(' '),
+            "assignment block must not merge into its predecessor"
+        );
+        let tokens: Vec<&str> = env.split_whitespace().collect();
+        assert_eq!(
+            tokens,
+            vec![
+                "EXOMONAD_E2E_INTERRUPT_AT=adoption_before_response",
+                "EXOMONAD_E2E_INTERRUPT_SCOPE=blocked-resume-abc",
+                "EXOMONAD_E2E_INTERRUPT_DIR=/tmp/interrupt",
+                "EXOMONAD_E2E_INTERRUPT_ACTION=pause",
+            ]
+        );
+    }
+
+    #[test]
     fn server_command_preserves_session_and_agent_routing() {
         let config = Config {
             root_agent_type: AgentType::Claude,
@@ -17960,14 +18026,31 @@ mod tests {
         let pid_path = exo_dir.join("server.pid");
         // argv and cwd carry the exomonad/serve/workspace identity the shutdown
         // verification requires, and the shell terminates on SIGTERM.
+        // `read` is a shell builtin, so the fake server blocks without spawning
+        // a child that could outlive the test and be reported as a leak. The
+        // piped stdin stays open because the Child owns its write end.
         let mut server = std::process::Command::new("sh")
             .current_dir(project.path())
             .arg("-c")
-            .arg("while :; do sleep 1; done")
+            .arg("read _")
             .arg("exomonad")
             .arg("serve")
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
+        // `spawn` returns after the fork but does not wait for the child's
+        // exec. Until that exec completes `/proc/<pid>/cmdline` still carries
+        // the test process's identity, so the workspace check would race a
+        // false "does not belong to this workspace" refusal under load.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !process_matches_server_record(server.id() as i32, project.path()) {
+            if Instant::now() >= deadline {
+                let _ = server.kill();
+                let _ = server.wait();
+                panic!("spawned server process did not expose its exomonad serve identity");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         std::fs::write(&pid_path, format!(r#"{{"pid":{}}}"#, server.id())).unwrap();
 
         stop_server_for_recreate(project.path()).await.unwrap();

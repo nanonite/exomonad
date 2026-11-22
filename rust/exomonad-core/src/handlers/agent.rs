@@ -4556,6 +4556,17 @@ impl<
                 req.expected_branch.as_str(),
             )?;
         }
+        crate::services::agent_control::invocation::record_blocked_resume_adoption(
+            owner_dir,
+            &invocation.invocation_id,
+            intent_id,
+        )
+        .await
+        .map_err(|error| {
+            EffectError::invalid_input(format!(
+                "blocked resume adoption receipt could not be recorded: {error}"
+            ))
+        })?;
         // The compiled interruption acceptance stops the real server after the
         // already-launched successor is durably adopted, but before the
         // controller observes the adoption response.

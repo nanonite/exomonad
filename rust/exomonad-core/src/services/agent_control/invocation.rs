@@ -954,6 +954,103 @@ fn verify_current_routing_owner(
     ))
 }
 
+pub const ADOPTION_RECEIPT_FILENAME: &str = "adoption.json";
+
+/// Durable receipt for a response-loss adoption of an already-launched
+/// successor. It is generation-scoped and idempotent per invocation and intent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdoptionReceipt {
+    pub invocation_id: String,
+    pub intent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_invocation_id: Option<String>,
+    pub adopted_at: u64,
+}
+
+fn adoption_receipt_path(agent_dir: &Path) -> std::path::PathBuf {
+    agent_dir.join(ADOPTION_RECEIPT_FILENAME)
+}
+
+/// The adoption receipt describes exactly one generation, so a successor
+/// generation retires it as it replaces the record the receipt belongs to.
+async fn retire_adoption_receipt(agent_dir: &Path) -> Result<()> {
+    match tokio::fs::remove_file(adoption_receipt_path(agent_dir)).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to retire the prior adoption receipt in {}",
+                agent_dir.display()
+            )
+        }),
+    }
+}
+
+async fn read_adoption_receipt(agent_dir: &Path) -> Result<Option<AdoptionReceipt>> {
+    let path = adoption_receipt_path(agent_dir);
+    match tokio::fs::read_to_string(&path).await {
+        Ok(contents) => Ok(Some(serde_json::from_str(&contents).with_context(
+            || format!("failed to parse adoption receipt {}", path.display()),
+        )?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+/// Record that a response-loss resume adopted the already-launched successor.
+///
+/// This is the durable evidence a restart (and the compiled interruption
+/// acceptance) can observe before the adoption response is returned. Repeated
+/// adoption of the same invocation and intent is idempotent and keeps the first
+/// receipt, so a restart cannot move the receipt past the interruption window.
+pub async fn record_blocked_resume_adoption(
+    agent_dir: &Path,
+    invocation_id: &str,
+    intent_id: &str,
+) -> Result<AdoptionReceipt> {
+    let _guard = mutation_lock().lock().await;
+    if let Some(existing) = read_adoption_receipt(agent_dir).await? {
+        if existing.invocation_id == invocation_id && existing.intent_id == intent_id {
+            return Ok(existing);
+        }
+        return Err(anyhow::anyhow!(
+            "adoption receipt belongs to another invocation or dispatch intent"
+        ));
+    }
+    let record = read_locked(agent_dir)
+        .await?
+        .context("adoption receipt requires the owned invocation record")?;
+    if record.invocation_id != invocation_id {
+        return Err(anyhow::anyhow!(
+            "the owned invocation changed before its adoption receipt was recorded"
+        ));
+    }
+    let receipt = AdoptionReceipt {
+        invocation_id: record.invocation_id.clone(),
+        intent_id: intent_id.to_string(),
+        prior_invocation_id: record.prior_invocation_id.clone(),
+        adopted_at: unix_timestamp(),
+    };
+    let path = adoption_receipt_path(agent_dir);
+    let temporary = agent_dir.join(format!(".adoption-{}.tmp", Uuid::new_v4()));
+    let json = serde_json::to_vec_pretty(&receipt)?;
+    if let Err(error) = tokio::fs::write(&temporary, json).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error).with_context(|| format!("failed to write {}", temporary.display()));
+    }
+    if let Err(error) = tokio::fs::rename(&temporary, &path).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error).with_context(|| format!("failed to replace {}", path.display()));
+    }
+    info!(
+        path = %path.display(),
+        invocation_id,
+        intent_id,
+        "Recorded blocked-resume adoption receipt"
+    );
+    Ok(receipt)
+}
+
 pub async fn read_invocation(agent_dir: &Path) -> Result<Option<InvocationRecord>> {
     read_locked(agent_dir).await
 }
@@ -1034,6 +1131,7 @@ async fn start_invocation_with_context(
         authorization_source: None,
         usage: None,
     };
+    retire_adoption_receipt(agent_dir).await?;
     write_atomic(agent_dir, &record).await?;
     persist_routing_ownership(
         agent_dir,
@@ -1296,6 +1394,7 @@ pub async fn start_invocation_with_provenance_and_context_and_mode_with_id_guard
         config_sources,
         usage: None,
     };
+    retire_adoption_receipt(agent_dir).await?;
     write_atomic(agent_dir, &record).await?;
     #[cfg(test)]
     if take_invocation_save_failpoint(agent_dir) {
@@ -1795,6 +1894,76 @@ mod tests {
         assert!(!persisted.invocation_id.is_empty());
         assert!(persisted.is_live());
         assert!(dir.path().join(INVOCATION_FILENAME).exists());
+    }
+
+    #[tokio::test]
+    async fn adoption_receipt_is_durable_idempotent_and_generation_scoped() {
+        let dir = tempdir().expect("tempdir");
+        let record = start_invocation(
+            dir.path(),
+            AgentType::OpenCode,
+            InvocationTrigger::ResumeBlocked,
+            routing(),
+            None,
+            None,
+        )
+        .await
+        .expect("start invocation");
+
+        let receipt = record_blocked_resume_adoption(
+            dir.path(),
+            &record.invocation_id,
+            "blocked-resume:test",
+        )
+        .await
+        .expect("record adoption receipt");
+        assert_eq!(receipt.invocation_id, record.invocation_id);
+        assert_eq!(receipt.intent_id, "blocked-resume:test");
+        assert_eq!(receipt.prior_invocation_id, record.prior_invocation_id);
+        assert!(dir.path().join(ADOPTION_RECEIPT_FILENAME).exists());
+        assert_eq!(
+            read_adoption_receipt(dir.path())
+                .await
+                .expect("read receipt")
+                .expect("receipt exists"),
+            receipt
+        );
+
+        let repeated = record_blocked_resume_adoption(
+            dir.path(),
+            &record.invocation_id,
+            "blocked-resume:test",
+        )
+        .await
+        .expect("repeat is idempotent");
+        assert_eq!(repeated, receipt, "a repeat must keep the first receipt");
+
+        assert!(
+            record_blocked_resume_adoption(
+                dir.path(),
+                &record.invocation_id,
+                "blocked-resume:another-intent",
+            )
+            .await
+            .is_err(),
+            "a receipt cannot be reused for another dispatch intent"
+        );
+
+        let successor = start_invocation(
+            dir.path(),
+            AgentType::OpenCode,
+            InvocationTrigger::ResumeBlocked,
+            routing(),
+            None,
+            None,
+        )
+        .await
+        .expect("start successor invocation");
+        assert!(successor.generation > record.generation);
+        assert!(
+            !dir.path().join(ADOPTION_RECEIPT_FILENAME).exists(),
+            "a new generation retires the prior adoption receipt"
+        );
     }
 
     #[tokio::test]

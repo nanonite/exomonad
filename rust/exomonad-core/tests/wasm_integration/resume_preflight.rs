@@ -181,6 +181,18 @@ async fn compiled_blocked_resume_uses_the_controller_selected_worker_route() {
         EventLog::open(project.join(".exo/logs")).expect("open event log"),
     ));
     let services = std::sync::Arc::new(services);
+    // The host binds a blocked resume to its own stable logical intent derived
+    // from the owner, issue, predecessor, branch, worktree and fingerprint. The
+    // controller-selected route must carry that exact intent, not a literal.
+    let fingerprint = worktree_fingerprint(&worktree);
+    let intent_id = blocked_resume_intent(
+        owner_name,
+        &worktree,
+        issue_id,
+        "opencode-invocation-1",
+        &owner_branch,
+        &fingerprint,
+    );
     let route = json!({
         "role": "worker",
         "harness": "codex/gpt-6-luna",
@@ -191,7 +203,7 @@ async fn compiled_blocked_resume_uses_the_controller_selected_worker_route() {
         "policy_fingerprint": "sha256:accepted-policy",
         "manifest_digest": "sha256:accepted-manifest",
         "route_fingerprint": "sha256:accepted-route",
-        "dispatch_intent_id": "dispatch-814-resume-2",
+        "dispatch_intent_id": intent_id.clone(),
         "scope_id": "issue-814"
     });
     EventLog::open(project.join(".exo/logs"))
@@ -201,7 +213,7 @@ async fn compiled_blocked_resume_uses_the_controller_selected_worker_route() {
             "root",
             &json!({
                 "slice_id": "issue-814",
-                "intent_id": "dispatch-814-resume-2",
+                "intent_id": intent_id.clone(),
                 "boundary": "dispatch_intended",
                 "started_at": "2026-11-03T12:00:00Z",
                 "attempt": 2,
@@ -230,7 +242,6 @@ async fn compiled_blocked_resume_uses_the_controller_selected_worker_route() {
     );
     let handler = AgentHandler::new(service, services);
     let runtime = build_wasm_runtime_with_agent_handler(&project, handler).await;
-    let fingerprint = worktree_fingerprint(&worktree);
     let mut stale_route = route.clone();
     stale_route["configuration_fingerprint"] = json!("sha256:stale-config");
     let missing = call_tool(
@@ -352,10 +363,7 @@ async fn compiled_blocked_resume_uses_the_controller_selected_worker_route() {
         "owner identity and invocation retain identical accepted route provenance"
     );
     assert_eq!(invocation["role_route"]["role"], "worker");
-    assert_eq!(
-        invocation["role_route"]["dispatch_intent_id"],
-        "dispatch-814-resume-2"
-    );
+    assert_eq!(invocation["role_route"]["dispatch_intent_id"], intent_id);
     assert_eq!(invocation["role_route"]["scope_id"], "issue-814");
     assert_eq!(
         output["result"]["agent"]["role_route"], invocation["role_route"],
@@ -1482,6 +1490,25 @@ fn seed_terminal_opencode_owner(
     std::fs::write(&owner.invocation_path, &owner.invocation_bytes)
         .expect("write terminal OpenCode invocation");
     owner
+}
+
+/// Mirror the host's stable logical-resume intent derivation for the test
+/// fixture. The host authoritative value lives in
+/// `handlers::agent::blocked_resume_intent_id`; this fixture must carry it in
+/// the controller-selected route and in the durable declaration it seeds.
+fn blocked_resume_intent(
+    agent_name: &str,
+    working_dir: &Path,
+    issue_id: u64,
+    prior_invocation_id: &str,
+    branch: &str,
+    fingerprint: &str,
+) -> String {
+    let input = format!(
+        "blocked-resume-v1\0{agent_name}\0{issue_id}\0{prior_invocation_id}\0{branch}\0{}\0{fingerprint}",
+        working_dir.display()
+    );
+    format!("blocked-resume:{:x}", Sha256::digest(input.as_bytes()))
 }
 
 struct EnvironmentRestore {

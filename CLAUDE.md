@@ -908,14 +908,21 @@ concurrent requests, holds every host negative control, and leaves historical
 bytes unchanged. Before that retry it pauses the real compiled server after
 authorization persistence, after request persistence, after launch and after
 durable adoption, kills the controller and host at that exact window, then
-restarts and re-runs compiled `init --continue` at each boundary; see the
-interruption table in
+restarts and re-runs compiled `init --continue` at each boundary. Each marker is
+checked for its exact boundary, dispatch scope, paused-host pid and live
+`exomonad serve` command; the adoption window also requires the durable
+`.exo/agents/<owner>/adoption.json` receipt, exactly one launch row older than
+the marker, and a controller journal action still `intended` with no result. See
+the interruption table in
 `docs/guides/changing-routes-mid-run.md`. Set
-`E2E_DISPATCH_RETAIN_ARTIFACTS` to retain and independently
+`E2E_DISPATCH_RETAIN_ARTIFACTS` to retain, per boundary, and independently
 rehash the exact binary, WASM guests and controller archive consumed by the
 passing run. It
-prints `DISPATCH-1..6` then `DISPATCH-ALL PASS`. The resolver and its
-backward-compatibility contract are described in
+prints `DISPATCH-1..6` then `DISPATCH-ALL PASS`. `just
+e2e-dispatch-interruptions` (`E2E_DISPATCH_INTERRUPT_ONLY=1`) runs the four
+interruption boundaries in separate fixtures and prints
+`DISPATCH-INTERRUPT-<boundary> PASS` then `DISPATCH-INTERRUPT-ALL PASS`. The
+resolver and its backward-compatibility contract are described in
 `docs/guides/changing-routes-mid-run.md`; the Docker-free syntax/compile checks
 are part of `just check-e2e-init-recovery`.
 

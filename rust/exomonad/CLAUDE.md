@@ -62,6 +62,15 @@ WASM plugin is awaited, because the budget covers that. `serve` also binds the p
 TCP listener at `0.0.0.0:<port>` (default 7433), so two projects on one host need
 distinct ports; `port = 0` takes an ephemeral one.
 
+When the compiled interruption acceptance has configured the harness-only
+`EXOMONAD_E2E_INTERRUPT_*` variables, `init` carries them into the Server window
+it starts so a replacement server still reaches the same boundary. The command
+clears each name with `env -u` before assigning it, because the tmux server's
+inherited environment may hold an earlier value and `std::env::var` reads the
+last duplicate, and the assignment block has its own leading separator so it
+cannot merge into the preceding model-route value. In production the variables
+are unset and the command is unchanged.
+
 Init also refreshes project-local WASM from `~/.exo/wasm/` if the global copy is newer (consuming projects only, not source projects with `.exo/roles/`).
 
 

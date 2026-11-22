@@ -563,11 +563,25 @@ name the ledger sequences and safe identity fields. One idempotent
 historical events and journals are only appended to, never rewritten. The wire
 contract is unchanged: no proto or Haskell type changes, because the full route
 tuple and the stable intent id already cross the boundary. Tests live in the
-module; the compiled acceptance is `just e2e-dispatch-collision`, which also
-pauses the real `serve` process at the authorization, request, launch and
-adoption boundaries through the inert-unless-configured
-`src/e2e_interrupt.rs` hook, kills the controller and host at that window, and
-proves each restart reconciles exactly once.
+module; the compiled acceptance is `just e2e-dispatch-collision`, and
+`just e2e-dispatch-interruptions` runs its four interruption boundaries in
+separate fixtures. Both pause the real `serve` process at the authorization,
+request, launch and adoption boundaries through the inert-unless-configured
+`src/e2e_interrupt.rs` hook, kill the controller and host at that window, and
+prove each restart reconciles exactly once. The marker is checked for its exact
+boundary, dispatch scope, paused-host pid and live `exomonad serve` command.
+
+A response-loss adoption is read-only on the ledger: it re-validates the
+already-launched successor instead of appending a second `agent.spawned`. The
+adoption path therefore records one durable, idempotent
+`.exo/agents/<owner>/adoption.json` receipt (`invocation_id`, `intent_id`,
+`prior_invocation_id`, `adopted_at`) before the boundary, so a restart and the
+compiled acceptance can prove adoption crossed durably before the response. A
+repeat adoption of the same invocation and intent keeps the first receipt, and
+a new invocation generation retires it. The compiled acceptance additionally
+requires exactly one launch row older than the marker and an `intended`
+controller journal action with no result, which proves the response was not yet
+returned.
 
 The accepted configuration itself is one canonical `sha256:v2:` identity over
 each role's effective harness/model/effort, computed by the single

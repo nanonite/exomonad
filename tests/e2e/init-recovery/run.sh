@@ -1975,15 +1975,23 @@ if [[ "${E2E_DISPATCH_INTERRUPT_ONLY:-0}" == "1" ]]; then
     unset TMUX TMUX_PANE
     export TMUX_TMPDIR="$AGGREGATE_TMUX_TMPDIR"
     e2e_log "Dispatch-interruption tmux server isolated to $TMUX_TMPDIR"
+    # Keep the caller's requested root so each boundary writes its own retained
+    # directory. Exporting the per-boundary path back over the root would nest
+    # every later boundary inside the previous one.
+    DISPATCH_RETAIN_ROOT="${E2E_DISPATCH_RETAIN_ARTIFACTS:-}"
     for boundary in authorization_persisted request_persisted launch_before_adoption adoption_before_response; do
         DISPATCH_HOME="$WORK_DIR/dispatch-interrupt-$boundary-home"
         mkdir -p "$DISPATCH_HOME/.exo"
-        if [[ -n "${E2E_DISPATCH_RETAIN_ARTIFACTS:-}" ]]; then
-            export E2E_DISPATCH_RETAIN_ARTIFACTS="$E2E_DISPATCH_RETAIN_ARTIFACTS/$boundary"
+        if [[ -n "$DISPATCH_RETAIN_ROOT" ]]; then
+            export E2E_DISPATCH_RETAIN_ARTIFACTS="$DISPATCH_RETAIN_ROOT/$boundary"
         fi
+        # The fixture's server socket is <work>/repo/.exo/server.sock, and a
+        # Unix socket path must fit in sun_path (107 bytes before the NUL). The
+        # boundary name is long enough to overflow that with a descriptive work
+        # directory, so the disposable work root uses a short per-boundary name.
         E2E_DISPATCH_INTERRUPT_BOUNDARY="$boundary" \
             bash "$SCRIPT_DIR/dispatch-collision-acceptance.sh" \
-            "$EXOMONAD_BIN" "$WORK_DIR/dispatch-interrupt-$boundary" "$DISPATCH_HOME" \
+            "$EXOMONAD_BIN" "$WORK_DIR/d-$boundary" "$DISPATCH_HOME" \
             "$CODEX_HOME" "$PROJECT_ROOT" "$WASM_ARTIFACT_DIR" "$DISPATCH_RETAINED"
         printf 'DISPATCH-INTERRUPT-%s PASS\n' "$boundary"
         e2e_log "PASS: DISPATCH-INTERRUPT-$boundary"
