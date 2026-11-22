@@ -122,8 +122,8 @@ git commit -m "initial commit" -q
 git push -u origin main -q
 
 "$EXOMONAD_BIN" new >"$WORK_DIR/new.log" 2>&1
-chainlink init >"$WORK_DIR/chainlink-init.log" 2>&1
 export CHAINLINK_DB="$REPO_DIR/.chainlink/issues.db"
+chainlink init >"$WORK_DIR/chainlink-init.log" 2>&1
 E2E_ISSUE_ID="$(chainlink quick --quiet -p low -l test "Run live TL shadow trajectory")"
 chainlink session start >"$WORK_DIR/chainlink-session.log" 2>&1
 chainlink session work "$E2E_ISSUE_ID" >>"$WORK_DIR/chainlink-session.log" 2>&1

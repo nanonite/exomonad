@@ -206,6 +206,7 @@ git push -u origin main -q
     sed 's/^/[exomonad-new] /' "$WORK_DIR/new.log"
     fail "exomonad new failed"
 }
+export CHAINLINK_DB="$REPO_DIR/.chainlink/issues.db"
 chainlink init >"$WORK_DIR/chainlink-init.log" 2>&1 || {
     sed 's/^/[chainlink-init] /' "$WORK_DIR/chainlink-init.log"
     fail "chainlink init failed"

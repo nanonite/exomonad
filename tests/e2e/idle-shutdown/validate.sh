@@ -37,7 +37,7 @@ wait_for() {
 open_issue_count() {
     (
         cd "$REPO_DIR"
-        chainlink issue list --json
+        CHAINLINK_DB="$REPO_DIR/.chainlink/issues.db" chainlink issue list --json
     ) | python3 -c 'import json, sys; issues = json.load(sys.stdin); print(sum(1 for issue in issues if issue.get("status") == "open"))'
 }
 

@@ -155,6 +155,7 @@ e2e_install_project_wasm_and_roles() {
 }
 
 e2e_chainlink_init() {
+    export CHAINLINK_DB="$REPO_DIR/.chainlink/issues.db"
     if ! chainlink init 2>&1 | sed 's/^/  /'; then
         e2e_fail "chainlink init failed during E2E setup."
     fi

@@ -19,6 +19,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const DIRTY_WORKTREE_CODE: &str = "agent.spawn_precondition.dirty_worktree";
+const CHAINLINK_DB_ENV: &str = "CHAINLINK_DB";
 
 struct OwnerFixture {
     name: String,
@@ -34,6 +35,7 @@ struct OwnerFixture {
 async fn compiled_resume_blocked_leaf_preserves_typed_dirty_refusal_without_intent() {
     let temp = tempfile::tempdir().expect("temporary blocked-resume fixture");
     let project = temp.path().join("checkout");
+    let _chainlink_db = pin_chainlink_database(&project);
     let remote = temp.path().join("fixture.git");
     let owner_name = "blocked-owner-codex";
     let owner_branch = format!("main.{owner_name}");
@@ -96,6 +98,7 @@ async fn compiled_blocked_resume_uses_the_controller_selected_worker_route() {
 
     let temp = tempfile::tempdir().expect("temporary blocked-resume fixture");
     let project = temp.path().join("checkout");
+    let _chainlink_db = pin_chainlink_database(&project);
     let remote = temp.path().join("fixture.git");
     let owner_name = "issue-814-opencode";
     let owner_branch = format!("main.{owner_name}");
@@ -382,6 +385,7 @@ async fn compiled_fresh_spawns_return_the_persisted_controller_route() {
 
     let temp = tempfile::tempdir().expect("temporary route-bound spawn fixture");
     let project = temp.path().join("checkout");
+    let _chainlink_db = pin_chainlink_database(&project);
     let remote = temp.path().join("fixture.git");
     initialize_repository(&project, &remote);
 
@@ -716,6 +720,7 @@ fn record_route_dispatch(project: &Path, route: &Value) {
 async fn compiled_resume_pr_preserves_typed_dirty_refusal_after_owner_and_head_checks() {
     let temp = tempfile::tempdir().expect("temporary PR-resume fixture");
     let project = temp.path().join("checkout");
+    let _chainlink_db = pin_chainlink_database(&project);
     let remote = temp.path().join("fixture.git");
     let owner_name = "pr-owner-codex";
     let owner_branch = format!("main.{owner_name}");
@@ -873,6 +878,7 @@ async fn resume_pr_across_configured_harness(
 
     let temp = tempfile::tempdir().expect("temporary configured-resume fixture");
     let project = temp.path().join("checkout");
+    let _chainlink_db = pin_chainlink_database(&project);
     let remote_root = temp.path().join("remote-root");
     let remote = remote_root.join("acme").join("repo.git");
     std::fs::create_dir_all(remote.parent().expect("remote parent")).expect("create remote parent");
@@ -1535,9 +1541,11 @@ impl Drop for EnvironmentRestore {
 }
 
 fn create_open_chainlink_issue(project: &Path) -> u64 {
+    let database = chainlink_database_path(project);
     let init = Command::new("chainlink")
         .args(["init", "--no-hooks", "--quiet"])
         .current_dir(project)
+        .env(CHAINLINK_DB_ENV, &database)
         .output()
         .expect("Chainlink CLI is available to create isolated issue fixture");
     assert!(
@@ -1555,6 +1563,7 @@ fn create_open_chainlink_issue(project: &Path) -> u64 {
             "--quiet",
         ])
         .current_dir(project)
+        .env(CHAINLINK_DB_ENV, &database)
         .output()
         .expect("create open temporary Chainlink issue");
     assert!(
@@ -1566,6 +1575,105 @@ fn create_open_chainlink_issue(project: &Path) -> u64 {
         .trim()
         .parse()
         .expect("quiet issue creation returns its numeric ID")
+}
+
+/// The test fixture's Chainlink database is always the temporary project's own
+/// `issues.db`, never a path inherited from the operator's environment.
+fn chainlink_database_path(project: &Path) -> PathBuf {
+    project.join(".chainlink").join("issues.db")
+}
+
+/// Pin this test process's `CHAINLINK_DB` for the duration of the test so any
+/// in-process production host code that shells out to Chainlink also resolves
+/// the temporary project's database. Tests in this file are serialized.
+fn pin_chainlink_database(project: &Path) -> EnvironmentRestore {
+    EnvironmentRestore::set(
+        CHAINLINK_DB_ENV,
+        chainlink_database_path(project).into_os_string(),
+    )
+}
+
+fn run_chainlink(project: &Path, database: &Path, arguments: &[&str]) -> std::process::Output {
+    Command::new("chainlink")
+        .args(arguments)
+        .current_dir(project)
+        .env(CHAINLINK_DB_ENV, database)
+        .output()
+        .expect("Chainlink CLI is available for the isolated database fixture")
+}
+
+fn chainlink_issue_list(project: &Path, database: &Path) -> Vec<u8> {
+    let listed = run_chainlink(project, database, &["issue", "list", "--json"]);
+    assert!(
+        listed.status.success(),
+        "list issues from {}: {}",
+        database.display(),
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    listed.stdout
+}
+
+#[test]
+#[serial_test::serial]
+fn create_open_chainlink_issue_never_honours_a_caller_chainlink_database() {
+    let temp = tempfile::tempdir().expect("temporary Chainlink isolation fixture");
+    let sentinel_project = temp.path().join("sentinel");
+    std::fs::create_dir_all(&sentinel_project).expect("create sentinel project");
+    let sentinel_database = chainlink_database_path(&sentinel_project);
+    let init = run_chainlink(
+        &sentinel_project,
+        &sentinel_database,
+        &["init", "--no-hooks", "--quiet"],
+    );
+    assert!(
+        init.status.success(),
+        "initialize sentinel Chainlink database: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let sentinel_issue = run_chainlink(
+        &sentinel_project,
+        &sentinel_database,
+        &[
+            "issue",
+            "create",
+            "Sentinel caller database issue",
+            "--priority",
+            "low",
+            "--quiet",
+        ],
+    );
+    assert!(
+        sentinel_issue.status.success(),
+        "create sentinel issue: {}",
+        String::from_utf8_lossy(&sentinel_issue.stderr)
+    );
+    let sentinel_before = chainlink_issue_list(&sentinel_project, &sentinel_database);
+
+    let project = temp.path().join("checkout");
+    std::fs::create_dir_all(&project).expect("create disposable project");
+    let _caller_database =
+        EnvironmentRestore::set(CHAINLINK_DB_ENV, sentinel_database.clone().into_os_string());
+
+    let issue_id = create_open_chainlink_issue(&project);
+
+    let sentinel_after = chainlink_issue_list(&sentinel_project, &sentinel_database);
+    assert_eq!(
+        sentinel_before, sentinel_after,
+        "the caller-exported CHAINLINK_DB sentinel must stay byte-for-byte unchanged"
+    );
+
+    let project_database = chainlink_database_path(&project);
+    let issues: Value = serde_json::from_slice(&chainlink_issue_list(&project, &project_database))
+        .expect("temporary project issue list is JSON");
+    assert!(
+        issues
+            .as_array()
+            .is_some_and(|issues| issues.iter().any(|issue| {
+                issue["id"].as_u64() == Some(issue_id)
+                    && issue["title"] == "Disposable blocked resume fixture"
+            })),
+        "the temporary project's own database contains the created issue: {issues:#}"
+    );
 }
 
 fn append_parked_event(project: &Path, slice_id: &str) {

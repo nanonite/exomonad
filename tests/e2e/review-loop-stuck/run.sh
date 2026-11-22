@@ -46,7 +46,7 @@ dump_debug() {
     fi
     if [[ -n "${REPO_DIR:-}" && -d "$REPO_DIR/.chainlink" ]]; then
         log "review-stuck issues:"
-        (cd "$REPO_DIR" && chainlink list --label review-stuck --status all) 2>&1 | sed 's/^/[chainlink] /' || true
+        (cd "$REPO_DIR" && CHAINLINK_DB="$REPO_DIR/.chainlink/issues.db" chainlink list --label review-stuck --status all) 2>&1 | sed 's/^/[chainlink] /' || true
     fi
 }
 
@@ -302,6 +302,7 @@ git commit -m "initial commit" -q
 git push bare main -q
 
 "$EXOMONAD_BIN" new >"$WORK_DIR/new.log" 2>&1 || fail "exomonad new failed"
+export CHAINLINK_DB="$REPO_DIR/.chainlink/issues.db"
 chainlink init >"$WORK_DIR/chainlink-init.log" 2>&1 || fail "chainlink init failed"
 mkdir -p .exo/wasm
 for wasm_file in "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm; do

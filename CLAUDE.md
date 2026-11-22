@@ -1003,6 +1003,11 @@ All E2E tests live in `tests/e2e/{name}/` and follow the same structure:
 - A harness never inherits the caller's `CHAINLINK_DB`: it initializes and
   exports each disposable repository's own `.chainlink/issues.db` before any
   phase that runs Chainlink, `exomonad init`/`serve`, or the TL controller.
+- Test fixtures follow the same rule. A helper that shells out to Chainlink
+  passes an explicit `CHAINLINK_DB` for the temporary project's
+  `.chainlink/issues.db` on every `Command`, and a test that exercises
+  in-process host code pins that same value for the test process instead of
+  trusting whatever the caller exported.
 - Tmux isolation is per run: set `TMUX_TMPDIR` to a run-owned directory, unset
   `TMUX`/`TMUX_PANE`, and before any `kill-server` assert the socket path is
   inside that directory and is not the default `/tmp/tmux-*` server. The

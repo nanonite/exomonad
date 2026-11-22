@@ -135,6 +135,14 @@ if ! "$EXOMONAD_BIN" new 2>&1 | sed 's/^/  /'; then
     exit 1
 fi
 
+# This scenario creates an issue through the MCP tool, so bind Chainlink to
+# this disposable repository instead of any database inherited from the caller.
+export CHAINLINK_DB="$REPO_DIR/.chainlink/issues.db"
+if ! chainlink init --no-hooks --quiet 2>&1 | sed 's/^/  /'; then
+    echo "ERROR: chainlink init failed during E2E setup."
+    exit 1
+fi
+
 # Symlink WASM from project
 mkdir -p .exo/wasm
 for wasm_file in "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm; do

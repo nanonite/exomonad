@@ -107,6 +107,7 @@ if ! "$EXOMONAD_BIN" new 2>&1 | sed 's/^/  /'; then
     exit 1
 fi
 
+export CHAINLINK_DB="$REPO_DIR/.chainlink/issues.db"
 if ! chainlink init 2>&1 | sed 's/^/  /'; then
     echo "ERROR: chainlink init failed during E2E setup."
     exit 1

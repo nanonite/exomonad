@@ -118,6 +118,7 @@ for wasm_file in "$PROJECT_ROOT/.exo/wasm/"wasm-guest-*.wasm; do
     ln -sf "$wasm_file" ".exo/wasm/$(basename "$wasm_file")"
 done
 
+export CHAINLINK_DB="$REPO_DIR/.chainlink/issues.db"
 if ! chainlink init 2>&1 | sed 's/^/  /'; then
     echo "ERROR: chainlink init failed."
     exit 1
