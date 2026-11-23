@@ -65,10 +65,16 @@ The same adapter maps the provider ids onto the canonical OpenCode ids that
 | `exomonad_<tool>` (ExoMonad MCP server) | `<tool>` (e.g. `exomonad_approve_pr` → `approve_pr`) |
 | other MCP tools | unchanged server-prefixed id |
 
-An unknown id with no underscore is logged as `hook.opencode_unknown_tool` and
-passed through unchanged; it is never silently rewritten into a guarded or
-unguarded canonical name. Any other id is treated as an external MCP tool and
-keeps its server prefix (debug event `hook.opencode_mcp_tool`).
+An id that is not in the table above, is not an `exomonad_<tool>` id, and does
+not contain an underscore (the MCP `<server>_<tool>` shape) is **denied on
+PreToolUse**. Failure is closed: the CLI prints a deny envelope and exits 2
+before it looks for `exomonad serve`, and the reason contains the exact id and
+`canonical_opencode_builtin`, the table to extend in
+`exomonad-core/src/protocol/hook.rs`. Every role gets this deny; there is no
+per-role allowlist and no env/flag bypass. PostToolUse, Stop, and worker-exit
+never deny: they log the same `hook.opencode_unknown_tool` warning and pass the
+id through as observation only. MCP ids keep their server prefix and are
+debugged as `hook.opencode_mcp_tool`.
 
 ## Deny Exit Code
 

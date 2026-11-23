@@ -485,8 +485,9 @@ fn codex_hook_event_name(event_type: HookEventType) -> &'static str {
 ///   not the canonical names the role hooks match.
 ///
 /// This is the single OpenCode mapping layer. An unrecognised non-MCP tool id
-/// is logged by name rather than passed through silently, because an
-/// unrecognised file or shell tool would otherwise skip the role guardrails.
+/// would skip every role guardrail, so PreToolUse fails closed through
+/// [`opencode_unknown_tool_deny`]. PostToolUse and Stop only log and observe
+/// the same id, because there is nothing left to block after the call.
 pub fn normalize_opencode_hook_payload(event_type: HookEventType, input: Value) -> Value {
     let mut object = match input {
         Value::Object(object) => object,
@@ -537,6 +538,76 @@ pub fn normalize_opencode_hook_payload(event_type: HookEventType, input: Value) 
     Value::Object(object)
 }
 
+/// Fail closed on a PreToolUse for an OpenCode tool id that is neither a
+/// canonical built-in nor an MCP tool id.
+///
+/// OpenCode can add or rename a built-in without telling ExoMonad, and the role
+/// hooks only match the canonical ids in `OPENCODE_CANONICAL_BUILTINS`. An
+/// unrecognised id would therefore skip every role guardrail, so the id is
+/// denied with a reason that names it and the table a maintainer must update.
+///
+/// PostToolUse/Stop (and every other event) return `None`: the call already
+/// happened (or the event is not a tool gate), so they only observe and log.
+pub fn opencode_unknown_tool_deny(
+    event_type: HookEventType,
+    input: &Value,
+) -> Option<HookEnvelope> {
+    if event_type != HookEventType::PreToolUse {
+        return None;
+    }
+
+    let tool_name = opencode_tool_id(input)?;
+    if is_known_opencode_tool(tool_name) {
+        return None;
+    }
+
+    tracing::warn!(
+        event = "hook.opencode_unknown_tool",
+        tool_name,
+        "Unrecognised OpenCode tool id denied on PreToolUse"
+    );
+
+    let reason = format!(
+        "OpenCode tool id `{tool_name}` is not a known built-in or MCP tool, so no role \
+         guardrail can match it. Add it to canonical_opencode_builtin in \
+         rust/exomonad-core/src/protocol/hook.rs if OpenCode ships it as a built-in."
+    );
+    let output = ClaudePreToolUseOutput {
+        continue_: false,
+        stop_reason: Some(reason.clone()),
+        hook_specific_output: Some(HookSpecificOutput::PreToolUse {
+            permission_decision: ToolPermission::Deny,
+            permission_decision_reason: Some(reason),
+            updated_input: None,
+        }),
+        ..Default::default()
+    };
+
+    Some(HookEnvelope {
+        stdout: serde_json::to_string(&output)
+            .unwrap_or_else(|_| r#"{"continue":false}"#.to_string()),
+        exit_code: 2,
+    })
+}
+
+/// Read the provider tool id from the raw OpenCode payload, accepting the same
+/// `tool` alias the normalizer does.
+fn opencode_tool_id(input: &Value) -> Option<&str> {
+    input
+        .get("tool_name")
+        .or_else(|| input.get("tool"))
+        .and_then(Value::as_str)
+}
+
+/// The closed set of ids the adapter knows how to map. MCP tools are not in
+/// this table: they carry an underscore (`<server>_<tool>`) and keep their
+/// provider id, except the ExoMonad server whose prefix is stripped.
+fn is_known_opencode_tool(tool_name: &str) -> bool {
+    canonical_opencode_builtin(tool_name).is_some()
+        || tool_name.starts_with("exomonad_")
+        || tool_name.contains('_')
+}
+
 /// Map one OpenCode v2 tool id to the canonical name the WASM role hooks match
 /// for `Runtime::OpenCode`.
 ///
@@ -578,52 +649,66 @@ fn normalize_opencode_tool_name(tool_name: &str) -> String {
     tracing::warn!(
         event = "hook.opencode_unknown_tool",
         tool_name,
-        "Unrecognised OpenCode tool id; role hooks will not recognise it"
+        "Unrecognised OpenCode tool id; PreToolUse denies it and other events only observe it"
     );
     tool_name.to_string()
 }
 
-/// Canonical OpenCode tool ids for the v2.3.2 built-ins.
+/// The closed table of OpenCode v2.3.2 provider ids and the canonical ids the
+/// WASM role hooks match.
+///
+/// The left column is the exact id the plugin sends; the right column is what
+/// `.exo/lib/HookPolicy.hs` matches for `Runtime::OpenCode`. Add a new built-in
+/// here *and* to `test_opencode_canonical_builtin_table_is_complete`; until
+/// then PreToolUse denies it rather than letting it skip the guardrails.
+const OPENCODE_CANONICAL_BUILTINS: &[(&str, &str)] = &[
+    // Shell / command execution. `bash` is the v1 plugin name and
+    // `run_command` is a legacy provider id; both map onto v2 `shell`.
+    ("shell", "shell"),
+    ("bash", "shell"),
+    ("run_command", "shell"),
+    // File reading and mutation. `multiedit` (a removed provider tool) is
+    // folded onto `patch` so an old payload still hits the mutation guard.
+    ("read", "read"),
+    ("write", "write"),
+    ("edit", "edit"),
+    ("patch", "patch"),
+    ("multiedit", "patch"),
+    // Search.
+    ("grep", "grep"),
+    ("glob", "glob"),
+    ("list", "list"),
+    ("ls", "list"),
+    // Network.
+    ("webfetch", "webfetch"),
+    ("websearch", "websearch"),
+    // Delegation and interaction.
+    ("subagent", "subagent"),
+    ("task", "subagent"),
+    ("question", "question"),
+    ("skill", "skill"),
+    // Todo tools (the experimental `todowrite` tool when enabled).
+    ("todowrite", "todowrite"),
+    ("todoread", "todoread"),
+    // Code-mode tool; it executes and its inner calls are hooked separately.
+    ("execute", "execute"),
+    // Other built-ins with no role-guard equivalent. They keep their own
+    // names because no role guardrail matches them.
+    ("experimental_image_generate", "experimental_image_generate"),
+    ("opencode_session_rename", "opencode_session_rename"),
+    ("opencode_session_move", "opencode_session_move"),
+    ("opencode_worktree_create", "opencode_worktree_create"),
+    ("opencode_worktree_list", "opencode_worktree_list"),
+    ("opencode_worktree_remove", "opencode_worktree_remove"),
+    ("opencode_models", "opencode_models"),
+    ("opencode_list_mcp_resources", "opencode_list_mcp_resources"),
+    ("opencode_read_mcp_resource", "opencode_read_mcp_resource"),
+];
+
 fn canonical_opencode_builtin(tool_name: &str) -> Option<&str> {
-    Some(match tool_name {
-        // Shell / command execution. `bash` is the v1 plugin name and
-        // `run_command` is a legacy provider id; both map onto v2 `shell`.
-        "shell" | "bash" | "run_command" => "shell",
-        // File reading and mutation. `multiedit` (a removed provider tool) is
-        // folded onto `patch` so an old payload still hits the mutation guard.
-        "read" => "read",
-        "write" => "write",
-        "edit" => "edit",
-        "patch" | "multiedit" => "patch",
-        // Search.
-        "grep" => "grep",
-        "glob" => "glob",
-        "list" | "ls" => "list",
-        // Network.
-        "webfetch" => "webfetch",
-        "websearch" => "websearch",
-        // Delegation and interaction.
-        "subagent" | "task" => "subagent",
-        "question" => "question",
-        "skill" => "skill",
-        // Todo tools (the experimental `todowrite` tool when enabled).
-        "todowrite" => "todowrite",
-        "todoread" => "todoread",
-        // Code-mode tool; it executes and its inner calls are hooked separately.
-        "execute" => "execute",
-        // Other built-ins with no role-guard equivalent. They keep their own
-        // names because no role guardrail matches them.
-        "experimental_image_generate"
-        | "opencode_session_rename"
-        | "opencode_session_move"
-        | "opencode_worktree_create"
-        | "opencode_worktree_list"
-        | "opencode_worktree_remove"
-        | "opencode_models"
-        | "opencode_list_mcp_resources"
-        | "opencode_read_mcp_resource" => tool_name,
-        _ => return None,
-    })
+    OPENCODE_CANONICAL_BUILTINS
+        .iter()
+        .find_map(|(provider, canonical)| (*provider == tool_name).then_some(*canonical))
 }
 
 fn opencode_hook_event_name(event_type: HookEventType) -> &'static str {
@@ -845,6 +930,7 @@ pub struct InternalAfterModelOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn test_hook_input_deserialize() {
@@ -1118,14 +1204,22 @@ mod tests {
             ("exomonad_request_changes", "request_changes"),
             ("exomonad_file_pr", "file_pr"),
             ("exomonad_notify_parent", "notify_parent"),
+            // The bare name has no underscore; the raw `exomonad_` prefix is
+            // what keeps it out of the fail-closed path.
+            ("exomonad_merge", "merge"),
         ] {
             let input = serde_json::json!({
                 "tool_name": provider_name,
                 "session_id": "ses",
                 "args": {}
             });
-            let normalized = normalize_opencode_hook_payload(HookEventType::PreToolUse, input);
+            let normalized =
+                normalize_opencode_hook_payload(HookEventType::PreToolUse, input.clone());
             assert_eq!(normalized["tool_name"], expected);
+            assert!(
+                opencode_unknown_tool_deny(HookEventType::PreToolUse, &input).is_none(),
+                "ExoMonad MCP id {provider_name} must not be denied"
+            );
         }
     }
 
@@ -1135,28 +1229,183 @@ mod tests {
             "tilth_tilth_search",
             "probe_probe_echo",
             "context-mode_context_search",
+            "context-mode_ctx_execute",
         ] {
             let input = serde_json::json!({
                 "tool_name": tool_name,
                 "session_id": "ses",
                 "args": {}
             });
-            let normalized = normalize_opencode_hook_payload(HookEventType::PreToolUse, input);
+            let normalized =
+                normalize_opencode_hook_payload(HookEventType::PreToolUse, input.clone());
             assert_eq!(normalized["tool_name"], tool_name);
+            assert!(
+                opencode_unknown_tool_deny(HookEventType::PreToolUse, &input).is_none(),
+                "external MCP id {tool_name} must not be denied"
+            );
         }
     }
 
     #[test]
-    fn test_normalize_opencode_unknown_tool_is_named_and_preserved() {
+    fn test_opencode_unknown_non_mcp_tool_is_denied_on_pre_tool_use() {
         let input = serde_json::json!({
             "tool_name": "futuretool",
             "session_id": "ses",
             "args": {}
         });
+        let deny = opencode_unknown_tool_deny(HookEventType::PreToolUse, &input)
+            .expect("unknown non-MCP id must be denied on PreToolUse");
+
+        assert_eq!(deny.exit_code, 2);
+        let envelope: Value = serde_json::from_str(&deny.stdout).expect("deny envelope JSON");
+        assert_eq!(envelope["continue"], false);
+        assert_eq!(envelope["hookSpecificOutput"]["permissionDecision"], "deny");
+        let reason = envelope["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .expect("deny reason");
+        assert!(reason.contains("futuretool"), "{reason}");
+        assert!(reason.contains("canonical_opencode_builtin"), "{reason}");
+        assert_eq!(envelope["stopReason"].as_str(), Some(reason));
+
+        // The mapping itself still preserves the id for observation.
         let normalized = normalize_opencode_hook_payload(HookEventType::PreToolUse, input);
-        // Unknown names are logged by `hook.opencode_unknown_tool`; they are not
-        // silently rewritten into a guarded or unguarded canonical name.
         assert_eq!(normalized["tool_name"], "futuretool");
+    }
+
+    /// The table is the closed set. This expectation is deliberately separate
+    /// from `OPENCODE_CANONICAL_BUILTINS`, so deleting an entry makes the test
+    /// fail instead of shrinking the assertion with the table.
+    #[test]
+    fn test_opencode_canonical_builtin_table_is_complete() {
+        let expected = [
+            ("shell", "shell"),
+            ("bash", "shell"),
+            ("run_command", "shell"),
+            ("read", "read"),
+            ("write", "write"),
+            ("edit", "edit"),
+            ("patch", "patch"),
+            ("multiedit", "patch"),
+            ("grep", "grep"),
+            ("glob", "glob"),
+            ("list", "list"),
+            ("ls", "list"),
+            ("webfetch", "webfetch"),
+            ("websearch", "websearch"),
+            ("subagent", "subagent"),
+            ("task", "subagent"),
+            ("question", "question"),
+            ("skill", "skill"),
+            ("todowrite", "todowrite"),
+            ("todoread", "todoread"),
+            ("execute", "execute"),
+            ("experimental_image_generate", "experimental_image_generate"),
+            ("opencode_session_rename", "opencode_session_rename"),
+            ("opencode_session_move", "opencode_session_move"),
+            ("opencode_worktree_create", "opencode_worktree_create"),
+            ("opencode_worktree_list", "opencode_worktree_list"),
+            ("opencode_worktree_remove", "opencode_worktree_remove"),
+            ("opencode_models", "opencode_models"),
+            ("opencode_list_mcp_resources", "opencode_list_mcp_resources"),
+            ("opencode_read_mcp_resource", "opencode_read_mcp_resource"),
+        ];
+
+        assert_eq!(OPENCODE_CANONICAL_BUILTINS, expected.as_slice());
+    }
+
+    /// Every id in the real table must pass PreToolUse unchanged (or be folded
+    /// onto its canonical alias) and must never be denied.
+    #[test]
+    fn test_opencode_every_canonical_builtin_passes_and_is_not_denied() {
+        for (provider_name, canonical) in OPENCODE_CANONICAL_BUILTINS {
+            let input = serde_json::json!({
+                "tool_name": provider_name,
+                "session_id": "ses",
+                "args": {}
+            });
+            let normalized =
+                normalize_opencode_hook_payload(HookEventType::PreToolUse, input.clone());
+            assert_eq!(
+                normalized["tool_name"], *canonical,
+                "table id {provider_name} must map to {canonical}"
+            );
+            assert!(
+                opencode_unknown_tool_deny(HookEventType::PreToolUse, &input).is_none(),
+                "table id {provider_name} must not be denied"
+            );
+        }
+    }
+
+    /// An unknown id on an observation-only event is logged but never denied,
+    /// because the tool call already happened (PostToolUse) or the event is not
+    /// a tool gate (Stop).
+    #[test]
+    fn test_opencode_unknown_tool_on_post_and_stop_is_logged_not_denied() {
+        for event in [HookEventType::PostToolUse, HookEventType::Stop] {
+            let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+            let guard = tracing::subscriber::set_default(capture_tracing_events(captured.clone()));
+
+            let input = serde_json::json!({
+                "tool_name": "futuretool",
+                "session_id": "ses",
+                "args": {}
+            });
+            assert!(
+                opencode_unknown_tool_deny(event, &input).is_none(),
+                "{event:?} must never deny an unknown id"
+            );
+            let normalized = normalize_opencode_hook_payload(event, input);
+            drop(guard);
+
+            assert_eq!(normalized["tool_name"], "futuretool");
+            let records = captured.lock().expect("capture lock");
+            assert!(
+                records.iter().any(|message| {
+                    message.contains("hook.opencode_unknown_tool")
+                        && message.contains("futuretool")
+                        && message.contains("Warn")
+                }),
+                "{event:?} must log hook.opencode_unknown_tool; got {records:?}"
+            );
+        }
+    }
+
+    /// A tracing subscriber that records each event's level and fields so a
+    /// test can prove an observation-only path really logged.
+    fn capture_tracing_events(
+        sink: Arc<Mutex<Vec<String>>>,
+    ) -> impl tracing::Subscriber + Send + Sync + 'static {
+        use std::fmt::Write as _;
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+
+        struct Capture(Arc<Mutex<Vec<String>>>);
+
+        #[derive(Default)]
+        struct Fields(String);
+
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                let _ = write!(self.0, " {}={:?}", field.name(), value);
+            }
+        }
+
+        impl<S> Layer<S> for Capture
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, _context: Context<'_, S>) {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                self.0.lock().expect("capture lock").push(format!(
+                    "LEVEL_{:?}{}",
+                    event.metadata().level(),
+                    fields.0
+                ));
+            }
+        }
+
+        tracing_subscriber::registry().with(Capture(sink))
     }
 
     #[test]

@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 
 use exomonad_core::{
     codex_noop_envelope, format_codex_hook_response, normalize_codex_hook_payload,
-    normalize_opencode_hook_payload, HookEnvelope, HookEventType,
+    normalize_opencode_hook_payload, opencode_unknown_tool_deny, HookEnvelope, HookEventType,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -519,6 +519,23 @@ async fn main() -> Result<()> {
             use std::io::Read;
             std::io::stdin().read_to_string(&mut body)?;
 
+            let json_body: serde_json::Value = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, body_len = body.len(), "Hook body is not valid JSON, using empty object");
+                    serde_json::json!({})
+                }
+            };
+
+            // Fail closed before looking for a server: an unknown OpenCode tool
+            // id must never pass just because the guardrail server is absent.
+            if runtime == HookRuntime::OpenCode {
+                if let Some(deny) = opencode_unknown_tool_deny(event, &json_body) {
+                    print!("{}", deny.stdout);
+                    std::process::exit(deny.exit_code);
+                }
+            }
+
             let is_root_session_start =
                 event == HookEventType::SessionStart && std::env::var("EXOMONAD_AGENT_ID").is_err();
 
@@ -551,13 +568,6 @@ async fn main() -> Result<()> {
             };
 
             let client = uds_client::ServerClient::new(socket);
-            let json_body: serde_json::Value = match serde_json::from_str(&body) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(error = %e, body_len = body.len(), "Hook body is not valid JSON, using empty object");
-                    serde_json::json!({})
-                }
-            };
             let json_body = match runtime {
                 HookRuntime::Codex => normalize_codex_hook_payload(event, json_body),
                 HookRuntime::OpenCode => normalize_opencode_hook_payload(event, json_body),

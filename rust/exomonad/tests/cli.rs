@@ -399,6 +399,28 @@ fn test_hook_invalid_json_fails_open() -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+/// An OpenCode PreToolUse for an unknown non-MCP tool id fails closed at the
+/// CLI boundary: exit 2 with a deny envelope naming the id and the table to
+/// update. This must not depend on a reachable server, or a new built-in would
+/// fail open exactly when it skips the role guardrails.
+#[test]
+fn test_opencode_unknown_tool_pre_tool_use_denies() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = cargo_bin_cmd!("exomonad");
+
+    // Exact v2 plugin payload shape from OPENCODE_PLUGIN_TS.
+    cmd.args(["hook", "pre-tool-use", "--runtime", "opencode"])
+        .write_stdin(
+            r#"{"tool_name":"futuretool","session_id":"ses_opencode","call_id":"call-1","args":{}}"#,
+        )
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains(r#""permissionDecision":"deny""#))
+        .stdout(predicate::str::contains("futuretool"))
+        .stdout(predicate::str::contains("canonical_opencode_builtin"));
+
+    Ok(())
+}
+
 /// Codex hooks fail open with Codex's no-op stdout shape.
 #[test]
 fn test_codex_hook_fails_open_when_server_unreachable() -> Result<(), Box<dyn std::error::Error>> {

@@ -29,11 +29,16 @@ non-zero exit, because a deny exits 2.
 `protocol/hook.rs` owns the single OpenCode adapter,
 `normalize_opencode_hook_payload`. It fills the fields OpenCode omits
 (`hook_event_name`, `tool_input`, `tool_response`, `tool_use_id`,
-`session_id`), and maps provider tool ids onto the canonical OpenCode ids
+`session_id`), and maps provider tool ids from the closed
+`OPENCODE_CANONICAL_BUILTINS` table onto the canonical OpenCode ids
 `.exo/lib/HookPolicy.hs` matches (`shell`/`bash`/`run_command`→`shell`,
 `edit`→`edit`, `patch`/`multiedit`→`patch`, `write`→`write`, and
-`exomonad_<tool>`→`<tool>`). Unknown non-MCP ids log
-`hook.opencode_unknown_tool` rather than passing through silently.
+`exomonad_<tool>`→`<tool>`). `opencode_unknown_tool_deny` fails **closed** on
+PreToolUse: an id that is not in that table, an `exomonad_<tool>` id, or an MCP
+`<server>_<tool>` id produces a deny envelope with exit 2 whose reason names
+the exact id and `canonical_opencode_builtin`. Every role gets the deny; there
+is no per-role allowlist and no env/flag bypass. PostToolUse, Stop, and
+worker-exit only log `hook.opencode_unknown_tool` (warn) and never deny.
 
 The v1 `server` export is intentionally absent; v2.3.2 rejects it and v1.14.48
 is not available to verify a dual-shape module. A real-CLI probe runs from

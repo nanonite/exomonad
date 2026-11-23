@@ -24,9 +24,9 @@ use serde::{Deserialize, Serialize};
 // Re-export commonly used types
 pub use hook::{
     codex_noop_envelope, format_codex_hook_response, normalize_codex_hook_payload,
-    normalize_opencode_hook_payload, ClaudePreToolUseOutput, ClaudeStopHookOutput, HookEnvelope,
-    HookInput, HookSpecificOutput, InternalAfterModelOutput, InternalBeforeModelOutput,
-    InternalStopHookOutput, PermissionDecision, StopDecision,
+    normalize_opencode_hook_payload, opencode_unknown_tool_deny, ClaudePreToolUseOutput,
+    ClaudeStopHookOutput, HookEnvelope, HookInput, HookSpecificOutput, InternalAfterModelOutput,
+    InternalBeforeModelOutput, InternalStopHookOutput, PermissionDecision, StopDecision,
 };
 pub use mcp::{McpError, ToolDefinition};
 pub use service::{

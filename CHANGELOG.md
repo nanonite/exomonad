@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Fail closed on an unrecognised OpenCode tool id: `exomonad hook pre-tool-use --runtime opencode` now denies (exit 2, naming the id and `canonical_opencode_builtin`) any non-MCP id outside the closed built-in table before contacting the server, so a new or renamed OpenCode built-in can no longer skip role guardrails; post-tool-use and stop only log it.
 - Record a second dispatch intent adopting the same already-launched successor in the adoption receipt (`subsequent_intents`, original fields and old single-intent receipts unchanged) instead of failing the recovery; a receipt owned by another invocation still refuses and names both.
 - Recognise the host's "role route dispatch authorization is missing or ambiguous" refusal as a proven prelaunch refusal through one closed error set shared by the controller and the host (cross-language test), so `init --continue` releases a blocked leaf held behind it; a model, harness or effort change after such a refusal now resumes under a fresh linked authorization (saved proof kept as history, approved gate required), and a held resume names the journal entry (index, status, error, fingerprint).
 - Normalize OpenCode v2 hook payloads (`args`/`output`/`call_id`, event name, tool ids such as `shell`, `exomonad_<tool>`) before they reach the server, and let the generated plugin honour a deny that exits 2, so role guardrails are enforced for OpenCode agents instead of failing open.
