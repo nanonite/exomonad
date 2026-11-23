@@ -87,9 +87,10 @@ worktree. The plugin runs inside OpenCode and forwards lifecycle events to the
 ExoMonad hook command over the existing UDS path. The current plugin can:
 
 - inspect and rewrite tool arguments before execution;
-- deny a tool by throwing from `tool.execute.before`;
-- observe tool results after execution; and
-- observe `session.stopped` and route it to the stop or worker-exit hook.
+- deny a tool by throwing from `execute.before`;
+- observe tool results after execution (`execute.after`); and
+- observe the terminal `session.execution.*` event and route it to the stop or
+  worker-exit hook.
 
 Those callbacks are valuable control points, but they are not a queue API or a
 contract for appending a user message to the next model turn. The plugin's

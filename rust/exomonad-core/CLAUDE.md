@@ -13,6 +13,20 @@ ExoMonad core is the unified library providing the effect system framework, WASM
 | `mcp/` | MCP types (ToolDefinition) and tools module |
 | `protocol/` | Wire format types (hook, mcp, service) |
 | `codex_config.rs` | Codex runtime config rendering: `.codex/config.toml`, MCP server entries, model field, developer instructions, extra MCP servers, and shell-native hook command JSON |
+| `opencode_plugin.rs` | OpenCode TypeScript plugin package as compile-time constants (`OPENCODE_PLUGIN_TS`, `OPENCODE_PLUGIN_PKG_JSON`) and its shape tests |
+
+## OpenCode plugin (`opencode_plugin.rs`)
+
+The generated `.exo/opencode-plugin/index.ts` targets the OpenCode v2 plugin
+API: its default export is `{ id: "exomonad", setup }`, and `setup(ctx)`
+registers `ctx.tool.hook("execute.before")`, `ctx.tool.hook("execute.after")`,
+and `ctx.event.subscribe(...)` for the terminal `session.execution.*` events.
+Handlers spawn `exomonad hook <event> --runtime opencode`; deny is a thrown
+error from the before hook, argument mutation is `Object.assign` from the
+hook's `updatedInput`. The v1 `server` export is intentionally absent; v2.3.2
+rejects it and v1.14.48 is not available to verify a dual-shape module. A
+real-CLI probe runs from `tests/opencode_plugin_v2.rs` when
+`EXOMONAD_OPENCODE_V2_PROBE=1` and skips otherwise.
 
 ## Feature Flags
 

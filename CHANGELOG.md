@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Rewrite the generated OpenCode plugin for the v2 `{ id, setup }` API so it loads on OpenCode v2.3.2 and `exomonad hook pre-tool-use`/`post-tool-use`/`stop`/`worker-exit` fire again, with deny and argument mutation proven against the real CLI; OpenCode 1.14 plugin loading is no longer emitted.
 - Launch task-less OpenCode companions with a per-version interactive form: v2.0.22 keeps top-level `--model`/`--agent`, v2.3.2 uses `opencode mini`, and `init` fails closed before creating a session for a version with no known form.
 - Commit the OpenCode v2.3.2 model table captured from the installed CLI (59 models, identical across three captures) beside the retained v2.0.22 table, so `init` validates OpenCode routes again; interactive-companion flags (#1584) and plugin loading (#1585) on v2.3.2 are tracked separately.
 - Prove the `adoption_before_response` interruption in the compiled `init --continue` path with its own marker and durable before-response evidence (adoption receipt, one launch row, controller action still `intended`): fix the harness-only interrupt carrier in `init` (missing separator, inherited duplicate shadowing) and record a generation-scoped adoption receipt on response-loss adoption (#1547).

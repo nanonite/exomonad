@@ -8,37 +8,44 @@ OpenCode agents were excluded from hooks because OpenCode doesn't support the sh
 
 ## Decision
 
-OpenCode 1.14.48 provides a TypeScript plugin API. A plugin is a local npm-style package (Bun resolves `.ts` natively, no compilation needed) referenced in `opencode.json` via a `"plugin"` array. The plugin exports a `server: Plugin` function that returns a `Hooks` object with lifecycle handlers.
+OpenCode v2 provides a TypeScript plugin API. A plugin is a local npm-style package (Bun resolves `.ts` natively, no compilation needed) referenced in `opencode.json` via a `"plugin"` array. The default export is a definition object `{ id, setup }`, and `setup(ctx)` registers handlers on the host context with `ctx.tool.hook("execute.before", ...)`, `ctx.tool.hook("execute.after", ...)`, and `ctx.event.subscribe(...)`. This is the same shape the bundled `context-mode` v2 plugin uses.
 
-Because plugin handlers receive `input.$` (Bun's shell), they can subprocess-call `exomonad hook <event> --runtime opencode` exactly like the other runtimes. This makes the TypeScript plugin a thin bridge to the existing WASM dispatch path with no new server-side logic.
+Because the setup handlers can spawn a subprocess, they call `exomonad hook <event> --runtime opencode` exactly like the other runtimes. This makes the TypeScript plugin a thin bridge to the existing WASM dispatch path with no new server-side logic.
 
 ## Bridge Pattern
 
 ```
-OpenCode (TypeScript plugin, in-process)
-  ├── tool.execute.before
-  │     └── Bun $`exomonad hook pre-tool-use --runtime opencode`
+OpenCode v2 (TypeScript plugin, in-process Bun)
+  ├── ctx.tool.hook("execute.before")
+  │     └── node:child_process → exomonad hook pre-tool-use --runtime opencode
   │           └── stdin: { tool_name, session_id, call_id, args }
   │                 └── UDS → exomonad serve → WASM dispatch
   │                       └── Haskell role handler → HookEnvelope { stdout, exit_code }
-  │                 └── TypeScript reads stdout, merges into output.args
+  │                 └── TypeScript reads stdout, denies or merges into input
   │
-  ├── tool.execute.after
-  │     └── Bun $`exomonad hook post-tool-use --runtime opencode`
+  ├── ctx.tool.hook("execute.after")
+  │     └── exomonad hook post-tool-use --runtime opencode
   │
-  └── event (type = "session.stopped")
-        └── Bun $`exomonad hook stop --runtime opencode`
+  └── ctx.event.subscribe (terminal session.execution.* event)
+        └── exomonad hook stop|worker-exit --runtime opencode
 ```
 
 All hook logic lives in Haskell WASM — the plugin is purely glue.
 
 ## Event Mapping
 
-| OpenCode event | ExoMonad HookEventType | HookDispatch |
+| OpenCode v2 event | ExoMonad HookEventType | HookDispatch |
 |---|---|---|
-| `tool.execute.before` | `PreToolUse` | `ToolUse` |
-| `tool.execute.after` | `PostToolUse` | `ToolUse` |
-| `event` (type=`session.stopped`) | `Stop` | `Stop` |
+| `execute.before` | `PreToolUse` | `ToolUse` |
+| `execute.after` | `PostToolUse` | `ToolUse` |
+| `session.execution.succeeded` | `Stop` (or `WorkerExit` when `EXOMONAD_ROLE=worker`) | `Stop` |
+| `session.execution.failed` | `Stop` (or `WorkerExit`) | `Stop` |
+| `session.execution.interrupted` | `Stop` (or `WorkerExit`) | `Stop` |
+
+`session.stopped` from the v1 API no longer exists in v2. A one-shot
+`opencode run` emits `session.execution.succeeded` at the end and does not emit
+`session.idle`, so the terminal `session.execution.*` events are the Stop /
+worker-exit trigger.
 
 ## Plugin Package
 
@@ -52,7 +59,20 @@ The plugin is embedded as Rust compile-time constants in `rust/exomonad-core/src
     └── package.json        { "name": "@exomonad/opencode-plugin", "type": "module" }
 ```
 
-No external npm install is required. Bun resolves `.ts` natively and `@opencode-ai/plugin` types are bundled with OpenCode.
+No external npm install is required. Bun resolves `.ts` natively.
+
+## Version Support Decision
+
+The generated module is **v2-only**: its default export is
+`{ id: "exomonad", setup }`, with no legacy `server` export. OpenCode v1.14
+used a different plugin API (`export const server` returning a hooks object),
+but v2.3.2's loader rejects any module whose default export lacks `{ id, setup }`.
+A dual-shape module was considered, but v1.14.48 is not installed on the
+verification host, so the v1 half could not be exercised. Exporting an
+unverified v1 path would be a silent, untested fallback, so this bridge drops
+v1.14 plugin hooks and states that limitation here rather than claiming
+compatibility. v1.14 users keep the previously released plugin; no v2 code path
+sniffs the CLI version.
 
 ## Spawn Sites
 
@@ -76,36 +96,43 @@ Because pre/post hooks intercept every MCP tool call, they enable WASM-enforced 
 
 This logic lives in Haskell WASM role handlers, not the TypeScript plugin. The plugin calls the binary; the binary routes to WASM; WASM applies role-specific logic.
 
-## Tested Against
+## Verified Against
 
-OpenCode 1.14.48
+OpenCode v2.3.2, with the generated plugin written by the production
+`write_opencode_plugin_files` path into a disposable Git repository and the
+real CLI launched as:
 
-## OpenCode v2.3.2 status (2026-11-22)
+```bash
+opencode run --standalone --auto --model opencode-go/beam-free '<one bash call>'
+```
 
-The bridge above was written against OpenCode 1.14.48. On the current system
-CLI, `opencode v2.3.2`, the launch command still works and the config still
-parses, but the plugin no longer loads:
+With the v2 plugin in place the loader emits no warning, and a probe shim on
+`PATH` recorded `hook pre-tool-use --runtime opencode` and `hook
+post-tool-use --runtime opencode` for the tool call, followed by `hook stop
+--runtime opencode` for `session.execution.succeeded`. A deny response blocked
+the tool (`Error: <reason>` surfaced and the command did not run), an
+`updatedInput` response replaced the arguments (the post hook observed the
+mutated arguments), and `EXOMONAD_ROLE=worker` produced `hook worker-exit
+--runtime opencode`.
+
+## OpenCode v2 plugin loader (root cause)
+
+The pre-fix `OPENCODE_PLUGIN_TS` exported only the v1 `server` function. On
+v2.3.2 the loader rejects that module:
 
 ```
 level=WARN message="failed to load plugin"
 cause="Plugin must export a default definition with an id and an effect or setup function."
 ```
 
-The v2 plugin loader expects a default definition with `id` plus `setup` (or
-`effect`), and v2 plugins register hooks through the setup context, for example
-`ctx.tool.hook("execute.before", ...)`, `ctx.tool.hook("execute.after", ...)`,
-and `ctx.event.subscribe(...)` (the shape the bundled `context-mode` v2 plugin
-uses). `OPENCODE_PLUGIN_TS` still exports only the legacy `server` function, so
-on v2.3.2 `tool.execute.before`, `tool.execute.after`, and the
-`session.stopped` event never fire. `opencode debug config` and
-`opencode debug agents` still accept the generated `opencode.json`, and
-`opencode plugin list` still lists the local package; only the module load
-fails.
+The loader schema requires `default` to be `{ id, effect }` or `{ id, setup }`,
+so the rewrite exports `{ id: "exomonad", setup }` and registers every handler
+from the setup context. The same probe now loads without a warning. The
+integration test `rust/exomonad-core/tests/opencode_plugin_v2.rs` asserts the
+generated files and, when `EXOMONAD_OPENCODE_V2_PROBE=1` is set and the CLI is
+available, runs this launch probe and checks the observed hook lines.
 
-Not fixed in #1583 (its scope is the committed model table). Follow-up: rewrite
-`OPENCODE_PLUGIN_TS` for the v2 `{ id, setup }` API and add a launch test that
-asserts the generated plugin actually invokes `exomonad hook ... --runtime
-opencode` under v2.3.2, rather than only that the package is listed.
+## Companion launch note
 
 The task-less interactive companion command
 `opencode --model ... --agent exomonad-<role>` is also rejected by v2.3.2:
@@ -120,5 +147,4 @@ supported interactive interface in v2.3.2 and accepts the model (including the
 `#variant` effort suffix) and the generated agent; a PTY launch shows
 `exomonad-worker · Beam Free [high]` in its status line. `init` resolves the
 form before creating a session, and an unknown version is a named error naming
-the known versions instead of a guessed form. The TypeScript plugin loader
-change above remains open.
+the known versions instead of a guessed form.
