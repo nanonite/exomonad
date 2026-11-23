@@ -59,11 +59,13 @@
 //! OpenCode (Bun, in-process TypeScript plugin)
 //!   → execute.before fires
 //!   → node:child_process → exomonad hook pre-tool-use --runtime opencode
+//!       → CLI normalizes the OpenCode payload (tool ids, args, event name)
 //!       → subprocess makes one HTTP request to exomonad serve via UDS
-//!       → exomonad serve returns HookEnvelope { stdout: '{"continue":true,...}', exit_code: 0 }
-//!       → subprocess exits 0
-//!   ← plugin reads subprocess stdout
-//!   → plugin parses JSON, sees permissionDecision = "deny"
+//!       → exomonad serve returns HookEnvelope {
+//!           stdout: '{"continue":false,...}', exit_code: 2 }
+//!       → subprocess prints stdout and exits 2
+//!   ← plugin parses stdout even though execFile reports exit 2
+//!   → plugin sees permissionDecision = "deny"
 //!   → plugin throws new Error("reason")   ← inside Bun/OpenCode only
 //!   → OpenCode catches the throw, blocks that tool call
 //!   → OpenCode continues running normally
@@ -87,19 +89,22 @@ function callHook(event: string, payload: unknown): Promise<HookResponse> {
       "exomonad",
       ["hook", event, "--runtime", "opencode"],
       { timeout: 30000, maxBuffer: 8 * 1024 * 1024 },
-      (error, stdout) => {
-        if (error) {
-          resolve({ continue: true });
-          return;
+      (_error, stdout) => {
+        // A deny exits 2, so stdout must be parsed even when execFile reports
+        // an error. Ignoring it would turn every enforced deny into an allow.
+        const text = typeof stdout === "string" ? stdout.trim() : "";
+        if (text) {
+          try {
+            const parsed = JSON.parse(text);
+            if (parsed && typeof parsed === "object") {
+              resolve(parsed);
+              return;
+            }
+          } catch {
+            // Fall through to the fail-open response below.
+          }
         }
-        try {
-          const parsed = JSON.parse(stdout.trim());
-          resolve(
-            parsed && typeof parsed === "object" ? parsed : { continue: true },
-          );
-        } catch {
-          resolve({ continue: true });
-        }
+        resolve({ continue: true });
       },
     );
     child.stdin?.end(JSON.stringify(payload));
@@ -228,6 +233,13 @@ mod tests {
     #[test]
     fn opencode_plugin_shells_out_to_hook_command() {
         assert!(OPENCODE_PLUGIN_TS.contains("\"hook\", event, \"--runtime\", \"opencode\""));
+    }
+
+    #[test]
+    fn opencode_plugin_parses_deny_stdout_despite_nonzero_exit() {
+        assert!(OPENCODE_PLUGIN_TS.contains("(_error, stdout)"));
+        assert!(OPENCODE_PLUGIN_TS.contains("typeof stdout === \"string\""));
+        assert!(!OPENCODE_PLUGIN_TS.contains("if (error) {"));
     }
 
     #[test]

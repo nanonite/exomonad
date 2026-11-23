@@ -23,10 +23,22 @@ registers `ctx.tool.hook("execute.before")`, `ctx.tool.hook("execute.after")`,
 and `ctx.event.subscribe(...)` for the terminal `session.execution.*` events.
 Handlers spawn `exomonad hook <event> --runtime opencode`; deny is a thrown
 error from the before hook, argument mutation is `Object.assign` from the
-hook's `updatedInput`. The v1 `server` export is intentionally absent; v2.3.2
-rejects it and v1.14.48 is not available to verify a dual-shape module. A
-real-CLI probe runs from `tests/opencode_plugin_v2.rs` when
-`EXOMONAD_OPENCODE_V2_PROBE=1` and skips otherwise.
+hook's `updatedInput`. `callHook` parses stdout even when `execFile` reports a
+non-zero exit, because a deny exits 2.
+
+`protocol/hook.rs` owns the single OpenCode adapter,
+`normalize_opencode_hook_payload`. It fills the fields OpenCode omits
+(`hook_event_name`, `tool_input`, `tool_response`, `tool_use_id`,
+`session_id`), and maps provider tool ids onto the canonical OpenCode ids
+`.exo/lib/HookPolicy.hs` matches (`shell`/`bash`/`run_command`→`shell`,
+`edit`→`edit`, `patch`/`multiedit`→`patch`, `write`→`write`, and
+`exomonad_<tool>`→`<tool>`). Unknown non-MCP ids log
+`hook.opencode_unknown_tool` rather than passing through silently.
+
+The v1 `server` export is intentionally absent; v2.3.2 rejects it and v1.14.48
+is not available to verify a dual-shape module. A real-CLI probe runs from
+`tests/opencode_plugin_v2.rs` when `EXOMONAD_OPENCODE_V2_PROBE=1` and skips
+otherwise.
 
 ## Feature Flags
 

@@ -19,8 +19,9 @@ OpenCode v2 (TypeScript plugin, in-process Bun)
   ├── ctx.tool.hook("execute.before")
   │     └── node:child_process → exomonad hook pre-tool-use --runtime opencode
   │           └── stdin: { tool_name, session_id, call_id, args }
-  │                 └── UDS → exomonad serve → WASM dispatch
-  │                       └── Haskell role handler → HookEnvelope { stdout, exit_code }
+  │                 └── normalize_opencode_hook_payload (Rust CLI)
+  │                       └── UDS → exomonad serve → WASM dispatch
+  │                             └── Haskell role handler → HookEnvelope { stdout, exit_code }
   │                 └── TypeScript reads stdout, denies or merges into input
   │
   ├── ctx.tool.hook("execute.after")
@@ -31,6 +32,52 @@ OpenCode v2 (TypeScript plugin, in-process Bun)
 ```
 
 All hook logic lives in Haskell WASM — the plugin is purely glue.
+
+## Payload and Tool-Name Normalization
+
+OpenCode's v2 plugin payload is not the internal `HookInput` shape. Before the
+CLI posts to `exomonad serve`, `normalize_opencode_hook_payload` in
+`exomonad-core/src/protocol/hook.rs` performs the single OpenCode mapping:
+
+| OpenCode payload | Internal field |
+|---|---|
+| `args` | `tool_input` |
+| `output` | `tool_response` |
+| `call_id` | `tool_use_id` |
+| `session.execution.*` `data.sessionID` / `durable.aggregateID` | `session_id` |
+| `hook` subcommand event (`pre-tool-use`, `post-tool-use`, `stop`, `worker-exit`) | `hook_event_name` |
+
+The v2 CLI sends `shell` where the v1 plugin sent `bash`
+(verified against OpenCode v2.3.2 with `ctx.tool.list()` and live tool calls).
+The same adapter maps the provider ids onto the canonical OpenCode ids that
+`.exo/lib/HookPolicy.hs` matches for `Runtime::OpenCode`:
+
+| OpenCode provider id | Canonical id |
+|---|---|
+| `shell`, `bash`, `run_command` | `shell` |
+| `read` | `read` |
+| `write` | `write` |
+| `edit` | `edit` |
+| `patch`, `multiedit` | `patch` |
+| `grep`, `glob`, `webfetch`, `websearch` | unchanged |
+| `list`, `ls` | `list` |
+| `subagent`, `task` | `subagent` |
+| `exomonad_<tool>` (ExoMonad MCP server) | `<tool>` (e.g. `exomonad_approve_pr` → `approve_pr`) |
+| other MCP tools | unchanged server-prefixed id |
+
+An unknown id with no underscore is logged as `hook.opencode_unknown_tool` and
+passed through unchanged; it is never silently rewritten into a guarded or
+unguarded canonical name. Any other id is treated as an external MCP tool and
+keeps its server prefix (debug event `hook.opencode_mcp_tool`).
+
+## Deny Exit Code
+
+`exomonad hook` prints the `HookEnvelope.stdout` and exits `2` when
+`continue=false`. The plugin must parse stdout even when `execFile` reports a
+non-zero exit; treating `_error` as a spawn failure would turn every enforced
+deny into an allow. `callHook` therefore parses whatever stdout it received
+first and only falls back to `{ continue: true }` when stdout is absent or not
+JSON.
 
 ## Event Mapping
 
@@ -114,6 +161,13 @@ the tool (`Error: <reason>` surfaced and the command did not run), an
 `updatedInput` response replaced the arguments (the post hook observed the
 mutated arguments), and `EXOMONAD_ROLE=worker` produced `hook worker-exit
 --runtime opencode`.
+
+The role-filtering path was then verified end-to-end against the real built
+`exomonad` binary and a real `exomonad serve` (no hook shim): a `dev` agent's
+`shell` call carrying a `gh` command was denied by `HookPolicy`, a `tl` agent's
+`shell` file write (`printf x > file`) was denied by the implementation guard,
+and a plain `touch` was allowed. The server trace showed `runtime=OpenCode`,
+`tool="shell"`, `exit_code=2`, and the deny reason for the denied calls.
 
 ## OpenCode v2 plugin loader (root cause)
 

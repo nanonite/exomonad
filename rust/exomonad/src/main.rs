@@ -45,8 +45,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use exomonad_core::{
-    codex_noop_envelope, format_codex_hook_response, normalize_codex_hook_payload, HookEnvelope,
-    HookEventType,
+    codex_noop_envelope, format_codex_hook_response, normalize_codex_hook_payload,
+    normalize_opencode_hook_payload, HookEnvelope, HookEventType,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
@@ -560,6 +560,7 @@ async fn main() -> Result<()> {
             };
             let json_body = match runtime {
                 HookRuntime::Codex => normalize_codex_hook_payload(event, json_body),
+                HookRuntime::OpenCode => normalize_opencode_hook_payload(event, json_body),
                 _ => json_body,
             };
 

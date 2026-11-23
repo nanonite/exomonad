@@ -2312,6 +2312,119 @@ async fn wasm_hook_worker_exit_notifies_parent_and_closes_self() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn wasm_hook_opencode_payload_normalization_enforces_role_policy() {
+    let runtime = build_test_runtime().await;
+
+    // Raw v2.3.2 payload: the adapter adds the event/args fields and keeps the
+    // canonical OpenCode tool id `edit`, which the root/TL guard denies.
+    let root_input = exomonad_core::normalize_opencode_hook_payload(
+        exomonad_core::HookEventType::PreToolUse,
+        json!({
+            "tool_name": "edit",
+            "session_id": "ses_opencode",
+            "call_id": "call-1",
+            "args": {"path": "src/lib.rs", "oldString": "a", "newString": "b"}
+        }),
+    );
+    let mut root_input = root_input;
+    root_input["role"] = json!("root");
+    root_input["runtime"] = json!("opencode");
+    let output: Value = runtime
+        .plugin_manager()
+        .call("handle_pre_tool_use", &root_input)
+        .await
+        .expect("OpenCode edit hook failed");
+    assert_eq!(
+        output["continue"], false,
+        "root should deny OpenCode edit: {output:#}"
+    );
+    assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+
+    // Raw `shell` with a file-writing command stays canonical `shell` and the
+    // TL implementation guard denies it.
+    let tl_input = exomonad_core::normalize_opencode_hook_payload(
+        exomonad_core::HookEventType::PreToolUse,
+        json!({
+            "tool_name": "shell",
+            "session_id": "ses_opencode",
+            "call_id": "call-2",
+            "args": {"command": "cat > src/lib.rs"}
+        }),
+    );
+    let mut tl_input = tl_input;
+    tl_input["role"] = json!("tl");
+    tl_input["runtime"] = json!("opencode");
+    let output: Value = runtime
+        .plugin_manager()
+        .call("handle_pre_tool_use", &tl_input)
+        .await
+        .expect("OpenCode shell hook failed");
+    assert_eq!(
+        output["continue"], false,
+        "tl should deny OpenCode shell file write: {output:#}"
+    );
+
+    // A read-only shell command stays allowed.
+    let read_input = exomonad_core::normalize_opencode_hook_payload(
+        exomonad_core::HookEventType::PreToolUse,
+        json!({
+            "tool_name": "shell",
+            "session_id": "ses_opencode",
+            "call_id": "call-3",
+            "args": {"command": "cat src/lib.rs"}
+        }),
+    );
+    let mut read_input = read_input;
+    read_input["role"] = json!("tl");
+    read_input["runtime"] = json!("opencode");
+    let output: Value = runtime
+        .plugin_manager()
+        .call("handle_pre_tool_use", &read_input)
+        .await
+        .expect("OpenCode shell read hook failed");
+    assert_eq!(
+        output["continue"], true,
+        "tl should allow a read-only OpenCode shell command: {output:#}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn wasm_hook_opencode_exomonad_mcp_tool_keeps_reviewer_policy() {
+    let runtime = build_test_runtime().await;
+
+    // OpenCode presents ExoMonad's own MCP server as `exomonad_<tool>`; the
+    // adapter must reduce it to the bare tool name the reviewer post-hook
+    // matches.
+    let input = exomonad_core::normalize_opencode_hook_payload(
+        exomonad_core::HookEventType::PostToolUse,
+        json!({
+            "tool_name": "exomonad_approve_pr",
+            "session_id": "ses_opencode",
+            "call_id": "call-4",
+            "args": {},
+            "output": {"ok": true}
+        }),
+    );
+    let mut input = input;
+    input["role"] = json!("reviewer");
+    input["runtime"] = json!("opencode");
+    let output: Value = runtime
+        .plugin_manager()
+        .call("handle_pre_tool_use", &input)
+        .await
+        .expect("OpenCode reviewer post hook failed");
+    let context = output["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        context.contains("Exit now"),
+        "OpenCode approve_pr must keep the reviewer exit nudge: {output:#}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn wasm_hook_pre_tool_use_allow() {
     let runtime = build_test_runtime().await;
 

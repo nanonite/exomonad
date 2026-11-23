@@ -465,6 +465,200 @@ fn codex_hook_event_name(event_type: HookEventType) -> &'static str {
     }
 }
 
+// ============================================================================
+// OpenCode Hook Adapter
+// ============================================================================
+
+/// Normalize an OpenCode v2 plugin payload into ExoMonad's internal `HookInput`
+/// shape.
+///
+/// The v2 plugin sends the provider's own shape:
+///
+/// ```json
+/// {"tool_name":"shell","session_id":"ses_...","call_id":"call-...","args":{"command":"..."}}
+/// ```
+///
+/// Two things make that unparseable and unsteerable on its own:
+///
+/// * `hook_event_name` is only known from the `hook` command, not the payload.
+/// * provider tool ids (`shell`, `edit`, `patch`, `exomonad_approve_pr`, …) are
+///   not the canonical names the role hooks match.
+///
+/// This is the single OpenCode mapping layer. An unrecognised non-MCP tool id
+/// is logged by name rather than passed through silently, because an
+/// unrecognised file or shell tool would otherwise skip the role guardrails.
+pub fn normalize_opencode_hook_payload(event_type: HookEventType, input: Value) -> Value {
+    let mut object = match input {
+        Value::Object(object) => object,
+        _ => Map::new(),
+    };
+
+    if !has_non_empty_string(&object, "session_id") {
+        let session_id = opencode_event_session_id(&object).unwrap_or_else(|| "opencode".into());
+        object.insert("session_id".to_string(), Value::String(session_id));
+    }
+    insert_default_string(&mut object, "cwd", ".");
+    insert_default_string(&mut object, "permission_mode", "default");
+    normalize_optional_string(&mut object, "transcript_path");
+
+    // OpenCode identifies the event on the command line, never in the payload.
+    object.insert(
+        "hook_event_name".to_string(),
+        Value::String(opencode_hook_event_name(event_type).to_string()),
+    );
+
+    if !object.contains_key("tool_name") {
+        if let Some(tool) = object.remove("tool") {
+            object.insert("tool_name".to_string(), tool);
+        }
+    }
+
+    if let Some(Value::String(tool_name)) = object.get("tool_name") {
+        let normalized = normalize_opencode_tool_name(tool_name);
+        object.insert("tool_name".to_string(), Value::String(normalized));
+    }
+
+    if !object.contains_key("tool_input") {
+        if let Some(args) = object.remove("args") {
+            object.insert("tool_input".to_string(), args);
+        }
+    }
+    if !object.contains_key("tool_use_id") {
+        if let Some(call_id) = object.remove("call_id") {
+            object.insert("tool_use_id".to_string(), call_id);
+        }
+    }
+    if !object.contains_key("tool_response") {
+        if let Some(output) = object.remove("output") {
+            object.insert("tool_response".to_string(), output);
+        }
+    }
+
+    Value::Object(object)
+}
+
+/// Map one OpenCode v2 tool id to the canonical name the WASM role hooks match
+/// for `Runtime::OpenCode`.
+///
+/// `.exo/lib/HookPolicy.hs` matches OpenCode's own ids (`shell`, `edit`,
+/// `write`, `patch`, …). This table is the single place that absorbs aliases
+/// (`bash` from the v1 plugin, legacy `run_command`) onto those canonical ids,
+/// so the Haskell role policy stays runtime-specific without a second mapping.
+///
+/// Every built-in id observed from `opencode v2.3.2` (`ctx.tool.list()` plus
+/// the `execute` code-mode tool) has an explicit entry. ExoMonad's own MCP
+/// server is registered as `exomonad`, so OpenCode presents its tools as
+/// `exomonad_<tool>` (for example `exomonad_approve_pr`); those are reduced to
+/// the bare MCP tool name the role hooks already use. Any other MCP tool keeps
+/// its full server-prefixed id.
+fn normalize_opencode_tool_name(tool_name: &str) -> String {
+    if let Some(canonical) = canonical_opencode_builtin(tool_name) {
+        return canonical.to_string();
+    }
+
+    if let Some(mcp_tool) = tool_name.strip_prefix("exomonad_") {
+        tracing::debug!(
+            event = "hook.opencode_mcp_tool",
+            server = "exomonad",
+            tool_name = mcp_tool,
+            "Normalized ExoMonad MCP tool id"
+        );
+        return mcp_tool.to_string();
+    }
+
+    if tool_name.contains('_') {
+        tracing::debug!(
+            event = "hook.opencode_mcp_tool",
+            tool_name,
+            "Passing through external MCP tool id"
+        );
+        return tool_name.to_string();
+    }
+
+    tracing::warn!(
+        event = "hook.opencode_unknown_tool",
+        tool_name,
+        "Unrecognised OpenCode tool id; role hooks will not recognise it"
+    );
+    tool_name.to_string()
+}
+
+/// Canonical OpenCode tool ids for the v2.3.2 built-ins.
+fn canonical_opencode_builtin(tool_name: &str) -> Option<&str> {
+    Some(match tool_name {
+        // Shell / command execution. `bash` is the v1 plugin name and
+        // `run_command` is a legacy provider id; both map onto v2 `shell`.
+        "shell" | "bash" | "run_command" => "shell",
+        // File reading and mutation. `multiedit` (a removed provider tool) is
+        // folded onto `patch` so an old payload still hits the mutation guard.
+        "read" => "read",
+        "write" => "write",
+        "edit" => "edit",
+        "patch" | "multiedit" => "patch",
+        // Search.
+        "grep" => "grep",
+        "glob" => "glob",
+        "list" | "ls" => "list",
+        // Network.
+        "webfetch" => "webfetch",
+        "websearch" => "websearch",
+        // Delegation and interaction.
+        "subagent" | "task" => "subagent",
+        "question" => "question",
+        "skill" => "skill",
+        // Todo tools (the experimental `todowrite` tool when enabled).
+        "todowrite" => "todowrite",
+        "todoread" => "todoread",
+        // Code-mode tool; it executes and its inner calls are hooked separately.
+        "execute" => "execute",
+        // Other built-ins with no role-guard equivalent. They keep their own
+        // names because no role guardrail matches them.
+        "experimental_image_generate"
+        | "opencode_session_rename"
+        | "opencode_session_move"
+        | "opencode_worktree_create"
+        | "opencode_worktree_list"
+        | "opencode_worktree_remove"
+        | "opencode_models"
+        | "opencode_list_mcp_resources"
+        | "opencode_read_mcp_resource" => tool_name,
+        _ => return None,
+    })
+}
+
+fn opencode_hook_event_name(event_type: HookEventType) -> &'static str {
+    match event_type {
+        HookEventType::PreToolUse | HookEventType::BeforeTool => "PreToolUse",
+        HookEventType::PostToolUse => "PostToolUse",
+        HookEventType::Stop | HookEventType::AfterAgent => "Stop",
+        HookEventType::SubagentStop => "SubagentStop",
+        HookEventType::WorkerExit => "WorkerExit",
+        HookEventType::SessionStart => "SessionStart",
+        HookEventType::SessionEnd => "SessionEnd",
+        HookEventType::BeforeModel => "BeforeModel",
+        HookEventType::AfterModel => "AfterModel",
+        _ => "PreToolUse",
+    }
+}
+
+/// OpenCode's terminal `session.execution.*` event carries the session in the
+/// event envelope rather than a top-level `session_id`.
+fn opencode_event_session_id(object: &Map<String, Value>) -> Option<String> {
+    object
+        .get("data")
+        .and_then(|data| data.get("sessionID"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            object
+                .get("durable")
+                .and_then(|durable| durable.get("aggregateID"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
+        .map(str::to_string)
+}
+
 fn insert_default_string(object: &mut Map<String, Value>, key: &str, default: &str) {
     if !has_non_empty_string(object, key) {
         object.insert(key.to_string(), Value::String(default.to_string()));
@@ -777,6 +971,192 @@ mod tests {
         let normalized =
             normalize_codex_hook_payload(HookEventType::SessionStart, serde_json::json!({}));
         assert_eq!(normalized["hook_event_name"], "SessionStart");
+    }
+
+    #[test]
+    fn test_normalize_opencode_pre_tool_use_is_parseable_hook_input() {
+        // Exact shape recorded from opencode v2.3.2 (#1585 / #1586 evidence).
+        let input = serde_json::json!({
+            "tool_name": "shell",
+            "session_id": "ses_123",
+            "call_id": "call-456",
+            "args": {"command": "gh auth status"}
+        });
+
+        let normalized = normalize_opencode_hook_payload(HookEventType::PreToolUse, input);
+        assert_eq!(normalized["hook_event_name"], "PreToolUse");
+        assert_eq!(normalized["tool_name"], "shell");
+        assert_eq!(
+            normalized["tool_input"],
+            serde_json::json!({"command": "gh auth status"})
+        );
+        assert_eq!(normalized["tool_use_id"], "call-456");
+        assert_eq!(normalized["session_id"], "ses_123");
+
+        let parsed: HookInput = serde_json::from_value(normalized).expect("parseable HookInput");
+        assert_eq!(parsed.tool_name.as_ref().map(|t| t.as_str()), Some("shell"));
+    }
+
+    #[test]
+    fn test_normalize_opencode_post_tool_use_maps_output() {
+        let input = serde_json::json!({
+            "tool_name": "read",
+            "session_id": "ses_123",
+            "call_id": "call-456",
+            "args": {"path": "sample.txt"},
+            "output": {"exitCode": 0, "output": "alpha\n"}
+        });
+
+        let normalized = normalize_opencode_hook_payload(HookEventType::PostToolUse, input);
+        assert_eq!(normalized["hook_event_name"], "PostToolUse");
+        assert_eq!(normalized["tool_name"], "read");
+        assert_eq!(
+            normalized["tool_input"],
+            serde_json::json!({"path": "sample.txt"})
+        );
+        assert_eq!(
+            normalized["tool_response"],
+            serde_json::json!({"exitCode": 0, "output": "alpha\n"})
+        );
+    }
+
+    #[test]
+    fn test_normalize_opencode_stop_event_extracts_session() {
+        let input = serde_json::json!({
+            "id": "evt_1",
+            "type": "session.execution.succeeded",
+            "durable": {"aggregateID": "ses_durable", "seq": 25},
+            "data": {"sessionID": "ses_data"}
+        });
+
+        let normalized = normalize_opencode_hook_payload(HookEventType::Stop, input);
+        assert_eq!(normalized["hook_event_name"], "Stop");
+        assert_eq!(normalized["session_id"], "ses_data");
+
+        let parsed: HookInput = serde_json::from_value(normalized).expect("parseable HookInput");
+        assert_eq!(parsed.session_id.as_str(), "ses_data");
+    }
+
+    #[test]
+    fn test_normalize_opencode_stop_event_falls_back_to_durable_aggregate() {
+        let input = serde_json::json!({
+            "type": "session.execution.failed",
+            "durable": {"aggregateID": "ses_durable"},
+            "data": {}
+        });
+
+        let normalized = normalize_opencode_hook_payload(HookEventType::Stop, input);
+        assert_eq!(normalized["session_id"], "ses_durable");
+    }
+
+    #[test]
+    fn test_normalize_opencode_worker_exit_event() {
+        let input = serde_json::json!({
+            "type": "session.execution.succeeded",
+            "durable": {"aggregateID": "ses_durable"}
+        });
+        let normalized = normalize_opencode_hook_payload(HookEventType::WorkerExit, input);
+        assert_eq!(normalized["hook_event_name"], "WorkerExit");
+    }
+
+    #[test]
+    fn test_normalize_opencode_builtin_tool_names() {
+        // Every built-in id returned by opencode v2.3.2 `ctx.tool.list()` plus
+        // the `execute` code-mode tool. The canonical name is what the WASM
+        // role hooks match.
+        let cases = [
+            ("shell", "shell"),
+            ("bash", "shell"),
+            ("run_command", "shell"),
+            ("read", "read"),
+            ("write", "write"),
+            ("edit", "edit"),
+            ("patch", "patch"),
+            ("multiedit", "patch"),
+            ("grep", "grep"),
+            ("glob", "glob"),
+            ("list", "list"),
+            ("ls", "list"),
+            ("webfetch", "webfetch"),
+            ("websearch", "websearch"),
+            ("task", "subagent"),
+            ("subagent", "subagent"),
+            ("question", "question"),
+            ("skill", "skill"),
+            ("todowrite", "todowrite"),
+            ("todoread", "todoread"),
+            ("execute", "execute"),
+            ("experimental_image_generate", "experimental_image_generate"),
+            ("opencode_session_rename", "opencode_session_rename"),
+            ("opencode_session_move", "opencode_session_move"),
+            ("opencode_worktree_create", "opencode_worktree_create"),
+            ("opencode_worktree_list", "opencode_worktree_list"),
+            ("opencode_worktree_remove", "opencode_worktree_remove"),
+            ("opencode_models", "opencode_models"),
+            ("opencode_list_mcp_resources", "opencode_list_mcp_resources"),
+            ("opencode_read_mcp_resource", "opencode_read_mcp_resource"),
+        ];
+
+        for (provider_name, canonical) in cases {
+            let input = serde_json::json!({
+                "tool_name": provider_name,
+                "session_id": "ses",
+                "args": {}
+            });
+            let normalized = normalize_opencode_hook_payload(HookEventType::PreToolUse, input);
+            assert_eq!(
+                normalized["tool_name"], canonical,
+                "OpenCode tool id {provider_name} must map to {canonical}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_opencode_exomonad_mcp_tool_names() {
+        for (provider_name, expected) in [
+            ("exomonad_approve_pr", "approve_pr"),
+            ("exomonad_request_changes", "request_changes"),
+            ("exomonad_file_pr", "file_pr"),
+            ("exomonad_notify_parent", "notify_parent"),
+        ] {
+            let input = serde_json::json!({
+                "tool_name": provider_name,
+                "session_id": "ses",
+                "args": {}
+            });
+            let normalized = normalize_opencode_hook_payload(HookEventType::PreToolUse, input);
+            assert_eq!(normalized["tool_name"], expected);
+        }
+    }
+
+    #[test]
+    fn test_normalize_opencode_external_mcp_tool_keeps_server_prefix() {
+        for tool_name in [
+            "tilth_tilth_search",
+            "probe_probe_echo",
+            "context-mode_context_search",
+        ] {
+            let input = serde_json::json!({
+                "tool_name": tool_name,
+                "session_id": "ses",
+                "args": {}
+            });
+            let normalized = normalize_opencode_hook_payload(HookEventType::PreToolUse, input);
+            assert_eq!(normalized["tool_name"], tool_name);
+        }
+    }
+
+    #[test]
+    fn test_normalize_opencode_unknown_tool_is_named_and_preserved() {
+        let input = serde_json::json!({
+            "tool_name": "futuretool",
+            "session_id": "ses",
+            "args": {}
+        });
+        let normalized = normalize_opencode_hook_payload(HookEventType::PreToolUse, input);
+        // Unknown names are logged by `hook.opencode_unknown_tool`; they are not
+        // silently rewritten into a guarded or unguarded canonical name.
+        assert_eq!(normalized["tool_name"], "futuretool");
     }
 
     #[test]

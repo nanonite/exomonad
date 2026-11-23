@@ -249,10 +249,12 @@ accepts both flags, while `v2.3.2` uses
 `opencode mini [--model M] --agent exomonad-<role>` because its top-level
 command rejects them and `mini` is the supported interactive interface. `init`
 detects the version once, before creating a session, and an unknown version is a
-named error rather than a guessed form. The remaining v2.3.2 change is not
-handled yet: the TypeScript plugin loader requires a default `{ id, setup }`
-definition instead of the old `server` export. See
-`docs/decisions/opencode-hooks.md` for the plugin status.
+named error rather than a guessed form. The TypeScript plugin loader requires
+a default `{ id, setup }` definition instead of the old `server` export; the
+generated plugin provides it. The `hook` subcommand normalizes the v2 payload
+(`args`, `output`, `call_id`, provider tool ids including `shell`) before
+posting to the server, so role hooks see the canonical OpenCode tool ids. See
+`docs/decisions/opencode-hooks.md` for the plugin and hook status.
 
 **Configured harness-policy check:** before any controller side effect, `init`
 validates the worker and reviewer routes it resolved from `config.toml` (and any
