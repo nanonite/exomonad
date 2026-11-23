@@ -547,6 +547,28 @@ transition; it is never reported as an owner, scope, or worktree conflict. Owner
 scope, worktree, predecessor-invocation, epoch, and process-identity checks are
 unchanged.
 
+A blocked-leaf resume is multi-step and mutating, so it is cancellation-safe as
+one unit. `resume_blocked_leaf` runs the durable work on its own `tokio::spawn`
+task, so dropping the HTTP request future when a controller client disconnects
+cannot stop it after the route transition. Before the first durable route
+record it writes `.exo/agents/<owner>/blocked_resume_journal.json` (`pending`);
+every exit path then moves that journal to `launched` or `failed`. A failure
+after the transition writes one `agent.spawn_failed` row carrying
+`operation: "resume_blocked_leaf"`, the intent, the transition id, and the typed
+code. The server's recovery loop calls `reconcile_blocked_resume_journals` on
+its first tick and every tick after: a pending journal left by a dead server is
+re-driven through the same idempotent resume, so an already-launched successor
+is adopted and a launch that never happened becomes a classified terminal
+failure. A durable route transition with neither a launch row nor a terminal
+failure row therefore cannot be left behind.
+
+Every tool request has exactly one `tool.called` completion event in the
+canonical ledger, emitted by the detached `execute_tool_call` task and naming
+`dispatch_intent_id` (from `dispatch_intent_id`, `intent_id`, or
+`role_route.dispatch_intent_id`). The event is written on success, on error, and
+on an aborted task (`success=false`, `cancelled=true`); a dropped HTTP
+connection does not suppress it.
+
 ### Repeated dispatch declarations under one logical resume
 
 `handlers/dispatch_authorization.rs` resolves the `tl.dispatch_intended`

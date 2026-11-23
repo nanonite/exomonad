@@ -1603,89 +1603,34 @@ pub async fn call_tool(
     headers: axum::http::HeaderMap,
     Json(body): Json<ToolCallRequest>,
 ) -> impl IntoResponse {
-    tracing::info!(tool = %body.name, "Executing tool");
-    let tool_arguments = body.arguments.clone();
+    // Tool calls are detached from the transport request. A client disconnect
+    // drops this handler future, but a mutating tool (route transition plus
+    // launch) must not be cut off after a durable side effect. The detached
+    // task also owns the completion event, so `tool.called` is recorded once
+    // per request even when nobody is left to receive the response.
+    let task = tokio::spawn(execute_tool_call(
+        state.clone(),
+        Arc::clone(&plugin),
+        role,
+        name.clone(),
+        body,
+    ));
+    let result = match task.await {
+        Ok(result) => result,
+        Err(error) => Err(anyhow::anyhow!("tool call task failed: {error}")),
+    };
 
-    let input = exomonad_core::mcp::tools::MCPCallInput::new(
-        role.clone(),
-        body.name.clone(),
-        body.arguments,
-    );
-
-    let start = std::time::Instant::now();
-    let result: Result<exomonad_core::mcp::tools::MCPCallOutput, anyhow::Error> =
-        plugin.call("handle_mcp_call", &input).await;
-    let duration_ms = start.elapsed().as_millis() as u64;
-
-    let mut output = match result {
-        Ok(o) => o,
-        Err(e) => {
-            tracing::error!(tool = %body.name, error = %e, "WASM call failed");
-            tracing::info!(
-                otel.name = "tool.called",
-                tool_name = %body.name,
-                duration_ms = duration_ms,
-                success = false,
-                error = %e,
-                "[event] tool.called"
-            );
-            if let Some(ref log) = state.event_log {
-                let _ = log.append(
-                    "tool.called",
-                    &name,
-                    &serde_json::json!({
-                        "tool_name": body.name,
-                        "role": role,
-                        "arguments": tool_arguments.clone(),
-                        "duration_ms": duration_ms,
-                        "success": false,
-                        "error": e.to_string(),
-                    }),
-                );
-            }
+    let output = match result {
+        Ok(output) => output,
+        Err(error) => {
             return Json(serde_json::json!({
                 "success": false,
                 "result": null,
-                "error": format!("WASM call failed: {}", e)
+                "error": format!("WASM call failed: {}", error)
             }))
             .into_response();
         }
     };
-
-    if output.error_kind.as_deref() == Some("tool_unavailable") {
-        output.error_context = Some(serde_json::json!({
-            "tool_name": body.name,
-            "role": role,
-            "wasm_path": plugin.wasm_path(),
-            "wasm_mtime": plugin.wasm_mtime(),
-            "remediation": "just install-all-dev or exomonad reload",
-        }));
-    }
-
-    tracing::info!(
-        otel.name = "tool.called",
-        tool_name = %body.name,
-        duration_ms = duration_ms,
-        success = output.success,
-        error = ?output.error,
-        "[event] tool.called"
-    );
-    if let Some(ref log) = state.event_log {
-        let _ = log.append(
-            "tool.called",
-            &name,
-            &serde_json::json!({
-                "tool_name": body.name,
-                "role": role,
-                "arguments": tool_arguments,
-                "duration_ms": duration_ms,
-                "success": output.success,
-                "error": output.error,
-                "error_kind": output.error_kind,
-                "error_context": output.error_context,
-            }),
-        );
-    }
 
     Json(finalize_tool_response(
         output,
@@ -1694,6 +1639,154 @@ pub async fn call_tool(
         state.inbox_store.as_ref(),
     ))
     .into_response()
+}
+
+/// Extract the dispatch identity a mutating tool call carries.
+///
+/// `resume_blocked_leaf` carries it on the accepted role route; other
+/// controller tools pass it at the top level. Recording it on `tool.called`
+/// lets an operator pair the request, the launch, and the terminal outcome.
+fn tool_call_dispatch_intent(arguments: &serde_json::Value) -> Option<String> {
+    [
+        arguments.get("dispatch_intent_id"),
+        arguments.get("intent_id"),
+        arguments
+            .get("role_route")
+            .and_then(|route| route.get("dispatch_intent_id")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(serde_json::Value::as_str)
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+    .map(str::to_string)
+}
+
+/// Emits exactly one `tool.called` completion event for a tool request.
+///
+/// The drop path covers a task that is aborted or panics before it can report,
+/// so every handler exit path names the tool and its dispatch intent instead of
+/// disappearing silently.
+struct ToolCallCompletion {
+    event_log: Option<Arc<exomonad_core::services::EventLog>>,
+    tool_name: String,
+    role: String,
+    agent_name: String,
+    arguments: serde_json::Value,
+    dispatch_intent_id: Option<String>,
+    started: std::time::Instant,
+    emitted: bool,
+}
+
+impl ToolCallCompletion {
+    fn emit(
+        &mut self,
+        success: bool,
+        error: Option<String>,
+        error_kind: Option<String>,
+        error_context: Option<serde_json::Value>,
+        cancelled: bool,
+    ) {
+        if self.emitted {
+            return;
+        }
+        self.emitted = true;
+        let duration_ms = self.started.elapsed().as_millis() as u64;
+        tracing::info!(
+            otel.name = "tool.called",
+            tool_name = %self.tool_name,
+            dispatch_intent_id = ?self.dispatch_intent_id,
+            duration_ms = duration_ms,
+            success = success,
+            error = ?error,
+            cancelled = cancelled,
+            "[event] tool.called"
+        );
+        let Some(log) = self.event_log.as_ref() else {
+            return;
+        };
+        let mut payload = serde_json::json!({
+            "tool_name": self.tool_name,
+            "role": self.role,
+            "arguments": self.arguments,
+            "duration_ms": duration_ms,
+            "success": success,
+            "error": error,
+            "error_kind": error_kind,
+            "error_context": error_context,
+            "cancelled": cancelled,
+        });
+        if let Some(intent) = self.dispatch_intent_id.as_ref() {
+            payload["dispatch_intent_id"] = serde_json::json!(intent);
+        }
+        let _ = log.append("tool.called", &self.agent_name, &payload);
+    }
+}
+
+impl Drop for ToolCallCompletion {
+    fn drop(&mut self) {
+        self.emit(
+            false,
+            Some("tool call ended without a completion event".to_string()),
+            Some("tool_call_aborted".to_string()),
+            None,
+            true,
+        );
+    }
+}
+
+async fn execute_tool_call(
+    state: AppState,
+    plugin: Arc<PluginManager>,
+    role: String,
+    name: String,
+    body: ToolCallRequest,
+) -> Result<exomonad_core::mcp::tools::MCPCallOutput, anyhow::Error> {
+    tracing::info!(tool = %body.name, "Executing tool");
+    let arguments = body.arguments;
+    let dispatch_intent_id = tool_call_dispatch_intent(&arguments);
+    let mut completion = ToolCallCompletion {
+        event_log: state.event_log.clone(),
+        tool_name: body.name.clone(),
+        role: role.clone(),
+        agent_name: name,
+        arguments: arguments.clone(),
+        dispatch_intent_id,
+        started: std::time::Instant::now(),
+        emitted: false,
+    };
+
+    let input =
+        exomonad_core::mcp::tools::MCPCallInput::new(role.clone(), body.name.clone(), arguments);
+    let result: Result<exomonad_core::mcp::tools::MCPCallOutput, anyhow::Error> =
+        plugin.call("handle_mcp_call", &input).await;
+
+    match result {
+        Ok(mut output) => {
+            if output.error_kind.as_deref() == Some("tool_unavailable") {
+                output.error_context = Some(serde_json::json!({
+                    "tool_name": body.name,
+                    "role": role,
+                    "wasm_path": plugin.wasm_path(),
+                    "wasm_mtime": plugin.wasm_mtime(),
+                    "remediation": "just install-all-dev or exomonad reload",
+                }));
+            }
+            completion.emit(
+                output.success,
+                output.error.clone(),
+                output.error_kind.clone(),
+                output.error_context.clone(),
+                false,
+            );
+            Ok(output)
+        }
+        Err(error) => {
+            tracing::error!(tool = %body.name, error = %error, "WASM call failed");
+            completion.emit(false, Some(error.to_string()), None, None, false);
+            Err(error)
+        }
+    }
 }
 
 /// Build the stable `{success, result, error}` REST envelope for a tool call.
@@ -2268,6 +2361,30 @@ Run `exomonad recompile` first to build it.",
             orphan_event_log,
         )
         .await;
+    });
+
+    // A blocked-leaf resume journals its progress before its first durable
+    // route record. A server that died mid-handler leaves a pending journal;
+    // the first tick (immediate on startup) adopts an already-launched
+    // successor or records a classified terminal failure, so a route
+    // transition is never left without an outcome.
+    let resume_recovery =
+        exomonad_core::handlers::AgentHandler::new(agent_control.clone(), services.clone());
+    let resume_recovery_interval = orphan_reconciler_interval;
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(resume_recovery_interval);
+        loop {
+            ticker.tick().await;
+            match resume_recovery.reconcile_blocked_resume_journals().await {
+                Ok(0) => {}
+                Ok(recovered) => {
+                    info!(recovered, "Reconciled blocked resume journals");
+                }
+                Err(error) => {
+                    warn!(%error, "Blocked resume journal reconciliation failed");
+                }
+            }
+        }
     });
 
     let app_state = AppState {
@@ -3128,5 +3245,96 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("<unread-mail>"));
+    }
+
+    #[test]
+    fn tool_call_dispatch_intent_reads_the_route_and_top_level_fields() {
+        assert_eq!(
+            tool_call_dispatch_intent(&serde_json::json!({
+                "role_route": { "dispatch_intent_id": "blocked-resume:abc" }
+            }))
+            .as_deref(),
+            Some("blocked-resume:abc")
+        );
+        assert_eq!(
+            tool_call_dispatch_intent(&serde_json::json!({
+                "dispatch_intent_id": "intent-1592"
+            }))
+            .as_deref(),
+            Some("intent-1592")
+        );
+        assert_eq!(
+            tool_call_dispatch_intent(&serde_json::json!({ "intent_id": "intent-77" })).as_deref(),
+            Some("intent-77")
+        );
+        assert_eq!(
+            tool_call_dispatch_intent(&serde_json::json!({ "task": "no identity" })),
+            None
+        );
+    }
+
+    fn completion_fixture(
+        project: &std::path::Path,
+    ) -> (
+        std::sync::Arc<exomonad_core::services::EventLog>,
+        ToolCallCompletion,
+    ) {
+        let log = std::sync::Arc::new(
+            exomonad_core::services::EventLog::open(project.join(".exo/logs"))
+                .expect("open fixture event log"),
+        );
+        let completion = ToolCallCompletion {
+            event_log: Some(log.clone()),
+            tool_name: "resume_blocked_leaf".to_string(),
+            role: "tl".to_string(),
+            agent_name: "root".to_string(),
+            arguments: serde_json::json!({
+                "role_route": { "dispatch_intent_id": "blocked-resume:abc" }
+            }),
+            dispatch_intent_id: Some("blocked-resume:abc".to_string()),
+            started: std::time::Instant::now(),
+            emitted: false,
+        };
+        (log, completion)
+    }
+
+    fn tool_called_rows(log: &exomonad_core::services::EventLog) -> Vec<serde_json::Value> {
+        log.ledger()
+            .read_events()
+            .expect("read fixture ledger")
+            .into_iter()
+            .filter(|record| record.event.event_type == "tool.called")
+            .map(|record| record.event.data)
+            .collect()
+    }
+
+    #[test]
+    fn tool_completion_is_recorded_once_and_names_the_dispatch_intent() {
+        let project = stub_project();
+        let (log, mut completion) = completion_fixture(project.path());
+        completion.emit(true, None, None, None, false);
+        // A second report (or the drop path) must not duplicate the completion.
+        completion.emit(false, Some("late error".to_string()), None, None, false);
+        drop(completion);
+
+        let rows = tool_called_rows(&log);
+        assert_eq!(rows.len(), 1, "exactly one tool.called row per request");
+        assert_eq!(rows[0]["success"], true);
+        assert_eq!(rows[0]["dispatch_intent_id"], "blocked-resume:abc");
+        assert_eq!(rows[0]["cancelled"], false);
+    }
+
+    #[test]
+    fn aborted_tool_completion_still_records_a_failure_event() {
+        let project = stub_project();
+        let (log, completion) = completion_fixture(project.path());
+        // Dropping without a report is the abort/cancellation exit path.
+        drop(completion);
+
+        let rows = tool_called_rows(&log);
+        assert_eq!(rows.len(), 1, "the aborted request still completes once");
+        assert_eq!(rows[0]["success"], false);
+        assert_eq!(rows[0]["cancelled"], true);
+        assert_eq!(rows[0]["dispatch_intent_id"], "blocked-resume:abc");
     }
 }

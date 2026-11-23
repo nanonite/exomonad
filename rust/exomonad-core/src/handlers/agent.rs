@@ -4019,6 +4019,35 @@ impl<
         req: &SpawnLeafSubtreeRequest,
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnLeafSubtreeResponse> {
+        // A blocked-leaf resume mutates durable state across several awaits
+        // (route transition, preflight, worktree/tmux launch, launch rows). The
+        // transport drops a request handler when its client disconnects, so the
+        // mutating work runs on its own task. The caller still observes the
+        // result while it is connected; a disconnect can no longer cut the
+        // resume off after the route transition was recorded.
+        let service = Arc::clone(&self.service);
+        let handler_context = Arc::clone(&self.ctx);
+        let request = req.clone();
+        let effect_context = ctx.clone();
+        let task = tokio::spawn(async move {
+            AgentHandler::new(service, handler_context)
+                .resume_blocked_leaf_durable(&request, &effect_context)
+                .await
+        });
+        match task.await {
+            Ok(result) => result,
+            Err(error) => Err(EffectError::custom(
+                "agent_error",
+                format!("blocked resume task did not complete: {error}"),
+            )),
+        }
+    }
+
+    async fn resume_blocked_leaf_durable(
+        &self,
+        req: &SpawnLeafSubtreeRequest,
+        ctx: &crate::effects::EffectContext,
+    ) -> EffectResult<SpawnLeafSubtreeResponse> {
         validate_blocked_resume_request(req)?;
         let _resume_guard = resume_reconciliation_lock().lock().await;
         ensure_chainlink_issue_open(self.ctx.project_dir(), req.blocked_issue_id)
@@ -4237,6 +4266,32 @@ impl<
         let next_recovery_round = invocation.recovery_round.checked_add(1).ok_or_else(|| {
             EffectError::invalid_input("blocked owner recovery round is exhausted")
         })?;
+        let transition_id = configured_route_transition_id(
+            &intent_id,
+            desired_agent_type,
+            desired_model.as_deref(),
+            desired_effort.as_deref(),
+        );
+        // The journal is written before the first durable route record. From
+        // here on every exit path either records the launch or a terminal
+        // failure; a restart-triggered reconciler finishes a pending journal
+        // instead of leaving a route transition with no outcome.
+        let mut journal = BlockedResumeJournal {
+            schema_version: BLOCKED_RESUME_JOURNAL_SCHEMA,
+            intent_id: intent_id.clone(),
+            transition_id: transition_id.clone(),
+            owner_agent: owner.agent_name.to_string(),
+            caller_agent: ctx.agent_name.to_string(),
+            birth_branch: ctx.birth_branch.to_string(),
+            working_dir: ctx.working_dir.display().to_string(),
+            phase: BLOCKED_RESUME_PHASE_PENDING.to_string(),
+            owner_pid: std::process::id(),
+            updated_at: unix_now_secs(),
+            request: BlockedResumeJournalRequest::from_request(req),
+        };
+        write_blocked_resume_journal(owner_dir, &journal).await?;
+
+        let outcome: EffectResult<SpawnLeafSubtreeResponse> = async {
         if configured_route_changed(
             &invocation,
             owner,
@@ -4244,12 +4299,7 @@ impl<
             desired_model.as_deref(),
             desired_effort.as_deref(),
         ) {
-            let transition_id = configured_route_transition_id(
-                &intent_id,
-                desired_agent_type,
-                desired_model.as_deref(),
-                desired_effort.as_deref(),
-            );
+            let transition_id = transition_id.clone();
             let data = serde_json::json!({
                 "operation": "resume_blocked_leaf",
                 "transition_id": transition_id,
@@ -4281,6 +4331,11 @@ impl<
                 &data,
             )?;
         }
+        // Inert unless a compiled acceptance opts in. The boundary names the
+        // exact point where a durable route transition exists but the launch
+        // has not started, so cancellation and restart recovery can be proven
+        // against it instead of raced with sleeps.
+        crate::e2e_interrupt::interrupt_at("blocked_resume_before_launch", &intent_id);
 
         let options = SpawnLeafOptions {
             task: format!(
@@ -4313,8 +4368,10 @@ impl<
             effort: desired_effort.clone(),
             role_route: role_route.clone(),
         };
-        self.ensure_tl_spawn_preflight_for_child(ctx, owner.agent_name.as_str(), &req.intent_id)
-            .await?;
+        // The outer exit match records one classified terminal row for every
+        // failure after the journal, so the preflight must not append its own
+        // generic row here.
+        self.ensure_tl_spawn_preflight(ctx).await?;
         let result = self
             .service
             .spawn_leaf_subtree_with_intent_from_worktree(
@@ -4413,6 +4470,7 @@ impl<
                     "branch": owner.birth_branch,
                     "spawn_type": "resume_blocked",
                     "chainlink_issue_id": req.blocked_issue_id,
+                    "intent_id": intent_id,
                     "previous_invocation_id": invocation.invocation_id,
                     "invocation_id": fresh_invocation.invocation_id,
                     "generation": fresh_invocation.generation,
@@ -4429,6 +4487,46 @@ impl<
             agent: Some(agent_info),
             invocation: Some(invocation_handoff),
         })
+        }
+        .await;
+
+        match outcome {
+            Ok(response) => {
+                journal.phase = BLOCKED_RESUME_PHASE_LAUNCHED.to_string();
+                journal.updated_at = unix_now_secs();
+                if let Err(error) = write_blocked_resume_journal(owner_dir, &journal).await {
+                    warn!(
+                        intent_id = %intent_id,
+                        owner = %owner.agent_name,
+                        %error,
+                        "blocked resume launched but its journal could not be completed; a restart reconciler will adopt the live successor"
+                    );
+                }
+                Ok(response)
+            }
+            Err(error) => {
+                journal.phase = BLOCKED_RESUME_PHASE_FAILED.to_string();
+                journal.updated_at = unix_now_secs();
+                if let Err(write_error) = write_blocked_resume_journal(owner_dir, &journal).await {
+                    error!(
+                        intent_id = %intent_id,
+                        owner = %owner.agent_name,
+                        %write_error,
+                        "blocked resume failure journal could not be completed; the terminal failure row is still written"
+                    );
+                }
+                append_blocked_resume_failed(
+                    &self.ctx,
+                    ctx.agent_name.as_ref(),
+                    owner.agent_name.as_str(),
+                    owner.slice_id.as_deref().unwrap_or(owner.slug.as_str()),
+                    &intent_id,
+                    &transition_id,
+                    &error,
+                );
+                Err(error)
+            }
+        }
     }
 
     async fn adopt_blocked_resume_successor(
@@ -4566,6 +4664,115 @@ impl<
             agent: Some(agent_info),
             invocation: Some(invocation_handoff),
         })
+    }
+
+    /// Complete blocked-leaf resumes whose server died mid-handler.
+    ///
+    /// The journal is the durable progress marker: a pending entry means the
+    /// route transition may already exist with no launch and no terminal row.
+    /// Each tick re-drives the same idempotent resume, so an already-launched
+    /// successor is adopted and a launch that never happened fails closed with
+    /// a classified terminal row. Returns the number of journals processed.
+    pub async fn reconcile_blocked_resume_journals(&self) -> Result<usize, String> {
+        let agents_dir = self.ctx.project_dir().join(".exo/agents");
+        let mut entries = match fs::read_dir(&agents_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect blocked resume journals in {}: {error}",
+                    agents_dir.display()
+                ))
+            }
+        };
+        let now = unix_now_secs();
+        let pid = std::process::id();
+        let mut processed = 0;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|error| format!("cannot read blocked resume journal entry: {error}"))?
+        {
+            let owner_dir = entry.path();
+            if !entry
+                .file_type()
+                .await
+                .map_err(|error| format!("cannot inspect {}: {error}", owner_dir.display()))?
+                .is_dir()
+            {
+                continue;
+            }
+            let mut journal = match read_blocked_resume_journal(&owner_dir).await {
+                Some(journal) => journal,
+                None => continue,
+            };
+            if journal.phase != BLOCKED_RESUME_PHASE_PENDING {
+                continue;
+            }
+            if journal.owner_pid == pid
+                && now.saturating_sub(journal.updated_at) < BLOCKED_RESUME_IN_FLIGHT_WINDOW_SECS
+            {
+                continue;
+            }
+            let caller = AgentName::try_from_str(&journal.caller_agent).map_err(|error| {
+                format!(
+                    "blocked resume journal {} has an invalid caller: {error}",
+                    journal.intent_id
+                )
+            })?;
+            let birth_branch =
+                BirthBranch::try_from_str(&journal.birth_branch).map_err(|error| {
+                    format!(
+                        "blocked resume journal {} has an invalid birth branch: {error}",
+                        journal.intent_id
+                    )
+                })?;
+            let context = crate::effects::EffectContext {
+                agent_name: caller,
+                birth_branch,
+                working_dir: PathBuf::from(&journal.working_dir),
+            };
+            let outcome = self
+                .resume_blocked_leaf_durable(&journal.request.clone().into_request(), &context)
+                .await;
+            processed += 1;
+            match outcome {
+                Ok(_) => {
+                    journal.phase = BLOCKED_RESUME_PHASE_LAUNCHED.to_string();
+                    journal.updated_at = unix_now_secs();
+                    if let Err(error) = write_blocked_resume_journal(&owner_dir, &journal).await {
+                        warn!(
+                            intent_id = %journal.intent_id,
+                            %error,
+                            "recovered blocked resume launched but its journal could not be completed"
+                        );
+                    }
+                }
+                Err(error) => {
+                    journal.phase = BLOCKED_RESUME_PHASE_FAILED.to_string();
+                    journal.updated_at = unix_now_secs();
+                    if let Err(write_error) =
+                        write_blocked_resume_journal(&owner_dir, &journal).await
+                    {
+                        error!(
+                            intent_id = %journal.intent_id,
+                            %write_error,
+                            "recovered blocked resume failure journal could not be completed"
+                        );
+                    }
+                    append_blocked_resume_failed(
+                        &self.ctx,
+                        context.agent_name.as_ref(),
+                        &journal.owner_agent,
+                        "",
+                        &journal.intent_id,
+                        &journal.transition_id,
+                        &error,
+                    );
+                }
+            }
+        }
+        Ok(processed)
     }
 
     async fn reconcile_owner_runtime_metadata(
@@ -4926,6 +5133,204 @@ async fn worktree_fingerprint(worktree: &Path) -> EffectResult<String> {
 fn resume_reconciliation_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+const BLOCKED_RESUME_JOURNAL_SCHEMA: u32 = 1;
+const BLOCKED_RESUME_JOURNAL_FILE: &str = "blocked_resume_journal.json";
+const BLOCKED_RESUME_PHASE_PENDING: &str = "pending";
+const BLOCKED_RESUME_PHASE_LAUNCHED: &str = "launched";
+const BLOCKED_RESUME_PHASE_FAILED: &str = "failed";
+/// A pending journal owned by this live process is an in-flight handler. After
+/// this window even the same process treats it as abandoned, so a panic cannot
+/// park a resume forever without a restart.
+const BLOCKED_RESUME_IN_FLIGHT_WINDOW_SECS: u64 = 900;
+
+/// Durable progress for one blocked-leaf resume.
+///
+/// The journal is written before the route transition and is only ever moved
+/// forward (`pending` -> `launched` | `failed`). It is progress evidence, not a
+/// historical lifecycle record: the append-only ledger and the invocation
+/// history are never rewritten.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BlockedResumeJournal {
+    schema_version: u32,
+    intent_id: String,
+    transition_id: String,
+    owner_agent: String,
+    caller_agent: String,
+    birth_branch: String,
+    working_dir: String,
+    phase: String,
+    owner_pid: u32,
+    updated_at: u64,
+    request: BlockedResumeJournalRequest,
+}
+
+/// JSON-safe projection of the blocked-resume request.
+///
+/// Effect messages are protobuf-only, so the journal stores the validated
+/// fields it needs to re-drive the same resume instead of the whole message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BlockedResumeJournalRequest {
+    task: String,
+    blocked_issue_id: u64,
+    expected_invocation_id: String,
+    expected_branch: String,
+    expected_worktree_fingerprint: String,
+    human_approved: bool,
+    intent_id: String,
+    resume_pr_number: u64,
+    expected_head_sha: String,
+    role_route: Option<BlockedResumeJournalRoleRoute>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BlockedResumeJournalRoleRoute {
+    role: String,
+    harness: String,
+    agent_type: i32,
+    model: String,
+    effort: String,
+    configuration_fingerprint: String,
+    policy_fingerprint: String,
+    manifest_digest: String,
+    route_fingerprint: String,
+    dispatch_intent_id: String,
+    scope_id: String,
+}
+
+impl BlockedResumeJournalRequest {
+    fn from_request(request: &SpawnLeafSubtreeRequest) -> Self {
+        Self {
+            task: request.task.clone(),
+            blocked_issue_id: request.blocked_issue_id,
+            expected_invocation_id: request.expected_invocation_id.clone(),
+            expected_branch: request.expected_branch.clone(),
+            expected_worktree_fingerprint: request.expected_worktree_fingerprint.clone(),
+            human_approved: request.human_approved,
+            intent_id: request.intent_id.clone(),
+            resume_pr_number: request.resume_pr_number,
+            expected_head_sha: request.expected_head_sha.clone(),
+            role_route: request
+                .role_route
+                .as_ref()
+                .map(|route| BlockedResumeJournalRoleRoute {
+                    role: route.role.clone(),
+                    harness: route.harness.clone(),
+                    agent_type: route.agent_type,
+                    model: route.model.clone(),
+                    effort: route.effort.clone(),
+                    configuration_fingerprint: route.configuration_fingerprint.clone(),
+                    policy_fingerprint: route.policy_fingerprint.clone(),
+                    manifest_digest: route.manifest_digest.clone(),
+                    route_fingerprint: route.route_fingerprint.clone(),
+                    dispatch_intent_id: route.dispatch_intent_id.clone(),
+                    scope_id: route.scope_id.clone(),
+                }),
+        }
+    }
+
+    fn into_request(self) -> SpawnLeafSubtreeRequest {
+        SpawnLeafSubtreeRequest {
+            task: self.task,
+            blocked_issue_id: self.blocked_issue_id,
+            expected_invocation_id: self.expected_invocation_id,
+            expected_branch: self.expected_branch,
+            expected_worktree_fingerprint: self.expected_worktree_fingerprint,
+            human_approved: self.human_approved,
+            intent_id: self.intent_id,
+            resume_pr_number: self.resume_pr_number,
+            expected_head_sha: self.expected_head_sha,
+            role_route: self.role_route.map(|route| RoleRoute {
+                role: route.role,
+                harness: route.harness,
+                agent_type: route.agent_type,
+                model: route.model,
+                effort: route.effort,
+                configuration_fingerprint: route.configuration_fingerprint,
+                policy_fingerprint: route.policy_fingerprint,
+                manifest_digest: route.manifest_digest,
+                route_fingerprint: route.route_fingerprint,
+                dispatch_intent_id: route.dispatch_intent_id,
+                scope_id: route.scope_id,
+            }),
+            ..Default::default()
+        }
+    }
+}
+
+fn blocked_resume_journal_path(owner_dir: &Path) -> PathBuf {
+    owner_dir.join(BLOCKED_RESUME_JOURNAL_FILE)
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+async fn write_blocked_resume_journal(
+    owner_dir: &Path,
+    journal: &BlockedResumeJournal,
+) -> EffectResult<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let path = blocked_resume_journal_path(owner_dir);
+    let temporary = owner_dir.join(format!(
+        ".{BLOCKED_RESUME_JOURNAL_FILE}.{}.tmp",
+        std::process::id()
+    ));
+    let bytes = serde_json::to_vec_pretty(journal).map_err(|error| {
+        EffectError::custom(
+            "blocked_resume_journal_error",
+            format!("blocked resume journal could not be encoded: {error}"),
+        )
+    })?;
+    let mut file = fs::File::create(&temporary).await.map_err(|error| {
+        EffectError::custom(
+            "blocked_resume_journal_error",
+            format!("blocked resume journal could not be created: {error}"),
+        )
+    })?;
+    file.write_all(&bytes).await.map_err(|error| {
+        EffectError::custom(
+            "blocked_resume_journal_error",
+            format!("blocked resume journal could not be written: {error}"),
+        )
+    })?;
+    file.sync_all().await.map_err(|error| {
+        EffectError::custom(
+            "blocked_resume_journal_error",
+            format!("blocked resume journal could not be flushed: {error}"),
+        )
+    })?;
+    drop(file);
+    fs::rename(&temporary, &path).await.map_err(|error| {
+        EffectError::custom(
+            "blocked_resume_journal_error",
+            format!("blocked resume journal could not be published: {error}"),
+        )
+    })
+}
+
+async fn read_blocked_resume_journal(owner_dir: &Path) -> Option<BlockedResumeJournal> {
+    let path = blocked_resume_journal_path(owner_dir);
+    let bytes = match fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return None,
+        Err(error) => {
+            warn!(path = %path.display(), %error, "blocked resume journal is unreadable");
+            return None;
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(journal) => Some(journal),
+        Err(error) => {
+            warn!(path = %path.display(), %error, "blocked resume journal is malformed");
+            None
+        }
+    }
 }
 
 fn blocked_resume_intent_id(
@@ -6295,6 +6700,14 @@ fn spawn_result_branch_name(
 /// classify, so both failure paths here are logged at `error!` with the child,
 /// the intent, and the code. The refusal itself stays authoritative through the
 /// tool response; this row is the durable evidence, not the decision.
+fn spawn_failure_code(error: &EffectError) -> Option<String> {
+    match error {
+        EffectError::Custom { code, .. } => Some(code.clone()),
+        EffectError::Timeout { .. } => Some("dispatch.transport_timeout".to_string()),
+        _ => None,
+    }
+}
+
 fn append_spawn_failed<C: HasEventLog>(
     ctx: &Arc<C>,
     parent_agent: &str,
@@ -6302,11 +6715,7 @@ fn append_spawn_failed<C: HasEventLog>(
     intent_id: &str,
     error: &EffectError,
 ) {
-    let code = match error {
-        EffectError::Custom { code, .. } => Some(code.clone()),
-        EffectError::Timeout { .. } => Some("dispatch.transport_timeout".to_string()),
-        _ => None,
-    };
+    let code = spawn_failure_code(error);
     let Some(log) = ctx.event_log() else {
         error!(
             parent_agent,
@@ -6335,6 +6744,73 @@ fn append_spawn_failed<C: HasEventLog>(
             code = code.as_deref().unwrap_or("untyped"),
             error = %write_error,
             "failed to record the refused spawn; the controller cannot classify it"
+        );
+    }
+}
+
+/// Record the terminal failure a blocked-leaf resume owes its controller.
+///
+/// The route transition row is written before the launch, so a resume that
+/// fails afterwards must leave a classified terminal row beside it. The row
+/// names the resume intent and the transition it terminates, which lets an
+/// operator pair every durable route transition with exactly one outcome.
+fn append_blocked_resume_failed<C: HasEventLog>(
+    ctx: &Arc<C>,
+    parent_agent: &str,
+    owner_agent: &str,
+    scope: &str,
+    intent_id: &str,
+    transition_id: &str,
+    error: &EffectError,
+) {
+    let code = spawn_failure_code(error);
+    let Some(log) = ctx.event_log() else {
+        error!(
+            parent_agent,
+            owner_agent,
+            intent_id,
+            transition_id,
+            code = code.as_deref().unwrap_or("untyped"),
+            error = %error,
+            "no event log; the blocked resume terminal failure is unrecorded"
+        );
+        return;
+    };
+    if log
+        .ledger()
+        .read_events()
+        .map(|records| {
+            records.iter().any(|record| {
+                record.event.event_type == "agent.spawn_failed"
+                    && record.event.data["intent_id"].as_str() == Some(intent_id)
+                    && record.event.data["operation"].as_str() == Some("resume_blocked_leaf")
+            })
+        })
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let payload = serde_json::json!({
+        "child_agent": owner_agent,
+        "owner_agent_id": owner_agent,
+        "scope": scope,
+        "operation": "resume_blocked_leaf",
+        "phase": "terminal_failure",
+        "intent_id": intent_id,
+        "transition_id": transition_id,
+        "error": error.to_string(),
+        "code": code,
+        "source": "rust",
+    });
+    if let Err(write_error) = log.append("agent.spawn_failed", parent_agent, &payload) {
+        error!(
+            parent_agent,
+            owner_agent,
+            intent_id,
+            transition_id,
+            code = code.as_deref().unwrap_or("untyped"),
+            error = %write_error,
+            "failed to record the blocked resume terminal failure"
         );
     }
 }
@@ -8866,7 +9342,7 @@ mod tests {
         head_sha: String,
         prior_invocation_id: String,
         launch_log: PathBuf,
-        handler: AgentHandler<crate::services::Services>,
+        handler: std::sync::Arc<AgentHandler<crate::services::Services>>,
         context: crate::effects::EffectContext,
         tmux_socket: String,
         previous_tmux_socket: Option<std::ffi::OsString>,
@@ -9285,7 +9761,7 @@ mod tests {
             head_sha,
             prior_invocation_id: prior_invocation_id.to_string(),
             launch_log,
-            handler,
+            handler: std::sync::Arc::new(handler),
             context,
             tmux_socket,
             previous_tmux_socket,
@@ -9302,6 +9778,390 @@ mod tests {
                 ..Default::default()
             }
         }
+    }
+
+    const BLOCKED_RESUME_ISSUE: u64 = 814;
+
+    /// Turn the configured PR-resume fixture into the parked-leaf shape the
+    /// live incident used: an open human gate issue, an authoritative parked
+    /// event, and a dormant Codex owner that the configured route moves to
+    /// OpenCode. No Forgejo PR is involved.
+    async fn blocked_resume_fixture() -> (ConfiguredResumeFixture, SpawnLeafSubtreeRequest, String)
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture =
+            configured_resume_pr_fixture(ServiceAgentType::Codex, ServiceAgentType::OpenCode).await;
+        let fake_bin = fixture._temp.path().join("fake-bin");
+        let chainlink = fake_bin.join("chainlink");
+        std::fs::write(&chainlink, "#!/bin/sh\nprintf 'Status: open\\n'\n")
+            .expect("write chainlink shim");
+        std::fs::set_permissions(&chainlink, std::fs::Permissions::from_mode(0o755))
+            .expect("make chainlink shim executable");
+        std::fs::write(
+            fixture.owner_dir.join("active_issue"),
+            BLOCKED_RESUME_ISSUE.to_string(),
+        )
+        .expect("write the owner's active issue");
+        crate::services::EventLog::open(fixture.project.join(".exo/logs"))
+            .expect("open fixture event log")
+            .append(
+                "tl.slice_parked",
+                "root-controller",
+                &serde_json::json!({
+                    "slice_id": fixture.slice,
+                    "park_cause": "base_ci_unstable",
+                }),
+            )
+            .expect("record the authoritative parked event");
+
+        let identity: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.owner_dir.join("identity.json")).expect("read fixture identity"),
+        )
+        .expect("fixture identity is JSON");
+        let agent_name = AgentName::try_from_str(
+            identity["agent_name"]
+                .as_str()
+                .expect("identity agent name"),
+        )
+        .expect("valid fixture agent name");
+        let branch = identity["birth_branch"]
+            .as_str()
+            .expect("identity birth branch")
+            .to_string();
+        let worktree = PathBuf::from(
+            identity["working_dir"]
+                .as_str()
+                .expect("identity working dir"),
+        );
+        let fingerprint = worktree_fingerprint(&worktree)
+            .await
+            .expect("fingerprint fixture worktree");
+        let owner = fixture
+            .handler
+            .ctx
+            .agent_resolver()
+            .get(&agent_name)
+            .await
+            .expect("fixture owner is registered");
+        let intent = blocked_resume_intent_id(
+            &owner,
+            BLOCKED_RESUME_ISSUE,
+            &fixture.prior_invocation_id,
+            &branch,
+            &fingerprint,
+        );
+        let request = SpawnLeafSubtreeRequest {
+            task: "Resume the parked leaf after the operator fixed base CI".to_string(),
+            blocked_issue_id: BLOCKED_RESUME_ISSUE,
+            expected_invocation_id: fixture.prior_invocation_id.clone(),
+            expected_branch: branch,
+            expected_worktree_fingerprint: fingerprint,
+            human_approved: true,
+            ..Default::default()
+        };
+        (fixture, request, intent)
+    }
+
+    struct InterruptEnvironment {
+        keys: Vec<&'static str>,
+    }
+
+    impl InterruptEnvironment {
+        fn arm(intent: &str, directory: &Path) -> Self {
+            std::env::set_var("EXOMONAD_E2E_INTERRUPT_AT", "blocked_resume_before_launch");
+            std::env::set_var("EXOMONAD_E2E_INTERRUPT_SCOPE", intent);
+            std::env::set_var(
+                "EXOMONAD_E2E_INTERRUPT_DIR",
+                directory.to_string_lossy().as_ref(),
+            );
+            std::env::set_var("EXOMONAD_E2E_INTERRUPT_ACTION", "pause");
+            Self {
+                keys: vec![
+                    "EXOMONAD_E2E_INTERRUPT_AT",
+                    "EXOMONAD_E2E_INTERRUPT_SCOPE",
+                    "EXOMONAD_E2E_INTERRUPT_DIR",
+                    "EXOMONAD_E2E_INTERRUPT_ACTION",
+                ],
+            }
+        }
+    }
+
+    impl Drop for InterruptEnvironment {
+        fn drop(&mut self) {
+            for key in &self.keys {
+                std::env::remove_var(key);
+            }
+        }
+    }
+
+    async fn wait_for_file(path: &Path, description: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {description} at {}",
+                path.display()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn wait_for_ledger_event(
+        project: &Path,
+        event_type: &str,
+        predicate: impl Fn(&serde_json::Value) -> bool,
+        description: &str,
+    ) -> serde_json::Value {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(row) = ledger_rows(project)
+                .into_iter()
+                .find(|row| row["event_type"] == event_type && predicate(row))
+            {
+                return row;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {description}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+    }
+
+    fn blocked_resume_rows(project: &Path, event_type: &str, intent: &str) -> usize {
+        ledger_rows(project)
+            .into_iter()
+            .filter(|row| {
+                row["event_type"] == event_type && row["data"]["intent_id"].as_str() == Some(intent)
+            })
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn blocked_resume_launch_survives_request_cancellation_after_transition() {
+        let (fixture, request, intent) = blocked_resume_fixture().await;
+        let interrupt_dir = fixture._temp.path().join("interrupt");
+        std::fs::create_dir_all(&interrupt_dir).expect("create interrupt directory");
+        let _environment = InterruptEnvironment::arm(&intent, &interrupt_dir);
+
+        let handler = std::sync::Arc::clone(&fixture.handler);
+        let context = fixture.context.clone();
+        let request_for_task = request.clone();
+        let call = tokio::spawn(async move {
+            handler
+                .resume_blocked_leaf(&request_for_task, &context)
+                .await
+        });
+        wait_for_file(
+            &interrupt_dir.join("blocked_resume_before_launch.json"),
+            "the blocked resume to reach its durable transition boundary",
+        )
+        .await;
+
+        // The controller's HTTP client is gone. Dropping the request handler is
+        // exactly what the live server did after recording the transition.
+        call.abort();
+        std::fs::write(
+            interrupt_dir.join("blocked_resume_before_launch.release"),
+            b"released",
+        )
+        .expect("release the interrupted handler");
+
+        let launched = wait_for_ledger_event(
+            &fixture.project,
+            "agent.spawned",
+            |row| row["data"]["intent_id"].as_str() == Some(intent.as_str()),
+            "the detached blocked resume to launch",
+        )
+        .await;
+        assert_eq!(launched["data"]["spawn_type"], "resume_blocked");
+
+        let transitions = ledger_rows(&fixture.project)
+            .into_iter()
+            .filter(|row| row["event_type"] == "agent.harness_switch")
+            .count();
+        assert_eq!(transitions, 1, "the route transition stays auditable once");
+        assert_eq!(
+            blocked_resume_rows(&fixture.project, "agent.spawned", &intent),
+            1,
+            "a cancelled request must still launch exactly once"
+        );
+        assert_eq!(
+            blocked_resume_rows(&fixture.project, "agent.spawn_failed", &intent),
+            0,
+            "a completed launch must not also record a terminal failure"
+        );
+
+        // Criterion G: the stale Codex identity is refreshed to the configured
+        // route in the same resume.
+        let identity: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.owner_dir.join("identity.json"))
+                .expect("read refreshed identity"),
+        )
+        .expect("refreshed identity is JSON");
+        assert_eq!(identity["agent_type"], "opencode");
+        assert_eq!(identity["model"], "deepseek-v4.1-flash");
+        assert_eq!(identity["effort"], "high");
+
+        // Criterion C: the controller retries the same logical resume after its
+        // request was cut off. The completed launch is adopted, not repeated.
+        let replay = fixture
+            .handler
+            .resume_blocked_leaf(&request, &fixture.context)
+            .await
+            .expect("a repeat request adopts the launched successor");
+        assert!(
+            !replay.invocation.expect("replay handoff").fresh,
+            "the repeat must adopt rather than launch"
+        );
+        assert_eq!(
+            blocked_resume_rows(&fixture.project, "agent.spawned", &intent),
+            1,
+            "a retried request must not duplicate the invocation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn blocked_resume_concurrent_requests_launch_exactly_once() {
+        let (fixture, request, intent) = blocked_resume_fixture().await;
+        let first = {
+            let handler = std::sync::Arc::clone(&fixture.handler);
+            let context = fixture.context.clone();
+            let request = request.clone();
+            tokio::spawn(async move { handler.resume_blocked_leaf(&request, &context).await })
+        };
+        let second = {
+            let handler = std::sync::Arc::clone(&fixture.handler);
+            let context = fixture.context.clone();
+            let request = request.clone();
+            tokio::spawn(async move { handler.resume_blocked_leaf(&request, &context).await })
+        };
+        first
+            .await
+            .expect("first concurrent request runs")
+            .expect("first concurrent request launches");
+        second
+            .await
+            .expect("second concurrent request runs")
+            .expect("second concurrent request adopts");
+
+        assert_eq!(
+            blocked_resume_rows(&fixture.project, "agent.spawned", &intent),
+            1,
+            "concurrent dial-a-resume requests share one launch"
+        );
+        assert_eq!(
+            ledger_rows(&fixture.project)
+                .into_iter()
+                .filter(|row| row["event_type"] == "agent.harness_switch")
+                .count(),
+            1,
+            "the route transition is recorded once"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn blocked_resume_recovery_finishes_a_journal_left_by_a_dead_server() {
+        let (fixture, request, intent) = blocked_resume_fixture().await;
+        let identity: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.owner_dir.join("identity.json")).expect("read fixture identity"),
+        )
+        .expect("identity is JSON");
+        let journal = BlockedResumeJournal {
+            schema_version: BLOCKED_RESUME_JOURNAL_SCHEMA,
+            intent_id: intent.clone(),
+            transition_id: configured_route_transition_id(
+                &intent,
+                ServiceAgentType::OpenCode,
+                Some("deepseek-v4.1-flash"),
+                Some("high"),
+            ),
+            owner_agent: identity["agent_name"]
+                .as_str()
+                .expect("identity agent name")
+                .to_string(),
+            caller_agent: fixture.context.agent_name.to_string(),
+            birth_branch: fixture.context.birth_branch.to_string(),
+            working_dir: fixture.context.working_dir.display().to_string(),
+            phase: BLOCKED_RESUME_PHASE_PENDING.to_string(),
+            owner_pid: 0,
+            updated_at: 0,
+            request: BlockedResumeJournalRequest::from_request(&request),
+        };
+        write_blocked_resume_journal(&fixture.owner_dir, &journal)
+            .await
+            .expect("write the crashed server's journal");
+
+        let recovered = fixture
+            .handler
+            .reconcile_blocked_resume_journals()
+            .await
+            .expect("recovery tick succeeds");
+        assert_eq!(recovered, 1, "one pending journal is recovered");
+
+        assert_eq!(
+            blocked_resume_rows(&fixture.project, "agent.spawned", &intent),
+            1,
+            "recovery launches the interrupted resume exactly once"
+        );
+        let completed = read_blocked_resume_journal(&fixture.owner_dir)
+            .await
+            .expect("recovered journal remains readable");
+        assert_eq!(completed.phase, BLOCKED_RESUME_PHASE_LAUNCHED);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn blocked_resume_records_a_terminal_failure_when_the_launch_fails() {
+        let (fixture, request, intent) = blocked_resume_fixture().await;
+        let identity: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.owner_dir.join("identity.json")).expect("read fixture identity"),
+        )
+        .expect("fixture identity is JSON");
+        let worktree = PathBuf::from(identity["working_dir"].as_str().expect("worktree"));
+        let reset = std::process::Command::new("git")
+            .args(["reset", "--hard", "HEAD~1"])
+            .current_dir(&worktree)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .expect("rewind the owner branch");
+        assert!(reset.status.success(), "rewind the fixture owner branch");
+        let mut request = request;
+        request.expected_worktree_fingerprint = worktree_fingerprint(&worktree)
+            .await
+            .expect("fingerprint rewritten worktree");
+
+        let result = fixture
+            .handler
+            .resume_blocked_leaf(&request, &fixture.context)
+            .await;
+        assert!(
+            result.is_err(),
+            "a rewritten owner branch must refuse launch"
+        );
+
+        let transitions = ledger_rows(&fixture.project)
+            .into_iter()
+            .filter(|row| row["event_type"] == "agent.harness_switch")
+            .count();
+        assert_eq!(transitions, 1, "the transition row is retained");
+        let failure = wait_for_ledger_event(
+            &fixture.project,
+            "agent.spawn_failed",
+            |row| row["data"]["intent_id"].as_str() == Some(intent.as_str()),
+            "the refused launch to record a terminal failure",
+        )
+        .await;
+        assert_eq!(failure["data"]["operation"], "resume_blocked_leaf");
+        assert_eq!(
+            blocked_resume_rows(&fixture.project, "agent.spawned", &intent),
+            0,
+            "a failed launch records no spawn confirmation"
+        );
     }
 
     async fn run_configured_resume_pr(

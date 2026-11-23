@@ -12,6 +12,7 @@ import hashlib
 import importlib.util
 import json
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import quote
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 ORDERED_DIR = PROJECT_ROOT / "tests/e2e/ordered-recursive"
@@ -157,6 +159,67 @@ def resume_blocked_leaf(
     return ToolResult.from_raw(
         client.call_tool("tl", "root", "resume_blocked_leaf", args)
     )
+
+
+def send_tool_call_and_hold(
+    client: real.TransportClient,
+    *,
+    role: str,
+    name: str,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+) -> socket.socket:
+    """Send a tool-call request and keep the connection open for the caller.
+
+    The caller closes the socket to model the controller's timed-out client.
+    Keeping the request on the wire is what puts the disconnect in the middle of
+    the handler instead of before the server ever reads it.
+    """
+    path = f"/agents/{quote(role, safe='')}/{quote(name, safe='')}/tools/call"
+    body = json.dumps({"name": tool_name, "arguments": dict(arguments)}).encode()
+    request = (
+        f"POST {path} HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    ).encode() + body
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.settimeout(5)
+    connection.connect(str(client.socket_path))
+    connection.sendall(request)
+    return connection
+
+
+def ledger_resume_tool_called(
+    repo: Path, intent_id: str, *, success: bool | None = None
+) -> list[Mapping[str, Any]]:
+    rows: list[Mapping[str, Any]] = []
+    for row in real.server_ledger_events(repo):
+        data = row.get("data")
+        if row.get("type") != "tool.called" or not isinstance(data, Mapping):
+            continue
+        if data.get("dispatch_intent_id") != intent_id:
+            continue
+        if success is not None and data.get("success") is not success:
+            continue
+        rows.append(data)
+    return rows
+
+
+def ledger_blocked_resume_outcomes(
+    repo: Path, intent_id: str
+) -> list[Mapping[str, Any]]:
+    outcomes: list[Mapping[str, Any]] = []
+    for row in real.server_ledger_events(repo):
+        data = row.get("data")
+        if row.get("type") not in {"agent.spawned", "agent.spawn_failed"}:
+            continue
+        if not isinstance(data, Mapping) or data.get("intent_id") != intent_id:
+            continue
+        outcomes.append(data)
+    return outcomes
 
 
 def _ledger_helpers() -> Any:
@@ -601,6 +664,77 @@ def run_case(index: int) -> dict[str, Any]:
                 raise real.HarnessError(
                     "stale invocation resume unexpectedly succeeded"
                 )
+
+            # Criterion A/H: the production controller client times out and
+            # closes its UDS connection after the handler has recorded the
+            # durable route transition. The compiled server must still reach a
+            # launch (or a durable terminal failure) and record exactly one
+            # completion event for that request.
+            transitions_before = sum(
+                1
+                for row in real.server_ledger_events(repo)
+                if row.get("type") == "agent.harness_switch"
+            )
+            disconnected = send_tool_call_and_hold(
+                restarted,
+                role="tl",
+                name="root",
+                tool_name="resume_blocked_leaf",
+                arguments=resume_arguments(
+                    {
+                        "chainlink_issue_id": blocked_issue_id,
+                        "expected_invocation_id": initial["invocation_id"],
+                        "expected_branch": branch,
+                        "expected_worktree_fingerprint": fingerprint,
+                        "task": "The controller connection dropped during this resume; finish it.",
+                        "human_approved": True,
+                    },
+                    route,
+                ),
+            )
+            wait_until(
+                lambda: sum(
+                    1
+                    for row in real.server_ledger_events(repo)
+                    if row.get("type") == "agent.harness_switch"
+                )
+                > transitions_before,
+                "the disconnected request to record its route transition",
+                timeout=30,
+            )
+            disconnected.close()
+            disconnected_outcome = wait_until(
+                lambda: ledger_blocked_resume_outcomes(
+                    repo, route["dispatch_intent_id"]
+                ),
+                "the disconnected resume to reach a launch or terminal failure",
+                timeout=90,
+            )
+            if disconnected_outcome[0].get("intent_id") != route["dispatch_intent_id"]:
+                raise real.HarnessError(
+                    f"disconnected resume outcome lost its intent: {disconnected_outcome!r}"
+                )
+            completions = wait_until(
+                lambda: (
+                    ledger_resume_tool_called(
+                        repo, route["dispatch_intent_id"], success=True
+                    )
+                    if len(
+                        ledger_resume_tool_called(
+                            repo, route["dispatch_intent_id"], success=True
+                        )
+                    )
+                    == 1
+                    else None
+                ),
+                "the disconnected resume to record exactly one successful tool.called",
+                timeout=30,
+            )
+            if completions[0].get("cancelled") is not False:
+                raise real.HarnessError(
+                    "a completed tool call must not be marked cancelled"
+                )
+
             resumed = resume_blocked_leaf(
                 restarted,
                 resume_arguments(
@@ -869,6 +1003,8 @@ def run_case(index: int) -> dict[str, Any]:
                     "reviewer_model": reviewer_invocation.get("model"),
                     "reviewer_effort": reviewer_invocation.get("effort"),
                     "repeat_resume_adopted": repeated.success,
+                    "disconnected_resume_completed": bool(disconnected_outcome),
+                    "disconnected_completion_count": len(completions),
                     "pr_published_after_resume": published_after_resume,
                     "difficulty_scope": payload.get("scope_attribution"),
                 },
@@ -906,6 +1042,16 @@ def run_case(index: int) -> dict[str, Any]:
 
 
 def main() -> None:
+    if shutil.which("tmux") is None:
+        print(
+            json.dumps(
+                {
+                    "skipped": "tmux is not available; the compiled server acceptance needs a private tmux server"
+                },
+                sort_keys=True,
+            )
+        )
+        return
     evidence = [run_case(index) for index in range(1, 4)]
     print(json.dumps({"runs": evidence}, indent=2, sort_keys=True))
 

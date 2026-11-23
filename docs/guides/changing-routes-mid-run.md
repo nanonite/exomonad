@@ -536,6 +536,40 @@ complete route-provenance requirements, and the init-recovery fixture must emit
 this shape (`just check-e2e-init-recovery` rejects a seed that drops the nested
 `success`).
 
+## Cancellation and completion at a route transition
+
+A mid-run route change on a parked leaf is a mutating multi-step operation:
+record the configured transition, run the spawn preflight, launch the successor
+in the same worktree, then record the launch. The controller's HTTP client is
+not part of that transaction. `resume_blocked_leaf` therefore runs its durable
+work on a detached task, so a client disconnect (including the controller's own
+timeout) cannot cancel it after the route transition has been recorded.
+
+Progress is journaled at `.exo/agents/<owner>/blocked_resume_journal.json`
+before the transition and moves only forward:
+
+| Phase | Meaning |
+|-------|---------|
+| `pending` | the resume may own a route transition but has no outcome yet |
+| `launched` | the successor invocation and its `agent.spawned` row are durable |
+| `failed` | one `agent.spawn_failed` row names the intent, transition, and typed code |
+
+A failure after the transition is never silent: the handler writes the terminal
+row before returning the error. The server also re-drives pending journals on
+its first tick and every reconciliation tick, so a server killed mid-handler
+either adopts an already-launched successor (the same intent is idempotent and
+the live invocation is adopted rather than relaunched) or records the terminal
+failure. A durable `agent.harness_switch` row with neither a launch nor a
+terminal failure is therefore not a reachable state.
+
+Every tool request has one `tool.called` completion event, emitted from the
+detached execution task rather than the transport handler. It names
+`dispatch_intent_id` (top-level `dispatch_intent_id`, `intent_id`, or
+`role_route.dispatch_intent_id`) and is written for success, failure, and an
+aborted task (`success=false`, `cancelled=true`). Operators and the controller
+can therefore pair a resume request with its launch or its terminal refusal even
+when the response itself was lost.
+
 ## Reviewer
 
 The reviewer has its own route. A worker route change never selects a reviewer,
