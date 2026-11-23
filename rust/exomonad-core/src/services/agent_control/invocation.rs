@@ -956,8 +956,21 @@ fn verify_current_routing_owner(
 
 pub const ADOPTION_RECEIPT_FILENAME: &str = "adoption.json";
 
+/// One dispatch intent that adopted an already-launched successor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdoptionIntent {
+    pub intent_id: String,
+    pub adopted_at: u64,
+}
+
 /// Durable receipt for a response-loss adoption of an already-launched
 /// successor. It is generation-scoped and idempotent per invocation and intent.
+///
+/// The first adoption keeps the original flat fields, so a receipt written
+/// before additional intents existed reads unchanged (no migration). A later
+/// dispatch intent adopting the same successor is appended to
+/// `subsequent_intents` instead of replacing the first intent or failing the
+/// recovery.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdoptionReceipt {
     pub invocation_id: String,
@@ -965,6 +978,22 @@ pub struct AdoptionReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior_invocation_id: Option<String>,
     pub adopted_at: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subsequent_intents: Vec<AdoptionIntent>,
+}
+
+impl AdoptionReceipt {
+    /// Every intent that adopted this successor, in adoption order. The first
+    /// intent is reported from the original flat fields.
+    pub fn intents(&self) -> Vec<AdoptionIntent> {
+        let mut intents = Vec::with_capacity(1 + self.subsequent_intents.len());
+        intents.push(AdoptionIntent {
+            intent_id: self.intent_id.clone(),
+            adopted_at: self.adopted_at,
+        });
+        intents.extend(self.subsequent_intents.iter().cloned());
+        intents
+    }
 }
 
 fn adoption_receipt_path(agent_dir: &Path) -> std::path::PathBuf {
@@ -1003,19 +1032,42 @@ async fn read_adoption_receipt(agent_dir: &Path) -> Result<Option<AdoptionReceip
 /// acceptance) can observe before the adoption response is returned. Repeated
 /// adoption of the same invocation and intent is idempotent and keeps the first
 /// receipt, so a restart cannot move the receipt past the interruption window.
+/// A second dispatch intent adopting the same successor is appended to the
+/// existing receipt, because the receipt is host audit evidence and must never
+/// fail a recovery. A receipt owned by another invocation remains an error.
 pub async fn record_blocked_resume_adoption(
     agent_dir: &Path,
     invocation_id: &str,
     intent_id: &str,
 ) -> Result<AdoptionReceipt> {
     let _guard = mutation_lock().lock().await;
-    if let Some(existing) = read_adoption_receipt(agent_dir).await? {
-        if existing.invocation_id == invocation_id && existing.intent_id == intent_id {
+    if let Some(mut existing) = read_adoption_receipt(agent_dir).await? {
+        if existing.invocation_id != invocation_id {
+            return Err(anyhow::anyhow!(
+                "adoption receipt belongs to invocation {}; refusing adoption by invocation {invocation_id}",
+                existing.invocation_id
+            ));
+        }
+        if existing.intent_id == intent_id
+            || existing
+                .subsequent_intents
+                .iter()
+                .any(|intent| intent.intent_id == intent_id)
+        {
             return Ok(existing);
         }
-        return Err(anyhow::anyhow!(
-            "adoption receipt belongs to another invocation or dispatch intent"
-        ));
+        existing.subsequent_intents.push(AdoptionIntent {
+            intent_id: intent_id.to_string(),
+            adopted_at: unix_timestamp(),
+        });
+        let path = write_adoption_receipt(agent_dir, &existing).await?;
+        info!(
+            path = %path.display(),
+            invocation_id,
+            intent_id,
+            "Recorded an additional blocked-resume adoption intent"
+        );
+        return Ok(existing);
     }
     let record = read_locked(agent_dir)
         .await?
@@ -1030,10 +1082,27 @@ pub async fn record_blocked_resume_adoption(
         intent_id: intent_id.to_string(),
         prior_invocation_id: record.prior_invocation_id.clone(),
         adopted_at: unix_timestamp(),
+        subsequent_intents: Vec::new(),
     };
+    let path = write_adoption_receipt(agent_dir, &receipt).await?;
+    info!(
+        path = %path.display(),
+        invocation_id,
+        intent_id,
+        "Recorded blocked-resume adoption receipt"
+    );
+    Ok(receipt)
+}
+
+/// Replace the receipt through a temporary file and an atomic rename, so a
+/// crash can never leave a partially written audit record.
+async fn write_adoption_receipt(
+    agent_dir: &Path,
+    receipt: &AdoptionReceipt,
+) -> Result<std::path::PathBuf> {
     let path = adoption_receipt_path(agent_dir);
     let temporary = agent_dir.join(format!(".adoption-{}.tmp", Uuid::new_v4()));
-    let json = serde_json::to_vec_pretty(&receipt)?;
+    let json = serde_json::to_vec_pretty(receipt)?;
     if let Err(error) = tokio::fs::write(&temporary, json).await {
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(error).with_context(|| format!("failed to write {}", temporary.display()));
@@ -1042,13 +1111,7 @@ pub async fn record_blocked_resume_adoption(
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(error).with_context(|| format!("failed to replace {}", path.display()));
     }
-    info!(
-        path = %path.display(),
-        invocation_id,
-        intent_id,
-        "Recorded blocked-resume adoption receipt"
-    );
-    Ok(receipt)
+    Ok(path)
 }
 
 pub async fn read_invocation(agent_dir: &Path) -> Result<Option<InvocationRecord>> {
@@ -1929,6 +1992,9 @@ mod tests {
             receipt
         );
 
+        let bytes_before_repeat = tokio::fs::read(dir.path().join(ADOPTION_RECEIPT_FILENAME))
+            .await
+            .expect("read receipt bytes before the repeat");
         let repeated = record_blocked_resume_adoption(
             dir.path(),
             &record.invocation_id,
@@ -1937,16 +2003,12 @@ mod tests {
         .await
         .expect("repeat is idempotent");
         assert_eq!(repeated, receipt, "a repeat must keep the first receipt");
-
-        assert!(
-            record_blocked_resume_adoption(
-                dir.path(),
-                &record.invocation_id,
-                "blocked-resume:another-intent",
-            )
-            .await
-            .is_err(),
-            "a receipt cannot be reused for another dispatch intent"
+        assert_eq!(
+            tokio::fs::read(dir.path().join(ADOPTION_RECEIPT_FILENAME))
+                .await
+                .expect("read receipt bytes after the repeat"),
+            bytes_before_repeat,
+            "a repeat must not rewrite the receipt"
         );
 
         let successor = start_invocation(
@@ -1964,6 +2026,310 @@ mod tests {
             !dir.path().join(ADOPTION_RECEIPT_FILENAME).exists(),
             "a new generation retires the prior adoption receipt"
         );
+    }
+
+    async fn adoption_fixture(dir: &Path) -> InvocationRecord {
+        start_invocation(
+            dir,
+            AgentType::OpenCode,
+            InvocationTrigger::ResumeBlocked,
+            routing(),
+            None,
+            None,
+        )
+        .await
+        .expect("start invocation")
+    }
+
+    /// The receipt is host audit evidence, so a second dispatch intent adopting
+    /// the same successor must be recorded, not turned into a recovery failure.
+    #[tokio::test]
+    async fn adoption_receipt_accepts_a_second_dispatch_intent_for_the_same_successor() {
+        let dir = tempdir().expect("tempdir");
+        let record = adoption_fixture(dir.path()).await;
+        let path = dir.path().join(ADOPTION_RECEIPT_FILENAME);
+        let first_intent = "blocked-resume:first";
+        let second_intent = "blocked-resume:second";
+
+        let first = record_blocked_resume_adoption(dir.path(), &record.invocation_id, first_intent)
+            .await
+            .expect("record the first adoption receipt");
+        assert_eq!(first.intent_id, first_intent);
+        let first_bytes = tokio::fs::read(&path).await.expect("read first receipt");
+
+        let second = record_blocked_resume_adoption(
+            dir.path(),
+            &record.invocation_id,
+            second_intent,
+        )
+        .await
+        .expect("a second dispatch intent adopting the same successor must not fail the recovery");
+        assert_eq!(second.invocation_id, record.invocation_id);
+
+        let second_bytes = tokio::fs::read(&path)
+            .await
+            .expect("read receipt after the second intent");
+        assert_ne!(second_bytes, first_bytes, "the second intent is durable");
+        let second_text = String::from_utf8(second_bytes.clone()).expect("receipt is UTF-8");
+        let first_position = second_text
+            .find(first_intent)
+            .expect("the first intent stays recorded");
+        let second_position = second_text
+            .find(second_intent)
+            .expect("the second intent is recorded");
+        assert!(
+            first_position < second_position,
+            "intents stay in adoption order"
+        );
+
+        let repeated =
+            record_blocked_resume_adoption(dir.path(), &record.invocation_id, second_intent)
+                .await
+                .expect("recording the second intent again is idempotent");
+        assert_eq!(repeated, second);
+        assert_eq!(
+            tokio::fs::read(&path)
+                .await
+                .expect("reread receipt after the repeat"),
+            second_bytes,
+            "recording the second intent again must not rewrite the receipt"
+        );
+    }
+
+    #[tokio::test]
+    async fn adoption_receipt_exposes_every_intent_in_order_and_preserves_the_first() {
+        let dir = tempdir().expect("tempdir");
+        let record = adoption_fixture(dir.path()).await;
+        let path = dir.path().join(ADOPTION_RECEIPT_FILENAME);
+        let first_intent = "blocked-resume:alpha";
+        let second_intent = "blocked-resume:beta";
+
+        let first = record_blocked_resume_adoption(dir.path(), &record.invocation_id, first_intent)
+            .await
+            .expect("record the first adoption receipt");
+        let first_bytes = tokio::fs::read_to_string(&path)
+            .await
+            .expect("read the first receipt text");
+
+        let second =
+            record_blocked_resume_adoption(dir.path(), &record.invocation_id, second_intent)
+                .await
+                .expect("record the second adoption intent");
+
+        let updated = tokio::fs::read_to_string(&path)
+            .await
+            .expect("read the updated receipt text");
+        let first_without_close = first_bytes
+            .trim_end_matches('\n')
+            .strip_suffix('}')
+            .expect("a receipt is a JSON object");
+        let preserved = first_without_close.trim_end_matches('\n');
+        assert!(
+            updated.starts_with(preserved),
+            "the first receipt's fields keep their exact bytes"
+        );
+        assert!(
+            updated[preserved.len()..].starts_with(','),
+            "the second intent is appended after the preserved fields"
+        );
+
+        let reloaded = read_adoption_receipt(dir.path())
+            .await
+            .expect("read the receipt")
+            .expect("the receipt exists");
+        assert_eq!(reloaded.invocation_id, record.invocation_id);
+        assert_eq!(reloaded.intent_id, first_intent);
+        assert_eq!(reloaded.adopted_at, first.adopted_at);
+        assert_eq!(reloaded.prior_invocation_id, first.prior_invocation_id);
+        assert_eq!(reloaded.subsequent_intents.len(), 1);
+        assert_eq!(reloaded.subsequent_intents[0].intent_id, second_intent);
+        assert!(
+            reloaded.subsequent_intents[0].adopted_at >= first.adopted_at,
+            "the second intent has its own adopted_at"
+        );
+        assert_eq!(
+            reloaded.intents(),
+            vec![
+                AdoptionIntent {
+                    intent_id: first_intent.to_string(),
+                    adopted_at: first.adopted_at,
+                },
+                reloaded.subsequent_intents[0].clone(),
+            ],
+            "reading the receipt exposes both intents in adoption order"
+        );
+        assert_eq!(
+            second.intents(),
+            reloaded.intents(),
+            "recording returns the full durable receipt"
+        );
+
+        let second_bytes = tokio::fs::read(&path)
+            .await
+            .expect("read receipt bytes after the second intent");
+        assert!(
+            record_blocked_resume_adoption(dir.path(), &record.invocation_id, second_intent)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            tokio::fs::read(&path)
+                .await
+                .expect("reread receipt bytes after the repeat"),
+            second_bytes,
+            "recording the second intent again is idempotent"
+        );
+    }
+
+    #[tokio::test]
+    async fn adoption_receipt_refuses_a_different_invocation_and_keeps_the_file() {
+        let dir = tempdir().expect("tempdir");
+        let record = adoption_fixture(dir.path()).await;
+        let path = dir.path().join(ADOPTION_RECEIPT_FILENAME);
+        record_blocked_resume_adoption(dir.path(), &record.invocation_id, "blocked-resume:first")
+            .await
+            .expect("record the first adoption receipt");
+        let before = tokio::fs::read(&path).await.expect("read the receipt");
+
+        let error = record_blocked_resume_adoption(
+            dir.path(),
+            "another-invocation",
+            "blocked-resume:first",
+        )
+        .await
+        .expect_err("a receipt owned by another invocation is an ownership conflict");
+        let message = error.to_string();
+        assert!(
+            message.contains(&record.invocation_id),
+            "the conflict names the owning invocation: {message}"
+        );
+        assert!(
+            message.contains("another-invocation"),
+            "the conflict names the refused invocation: {message}"
+        );
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("reread the receipt"),
+            before,
+            "a refused adoption leaves the receipt file unchanged"
+        );
+    }
+
+    /// A receipt written before the additional-intents list existed is still a
+    /// single-intent receipt; reading it neither migrates nor rewrites it.
+    #[tokio::test]
+    async fn adoption_receipt_reads_the_old_single_intent_schema_without_rewriting() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join(ADOPTION_RECEIPT_FILENAME);
+        let legacy = serde_json::json!({
+            "invocation_id": "legacy-invocation",
+            "intent_id": "blocked-resume:legacy",
+            "prior_invocation_id": "legacy-prior",
+            "adopted_at": 1_791_330_600u64,
+        });
+        let legacy_bytes = serde_json::to_vec_pretty(&legacy).expect("serialize legacy receipt");
+        tokio::fs::write(&path, &legacy_bytes)
+            .await
+            .expect("write legacy receipt");
+
+        let receipt = read_adoption_receipt(dir.path())
+            .await
+            .expect("read the legacy receipt")
+            .expect("the legacy receipt exists");
+        assert_eq!(receipt.invocation_id, "legacy-invocation");
+        assert_eq!(receipt.intent_id, "blocked-resume:legacy");
+        assert_eq!(receipt.prior_invocation_id.as_deref(), Some("legacy-prior"));
+        assert_eq!(receipt.adopted_at, 1_791_330_600);
+        assert!(
+            receipt.subsequent_intents.is_empty(),
+            "a legacy receipt has exactly one intent"
+        );
+        assert_eq!(receipt.intents().len(), 1);
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("reread legacy receipt"),
+            legacy_bytes,
+            "reading a legacy receipt must not rewrite it"
+        );
+    }
+
+    /// The compiled `init-recovery` acceptance parses the top-level receipt
+    /// fields directly. A first adoption still writes exactly that shape; the
+    /// additional-intents list appears only once a second intent adopts.
+    #[tokio::test]
+    async fn adoption_receipt_first_record_keeps_the_compiled_acceptance_schema() {
+        let dir = tempdir().expect("tempdir");
+        let prior = start_invocation(
+            dir.path(),
+            AgentType::Codex,
+            InvocationTrigger::Spawn,
+            routing(),
+            None,
+            None,
+        )
+        .await
+        .expect("prior invocation");
+        finish_invocation(
+            dir.path(),
+            &prior.invocation_id,
+            InvocationStatus::Killed,
+            Some(137),
+        )
+        .await
+        .expect("finish prior invocation");
+        let lineage = RecoveryInvocationLineage {
+            prior_invocation_id: prior.invocation_id.clone(),
+            invocation_generation: 2,
+            recovery_round: 2,
+            authorization_source: RecoveryAuthorization::HumanApproved,
+        };
+        let record = start_invocation_with_provenance_and_context(
+            dir.path(),
+            AgentType::OpenCode,
+            InvocationTrigger::ResumeBlocked,
+            routing(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(lineage),
+        )
+        .await
+        .expect("successor invocation");
+
+        let receipt = record_blocked_resume_adoption(
+            dir.path(),
+            &record.invocation_id,
+            "blocked-resume:acceptance",
+        )
+        .await
+        .expect("record adoption receipt");
+        let value: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(dir.path().join(ADOPTION_RECEIPT_FILENAME))
+                .await
+                .expect("receipt bytes"),
+        )
+        .expect("receipt is JSON");
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .expect("receipt is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "adopted_at",
+                "intent_id",
+                "invocation_id",
+                "prior_invocation_id"
+            ],
+            "a first adoption keeps the schema the compiled acceptance parses"
+        );
+        assert_eq!(value["invocation_id"], record.invocation_id);
+        assert_eq!(value["intent_id"], "blocked-resume:acceptance");
+        assert_eq!(value["prior_invocation_id"], prior.invocation_id);
+        assert_eq!(value["adopted_at"], receipt.adopted_at);
     }
 
     #[tokio::test]

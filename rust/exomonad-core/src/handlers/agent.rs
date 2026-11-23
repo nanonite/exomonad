@@ -4556,17 +4556,8 @@ impl<
                 req.expected_branch.as_str(),
             )?;
         }
-        crate::services::agent_control::invocation::record_blocked_resume_adoption(
-            owner_dir,
-            &invocation.invocation_id,
-            intent_id,
-        )
-        .await
-        .map_err(|error| {
-            EffectError::invalid_input(format!(
-                "blocked resume adoption receipt could not be recorded: {error}"
-            ))
-        })?;
+        record_blocked_resume_adoption_receipt(owner_dir, &invocation.invocation_id, intent_id)
+            .await?;
         // The compiled interruption acceptance stops the real server after the
         // already-launched successor is durably adopted, but before the
         // controller observes the adoption response.
@@ -4791,6 +4782,31 @@ fn record_blocked_resume_launch(
         )
     })?;
     Ok(())
+}
+
+/// Persist the response-loss adoption receipt for an already-launched successor.
+///
+/// The write must be durable before the adoption response, so a genuine write
+/// failure still fails the resume. A second dispatch intent adopting the same
+/// successor is recorded inside the receipt instead of becoming an
+/// `invalid_input` refusal, because the receipt is host audit evidence only.
+async fn record_blocked_resume_adoption_receipt(
+    owner_dir: &Path,
+    invocation_id: &str,
+    intent_id: &str,
+) -> EffectResult<()> {
+    crate::services::agent_control::invocation::record_blocked_resume_adoption(
+        owner_dir,
+        invocation_id,
+        intent_id,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| {
+        EffectError::invalid_input(format!(
+            "blocked resume adoption receipt could not be recorded: {error}"
+        ))
+    })
 }
 
 fn validate_blocked_resume_request(req: &SpawnLeafSubtreeRequest) -> EffectResult<()> {
@@ -8529,6 +8545,59 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("intent is host-owned"));
+    }
+
+    /// The adoption receipt is host audit evidence. When a later dispatch intent
+    /// adopts the same already-launched successor, the handler's adoption
+    /// receipt step must succeed instead of mapping the receipt to
+    /// `invalid_input`, while a receipt owned by another invocation stays a
+    /// conflict.
+    #[tokio::test]
+    async fn blocked_resume_adoption_accepts_a_second_dispatch_intent() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let agent_dir = temp.path().join("owner");
+        tokio::fs::create_dir_all(&agent_dir)
+            .await
+            .expect("agent dir");
+        let record = crate::services::agent_control::start_invocation(
+            &agent_dir,
+            ServiceAgentType::OpenCode,
+            InvocationTrigger::ResumeBlocked,
+            RoutingInfo::window(
+                crate::services::tmux_ipc::WindowId::parse("@42").expect("window id"),
+            ),
+            None,
+            None,
+        )
+        .await
+        .expect("start invocation");
+
+        record_blocked_resume_adoption_receipt(
+            &agent_dir,
+            &record.invocation_id,
+            "blocked-resume:first",
+        )
+        .await
+        .expect("the first adoption receipt is recorded");
+        record_blocked_resume_adoption_receipt(
+            &agent_dir,
+            &record.invocation_id,
+            "blocked-resume:second",
+        )
+        .await
+        .expect("a second intent adopting the same successor must not become invalid_input");
+
+        let conflict = record_blocked_resume_adoption_receipt(
+            &agent_dir,
+            "another-invocation",
+            "blocked-resume:second",
+        )
+        .await
+        .expect_err("a receipt owned by another invocation remains a conflict");
+        assert!(
+            conflict.to_string().contains(&record.invocation_id),
+            "the conflict still names the owning invocation: {conflict}"
+        );
     }
 
     #[test]

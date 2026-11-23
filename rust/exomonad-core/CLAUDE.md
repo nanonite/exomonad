@@ -604,7 +604,12 @@ adoption path therefore records one durable, idempotent
 `prior_invocation_id`, `adopted_at`) before the boundary, so a restart and the
 compiled acceptance can prove adoption crossed durably before the response. A
 repeat adoption of the same invocation and intent keeps the first receipt, and
-a new invocation generation retires it. The compiled acceptance additionally
+a new invocation generation retires it. A different dispatch intent adopting
+the same successor is not an error: it is appended to the receipt's
+`subsequent_intents` list with its own `adopted_at`, so the first intent's flat
+fields and bytes are preserved and every intent stays readable in adoption
+order. A receipt owned by another `invocation_id` remains an ownership
+conflict. The compiled acceptance additionally
 requires exactly one launch row older than the marker and an `intended`
 controller journal action with no result, which proves the response was not yet
 returned.

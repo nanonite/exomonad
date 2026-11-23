@@ -332,7 +332,11 @@ adoption durable and assertable, the host writes
 `.exo/agents/<owner>/adoption.json` with the invocation id, dispatch intent id,
 prior invocation id and `adopted_at` immediately before the boundary. It is
 idempotent for that invocation and intent, keeps the first receipt, and is
-retired when a new invocation generation starts. The acceptance asserts that
+retired when a new invocation generation starts. The receipt is host audit
+evidence only, so a second dispatch intent adopting the same successor is
+recorded in a `subsequent_intents` list with its own `adopted_at` instead of
+failing the recovery; the first intent's flat fields are never rewritten, and a
+receipt owned by another invocation remains an error. The acceptance asserts that
 this receipt and exactly one launch row are older than the marker and that the
 controller's journaled resume action is still `intended` with no result, so the
 response cannot already have been returned.
