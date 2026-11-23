@@ -11,8 +11,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -253,11 +254,22 @@ def main() -> None:
             ("wrong-scope-manifest", wrong_scope, harness.proof),
             ("wrong-predecessor", wrong_predecessor, harness.proof),
             ("unaccepted-current-identity", lambda: lambda: None, lambda: harness.proof(unsupported)),
-            ("genuine-model-change", lambda: lambda: None, lambda: harness.proof(changed_route)),
-            ("genuine-effort-change", lambda: lambda: None, lambda: harness.proof(changed_effort)),
             ("unknown-prior-effect", lambda: harness.mutate_journal("unknown"), harness.proof),
             ("live-worker", lambda: harness.mutate_invocation("running"), harness.proof),
         ]
+    )
+
+    def pending_gate() -> Callable[[], None]:
+        gate_name = "tl-terminal-owner-recovery-issue-814-substitution-model-kani"
+        harness.child_store.set_gate(gate_name, GateStatus.PENDING)
+
+        def restore() -> None:
+            harness.child_store.set_gate(gate_name, GateStatus.APPROVED)
+
+        return restore
+
+    cases.append(
+        ("route-change-with-pending-gate", pending_gate, lambda: harness.proof(changed_route))
     )
 
     for name, mutate, run in cases:
@@ -269,6 +281,17 @@ def main() -> None:
         if held is not None:
             raise SystemExit(f"{name} was not held: the proof still accepted the state")
         results.append({"case": name, "held": True, "reason": held_reason})
+
+    # A proven prelaunch refusal is the supported continue path for model,
+    # harness, runtime and effort changes. These are accepted, not held.
+    for name, config in (
+        ("genuine-model-change", changed_route),
+        ("genuine-effort-change", changed_effort),
+    ):
+        accepted, accepted_reason = harness.proof(config)
+        if accepted is None:
+            raise SystemExit(f"{name} was held: {accepted_reason}")
+        results.append({"case": name, "held": False, "reason": accepted_reason})
 
     gate_name = "tl-terminal-owner-recovery-issue-814-substitution-model-kani"
     harness.child_store.answer_gate(gate_name, GateStatus.REJECTED)

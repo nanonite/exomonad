@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- Recognise the host's "role route dispatch authorization is missing or ambiguous" refusal as a proven prelaunch refusal through one closed error set shared by the controller and the host (cross-language test), so `init --continue` releases a blocked leaf held behind it; a model, harness or effort change after such a refusal now resumes under a fresh linked authorization (saved proof kept as history, approved gate required), and a held resume names the journal entry (index, status, error, fingerprint).
 - Normalize OpenCode v2 hook payloads (`args`/`output`/`call_id`, event name, tool ids such as `shell`, `exomonad_<tool>`) before they reach the server, and let the generated plugin honour a deny that exits 2, so role guardrails are enforced for OpenCode agents instead of failing open.
 - Rewrite the generated OpenCode plugin for the v2 `{ id, setup }` API so it loads on OpenCode v2.3.2 and `exomonad hook pre-tool-use`/`post-tool-use`/`stop`/`worker-exit` fire again, with deny and argument mutation proven against the real CLI; OpenCode 1.14 plugin loading is no longer emitted.
 - Launch task-less OpenCode companions with a per-version interactive form: v2.0.22 keeps top-level `--model`/`--agent`, v2.3.2 uses `opencode mini`, and `init` fails closed before creating a session for a version with no known form.

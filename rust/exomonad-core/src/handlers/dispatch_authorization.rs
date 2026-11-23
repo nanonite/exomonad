@@ -149,6 +149,26 @@ pub(crate) struct DispatchPrelaunchRefusal<'a> {
 pub(crate) const ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED: &str =
     "Invalid input: role route configuration is stale or was not accepted by this server";
 
+/// A durable authorization with no matching declaration, also refused before launch.
+pub(crate) const ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS: &str =
+    "Invalid input: role route dispatch authorization is missing or ambiguous";
+
+/// The one shared set of host refusals that prove no launch occurred.
+///
+/// Contract: see `docs/dispatch-prelaunch-refusal-contract.md` and the matching
+/// `PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS` constant in `tl_loop/loop/driver.py`.
+/// The set is closed: an unrelated host error, or the right error string on a
+/// successful/launched/contradictory row, is never proof.
+pub(crate) const PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS: [&str; 2] = [
+    ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+    ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS,
+];
+
+/// Whether `error` is one of the shared prelaunch role-route refusals.
+pub(crate) fn is_prelaunch_role_route_refusal_error(error: &str) -> bool {
+    PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS.contains(&error)
+}
+
 /// Durable owner evidence that bounds which declaration could have launched.
 pub(crate) struct DispatchNoEffectProof<'a> {
     pub expected_invocation_id: &'a str,
@@ -1297,7 +1317,10 @@ fn verify_refusal_envelope(
     }
     if data.get("tool_name").and_then(Value::as_str) != Some("resume_blocked_leaf")
         || data.get("success") != Some(&Value::Bool(false))
-        || data.get("error").and_then(Value::as_str) != Some(ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED)
+        || !data
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(is_prelaunch_role_route_refusal_error)
         || data.get("result").is_some_and(|result| !result.is_null())
     {
         return Err(EffectError::invalid_input(format!(
@@ -1861,6 +1884,196 @@ mod tests {
         )
         .err()
         .expect("a successful request is not a refusal")
+        .to_string();
+        assert!(
+            error.contains("not the exact permitted prelaunch configuration refusal"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn prelaunch_refusal_error_set_is_shared_and_closed() {
+        assert!(is_prelaunch_role_route_refusal_error(
+            ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED
+        ));
+        assert!(is_prelaunch_role_route_refusal_error(
+            ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS
+        ));
+        assert_eq!(PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS.len(), 2);
+        assert!(!is_prelaunch_role_route_refusal_error(
+            "Invalid input: top-level model conflicts with the accepted role route"
+        ));
+        assert!(!is_prelaunch_role_route_refusal_error(""));
+    }
+
+    #[test]
+    fn ambiguity_refusal_releases_a_proven_no_effect_predecessor() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let mut old_refusal = refusal_data(&old);
+        old_refusal["error"] = json!(ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS);
+        let (old_row, new_row) = old_and_new(&old, &new);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let resolution = resolve(
+            &[old_row, new_row],
+            &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &approved_answers(),
+            expected(),
+            Some(&proof),
+        )
+        .expect("the ambiguity refusal also proves no launch occurred");
+        assert_eq!(resolution.selected_run_seq, Some(188_878));
+        assert_eq!(resolution.superseded_run_seqs, vec![188_678]);
+        assert_eq!(resolution.superseded_refusal_run_seqs, vec![188_693]);
+    }
+
+    #[test]
+    fn ambiguity_refusal_with_a_result_payload_is_refused() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let mut old_refusal = refusal_data(&old);
+        old_refusal["error"] = json!(ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS);
+        old_refusal["result"] = json!({"invocation": {"invocation_id": "launched"}});
+        let (old_row, new_row) = old_and_new(&old, &new);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let error = resolve(
+            &[old_row, new_row],
+            &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &approved_answers(),
+            expected(),
+            Some(&proof),
+        )
+        .err()
+        .expect("a refusal carrying a result cannot prove no launch")
+        .to_string();
+        assert!(
+            error.contains("not the exact permitted prelaunch configuration refusal"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn live_redacted_journal_refusal_releases_through_the_compiled_host() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../tests/e2e/init-recovery/fixtures/live-issue-814-ambiguity-journal.json"
+        ))
+        .expect("the committed live journal fixture is valid JSON");
+        let entries = fixture["entries"]
+            .as_array()
+            .expect("the fixture carries journal entries");
+        let ambiguity = entries
+            .iter()
+            .find(|entry| entry["index"] == 36)
+            .expect("the live ambiguity entry is retained");
+        assert_eq!(
+            ambiguity["error"].as_str(),
+            Some(ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS)
+        );
+        let recorded = &ambiguity["arguments"];
+        assert_eq!(
+            recorded["route_configuration_fingerprint"].as_str(),
+            Some(NEW_CONFIG)
+        );
+        assert_eq!(recorded["route_fingerprint"].as_str(), Some(NEW_ROUTE));
+        assert_eq!(recorded["dispatch_intent_id"].as_str(), Some(INTENT));
+        let role_route = json!({
+            "dispatch_intent_id": recorded["dispatch_intent_id"],
+            "scope_id": SLICE,
+            "role": recorded["configured_role"],
+            "harness": recorded["desired_harness"],
+            "agent_type": recorded["desired_agent_type"],
+            "model": recorded["desired_model"],
+            "effort": recorded["desired_effort"],
+            "configuration_fingerprint": recorded["route_configuration_fingerprint"],
+            "policy_fingerprint": recorded["route_policy_fingerprint"],
+            "manifest_digest": recorded["route_manifest_digest"],
+            "route_fingerprint": recorded["route_fingerprint"],
+        });
+        let refusal = json!({
+            "tool_name": "resume_blocked_leaf",
+            "arguments": {
+                "chainlink_issue_id": 814,
+                "expected_invocation_id": recorded["expected_invocation_id"],
+                "expected_branch": recorded["expected_branch"],
+                "expected_worktree_fingerprint": recorded["expected_worktree_fingerprint"],
+                "task": "resume the blocked leaf",
+                "human_approved": true,
+                "role_route": role_route,
+            },
+            "success": false,
+            "error": ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS,
+        });
+        let branch = recorded["expected_branch"].as_str().unwrap();
+        let fingerprint = recorded["expected_worktree_fingerprint"].as_str().unwrap();
+        let old = declaration(188_678, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 2.0);
+        let expected = ExpectedDispatchAuthorization {
+            intent_id: INTENT,
+            caller: CALLER,
+            scope_id: SLICE,
+            role: "worker",
+            harness: "opencode/opencode-go/deepseek-v4.1-flash",
+            agent_type: "opencode",
+            model: Some("opencode-go/deepseek-v4.1-flash"),
+            effort: Some("high"),
+            configuration_fingerprint: OLD_CONFIG,
+            policy_fingerprint: Some(POLICY),
+            manifest_digest: Some(MANIFEST),
+            route_fingerprint: OLD_ROUTE,
+        };
+        let owner = predecessor();
+        let proof = DispatchNoEffectProof {
+            expected_invocation_id: PREDECESSOR,
+            expected_issue_id: 814,
+            expected_branch: branch,
+            expected_worktree_fingerprint: fingerprint,
+            invocation: &owner,
+        };
+        let resolution = resolve(
+            &[
+                row(&old, CALLER, Some(188_678)),
+                row(&new, CALLER, Some(188_878)),
+            ],
+            &[],
+            &[DispatchPrelaunchRefusal {
+                run_seq: Some(188_693),
+                caller: Some(CALLER),
+                data: &refusal,
+            }],
+            &approved_answers(),
+            expected,
+            Some(&proof),
+        )
+        .expect("the recorded ambiguity refusal proves the #36 route never launched");
+        assert_eq!(resolution.selected_run_seq, Some(188_878));
+        assert_eq!(resolution.superseded_run_seqs, vec![188_678]);
+        assert_eq!(resolution.superseded_refusal_run_seqs, vec![188_693]);
+    }
+
+    #[test]
+    fn ambiguity_refusal_with_a_successful_envelope_is_refused() {
+        let old = declaration(188_678, INTENT, CALLER, SLICE, OLD_CONFIG, OLD_ROUTE, 1.0);
+        let new = declaration(188_878, INTENT, CALLER, SLICE, NEW_CONFIG, NEW_ROUTE, 2.0);
+        let mut old_refusal = refusal_data(&old);
+        old_refusal["error"] = json!(ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS);
+        old_refusal["success"] = json!(true);
+        let (old_row, new_row) = old_and_new(&old, &new);
+        let owner = predecessor();
+        let proof = no_effect(&owner);
+        let error = resolve(
+            &[old_row, new_row],
+            &[],
+            &[refusal_row(&old_refusal, 188_693, CALLER)],
+            &approved_answers(),
+            expected(),
+            Some(&proof),
+        )
+        .err()
+        .expect("a successful request is not a prelaunch refusal")
         .to_string();
         assert!(
             error.contains("not the exact permitted prelaunch configuration refusal"),

@@ -6339,7 +6339,7 @@ def _terminal_resume_history_proof(
         if (
             status in {"not_dispatched"}
             or _is_legacy_missing_role_route_refusal(entry)
-            or _is_prelaunch_role_configuration_refusal(entry)
+            or _is_proven_prelaunch_role_route_refusal(entry)
         ):
             continue
         if status in {"intended", "unknown"}:
@@ -6855,6 +6855,18 @@ def _blocked_leaf_resume_proof(
     return proof, None
 
 
+def _resume_entry_diagnostic(entry: Mapping[str, object], index: int) -> str:
+    """Name one resume journal entry without leaking credentials or task text."""
+    arguments = entry.get("arguments")
+    route = arguments if isinstance(arguments, Mapping) else {}
+    return (
+        f"entry {index} status={entry.get('status')!r} "
+        f"error={entry.get('error')!r} "
+        f"route_configuration_fingerprint={route.get('route_configuration_fingerprint')!r} "
+        f"dispatch_intent_id={route.get('dispatch_intent_id')!r}"
+    )
+
+
 def _resolve_blocked_leaf_owner(
     state: RunState,
     config: TLLoopConfig,
@@ -6864,6 +6876,7 @@ def _resolve_blocked_leaf_owner(
     *,
     allow_terminal_route_refusal: bool = False,
     resume_entries: Sequence[Mapping[str, object]] | None = None,
+    resume_entry_offset: int = 0,
     allow_terminal_resume_history: bool = False,
 ) -> _BlockedLeafResumeProof:
     if config.project_root is None:
@@ -6876,19 +6889,33 @@ def _resolve_blocked_leaf_owner(
             "resume_blocked_leaf", leaf.name
         )
     )
+    last_entry_index = resume_entry_offset
     if len(entries) > 1:
+        last_entry_index = resume_entry_offset + len(entries) - 1
+        if not allow_terminal_route_refusal:
+            raise BlockedLeafOwnerError(
+                "multiple blocked-leaf resume actions require reconciliation: "
+                + "; ".join(
+                    _resume_entry_diagnostic(entry, resume_entry_offset + index)
+                    for index, entry in enumerate(entries)
+                )
+            )
         allowed_prior_statuses = (
             {"confirmed", "not_dispatched"} if allow_terminal_resume_history else {"not_dispatched"}
         )
-        prior_entries_are_safe = allow_terminal_route_refusal and all(
-            entry.get("status") in allowed_prior_statuses
-            or _is_legacy_missing_role_route_refusal(entry)
-            or _is_prelaunch_role_configuration_refusal(entry)
-            for entry in entries[:-1]
-        )
-        if not prior_entries_are_safe:
+        unsafe_prior_entries = [
+            _resume_entry_diagnostic(entry, resume_entry_offset + index)
+            for index, entry in enumerate(entries[:-1])
+            if not (
+                entry.get("status") in allowed_prior_statuses
+                or _is_legacy_missing_role_route_refusal(entry)
+                or _is_proven_prelaunch_role_route_refusal(entry)
+            )
+        ]
+        if unsafe_prior_entries:
             raise BlockedLeafOwnerError(
-                "multiple blocked-leaf resume actions require reconciliation"
+                "multiple blocked-leaf resume actions require reconciliation: "
+                + "; ".join(unsafe_prior_entries)
             )
         entries = (entries[-1],)
     if entries:
@@ -6912,10 +6939,13 @@ def _resolve_blocked_leaf_owner(
             allow_terminal_route_refusal
             and (
                 _is_legacy_missing_role_route_refusal(entry)
-                or _is_prelaunch_role_configuration_refusal(entry)
+                or _is_proven_prelaunch_role_route_refusal(entry)
             )
         ):
-            raise BlockedLeafOwnerError("the exact blocked-leaf resume request was rejected")
+            raise BlockedLeafOwnerError(
+                "the exact blocked-leaf resume request was rejected: "
+                + _resume_entry_diagnostic(entry, last_entry_index)
+            )
         if entry.get("status") in {"intended", "unknown"} and not isinstance(
             args.get("route_fingerprint"), str
         ):
@@ -7159,6 +7189,9 @@ def _terminal_owner_recovery_proof(
             current,
             allow_terminal_route_refusal=True,
             resume_entries=uncheckpointed_entries,
+            resume_entry_offset=(
+                checkpointed_index + 1 if checkpointed_index is not None else 0
+            ),
             allow_terminal_resume_history=True,
         )
     except BlockedLeafOwnerError as error:
@@ -7491,6 +7524,7 @@ def _terminal_owner_recovery_proof(
         and not _terminal_route_authorization_supersedes(saved_authorization, route_authorization)
     ):
         replayed = False
+        routed_forward = False
         if _unresolved_historical_resume_effect(
             history_latest_entry, resume_history, config
         ):
@@ -7498,21 +7532,61 @@ def _terminal_owner_recovery_proof(
                 None,
                 "an unresolved terminal-owner resume effect prevents another launch",
             )
-        reconciled = _terminal_route_authorization_historical_reconciliation(
+        # Repeating `init --continue` after the fresh linked proof was written
+        # reuses that exact proof instead of relinking it.
+        replayed = _prelaunch_refusal_route_reauthorization_replay_matches(
+            saved_authorization, route_authorization
+        )
+        if not replayed and _prelaunch_refusal_route_change_is_authorized(
             saved_authorization,
             route_authorization,
+            latest_resume_entry,
+            gate_name,
+            gate_authorization,
+            recovery_gate,
             config,
             manifest_digest,
-        )
-        if reconciled is None:
-            replayed = _terminal_route_authorization_reconciliation_replay_matches(
-                saved_authorization,
+        ):
+            # A host refusal proved the saved route never launched. The
+            # operator may retry the same logical owner under the newly
+            # accepted route; the saved proof stays immutable history and the
+            # fresh proof is linked over it.
+            assert isinstance(saved_authorization, Mapping)
+            refreshed = _prelaunch_refusal_route_reauthorization_record(
                 route_authorization,
-                evidence,
+                cast(str, saved_authorization["digest"]),
                 config,
                 manifest_digest,
             )
-        if reconciled is not None:
+            if refreshed is not None:
+                historical_route_authorization_digest = cast(
+                    str, saved_authorization["digest"]
+                )
+                route_authorization = refreshed
+                route_digest = cast(str, refreshed["digest"])
+                route_authorization_supersedes_digest = cast(
+                    str, refreshed["supersedes_route_authorization_digest"]
+                )
+                routed_forward = True
+        reconciled = None
+        if not replayed and not routed_forward:
+            reconciled = _terminal_route_authorization_historical_reconciliation(
+                saved_authorization,
+                route_authorization,
+                config,
+                manifest_digest,
+            )
+            if reconciled is None:
+                replayed = _terminal_route_authorization_reconciliation_replay_matches(
+                    saved_authorization,
+                    route_authorization,
+                    evidence,
+                    config,
+                    manifest_digest,
+                )
+        if routed_forward:
+            pass
+        elif reconciled is not None:
             # The saved proof keeps its own identity scheme and stays immutable
             # history; the next effect is authorized by a fresh proof bound to
             # the current accepted snapshot and linked over the old one.
@@ -7638,7 +7712,7 @@ def _terminal_owner_recovery_proof(
                 latest_resume_entry is not None
                 and (
                     _is_legacy_missing_role_route_refusal(latest_resume_entry)
-                    or _is_prelaunch_role_configuration_refusal(latest_resume_entry)
+                    or _is_proven_prelaunch_role_route_refusal(latest_resume_entry)
                 )
                 and isinstance(gate_authorization, Mapping)
                 and gate_authorization.get("gate_name") == gate_name
@@ -7658,6 +7732,11 @@ def _terminal_owner_recovery_proof(
                     "model",
                     "role",
                     "effort",
+                    "desired_harness",
+                    "desired_agent_type",
+                    "desired_model",
+                    "desired_effort",
+                    "configured_role",
                     "route_configuration_fingerprint",
                     "route_policy_fingerprint",
                     "route_manifest_digest",
@@ -7701,10 +7780,46 @@ def _terminal_owner_recovery_proof(
                     manifest_digest,
                 )
             )
+            prelaunch_refusal_retry = (
+                latest_resume_entry is not None
+                and _is_proven_prelaunch_role_route_refusal(latest_resume_entry)
+                and _current_recovery_gate_is_approved(
+                    gate_name, gate_authorization, recovery_gate
+                )
+                and (
+                    saved_authorization == route_authorization
+                    or _fresh_terminal_gate_reauthorization(
+                        saved_authorization, route_authorization
+                    )
+                    or _prelaunch_refusal_route_reauthorization_matches(
+                        saved_authorization, route_authorization
+                    )
+                )
+                and set(conflicts)
+                <= {
+                    "route_authorization_digest",
+                    "recovery_gate_authorization",
+                    "harness",
+                    "agent_type",
+                    "model",
+                    "role",
+                    "effort",
+                    "desired_harness",
+                    "desired_agent_type",
+                    "desired_model",
+                    "desired_effort",
+                    "configured_role",
+                    "route_configuration_fingerprint",
+                    "route_policy_fingerprint",
+                    "route_manifest_digest",
+                    "route_fingerprint",
+                }
+            )
             if (
                 not fresh_not_dispatched_retry
                 and not fresh_legacy_refusal_retry
                 and not fresh_configuration_identity_retry
+                and not prelaunch_refusal_retry
             ):
                 return (
                     None,
@@ -7714,13 +7829,16 @@ def _terminal_owner_recovery_proof(
             action_arguments = None
         elif (
             latest_resume_entry is not None
-            and (
-                _is_legacy_missing_role_route_refusal(latest_resume_entry)
-                or _is_prelaunch_role_configuration_refusal(latest_resume_entry)
+            and _current_recovery_gate_is_approved(
+                gate_name, gate_authorization, recovery_gate
             )
-            and isinstance(gate_authorization, Mapping)
-            and gate_authorization.get("gate_name") == gate_name
-            and gate_authorization.get("status") == GateStatus.APPROVED.value
+            and (
+                _is_proven_prelaunch_role_route_refusal(latest_resume_entry)
+                or (
+                    isinstance(gate_authorization, Mapping)
+                    and _is_legacy_missing_role_route_refusal(latest_resume_entry)
+                )
+            )
         ):
             action_arguments = None
         else:
@@ -8024,6 +8142,241 @@ def _terminal_route_authorization_supersedes(
     )
 
 
+# One assignment/effect identity behind a route authorization. A route change
+# may replace the route fields (role is part of the assignment), but the owner,
+# predecessor, dispatch identity, evidence boundary and terminal invocation
+# must still describe the same effect.
+_TERMINAL_ROUTE_REAUTHORIZATION_ASSIGNMENT_FIELDS = (
+    "source",
+    "role",
+    "manifest_digest",
+    "slice_id",
+    "issue_id",
+    "owner_agent_id",
+    "prior_invocation_id",
+    "dispatch_intent_id",
+    "dispatch_generation",
+    "branch",
+    "worktree_fingerprint",
+    "accepted_spawn_event_seq",
+    "blocker_event_seq",
+    "terminal_invocation_digest",
+    "prior_runtime",
+    "prior_model",
+    "prior_effort",
+)
+
+
+def _prelaunch_refusal_route_reauthorization_matches(
+    previous: object, candidate: Mapping[str, object]
+) -> bool:
+    """True when `candidate` is the fresh route proof linked over `previous`.
+
+    The refused prelaunch attempt was authorized by `previous`; the new attempt
+    keeps the same assignment and effect but may carry a different accepted
+    route. Only the transition, digest and superseded digest are new.
+    """
+    if not isinstance(previous, Mapping):
+        return False
+    supersedes = candidate.get("supersedes_route_authorization_digest")
+    previous_digest = previous.get("digest")
+    return (
+        candidate.get("transition")
+        == PRELAUNCH_REFUSAL_ROUTE_REAUTHORIZATION_TRANSITION
+        and isinstance(supersedes, str)
+        and isinstance(previous_digest, str)
+        and _is_sha256_text(previous_digest)
+        and supersedes == previous_digest
+        and all(
+            candidate.get(field) == previous.get(field)
+            for field in _TERMINAL_ROUTE_REAUTHORIZATION_ASSIGNMENT_FIELDS
+        )
+    )
+
+
+def _current_recovery_gate_is_approved(
+    gate_name: str,
+    gate_authorization: Mapping[str, object] | None,
+    recovery_gate: object | None,
+) -> bool:
+    """The current per-slice gate must still be approved for any retry."""
+    if (
+        isinstance(gate_authorization, Mapping)
+        and gate_authorization.get("gate_name") == gate_name
+        and gate_authorization.get("status") == GateStatus.APPROVED.value
+    ):
+        return True
+    return getattr(recovery_gate, "status", None) is GateStatus.APPROVED
+
+
+def _saved_terminal_route_authorization_is_bound(
+    saved: Mapping[str, object], config: TLLoopConfig, manifest_digest: str
+) -> bool:
+    """The saved proof must still describe this assignment and accepted manifest.
+
+    A route change legitimately replaces the policy/route fields, so their
+    digest cannot be recomputed under the new configuration. The binding that
+    must survive is the accepted manifest, the authorization source, the role
+    and a versioned configuration identity.
+    """
+    return (
+        saved.get("manifest_digest") == manifest_digest
+        and saved.get("source") == "accepted_operator_role_configuration"
+        and saved.get("role") == config.role
+        and _is_role_route_configuration_fingerprint(
+            saved.get("configuration_fingerprint")
+        )
+    )
+
+
+def _prelaunch_refusal_route_change_is_authorized(
+    saved: object,
+    candidate: Mapping[str, object],
+    latest_resume_entry: Mapping[str, object] | None,
+    gate_name: str,
+    gate_authorization: Mapping[str, object] | None,
+    recovery_gate: object | None,
+    config: TLLoopConfig,
+    manifest_digest: str,
+) -> bool:
+    """A proven prelaunch refusal may be retried under a new accepted route.
+
+    The refused action must have been authorized by exactly the saved proof
+    (same digest, configuration identity, desired route and assignment), so a
+    route change can only replace the route that the host proved it did not
+    launch. A same-route retry is handled by the ordinary replay path. The
+    saved proof must still bind this assignment's accepted manifest, role,
+    authorization source and versioned identity, and the current recovery gate
+    must still be approved.
+    """
+    if not isinstance(saved, Mapping) or not isinstance(latest_resume_entry, Mapping):
+        return False
+    if not _is_proven_prelaunch_role_route_refusal(latest_resume_entry):
+        return False
+    saved_version = _role_route_configuration_version(
+        saved.get("configuration_fingerprint")
+    )
+    candidate_version = _role_route_configuration_version(
+        candidate.get("configuration_fingerprint")
+    )
+    same_route = all(
+        saved.get(field) == candidate.get(field)
+        for field in ("harness", "agent_type", "model", "effort")
+    )
+    if same_route and saved_version == "v1" and candidate_version == "v2":
+        # A v1 -> v2 identity-scheme upgrade is the historical revalidation
+        # contract, not a route change.
+        return False
+    unchanged = same_route and all(
+        saved.get(field) == candidate.get(field)
+        for field in (
+            "configuration_fingerprint",
+            "policy_fingerprint",
+            "manifest_digest",
+            "route_fingerprint",
+        )
+    )
+    if unchanged:
+        return False
+    if not _current_recovery_gate_is_approved(
+        gate_name, gate_authorization, recovery_gate
+    ):
+        return False
+    if not _saved_terminal_route_authorization_is_bound(
+        saved, config, manifest_digest
+    ):
+        return False
+    arguments = latest_resume_entry.get("arguments")
+    if not isinstance(arguments, Mapping):
+        return False
+    if arguments.get("route_authorization_digest") != saved.get("digest"):
+        return False
+    if arguments.get("route_configuration_fingerprint") != saved.get(
+        "configuration_fingerprint"
+    ):
+        return False
+    assignment_matches = (
+        ("owner_agent_name", "owner_agent_id"),
+        ("expected_invocation_id", "prior_invocation_id"),
+        ("prior_dispatch_intent_id", "dispatch_intent_id"),
+        ("prior_dispatch_generation", "dispatch_generation"),
+        ("expected_branch", "branch"),
+        ("expected_worktree_fingerprint", "worktree_fingerprint"),
+        ("accepted_spawn_event_seq", "accepted_spawn_event_seq"),
+        ("blocker_event_seq", "blocker_event_seq"),
+        ("terminal_invocation_digest", "terminal_invocation_digest"),
+        ("prior_runtime", "prior_runtime"),
+        ("prior_model", "prior_model"),
+        ("prior_effort", "prior_effort"),
+        ("configured_role", "role"),
+        ("desired_harness", "harness"),
+        ("desired_agent_type", "agent_type"),
+        ("desired_model", "model"),
+        ("desired_effort", "effort"),
+    )
+    return all(
+        arguments.get(argument) == saved.get(field)
+        for argument, field in assignment_matches
+    )
+
+
+def _prelaunch_refusal_route_reauthorization_record(
+    candidate: Mapping[str, object],
+    supersedes_digest: str,
+    config: TLLoopConfig,
+    manifest_digest: str,
+) -> Mapping[str, object] | None:
+    """Recompute one fresh proof linked over the refused route authorization."""
+    try:
+        digest = _terminal_route_authorization_digest(
+            config,
+            cast(str, candidate["harness"]),
+            cast(str, candidate["agent_type"]),
+            cast(str | None, candidate.get("model")),
+            cast(str, candidate["effort"]),
+            candidate.get("prior_runtime"),
+            candidate.get("prior_model"),
+            candidate.get("prior_effort"),
+            cast(
+                Mapping[str, object] | None,
+                candidate.get("recovery_gate_authorization"),
+            ),
+            manifest_digest,
+            supersedes_digest,
+            transition=PRELAUNCH_REFUSAL_ROUTE_REAUTHORIZATION_TRANSITION,
+        )
+    except (KeyError, ValueError):
+        return None
+    refreshed = dict(candidate)
+    refreshed["digest"] = digest
+    refreshed["supersedes_route_authorization_digest"] = supersedes_digest
+    refreshed["transition"] = PRELAUNCH_REFUSAL_ROUTE_REAUTHORIZATION_TRANSITION
+    return refreshed
+
+
+def _prelaunch_refusal_route_reauthorization_replay_matches(
+    saved: object, candidate: Mapping[str, object]
+) -> bool:
+    """Reuse the fresh linked proof after restart instead of relinking it."""
+    if not isinstance(saved, Mapping):
+        return False
+    if (
+        saved.get("transition")
+        != PRELAUNCH_REFUSAL_ROUTE_REAUTHORIZATION_TRANSITION
+    ):
+        return False
+    if not _is_sha256_text(
+        str(saved.get("supersedes_route_authorization_digest") or "")
+    ):
+        return False
+    mutable = {"digest", "transition", "supersedes_route_authorization_digest"}
+    return all(
+        saved.get(key) == candidate.get(key)
+        for key in set(saved) | set(candidate)
+        if key not in mutable
+    )
+
+
 def _terminal_route_authorization_replay_matches(
     saved: object,
     candidate: Mapping[str, object],
@@ -8324,6 +8677,9 @@ CONFIRMED_TERMINAL_SUCCESSOR_TRANSITION = (
 )
 HISTORICAL_ROUTE_REVALIDATION_TRANSITION = (
     "historical_route_authorization_revalidated_for_accepted_configuration"
+)
+PRELAUNCH_REFUSAL_ROUTE_REAUTHORIZATION_TRANSITION = (
+    "prelaunch_refusal_route_reauthorized_for_accepted_configuration"
 )
 
 
@@ -8779,7 +9135,7 @@ def _historical_configuration_refusal_retry(
     """
     if not isinstance(latest_resume_entry, Mapping):
         return False
-    if not _is_prelaunch_role_configuration_refusal(latest_resume_entry):
+    if not _is_proven_prelaunch_role_route_refusal(latest_resume_entry):
         return False
     arguments = latest_resume_entry.get("arguments")
     if not isinstance(arguments, Mapping):
@@ -8836,19 +9192,38 @@ def _is_role_route_configuration_fingerprint(value: object) -> bool:
 ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED = (
     "Invalid input: role route configuration is stale or was not accepted by this server"
 )
+ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS = (
+    "Invalid input: role route dispatch authorization is missing or ambiguous"
+)
+
+# Contract: a modern role-route refusal proves the host rejected the request
+# before any launch only when it is one of these exact envelopes. Both sides
+# implement this one set: see
+# docs/dispatch-prelaunch-refusal-contract.md and the matching
+# `PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS` constant in
+# rust/exomonad-core/src/handlers/dispatch_authorization.rs.
+PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS = frozenset(
+    {
+        ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+        ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS,
+    }
+)
 
 
-def _is_prelaunch_role_configuration_refusal(entry: Mapping[str, object]) -> bool:
-    """Recognize only the host refusal that proves no effect was launched.
+def _is_proven_prelaunch_role_route_refusal(entry: Mapping[str, object]) -> bool:
+    """Recognize only a host refusal that proves no effect was launched.
 
-    The historical action already carried a complete route receipt under the
-    old configuration identity, so it is not the older missing-route refusal.
-    The result must be the exact rejected envelope: a false success, no result
-    payload, and the configuration-not-accepted message. Anything else stays
-    held for its own outcome.
+    This is the controller side of the shared prelaunch refusal contract. The
+    historical action already carried a complete versioned route/configuration
+    receipt, so it is not the older missing-route refusal. The result must be
+    the exact rejected envelope: a false success, no result payload, one of the
+    shared prelaunch errors, and the same error at the entry and result level.
+    A matching error string alone is never enough, so successful, launched,
+    unresolved, or contradictory entries stay held for their own outcome.
     """
     arguments = entry.get("arguments")
     result = entry.get("result")
+    error = entry.get("error")
     return (
         entry.get("operation") == "resume_blocked_leaf"
         and entry.get("status") == "rejected"
@@ -8860,8 +9235,9 @@ def _is_prelaunch_role_configuration_refusal(entry: Mapping[str, object]) -> boo
         and isinstance(result, Mapping)
         and result.get("success") is False
         and result.get("result") is None
-        and result.get("error") == ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED
-        and entry.get("error") == ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED
+        and isinstance(error, str)
+        and error in PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS
+        and result.get("error") == error
     )
 
 
@@ -8903,6 +9279,9 @@ def _persist_terminal_route_authorization(
             if not (
                 _fresh_terminal_gate_reauthorization(existing, terminal.route_authorization)
                 or _terminal_route_authorization_supersedes(existing, terminal.route_authorization)
+                or _prelaunch_refusal_route_reauthorization_matches(
+                    existing, terminal.route_authorization
+                )
                 or (
                     terminal.historical_route_authorization_digest is not None
                     and isinstance(existing, Mapping)

@@ -1056,7 +1056,7 @@ checked there: `root_agent_type` is legacy and the controller resolves its own
 A rejected pre-launch `resume_blocked_leaf` whose exact result is
 `Invalid input: role route configuration is stale or was not accepted by this
 server` (no result payload, no launched invocation) is recognized by
-`_is_prelaunch_role_configuration_refusal`. Its rejected action/result is
+`_is_proven_prelaunch_role_route_refusal`. Its rejected action/result is
 preserved. After the current accepted identity agrees and the human-gate
 approval stands (a fresh approval is required only after an explicit
 rejection), `fresh_legacy_refusal_retry` or

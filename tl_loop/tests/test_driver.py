@@ -7,6 +7,7 @@ import json
 import logging
 import multiprocessing
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -23771,16 +23772,119 @@ def test_role_route_configuration_fingerprint_accepts_v1_and_v2_without_reinterp
     )
 
 
+def test_prelaunch_refusal_contract_matches_the_compiled_host_definition() -> None:
+    """The controller and host must share one error set, not two allowlists."""
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "rust/exomonad-core/src/handlers/dispatch_authorization.rs"
+    )
+    text = source.read_text(encoding="utf-8")
+    values = dict(
+        re.findall(r'(ROLE_ROUTE_[A-Z_]+): &str =\s*"([^"]*)"', text)
+    )
+    rust_errors = {
+        values["ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED"],
+        values["ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS"],
+    }
+    assert rust_errors == set(driver_module.PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS)
+
+
+def test_shared_prelaunch_refusal_definition_recognizes_both_host_error_codes() -> None:
+    arguments: dict[str, object] = {
+        "route_configuration_fingerprint": HISTORICAL_CONFIG_FINGERPRINT_V1,
+        "route_fingerprint": "sha256:v1:" + "1" * 64,
+    }
+    for error in (
+        driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+        driver_module.ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS,
+    ):
+        envelope: dict[str, object] = {
+            "success": False,
+            "result": None,
+            "error": error,
+        }
+        entry: dict[str, object] = {
+            "operation": "resume_blocked_leaf",
+            "status": "rejected",
+            "arguments": arguments,
+            "result": envelope,
+            "error": error,
+        }
+        assert driver_module._is_proven_prelaunch_role_route_refusal(entry), error
+        # The same error string is never enough on an unresolved outcome.
+        assert not driver_module._is_proven_prelaunch_role_route_refusal(
+            {**entry, "status": "unknown"}
+        )
+        # Nor is it proof on a launched or contradictory result envelope.
+        launched: dict[str, object] = dict(envelope)
+        launched["result"] = {"started": True}
+        assert not driver_module._is_proven_prelaunch_role_route_refusal(
+            {**entry, "result": launched}
+        )
+        contradictory: dict[str, object] = dict(envelope)
+        contradictory["success"] = True
+        assert not driver_module._is_proven_prelaunch_role_route_refusal(
+            {**entry, "result": contradictory}
+        )
+        # A different operation, missing route identity or unrelated error holds.
+        assert not driver_module._is_proven_prelaunch_role_route_refusal(
+            {**entry, "operation": "spawn_leaf"}
+        )
+        assert not driver_module._is_proven_prelaunch_role_route_refusal(
+            {**entry, "arguments": {"route_fingerprint": "sha256:v1:" + "1" * 64}}
+        )
+        unrelated: dict[str, object] = dict(envelope)
+        unrelated["error"] = "Invalid input: unrelated host refusal"
+        assert not driver_module._is_proven_prelaunch_role_route_refusal(
+            {**entry, "error": "Invalid input: unrelated host refusal", "result": unrelated}
+        )
+
+
+def test_live_journal_fixture_replays_through_the_shared_classifier() -> None:
+    """The committed redacted #814 journal parses and classifies as production saw it."""
+    fixture_path = (
+        Path(__file__).resolve().parents[2]
+        / "tests/e2e/init-recovery/fixtures/live-issue-814-ambiguity-journal.json"
+    )
+    raw = fixture_path.read_text(encoding="utf-8")
+    assert "/home/" not in raw and "/nix/" not in raw
+    fixture = json.loads(raw)
+    entries = {entry["index"]: entry for entry in fixture["entries"]}
+    assert entries[22]["status"] == "confirmed"
+    assert entries[30]["error"] == driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED
+    assert (
+        entries[36]["error"]
+        == driver_module.ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS
+    )
+    assert (
+        entries[30]["arguments"]["dispatch_intent_id"]
+        == entries[36]["arguments"]["dispatch_intent_id"]
+    )
+    assert (
+        entries[30]["arguments"]["route_configuration_fingerprint"]
+        != entries[36]["arguments"]["route_configuration_fingerprint"]
+    )
+    assert not driver_module._is_proven_prelaunch_role_route_refusal(entries[22])
+    assert driver_module._is_proven_prelaunch_role_route_refusal(entries[30])
+    assert driver_module._is_proven_prelaunch_role_route_refusal(entries[36])
+    diagnostic = driver_module._resume_entry_diagnostic(entries[36], 36)
+    assert "entry 36" in diagnostic
+    assert "rejected" in diagnostic
+    assert "dispatch authorization is missing or ambiguous" in diagnostic
+    assert "sha256:v2:" in diagnostic
+    assert "<redacted-task>" not in diagnostic
+
+
 def test_prelaunch_configuration_refusal_is_recognized_only_for_the_exact_shape() -> None:
     arguments = {
         "route_configuration_fingerprint": HISTORICAL_CONFIG_FINGERPRINT_V1,
         "route_fingerprint": "sha256:v1:" + "1" * 64,
     }
     entry = _prelaunch_configuration_refusal_entry(arguments)
-    assert driver_module._is_prelaunch_role_configuration_refusal(entry)
+    assert driver_module._is_proven_prelaunch_role_route_refusal(entry)
 
     unknown = {**entry, "status": "unknown"}
-    assert not driver_module._is_prelaunch_role_configuration_refusal(unknown)
+    assert not driver_module._is_proven_prelaunch_role_route_refusal(unknown)
 
     independent = {
         **entry,
@@ -23791,7 +23895,7 @@ def test_prelaunch_configuration_refusal_is_recognized_only_for_the_exact_shape(
         },
         "error": "Invalid input: top-level model conflicts with the accepted role route",
     }
-    assert not driver_module._is_prelaunch_role_configuration_refusal(independent)
+    assert not driver_module._is_proven_prelaunch_role_route_refusal(independent)
 
     launched = {
         **entry,
@@ -23801,7 +23905,7 @@ def test_prelaunch_configuration_refusal_is_recognized_only_for_the_exact_shape(
             "error": driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
         },
     }
-    assert not driver_module._is_prelaunch_role_configuration_refusal(launched)
+    assert not driver_module._is_proven_prelaunch_role_route_refusal(launched)
 
     contradictory = {
         **entry,
@@ -23811,7 +23915,7 @@ def test_prelaunch_configuration_refusal_is_recognized_only_for_the_exact_shape(
             "error": driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
         },
     }
-    assert not driver_module._is_prelaunch_role_configuration_refusal(contradictory)
+    assert not driver_module._is_proven_prelaunch_role_route_refusal(contradictory)
 
 
 def test_terminal_owner_retries_prelaunch_configuration_refusal_after_fresh_gate_approval(
@@ -24147,6 +24251,7 @@ def _accepted_configuration_transport(
     prior_invocation_id: str,
     successor_id: str,
     *,
+    successor_generation: int = 2,
     raise_after_launch: bool = False,
 ) -> RecordingTransport:
     class AcceptedConfigurationTransport(RecordingTransport):
@@ -24170,7 +24275,7 @@ def _accepted_configuration_transport(
             identity_path.write_text(json.dumps(identity), encoding="utf-8")
             invocation = {
                 "invocation_id": successor_id,
-                "generation": 2,
+                "generation": successor_generation,
                 "status": "running",
                 "runtime": identity["agent_type"],
                 "model": identity["model"],
@@ -24192,7 +24297,7 @@ def _accepted_configuration_transport(
                     {
                         "owner_agent_id": owner_name,
                         "owner_invocation_id": successor_id,
-                        "owner_generation": 2,
+                        "owner_generation": successor_generation,
                     }
                 ),
                 encoding="utf-8",
@@ -29256,10 +29361,13 @@ def test_legacy_resume_receipt_refuses_nested_true_without_outer_true(
     proof, reason = fixture.proof()
 
     assert proof is None
-    assert reason == (
+    assert reason is not None
+    assert reason.startswith(
         "terminal owner registry evidence is unavailable or conflicting: "
-        "BlockedLeafOwnerError: the exact blocked-leaf resume request was rejected"
+        "BlockedLeafOwnerError: the exact blocked-leaf resume request was rejected: entry 0 "
     )
+    assert "status='rejected'" in reason
+    assert "route_configuration_fingerprint=" in reason
 
 
 @pytest.mark.parametrize("outer_success", (False, None))
@@ -33486,6 +33594,9 @@ CONFIRMED_TERMINAL_SUCCESSOR_TRANSITION_TEXT = (
 HISTORICAL_ROUTE_REVALIDATION_TRANSITION_TEXT = (
     "historical_route_authorization_revalidated_for_accepted_configuration"
 )
+PRELAUNCH_REFUSAL_ROUTE_REAUTHORIZATION_TRANSITION_TEXT = (
+    "prelaunch_refusal_route_reauthorized_for_accepted_configuration"
+)
 STORED_PROOF_BINDING_FIELDS = (
     "source",
     "role",
@@ -33521,6 +33632,49 @@ def _stored_proof_route_config(
         config,
         role_route_configuration_fingerprint=fingerprint,
         worker_effort_level=effort,
+    )
+
+
+def _route_switched_config(
+    config: TLLoopConfig,
+    harness: str,
+    model: str | None,
+    effort: str,
+    *,
+    fingerprint: str | None = None,
+) -> TLLoopConfig:
+    """Rebuild the accepted policy/catalog for a different continue route."""
+    route = parse_harness_identifier(harness)
+    role = {
+        "allow": [harness],
+        "cost_rank": {harness: 1},
+        "token_budget": 120000,
+        "per_harness_budget": {harness: 80000},
+        "escalate_after_attempts": 1,
+    }
+    policy = validate_policy(
+        {"roles": {"tl": dict(role), "worker": dict(role), "reviewer": dict(role)}}
+    )
+    catalog = ModelCatalog.from_payload(
+        {
+            "models": [
+                {
+                    "harness": route.agent_type,
+                    "model_id": model or route.model or "model-default",
+                }
+            ]
+        }
+    )
+    return replace(
+        config,
+        policy=policy,
+        capabilities=CapabilityMap({harness: Difficulty.STANDARD}),
+        catalog=catalog,
+        requested_model=model,
+        worker_effort_level=effort,
+        role_route_configuration_fingerprint=(
+            fingerprint or config.role_route_configuration_fingerprint
+        ),
     )
 
 
@@ -33622,14 +33776,24 @@ def _seed_stored_v1_proof(
     *,
     record_refusal: bool = True,
     confirmed_successor: bool = True,
+    prior_runtime: str = "opencode",
+    prior_model: str = DIRECTED_WORKER_MODEL,
+    prior_effort: str = "high",
+    selected_harness: str = "opencode/opencode-go/deepseek-v4.1-flash",
+    selected_model: str = DIRECTED_WORKER_MODEL,
+    selected_effort: str = "high",
+    refusal_error: str = driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
 ) -> dict[str, Any]:
     """Reproduce the live stored-v1-proof state on the accepted f446/f285 chain."""
     plan, config, store, owner_dir, owner_name, original_id = (
         _seed_terminal_provider_failure_leaf(
             tmp_path,
-            selected_harness="opencode/opencode-go/deepseek-v4.1-flash",
-            selected_model=DIRECTED_WORKER_MODEL,
-            selected_effort="high",
+            prior_runtime=prior_runtime,
+            prior_model=prior_model,
+            prior_effort=prior_effort,
+            selected_harness=selected_harness,
+            selected_model=selected_model,
+            selected_effort=selected_effort,
         )
     )
     leaf = plan.leaves[0]
@@ -33710,7 +33874,7 @@ def _seed_stored_v1_proof(
                 {
                     "success": False,
                     "result": None,
-                    "error": driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+                    "error": refusal_error,
                 }
             ),
         )
@@ -33969,9 +34133,127 @@ def test_terminal_owner_rejects_stored_proof_for_wrong_scope(tmp_path: Path) -> 
     assert "historical identity" in reason or "conflicts with current configuration" in reason
 
 
-def test_terminal_owner_rejects_genuine_route_change_with_stored_proof(tmp_path: Path) -> None:
+def test_terminal_owner_authorizes_effort_only_route_change_after_prelaunch_refusal(
+    tmp_path: Path,
+) -> None:
+    """A route change alone must not hold a proven prelaunch-refused slice.
+
+    The saved proof authorized the refusal the host recorded before launch, so
+    the operator may continue under the newly accepted effort. The saved proof
+    stays immutable history and the fresh proof is linked over it.
+    """
     seed = _stored_proof_seed(tmp_path)
     plan, store = seed["plan"], seed["store"]
+    saved_v1 = seed["saved_v1"]
+    changed = replace(seed["config"], worker_effort_level="xhigh")
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), changed, store
+    )
+
+    assert proof is not None, reason
+    authorization = proof.route_authorization
+    assert authorization["transition"] == PRELAUNCH_REFUSAL_ROUTE_REAUTHORIZATION_TRANSITION_TEXT
+    assert authorization["supersedes_route_authorization_digest"] == saved_v1["digest"]
+    assert authorization["effort"] == "xhigh"
+    assert authorization["configuration_fingerprint"] == seed["config"].role_route_configuration_fingerprint
+    assert proof.resume.desired_effort == "xhigh"
+
+
+def _seed_live_ambiguity_refusal(
+    tmp_path: Path,
+) -> tuple[
+    WorkPlan,
+    TLLoopConfig,
+    RunStore,
+    EffectJournal,
+    Path,
+    str,
+    Mapping[str, object],
+]:
+    """Reproduce the live #814 journal shape: a v1 rejection, then v2 ambiguity.
+
+    The first refused action carries the historical `sha256:v1:` configuration
+    identity and the configuration-not-accepted envelope. The second carries
+    the current `sha256:v2:` identity and the dispatch-authorization-missing
+    refusal that the deployed host actually recorded (#36 in the live journal).
+    """
+    seed = _seed_stored_v1_proof(tmp_path)
+    plan, config, store, journal = (
+        seed["plan"],
+        seed["config"],
+        seed["store"],
+        seed["journal"],
+    )
+    leaf = plan.leaves[0]
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert proof is not None, reason
+    state = driver_module._persist_terminal_route_authorization(
+        proof, store.load(), store
+    )
+    recovery = state.slices[leaf.name].recovery
+    assert recovery is not None
+    saved = _required_mapping(
+        recovery.evidence.get("configured_route_authorization"),
+        "saved route authorization",
+    )
+    ambiguity_arguments = dict(
+        driver_module._blocked_leaf_resume_action_arguments(proof.resume, state)
+    )
+    started_at = ambiguity_arguments["dispatch_started_at"]
+    assert isinstance(started_at, (int, float))
+    ambiguity_arguments["dispatch_started_at"] = float(started_at) + 1.0
+    ambiguity_intent = EffectIntent(
+        "resume_blocked_leaf", leaf.name, ambiguity_arguments, True
+    )
+    journal.append(ambiguity_intent)
+    journal.mark_result(
+        ambiguity_intent,
+        ToolResult.from_raw(
+            {
+                "success": False,
+                "result": None,
+                "error": driver_module.ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS,
+            }
+        ),
+    )
+    statuses = [
+        entry["status"]
+        for entry in journal.entries_for("resume_blocked_leaf", leaf.name)
+    ]
+    assert statuses == ["confirmed", "rejected", "rejected"]
+    return (
+        plan,
+        config,
+        store,
+        journal,
+        seed["owner_dir"],
+        seed["owner_name"],
+        saved,
+    )
+
+
+def test_terminal_owner_rejects_route_change_without_a_proven_prelaunch_refusal(
+    tmp_path: Path,
+) -> None:
+    """A genuine route change still holds when the last refusal is not proven prelaunch."""
+    seed = _stored_proof_seed(tmp_path)
+    plan, store, journal = seed["plan"], seed["store"], seed["journal"]
+    leaf = plan.leaves[0]
+    latest = journal.entries_for("resume_blocked_leaf", leaf.name)[-1]
+    unproven = {
+        **latest,
+        "error": "Invalid input: some unrelated host refusal",
+        "result": {
+            "success": False,
+            "result": None,
+            "error": "Invalid input: some unrelated host refusal",
+        },
+    }
+    entries = journal.entries_for("resume_blocked_leaf", leaf.name)
+    _replace_resume_journal_entries(store, leaf.name, [*entries[:-1], unproven])
     changed = replace(seed["config"], worker_effort_level="xhigh")
 
     proof, reason = driver_module._terminal_owner_recovery_proof(
@@ -33979,7 +34261,7 @@ def test_terminal_owner_rejects_genuine_route_change_with_stored_proof(tmp_path:
     )
 
     assert proof is None
-    assert reason is not None and "conflicts with current configuration" in reason
+    assert reason is not None
     transport = RecordingTransport()
     driver_module._resume_terminal_owner_failure(
         plan,
@@ -33987,9 +34269,212 @@ def test_terminal_owner_rejects_genuine_route_change_with_stored_proof(tmp_path:
         changed,
         EffectClient(transport),
         store,
+        journal,
+    )
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in transport.calls)
+
+
+def test_terminal_owner_releases_the_live_ambiguity_refusal_once(
+    tmp_path: Path,
+) -> None:
+    """A journal shaped exactly like the live #814 run resumes exactly once."""
+    (
+        plan,
+        config,
+        store,
+        journal,
+        owner_dir,
+        owner_name,
+        saved,
+    ) = _seed_live_ambiguity_refusal(tmp_path)
+    leaf = plan.leaves[0]
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), config, store
+    )
+    assert proof is not None, reason
+    assert proof.resume.route_authorization_digest == saved["digest"]
+    assert proof.resume.action_arguments is None
+
+    successor_id = "live-ambiguity-successor"
+    transport = _accepted_configuration_transport(
+        owner_dir,
+        owner_name,
+        proof.resume.owner.prior_invocation_id,
+        successor_id,
+        successor_generation=3,
+    )
+    resumed = driver_module._resume_terminal_owner_failure(
+        plan, store.load(), config, EffectClient(transport), store, journal
+    )
+    assert sum(tool == "resume_blocked_leaf" for tool, _ in transport.calls) == 1
+    statuses = [
+        entry["status"]
+        for entry in journal.entries_for("resume_blocked_leaf", leaf.name)
+    ]
+    assert statuses == ["confirmed", "rejected", "rejected", "confirmed"]
+    assert resumed.slices[leaf.name].dispatch_invocation_id == successor_id
+
+    # A repeated init --continue after the release creates no second launch.
+    replay_transport = RecordingTransport()
+    replayed = driver_module._resume_terminal_owner_failure(
+        plan,
+        store.load(),
+        config,
+        EffectClient(replay_transport),
+        store,
+        journal,
+    )
+    assert not any(tool == "resume_blocked_leaf" for tool, _ in replay_transport.calls)
+    assert [
+        entry["status"]
+        for entry in journal.entries_for("resume_blocked_leaf", leaf.name)
+    ] == ["confirmed", "rejected", "rejected", "confirmed"]
+    assert replayed.slices[leaf.name].dispatch_invocation_id == successor_id
+
+
+def test_terminal_owner_route_change_holds_when_the_recovery_gate_is_pending(
+    tmp_path: Path,
+) -> None:
+    """A recovered ambiguity refusal never authorizes a route change by itself."""
+    seed = _seed_stored_v1_proof(
+        tmp_path,
+        confirmed_successor=False,
+        refusal_error=driver_module.ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS,
+    )
+    store = seed["store"]
+    store.set_gate(seed["gate_name"], GateStatus.PENDING)
+    switched = _route_switched_config(
+        seed["config"],
+        "codex/gpt-6.1-sol",
+        "gpt-6.1-sol",
+        "xhigh",
+    )
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        seed["plan"], store.load(), switched, store
+    )
+
+    assert proof is None
+    assert reason is not None
+    transport = RecordingTransport()
+    driver_module._resume_terminal_owner_failure(
+        seed["plan"],
+        store.load(),
+        switched,
+        EffectClient(transport),
+        store,
         seed["journal"],
     )
     assert not any(tool == "resume_blocked_leaf" for tool, _ in transport.calls)
+
+
+@pytest.mark.parametrize(
+    ("label", "seed_kwargs", "harness", "model", "effort"),
+    (
+        (
+            "codex-to-codex-new-model",
+            {
+                "prior_runtime": "codex",
+                "prior_model": "gpt-6-luna",
+                "prior_effort": "xhigh",
+                "selected_harness": "codex/gpt-6-luna",
+                "selected_model": "gpt-6-luna",
+                "selected_effort": "xhigh",
+            },
+            "codex/gpt-6.1-sol",
+            "gpt-6.1-sol",
+            "xhigh",
+        ),
+        (
+            "codex-to-opencode",
+            {
+                "prior_runtime": "codex",
+                "prior_model": "gpt-6-luna",
+                "prior_effort": "xhigh",
+                "selected_harness": "codex/gpt-6-luna",
+                "selected_model": "gpt-6-luna",
+                "selected_effort": "xhigh",
+            },
+            "opencode/opencode-go/deepseek-v4.1-flash",
+            DIRECTED_WORKER_MODEL,
+            "high",
+        ),
+        (
+            "opencode-to-codex",
+            {},
+            "codex/gpt-6.1-sol",
+            "gpt-6.1-sol",
+            "xhigh",
+        ),
+        (
+            "opencode-model-only",
+            {},
+            "opencode/opencode-go/glm-5.3-flash",
+            "opencode-go/glm-5.3-flash",
+            "high",
+        ),
+        (
+            "opencode-effort-only",
+            {},
+            "opencode/opencode-go/deepseek-v4.1-flash",
+            DIRECTED_WORKER_MODEL,
+            "xhigh",
+        ),
+    ),
+)
+def test_terminal_owner_resumes_across_supported_route_switches(
+    tmp_path: Path,
+    label: str,
+    seed_kwargs: dict[str, Any],
+    harness: str,
+    model: str,
+    effort: str,
+) -> None:
+    """A route change alone never holds a proven prelaunch-refused slice."""
+    seed = _seed_stored_v1_proof(
+        tmp_path,
+        confirmed_successor=False,
+        refusal_error=driver_module.ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS,
+        **seed_kwargs,
+    )
+    plan, store, journal = seed["plan"], seed["store"], seed["journal"]
+    fingerprint = "sha256:v2:" + hashlib.sha256(
+        f"{label}|{harness}|{model}|{effort}".encode()
+    ).hexdigest()
+    switched = _route_switched_config(
+        seed["config"], harness, model, effort, fingerprint=fingerprint
+    )
+
+    proof, reason = driver_module._terminal_owner_recovery_proof(
+        plan, store.load(), switched, store
+    )
+
+    assert proof is not None, f"{label}: {reason}"
+    authorization = proof.route_authorization
+    assert (
+        authorization["transition"]
+        == PRELAUNCH_REFUSAL_ROUTE_REAUTHORIZATION_TRANSITION_TEXT
+    ), label
+    assert authorization["supersedes_route_authorization_digest"] == seed["saved_v1"][
+        "digest"
+    ], label
+    assert authorization["harness"] == harness, label
+    assert authorization["effort"] == effort, label
+
+    successor_id = f"{label}-successor"
+    transport = _accepted_configuration_transport(
+        seed["owner_dir"],
+        seed["owner_name"],
+        proof.resume.owner.prior_invocation_id,
+        successor_id,
+    )
+    resumed = driver_module._resume_terminal_owner_failure(
+        plan, store.load(), switched, EffectClient(transport), store, journal
+    )
+    assert sum(tool == "resume_blocked_leaf" for tool, _ in transport.calls) == 1, label
+    assert resumed.slices[plan.leaves[0].name].dispatch_invocation_id == successor_id, label
+    entries = journal.entries_for("resume_blocked_leaf", plan.leaves[0].name)
+    assert entries[-1]["status"] == "confirmed", label
 
 
 def test_terminal_owner_rejects_unaccepted_current_identity_with_stored_proof(

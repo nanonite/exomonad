@@ -515,12 +515,13 @@ for required in (
     "genuine-effort-change",
     "unknown-prior-effect",
     "live-worker",
+    "route-change-with-pending-gate",
     "independent-gate-rejection",
 ):
     assert required in names, (required, names)
-print(json.dumps({"negative_cases": len(names), "all_held": True}))
+print(json.dumps({"negative_cases": len(names), "all_classified": True}))
 PY
-printf 'STOREDPROOF-4 negatives stay held: forged/malformed legacy digest, wrong owner/scope/manifest/predecessor, unaccepted current identity, unknown prior effect, live worker, independent gate rejection\n'
+printf 'STOREDPROOF-4 guards stay held: forged/malformed legacy digest, wrong owner/scope/manifest/predecessor, unaccepted current identity, unknown prior effect, live worker, pending-gate route change, independent gate rejection; proven prelaunch model/effort switches are the supported continue path\n'
 say "PASS: STOREDPROOF-4"
 
 # ---------------------------------------------------------------------------
@@ -755,8 +756,9 @@ assert stored["stored_proof"]["effort"] == expected["effort"]
 assert stored["v1_configuration_fingerprint"] != identity
 assert expected["configuration_fingerprint"] == identity
 held = {case["case"]: case for case in negatives["cases"]}
-assert held["genuine-model-change"]["held"] is True
-assert held["genuine-effort-change"]["held"] is True
+assert held["genuine-model-change"]["held"] is False
+assert held["genuine-effort-change"]["held"] is False
+assert held["route-change-with-pending-gate"]["held"] is True
 resume = [
     row
     for row in json.loads((repo / ".exo/tl-loop/root/kani/action-journal.json").read_text())
@@ -764,7 +766,7 @@ resume = [
 ]
 assert [row["status"] for row in resume] == ["confirmed", "rejected", "confirmed"], resume
 PY
-printf 'STOREDPROOF-5 genuine model/effort change and same-route-new-identity behave under normal current-config rules\n'
+printf 'STOREDPROOF-5 model/effort switches resume after a proven prelaunch refusal; a route change under a pending gate stays held; same-route-new-identity behaves under normal current-config rules\n'
 say "PASS: STOREDPROOF-5"
 
 # ---------------------------------------------------------------------------
