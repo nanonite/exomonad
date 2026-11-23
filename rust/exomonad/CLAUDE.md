@@ -241,11 +241,18 @@ fixtures create their executable atomically instead.
 CLI). Each has a committed `rust/exomonad/data/opencode/<version>.json` plus a
 plain `opencode models` capture in the matching `.models.txt`. `v2.3.2`'s
 `opencode run` accepts every flag `init` passes (`--standalone`, `--auto`,
-`--model provider/model#variant`, `--agent`, `--session`, `--fork`), but two
-v2.3.2 changes are not handled yet: the interactive top-level command no longer
-accepts `--model`/`--agent` (the task-less companion path), and the TypeScript
-plugin loader requires a default `{ id, setup }` definition instead of the old
-`server` export. See `docs/decisions/opencode-hooks.md` for the plugin status.
+`--model provider/model#variant`, `--agent`, `--session`, `--fork`). The
+task-less (interactive) companion form is version-specific and selected by
+`opencode_companion_launch_form`: `v2.0.22` keeps
+`opencode [--model M] --agent exomonad-<role>` because its top-level command
+accepts both flags, while `v2.3.2` uses
+`opencode mini [--model M] --agent exomonad-<role>` because its top-level
+command rejects them and `mini` is the supported interactive interface. `init`
+detects the version once, before creating a session, and an unknown version is a
+named error rather than a guessed form. The remaining v2.3.2 change is not
+handled yet: the TypeScript plugin loader requires a default `{ id, setup }`
+definition instead of the old `server` export. See
+`docs/decisions/opencode-hooks.md` for the plugin status.
 
 **Configured harness-policy check:** before any controller side effect, `init`
 validates the worker and reviewer routes it resolved from `config.toml` (and any
@@ -269,9 +276,12 @@ any TL route.
 `rust/exomonad/data/opencode/<version>.json` (schema_version 1, harness
 `opencode`, `version` equal to the file key, and `models` mapping each
 `provider/model` to `{"efforts": [...] | null}`), register it in
-`EMBEDDED_OPENCODE_TABLES`, and add the test that pins the new table. No code
-branch is added per version, and `exomonad models` lists the new table
-automatically under `# opencode <version>`.
+`EMBEDDED_OPENCODE_TABLES`, and add the test that pins the new table. Model
+validation has no code branch per version, and `exomonad models` lists the new
+table automatically under `# opencode <version>`. If the version's task-less
+interactive form differs from both supported versions, also add its
+`opencode_companion_launch_form` arm and test; an unlisted version fails
+`init` for an interactive OpenCode companion rather than guessing.
 
 **Bootstrap:** `exomonad new` auto-creates `.exo/config.toml` (empty, all defaults) and `.gitignore` entries if missing.
 

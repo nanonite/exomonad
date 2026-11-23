@@ -112,3 +112,13 @@ The task-less interactive companion command
 the top level no longer accepts `--model` or `--agent` (they are `opencode run`
 flags), so that path exits 1 with help text. Companion tasks that use
 `opencode run --standalone ...` are unaffected.
+
+Fixed in #1584. `opencode_companion_launch_form` selects one form per detected
+CLI version: v2.0.22 keeps the top-level `--model`/`--agent` form, and v2.3.2
+uses `opencode mini --model ... --agent exomonad-<role>`. `mini` is the
+supported interactive interface in v2.3.2 and accepts the model (including the
+`#variant` effort suffix) and the generated agent; a PTY launch shows
+`exomonad-worker · Beam Free [high]` in its status line. `init` resolves the
+form before creating a session, and an unknown version is a named error naming
+the known versions instead of a guessed form. The TypeScript plugin loader
+change above remains open.

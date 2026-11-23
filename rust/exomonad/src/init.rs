@@ -4601,6 +4601,79 @@ async fn detect_opencode_version(binary: &Path, probe_timeout: Duration) -> Resu
     Ok(version)
 }
 
+/// How a supported OpenCode CLI version accepts a model and agent for an
+/// interactive (task-less) session.
+///
+/// The form is a property of the installed CLI, so each supported version names
+/// exactly one of these. There is no "try one, then the other" fallback: a
+/// version whose form is unknown fails before a companion is launched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCodeCompanionLaunchForm {
+    /// The top-level interactive command carries `--model` and `--agent`.
+    TopLevelFlags,
+    /// The minimal interactive interface carries `--model` and `--agent`
+    /// because the top-level command rejects both.
+    MiniSubcommand,
+}
+
+/// The interactive launch form for one detected OpenCode version.
+///
+/// Fail-closed: an unknown version names itself, the known versions, and the
+/// change needed instead of guessing a form that may exit with help text.
+fn opencode_companion_launch_form(version: &str) -> Result<OpenCodeCompanionLaunchForm> {
+    match version {
+        "v2.0.22" => Ok(OpenCodeCompanionLaunchForm::TopLevelFlags),
+        "v2.3.2" => Ok(OpenCodeCompanionLaunchForm::MiniSubcommand),
+        unknown => {
+            let known = opencode_models::known_versions()?.join(", ");
+            anyhow::bail!(
+                "OpenCode harness version `{unknown}` has no known interactive companion launch form. \
+                 Known versions: {known}. Add the version's form here (with a test) before launching \
+                 an OpenCode companion; init will not guess between the top-level and `mini` forms."
+            )
+        }
+    }
+}
+
+/// The `--model provider/model#variant` segment for an OpenCode CLI.
+///
+/// OpenCode takes reasoning effort as a model variant, so an already-suffixed
+/// model is normalized to the resolved worker-effort variant. Returns an empty
+/// string when no model is configured.
+fn opencode_model_flag(model: Option<&str>, variant: &str) -> String {
+    model
+        .map(|model| {
+            let base = model.split_once('#').map_or(model, |(base, _)| base);
+            let model_ref = format!("{base}#{variant}");
+            format!(" --model {}", shell_escape::escape(model_ref.into()))
+        })
+        .unwrap_or_default()
+}
+
+/// Build the interactive companion command for a detected OpenCode version.
+///
+/// The command is a shell line for a tmux pane: env identity prefix, the
+/// version's interactive form, the worker-effort variant of the configured
+/// model (when one is configured), and the role's generated agent.
+fn opencode_companion_command(
+    version: &str,
+    env_prefix: &str,
+    model: Option<&str>,
+    variant: &str,
+    role: &str,
+) -> Result<String> {
+    let model_flag = opencode_model_flag(model, variant);
+    let agent = format!("exomonad-{role}");
+    Ok(match opencode_companion_launch_form(version)? {
+        OpenCodeCompanionLaunchForm::TopLevelFlags => {
+            format!("{env_prefix}opencode{model_flag} --agent {agent}")
+        }
+        OpenCodeCompanionLaunchForm::MiniSubcommand => {
+            format!("{env_prefix}opencode mini{model_flag} --agent {agent}")
+        }
+    })
+}
+
 async fn validate_opencode_model_with(
     binary: &Path,
     probe_timeout: Duration,
@@ -8130,6 +8203,28 @@ pub async fn run(
         .await
         .with_context(|| format!("validating the {} role model route", target.role))?;
     }
+    // An OpenCode companion that has no task is launched as an interactive
+    // session, and the form that selects its model/agent differs between
+    // supported CLI versions. Detect it once, before any session side effect,
+    // and fail closed for a version whose interactive form is not known. A
+    // task-having companion uses `opencode run`, whose form is version-stable.
+    let opencode_companion_version = if config.companions.iter().any(|companion| {
+        companion.agent_type == Some(AgentType::OpenCode) && companion.task.is_none()
+    }) {
+        let version = detect_opencode_version(Path::new("opencode"), OPENCODE_PROBE_TIMEOUT)
+            .await
+            .context("detecting the OpenCode version for the interactive companion launch form")?;
+        // Resolve the form now, before a session is created, so a version with
+        // no known interactive launch form fails init instead of leaving a
+        // half-started session behind. The command builder resolves it again
+        // from the same version string.
+        opencode_companion_launch_form(&version).with_context(|| {
+            format!("selecting the interactive launch form for OpenCode {version}")
+        })?;
+        Some(version)
+    } else {
+        None
+    };
     let init_argv = redact_init_argv(std::env::args().collect::<Vec<_>>());
     if let Err(e) = append_init_invocation_log(&cwd, &config, &init_argv, mode) {
         warn!(error = %e, "Failed to append init invocation log");
@@ -9017,26 +9112,28 @@ pub async fn run(
             }
             AgentType::OpenCode => {
                 let yolo = if config.yolo { " --auto" } else { "" };
-                let model_flag = companion
-                    .model
-                    .as_deref()
-                    .map(|m| {
-                        let base = m.split_once('#').map_or(m, |(base, _)| base);
-                        let model_ref = format!("{base}#{worker_variant}");
-                        format!(" --model {}", shell_escape::escape(model_ref.into()))
-                    })
-                    .unwrap_or_default();
                 let task_part = match &escaped_task {
                     Some(t) => format!(" '{}'", t),
                     None => String::new(),
                 };
                 if escaped_task.is_some() {
+                    let model_flag =
+                        opencode_model_flag(companion.model.as_deref(), &worker_variant);
                     format!("{env_prefix}opencode run --standalone{yolo}{model_flag}{task_part}")
                 } else {
-                    format!(
-                        "{env_prefix}opencode{model_flag} --agent exomonad-{}",
-                        companion.role
-                    )
+                    let Some(version) = opencode_companion_version.as_deref() else {
+                        anyhow::bail!(
+                            "OpenCode companion `{}` was reached without a detected OpenCode version",
+                            companion.name
+                        );
+                    };
+                    opencode_companion_command(
+                        version,
+                        &env_prefix,
+                        companion.model.as_deref(),
+                        &worker_variant,
+                        &companion.role,
+                    )?
                 }
             }
             AgentType::Codex => {
@@ -17312,6 +17409,63 @@ mod tests {
         assert!(error.contains("v2.3.2"));
         assert!(error.contains("rust/exomonad/data/opencode/v2.3.2.json"));
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn opencode_v232_companion_uses_the_mini_interactive_form() {
+        let command = opencode_companion_command(
+            "v2.3.2",
+            "EXOMONAD_AGENT_ID=companion EXOMONAD_ROLE=worker ",
+            Some("opencode-go/deepseek-v4.1-flash"),
+            "high",
+            "worker",
+        )
+        .expect("v2.3.2 has a known interactive companion form");
+
+        assert_eq!(
+            command,
+            "EXOMONAD_AGENT_ID=companion EXOMONAD_ROLE=worker opencode mini \
+             --model 'opencode-go/deepseek-v4.1-flash#high' --agent exomonad-worker"
+        );
+    }
+
+    #[test]
+    fn opencode_v2022_companion_keeps_the_top_level_flags() {
+        let command = opencode_companion_command(
+            "v2.0.22",
+            "EXOMONAD_AGENT_ID=companion EXOMONAD_ROLE=worker ",
+            Some("opencode-go/deepseek-v4.1-flash"),
+            "high",
+            "worker",
+        )
+        .expect("v2.0.22 has a known interactive companion form");
+
+        assert_eq!(
+            command,
+            "EXOMONAD_AGENT_ID=companion EXOMONAD_ROLE=worker opencode \
+             --model 'opencode-go/deepseek-v4.1-flash#high' --agent exomonad-worker"
+        );
+    }
+
+    #[test]
+    fn opencode_v232_companion_without_a_model_still_selects_its_agent() {
+        let command =
+            opencode_companion_command("v2.3.2", "", None, "high", "worker").expect("known form");
+
+        assert_eq!(command, "opencode mini --agent exomonad-worker");
+    }
+
+    #[test]
+    fn opencode_companion_unknown_version_fails_closed() {
+        let error = opencode_companion_command("v9.9.9", "", None, "high", "worker")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("OpenCode harness version `v9.9.9`"));
+        assert!(error.contains("no known interactive companion launch form"));
+        assert!(error.contains("v2.0.22"));
+        assert!(error.contains("v2.3.2"));
+        assert!(error.contains("init will not guess"));
     }
 
     #[cfg(unix)]
