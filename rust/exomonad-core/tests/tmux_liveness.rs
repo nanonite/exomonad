@@ -8,35 +8,26 @@
 use exomonad_core::domain::RoutingInfo;
 use exomonad_core::services::event_log::EventLog;
 use exomonad_core::services::tmux_ipc::{routing_target_alive, PaneId, TmuxIpc, WindowId};
+use exomonad_test_support::TmuxTestServer;
 use serde_json::json;
 use std::process::Command;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// A tmux session created for one test, torn down on drop.
+///
+/// The server guard owns the socket inside its own temp directory and kills
+/// that exact server on drop, so no `exo-liveness-*` socket reaches the shared
+/// `/tmp/tmux-<uid>/` directory.
 struct TestSession {
     name: String,
-}
-
-fn test_tmux_socket() -> &'static str {
-    static SOCKET: OnceLock<String> = OnceLock::new();
-    SOCKET.get_or_init(|| format!("exo-liveness-{}", std::process::id()))
-}
-
-fn test_tmux_command() -> Command {
-    let mut command = Command::new("tmux");
-    command.args(["-L", test_tmux_socket()]);
-    command
-}
-
-fn configure_test_tmux_socket() {
-    std::env::set_var("EXOMONAD_TMUX_SOCKET", test_tmux_socket());
+    server: TmuxTestServer,
 }
 
 impl TestSession {
     fn create(name: &str) -> Self {
-        configure_test_tmux_socket();
-        let status = test_tmux_command()
+        let server = TmuxTestServer::new();
+        let status = server
+            .command()
             .args([
                 "new-session",
                 "-d",
@@ -53,7 +44,12 @@ impl TestSession {
         assert!(status.success(), "failed to create tmux session {name}");
         Self {
             name: name.to_string(),
+            server,
         }
+    }
+
+    fn command(&self) -> Command {
+        self.server.command()
     }
 
     /// First window id (`@N`) of this session.
@@ -69,7 +65,8 @@ impl TestSession {
     }
 
     fn query(&self, format: &str) -> String {
-        let output = test_tmux_command()
+        let output = self
+            .command()
             .args(["list-panes", "-t", &self.name, "-F", format])
             .output()
             .expect("tmux list-panes");
@@ -87,7 +84,8 @@ impl TestSession {
     }
 
     fn new_shell_window(&self, name: &str) -> WindowId {
-        let output = test_tmux_command()
+        let output = self
+            .command()
             .args([
                 "new-window",
                 "-d",
@@ -108,7 +106,8 @@ impl TestSession {
 
     fn set_remain_on_exit(&self, window_id: &WindowId) {
         let target = format!("{}:{}", self.name, window_id);
-        let status = test_tmux_command()
+        let status = self
+            .command()
             .args(["set-window-option", "-t", &target, "remain-on-exit", "on"])
             .status()
             .expect("tmux set-window-option");
@@ -117,7 +116,8 @@ impl TestSession {
 
     fn respawn_exiting_shell(&self, window_id: &WindowId) {
         let target = format!("{}:{}", self.name, window_id);
-        let status = test_tmux_command()
+        let status = self
+            .command()
             .args(["respawn-window", "-k", "-t", &target, "sh -c 'exit 0'"])
             .status()
             .expect("tmux respawn-window");
@@ -125,16 +125,8 @@ impl TestSession {
     }
 }
 
-impl Drop for TestSession {
-    fn drop(&mut self) {
-        let _ = test_tmux_command()
-            .args(["kill-session", "-t", &self.name])
-            .status();
-    }
-}
-
 fn tmux_available() -> bool {
-    test_tmux_command()
+    Command::new("tmux")
         .arg("-V")
         .output()
         .map(|out| out.status.success())
@@ -180,7 +172,8 @@ async fn window_exists_reports_false_after_the_window_is_killed() {
         return;
     }
     let session = TestSession::create("exo-liveness-killed-window");
-    let extra = test_tmux_command()
+    let extra = session
+        .command()
         .args([
             "new-window",
             "-d",
@@ -205,7 +198,8 @@ async fn window_exists_reports_false_after_the_window_is_killed() {
         .await
         .expect("probe succeeds"));
 
-    let status = test_tmux_command()
+    let status = session
+        .command()
         .args(["kill-window", "-t", extra_id.as_str()])
         .status()
         .expect("tmux kill-window");
@@ -259,7 +253,8 @@ async fn created_controller_target_keeps_exact_ids_and_epoch_after_window_rename
     assert_eq!(epoch, "controller-test-epoch");
 
     let rename_target = format!("{}:{}", session.name, target.window_id);
-    let renamed = test_tmux_command()
+    let renamed = session
+        .command()
         .args(["rename-window", "-t", &rename_target, "renamed-controller"])
         .status()
         .expect("tmux rename-window");
@@ -282,8 +277,36 @@ async fn window_exists_is_scoped_to_the_probing_session() {
         return;
     }
     let own = TestSession::create("exo-liveness-scope-own");
-    let other = TestSession::create("exo-liveness-scope-other");
-    let foreign_window = other.window_id();
+    let status = own
+        .command()
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            "exo-liveness-scope-other",
+            "-n",
+            "probe",
+            "sh",
+            "-c",
+            "sleep 300",
+        ])
+        .status()
+        .expect("tmux new-session");
+    assert!(status.success(), "failed to create the second session");
+    let other = own
+        .command()
+        .args([
+            "list-panes",
+            "-t",
+            "exo-liveness-scope-other",
+            "-F",
+            "#{window_id}",
+        ])
+        .output()
+        .expect("tmux list-panes");
+    assert!(other.status.success(), "tmux list-panes failed");
+    let foreign_window = WindowId::parse(String::from_utf8_lossy(&other.stdout).trim())
+        .expect("tmux reported a valid window id");
 
     assert!(
         !own.ipc()
@@ -436,7 +459,8 @@ async fn live_tmux_dispatch_event_preserves_intent_and_sequence() {
         marker.display()
     );
     let target = format!("{}:{}", session.name, window);
-    let status = test_tmux_command()
+    let status = session
+        .command()
         .args(["respawn-window", "-k", "-t", &target, "sh", "-c", &command])
         .status()
         .expect("tmux respawn-window");

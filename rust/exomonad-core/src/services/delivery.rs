@@ -2023,6 +2023,7 @@ mod tests {
     use crate::domain::{AgentName, BirthBranch, Slug};
     use crate::services::agent_control::{AgentType, Topology};
     use crate::services::{AgentIdentityRecord, AgentResolver, HasAgentResolver};
+    use exomonad_test_support::TmuxTestServer;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
     use std::sync::Arc;
@@ -2443,21 +2444,11 @@ mod tests {
     #[serial_test::serial]
     async fn persisted_controller_guidance_targets_owned_pane_when_worker_is_selected() {
         let temp = tempfile::tempdir().expect("create isolated delivery workspace");
-        let socket = format!("exo-delivery-route-{}", uuid::Uuid::new_v4());
         let session = format!("exo-delivery-route-{}", uuid::Uuid::new_v4());
-        let previous_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
-        let previous_session = std::env::var_os("EXOMONAD_TMUX_SESSION");
-        std::env::set_var("EXOMONAD_TMUX_SOCKET", &socket);
-        std::env::set_var("EXOMONAD_TMUX_SESSION", &session);
-        let _environment = DeliveryTmuxEnvironment {
-            socket: socket.clone(),
-            previous_socket,
-            previous_session,
-        };
-
+        let environment = DeliveryTmuxEnvironment::new(&session);
         let command = |args: &[&str]| {
-            let mut command = std::process::Command::new("tmux");
-            command.args(["-L", socket.as_str()]).args(args);
+            let mut command = environment.command();
+            command.args(args);
             command
         };
         let started = command(&[
@@ -2733,26 +2724,33 @@ mod tests {
     }
 
     struct DeliveryTmuxEnvironment {
-        socket: String,
-        previous_socket: Option<std::ffi::OsString>,
+        server: TmuxTestServer,
         previous_session: Option<std::ffi::OsString>,
+    }
+
+    impl DeliveryTmuxEnvironment {
+        fn new(session: &str) -> Self {
+            let server = TmuxTestServer::new();
+            let previous_session = std::env::var_os("EXOMONAD_TMUX_SESSION");
+            std::env::set_var("EXOMONAD_TMUX_SESSION", session);
+            Self {
+                server,
+                previous_session,
+            }
+        }
+
+        fn command(&self) -> std::process::Command {
+            self.server.command()
+        }
     }
 
     impl Drop for DeliveryTmuxEnvironment {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("tmux")
-                .args(["-L", &self.socket, "kill-server"])
-                .status();
-            restore_test_env("EXOMONAD_TMUX_SOCKET", self.previous_socket.take());
-            restore_test_env("EXOMONAD_TMUX_SESSION", self.previous_session.take());
-        }
-    }
-
-    fn restore_test_env(key: &str, value: Option<std::ffi::OsString>) {
-        if let Some(value) = value {
-            std::env::set_var(key, value);
-        } else {
-            std::env::remove_var(key);
+            if let Some(previous) = self.previous_session.take() {
+                std::env::set_var("EXOMONAD_TMUX_SESSION", previous);
+            } else {
+                std::env::remove_var("EXOMONAD_TMUX_SESSION");
+            }
         }
     }
 

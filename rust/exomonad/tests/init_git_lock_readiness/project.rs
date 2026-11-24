@@ -184,14 +184,14 @@ pub fn preserve_unrelated_edits(project: &Path) {
     fs::write(project.join("untracked.txt"), "keep this\n").unwrap();
 }
 
-pub fn run_init(project: &Path, home: &Path, socket_dir: &Path, session: &str) -> Output {
-    run_init_mode(project, home, socket_dir, session, "--continue")
+pub fn run_init(project: &Path, home: &Path, socket_path: &Path, session: &str) -> Output {
+    run_init_mode(project, home, socket_path, session, "--continue")
 }
 
 pub fn run_init_mode(
     project: &Path,
     home: &Path,
-    socket_dir: &Path,
+    socket_path: &Path,
     session: &str,
     mode: &str,
 ) -> Output {
@@ -199,7 +199,7 @@ pub fn run_init_mode(
         .args(["init", mode, "--session", session])
         .current_dir(project)
         .env("HOME", home)
-        .env("TMUX_TMPDIR", socket_dir)
+        .env("EXOMONAD_TMUX_SOCKET", socket_path)
         .env("CODEX_HOME", home.join(".codex"))
         .env("EXOMONAD_TL_PREFLIGHT_ACK", "1")
         .env_remove("EXOMONAD_ROOT_AGENT_TYPE")

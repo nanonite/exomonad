@@ -9849,6 +9849,7 @@ mod tests {
     };
     use exomonad_test_support::{
         assert_fixture_git_root, init_fixture_git_repository, run_fixture_git_command,
+        TmuxTestServer,
     };
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
@@ -14606,26 +14607,12 @@ mod tests {
     async fn interrupted_target_creation_is_adopted_by_epoch_without_name_scanning() {
         use exomonad_core::services::tmux_ipc::TmuxIpc;
 
-        let previous_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
-        let socket = format!("exo-init-startup-{}", std::process::id());
-        std::env::set_var("EXOMONAD_TMUX_SOCKET", &socket);
-        let _restore = TmuxSocketRestore {
-            socket,
-            previous: previous_socket,
-        };
+        let tmux = TmuxTestServer::new();
         let dir = tempfile::tempdir().unwrap();
         let session = format!("exo-init-startup-{}", std::process::id());
-        let new_session = Command::new("tmux")
-            .args([
-                "-L",
-                &_restore.socket,
-                "new-session",
-                "-d",
-                "-s",
-                &session,
-                "sleep",
-                "300",
-            ])
+        let new_session = tmux
+            .command()
+            .args(["new-session", "-d", "-s", &session, "sleep", "300"])
             .output()
             .expect("create isolated tmux session");
         assert!(new_session.status.success());
@@ -14699,7 +14686,7 @@ mod tests {
     }
 
     struct ControllerStartupHandoffFixture {
-        _socket: TmuxSocketRestore,
+        _server: TmuxTestServer,
         dir: tempfile::TempDir,
         ipc: exomonad_core::services::tmux_ipc::TmuxIpc,
         session: String,
@@ -14731,19 +14718,12 @@ mod tests {
         {
             use exomonad_core::services::tmux_ipc::TmuxIpc;
 
-            let previous_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
-            let socket = format!("exo-shutdown-handoff-{}-{tag}", std::process::id());
-            std::env::set_var("EXOMONAD_TMUX_SOCKET", &socket);
-            let socket_restore = TmuxSocketRestore {
-                socket: socket.clone(),
-                previous: previous_socket,
-            };
+            let server = TmuxTestServer::new();
             let dir = tempfile::tempdir().unwrap();
             let session = format!("exo-shutdown-handoff-{}-{tag}", std::process::id());
-            let status = Command::new("tmux")
+            let status = server
+                .command()
                 .args([
-                    "-L",
-                    &socket,
                     "new-session",
                     "-d",
                     "-s",
@@ -14767,7 +14747,7 @@ mod tests {
             )
             .unwrap();
             let mut fixture = Self {
-                _socket: socket_restore,
+                _server: server,
                 dir,
                 ipc,
                 session,
@@ -15878,57 +15858,6 @@ mod tests {
         }
     }
 
-    struct TmuxSocketRestore {
-        socket: String,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl Drop for TmuxSocketRestore {
-        fn drop(&mut self) {
-            let _ = Command::new("tmux")
-                .args(["-L", &self.socket, "kill-server"])
-                .status();
-            if let Some(previous) = self.previous.take() {
-                std::env::set_var("EXOMONAD_TMUX_SOCKET", previous);
-            } else {
-                std::env::remove_var("EXOMONAD_TMUX_SOCKET");
-            }
-        }
-    }
-
-    struct InitSocketFixture {
-        socket: String,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl InitSocketFixture {
-        fn new(socket: String) -> Self {
-            let previous = std::env::var_os("EXOMONAD_TMUX_SOCKET");
-            std::env::set_var("EXOMONAD_TMUX_SOCKET", &socket);
-            Self { socket, previous }
-        }
-
-        fn command(&self) -> Command {
-            let mut command = Command::new("tmux");
-            command
-                .args(["-S", &self.socket])
-                .env_remove("TMUX")
-                .env_remove("TMUX_PANE");
-            command
-        }
-    }
-
-    impl Drop for InitSocketFixture {
-        fn drop(&mut self) {
-            let _ = self.command().arg("kill-server").status();
-            if let Some(previous) = self.previous.take() {
-                std::env::set_var("EXOMONAD_TMUX_SOCKET", previous);
-            } else {
-                std::env::remove_var("EXOMONAD_TMUX_SOCKET");
-            }
-        }
-    }
-
     #[tokio::test]
     #[serial_test::serial]
     async fn failed_ordered_repair_leaves_pending_startup_recoverable_for_shutdown_and_retry() {
@@ -15942,11 +15871,7 @@ mod tests {
 
         let project = tempfile::tempdir().unwrap();
         let project_dir = project.path().to_path_buf();
-        let socket = project_dir
-            .join(format!("exo-init-recovery-{}.sock", std::process::id()))
-            .to_string_lossy()
-            .into_owned();
-        let fixture = InitSocketFixture::new(socket);
+        let fixture = TmuxTestServer::new();
         let session = format!("exo-init-recovery-{}", std::process::id());
         let status = fixture
             .command()

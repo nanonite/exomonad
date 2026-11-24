@@ -3,6 +3,7 @@
 #[path = "init_git_lock_readiness/mod.rs"]
 mod fixture;
 
+use exomonad_test_support::TmuxTestServer;
 use fixture::*;
 use std::fs;
 use std::path::Path;
@@ -14,17 +15,20 @@ async fn init_continue_recovers_managed_orphan_and_attaches_once() {
     let temp = tempfile::tempdir().expect("temporary fixture root");
     let project = temp.path().join("repo");
     let home = temp.path().join("home");
-    let socket_dir = temp.path().join("tmux");
+    // The shipped binary still runs a few raw `tmux` commands, so name the
+    // socket the way tmux does under a private TMUX_TMPDIR while pointing
+    // EXOMONAD_TMUX_SOCKET at the same absolute path.
+    let tmux_server = TmuxTestServer::with_tmux_default_socket();
+    let socket_path = tmux_server.socket_path();
     let session = format!("exo-lock-recovery-{}", std::process::id());
     fs::create_dir_all(&project).unwrap();
     fs::create_dir_all(&home).unwrap();
-    fs::create_dir_all(&socket_dir).unwrap();
     init_git_repo(&project);
     install_project_runtime(&project, &home);
     configure_project(&project, &session);
     seed_runnable_checkpoint(&project);
     preserve_unrelated_edits(&project);
-    let tmux_session = create_exited_tl_session(&socket_dir, &session, &project).await;
+    let tmux_session = create_exited_tl_session(&socket_path, &session, &project).await;
 
     let index = fs::read(project.join(".git/index")).unwrap();
     let status = git_output(&project, &["status", "--porcelain"]);
@@ -32,13 +36,13 @@ async fn init_continue_recovers_managed_orphan_and_attaches_once() {
     assert_eq!(fs::read(&lock).unwrap(), b"");
     assert!(has_lock_owner_proof(&project));
 
-    let old_tl = window_id(&socket_dir, &session, "TL");
-    let first = run_init(&project, &home, &socket_dir, &session);
+    let old_tl = window_id(&socket_path, &session, "TL");
+    let first = run_init(&project, &home, &socket_path, &session);
     if process_inspection_was_denied(&first) {
         assert_limited_inspection_refusal(
             &first,
             &project,
-            &socket_dir,
+            &socket_path,
             &session,
             &lock,
             &index,
@@ -56,20 +60,20 @@ async fn init_continue_recovers_managed_orphan_and_attaches_once() {
     );
     assert_init_recovered(&first, "init --continue after orphan recovery");
     assert_recovery_preserved_state(&project, &lock, &index, &status);
-    assert_restarted_controller(&socket_dir, &session, &old_tl);
+    assert_restarted_controller(&socket_path, &session, &old_tl);
     let controller_target = assert_exact_controller_ownership(
         &project,
-        &socket_dir,
+        &socket_path,
         &session,
-        &window_id(&socket_dir, &session, "TL"),
+        &window_id(&socket_path, &session, "TL"),
     )
     .await;
 
-    let live_tl = window_id(&socket_dir, &session, "TL");
-    let repeat = run_init(&project, &home, &socket_dir, &session);
+    let live_tl = window_id(&socket_path, &session, "TL");
+    let repeat = run_init(&project, &home, &socket_path, &session);
     assert_init_repeat_is_idempotent(&repeat);
-    assert_exactly_one_live_role_window(&socket_dir, &session, "TL");
-    assert_eq!(window_id(&socket_dir, &session, "TL"), live_tl);
+    assert_exactly_one_live_role_window(&socket_path, &session, "TL");
+    assert_eq!(window_id(&socket_path, &session, "TL"), live_tl);
     assert_eq!(quarantine_count(&project), 1);
     assert_eq!(
         fs::read(project.join(".exo/tl-loop/root/controller-target.json")).unwrap(),
@@ -81,7 +85,7 @@ async fn init_continue_recovers_managed_orphan_and_attaches_once() {
 
 async fn assert_exact_controller_ownership(
     project: &Path,
-    socket_dir: &Path,
+    socket_path: &Path,
     session: &str,
     expected_window_id: &str,
 ) -> Vec<u8> {
@@ -100,7 +104,7 @@ async fn assert_exact_controller_ownership(
     );
 
     let panes = tmux(
-        socket_dir,
+        socket_path,
         &[
             "list-panes",
             "-a",
@@ -132,7 +136,7 @@ async fn assert_exact_controller_ownership(
         )
     );
 
-    let server = tmux(socket_dir, &["display-message", "-p", "#{pid}"]);
+    let server = tmux(socket_path, &["display-message", "-p", "#{pid}"]);
     assert_success(&server, "inspect exact tmux server process");
     let server_pid = String::from_utf8_lossy(&server.stdout)
         .trim()
@@ -187,7 +191,7 @@ fn process_inspection_was_denied(output: &Output) -> bool {
 fn assert_limited_inspection_refusal(
     output: &Output,
     project: &Path,
-    socket_dir: &Path,
+    socket_path: &Path,
     session: &str,
     lock: &Path,
     index: &[u8],
@@ -202,9 +206,9 @@ fn assert_limited_inspection_refusal(
     assert!(!has_quarantine_receipt(project));
     assert_eq!(fs::read(project.join(".git/index")).unwrap(), index);
     assert_eq!(git_output(project, &["status", "--porcelain"]), status);
-    assert_eq!(window_id(socket_dir, session, "TL"), old_tl);
-    assert_eq!(window_count(socket_dir, session, "Server"), 0);
-    assert_eq!(window_count(socket_dir, session, "Watcher"), 0);
+    assert_eq!(window_id(socket_path, session, "TL"), old_tl);
+    assert_eq!(window_count(socket_path, session, "Server"), 0);
+    assert_eq!(window_count(socket_path, session, "Watcher"), 0);
 }
 
 fn assert_recovery_preserved_state(project: &Path, lock: &Path, index: &[u8], status: &str) {
@@ -214,11 +218,11 @@ fn assert_recovery_preserved_state(project: &Path, lock: &Path, index: &[u8], st
     assert_eq!(git_output(project, &["status", "--porcelain"]), status);
 }
 
-fn assert_restarted_controller(socket_dir: &Path, session: &str, old_tl: &str) {
+fn assert_restarted_controller(socket_path: &Path, session: &str, old_tl: &str) {
     for role in ["Server", "Watcher", "TL"] {
-        assert_exactly_one_live_role_window(socket_dir, session, role);
+        assert_exactly_one_live_role_window(socket_path, session, role);
     }
-    assert_ne!(window_id(socket_dir, session, "TL"), old_tl);
+    assert_ne!(window_id(socket_path, session, "TL"), old_tl);
 }
 
 fn assert_init_recovered(output: &Output, action: &str) {

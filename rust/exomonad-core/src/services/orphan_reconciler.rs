@@ -649,22 +649,20 @@ async fn kill_agent_window(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
+    use exomonad_test_support::TmuxTestServer;
     use std::process::Command as StdCommand;
 
     struct OrphanTmuxServer {
-        socket: String,
+        server: TmuxTestServer,
         session: String,
-        previous_socket: Option<OsString>,
     }
 
     impl OrphanTmuxServer {
         fn new() -> Self {
-            let socket = format!("exo-orphan-recovery-{}", uuid::Uuid::new_v4());
+            let server = TmuxTestServer::new();
             let session = format!("exo-orphan-recovery-{}", uuid::Uuid::new_v4());
-            let previous_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
-            std::env::set_var("EXOMONAD_TMUX_SOCKET", &socket);
-            let status = Self::command(&socket)
+            let status = server
+                .command()
                 .args([
                     "new-session",
                     "-d",
@@ -679,21 +677,16 @@ mod tests {
                 .status()
                 .expect("start isolated orphan test tmux server");
             assert!(status.success(), "isolated tmux session starts");
-            Self {
-                socket,
-                session,
-                previous_socket,
-            }
+            Self { server, session }
         }
 
-        fn command(socket: &str) -> StdCommand {
-            let mut command = StdCommand::new("tmux");
-            command.args(["-L", socket]);
-            command
+        fn command(&self) -> StdCommand {
+            self.server.command()
         }
 
         fn window_id(&self) -> crate::services::tmux_ipc::WindowId {
-            let output = Self::command(&self.socket)
+            let output = self
+                .command()
                 .args(["list-windows", "-t", &self.session, "-F", "#{window_id}"])
                 .output()
                 .expect("list isolated windows");
@@ -708,7 +701,8 @@ mod tests {
         }
 
         fn keep_session_alive(&self) {
-            let status = Self::command(&self.socket)
+            let status = self
+                .command()
                 .args(["new-window", "-d", "-t", &self.session, "sleep", "300"])
                 .status()
                 .expect("create a second isolated window");
@@ -716,7 +710,8 @@ mod tests {
         }
 
         fn kill_window(&self, window: &crate::services::tmux_ipc::WindowId) {
-            let status = Self::command(&self.socket)
+            let status = self
+                .command()
                 .args(["kill-window", "-t", window.as_str()])
                 .status()
                 .expect("remove isolated target window");
@@ -724,18 +719,7 @@ mod tests {
         }
 
         fn kill_server(&self) {
-            let _ = Self::command(&self.socket).arg("kill-server").status();
-        }
-    }
-
-    impl Drop for OrphanTmuxServer {
-        fn drop(&mut self) {
-            let _ = Self::command(&self.socket).arg("kill-server").status();
-            if let Some(previous) = self.previous_socket.take() {
-                std::env::set_var("EXOMONAD_TMUX_SOCKET", previous);
-            } else {
-                std::env::remove_var("EXOMONAD_TMUX_SOCKET");
-            }
+            let _ = self.command().arg("kill-server").status();
         }
     }
 

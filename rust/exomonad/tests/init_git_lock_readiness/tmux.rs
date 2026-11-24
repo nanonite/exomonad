@@ -5,25 +5,26 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 pub struct TmuxSession {
-    socket_dir: PathBuf,
+    socket_path: PathBuf,
     name: String,
 }
 
 impl Drop for TmuxSession {
     fn drop(&mut self) {
-        let _ = tmux(&self.socket_dir, &["kill-session", "-t", &self.name]);
+        let _ = tmux(&self.socket_path, &["kill-session", "-t", &self.name]);
     }
 }
 
 pub async fn create_exited_tl_session(
-    socket_dir: &Path,
+    socket_path: &Path,
     session: &str,
     project: &Path,
 ) -> TmuxSession {
-    let config = socket_dir.join("tmux.conf");
+    let config = socket_path.with_file_name("tmux.conf");
     fs::write(&config, "set-window-option -g remain-on-exit on\n").unwrap();
     let output = Command::new("tmux")
-        .env("TMUX_TMPDIR", socket_dir)
+        .arg("-S")
+        .arg(socket_path)
         .arg("-f")
         .arg(config)
         .args([
@@ -39,24 +40,24 @@ pub async fn create_exited_tl_session(
         .expect("create isolated existing tmux session");
     assert_success(&output, "create initial exited TL pane");
     let environment = tmux(
-        socket_dir,
+        socket_path,
         &["set-environment", "-g", "EXOMONAD_TL_PREFLIGHT_ACK", "1"],
     );
     assert_success(
         &environment,
         "configure dirty-worktree preflight acknowledgement",
     );
-    persist_exact_controller_owner(socket_dir, session, project).await;
-    wait_for_exited_tl(socket_dir, session);
+    persist_exact_controller_owner(socket_path, session, project).await;
+    wait_for_exited_tl(socket_path, session);
     TmuxSession {
-        socket_dir: socket_dir.to_path_buf(),
+        socket_path: socket_path.to_path_buf(),
         name: session.to_string(),
     }
 }
 
-async fn persist_exact_controller_owner(socket_dir: &Path, session: &str, project: &Path) {
+async fn persist_exact_controller_owner(socket_path: &Path, session: &str, project: &Path) {
     let pane_output = tmux(
-        socket_dir,
+        socket_path,
         &[
             "list-panes",
             "-t",
@@ -72,7 +73,7 @@ async fn persist_exact_controller_owner(socket_dir: &Path, session: &str, projec
         .map(str::to_owned)
         .collect::<Vec<_>>();
     assert_eq!(pane.len(), 3);
-    let server_output = tmux(socket_dir, &["display-message", "-p", "#{pid}"]);
+    let server_output = tmux(socket_path, &["display-message", "-p", "#{pid}"]);
     assert_success(&server_output, "capture initial tmux server identity");
     let server_pid = String::from_utf8_lossy(&server_output.stdout)
         .trim()
@@ -105,9 +106,9 @@ async fn persist_exact_controller_owner(socket_dir: &Path, session: &str, projec
     .unwrap();
 }
 
-pub fn wait_for_exited_tl(socket_dir: &Path, session: &str) {
+pub fn wait_for_exited_tl(socket_path: &Path, session: &str) {
     let started = Instant::now();
-    while !pane_is_dead(socket_dir, session, "TL") {
+    while !pane_is_dead(socket_path, session, "TL") {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "TL pane did not exit"
@@ -116,9 +117,9 @@ pub fn wait_for_exited_tl(socket_dir: &Path, session: &str) {
     }
 }
 
-pub fn assert_exactly_one_live_role_window(socket_dir: &Path, session: &str, role: &str) {
+pub fn assert_exactly_one_live_role_window(socket_path: &Path, session: &str, role: &str) {
     let windows = tmux(
-        socket_dir,
+        socket_path,
         &[
             "list-windows",
             "-t",
@@ -144,9 +145,9 @@ pub fn assert_exactly_one_live_role_window(socket_dir: &Path, session: &str, rol
     );
 }
 
-pub fn window_id(socket_dir: &Path, session: &str, role: &str) -> String {
+pub fn window_id(socket_path: &Path, session: &str, role: &str) -> String {
     let output = tmux(
-        socket_dir,
+        socket_path,
         &[
             "list-windows",
             "-t",
@@ -165,9 +166,9 @@ pub fn window_id(socket_dir: &Path, session: &str, role: &str) -> String {
         .unwrap_or_else(|| panic!("missing {role} tmux window"))
 }
 
-pub fn window_count(socket_dir: &Path, session: &str, role: &str) -> usize {
+pub fn window_count(socket_path: &Path, session: &str, role: &str) -> usize {
     let output = tmux(
-        socket_dir,
+        socket_path,
         &["list-windows", "-t", session, "-F", "#{window_name}"],
     );
     assert_success(&output, "count tmux role windows");
@@ -177,9 +178,9 @@ pub fn window_count(socket_dir: &Path, session: &str, role: &str) -> usize {
         .count()
 }
 
-fn pane_is_dead(socket_dir: &Path, session: &str, role: &str) -> bool {
+fn pane_is_dead(socket_path: &Path, session: &str, role: &str) -> bool {
     let output = tmux(
-        socket_dir,
+        socket_path,
         &[
             "list-windows",
             "-t",
@@ -194,10 +195,13 @@ fn pane_is_dead(socket_dir: &Path, session: &str, role: &str) -> bool {
         .any(|line| line == format!("{role} 1"))
 }
 
-pub fn tmux(socket_dir: &Path, args: &[&str]) -> Output {
+pub fn tmux(socket_path: &Path, args: &[&str]) -> Output {
     Command::new("tmux")
-        .env("TMUX_TMPDIR", socket_dir)
+        .arg("-S")
+        .arg(socket_path)
         .args(args)
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
         .output()
         .expect("run tmux fixture command")
 }

@@ -2505,6 +2505,7 @@ impl<
 mod tests {
     use super::super::test_tracing::global_test_event_sink;
     use super::*;
+    use exomonad_test_support::TmuxTestServer;
     #[allow(clippy::upper_case_acronyms)]
     type ACS = AgentControlService<crate::services::Services>;
 
@@ -3575,19 +3576,14 @@ mod tests {
     struct OrderedTestTmux {
         socket: String,
         session: String,
-        previous_socket: Option<std::ffi::OsString>,
-        _socket_dir: tempfile::TempDir,
+        _server: TmuxTestServer,
     }
 
     impl OrderedTestTmux {
         fn new() -> Self {
-            let socket_dir = super::super::test_tmux::isolated_socket_directory();
-            let socket = super::super::test_tmux::socket_path(socket_dir.path())
-                .to_string_lossy()
-                .into_owned();
+            let server = TmuxTestServer::new();
+            let socket = server.socket().to_owned();
             let session = format!("exo-ordered-recovery-{}", uuid::Uuid::new_v4());
-            let previous_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
-            std::env::set_var("EXOMONAD_TMUX_SOCKET", &socket);
             let status = Self::command(&socket)
                 .args([
                     "new-session",
@@ -3606,8 +3602,7 @@ mod tests {
             Self {
                 socket,
                 session,
-                previous_socket,
-                _socket_dir: socket_dir,
+                _server: server,
             }
         }
 
@@ -3801,17 +3796,6 @@ mod tests {
             assert!(output.status.success(), "replacement session starts");
             super::super::tmux_ipc::WindowId::parse(String::from_utf8_lossy(&output.stdout).trim())
                 .expect("replacement session returns a TL window ID")
-        }
-    }
-
-    impl Drop for OrderedTestTmux {
-        fn drop(&mut self) {
-            let _ = Self::command(&self.socket).arg("kill-server").status();
-            if let Some(previous) = self.previous_socket.take() {
-                std::env::set_var("EXOMONAD_TMUX_SOCKET", previous);
-            } else {
-                std::env::remove_var("EXOMONAD_TMUX_SOCKET");
-            }
         }
     }
 

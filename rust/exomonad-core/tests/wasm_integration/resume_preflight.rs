@@ -10,6 +10,7 @@ use exomonad_core::services::forgejo::ForgejoClient;
 use exomonad_core::services::immutable_ledger::LedgerWriter;
 use exomonad_core::{EffectContext, EffectError, EffectHandler, EffectResult};
 use exomonad_proto::effects::agent as agent_proto;
+use exomonad_test_support::TmuxTestServer;
 use prost::Message;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -136,14 +137,11 @@ async fn compiled_blocked_resume_uses_the_controller_selected_worker_route() {
     path_value.push(":");
     path_value.push(prior_path);
     let _path_restore = EnvironmentRestore::set("PATH", path_value.clone());
-    let socket = format!("exo-route-resume-{}", std::process::id());
+    let server = TmuxTestServer::new();
     let session = format!("exo-route-resume-{}", std::process::id());
-    let _socket_restore =
-        EnvironmentRestore::set("EXOMONAD_TMUX_SOCKET", std::ffi::OsString::from(&socket));
-    let created = Command::new("tmux")
+    let created = server
+        .command()
         .args([
-            "-L",
-            &socket,
             "new-session",
             "-d",
             "-s",
@@ -157,8 +155,9 @@ async fn compiled_blocked_resume_uses_the_controller_selected_worker_route() {
         .expect("start isolated tmux session");
     assert!(created.success(), "isolated tmux session starts");
     let path_text = path_value.to_string_lossy().into_owned();
-    let set_path = Command::new("tmux")
-        .args(["-L", &socket, "set-environment", "-g", "PATH", &path_text])
+    let set_path = server
+        .command()
+        .args(["set-environment", "-g", "PATH", &path_text])
         .status()
         .expect("set isolated tmux PATH");
     assert!(
@@ -338,10 +337,6 @@ async fn compiled_blocked_resume_uses_the_controller_selected_worker_route() {
         .expect("successor owner identity is persisted"),
     )
     .expect("successor identity is JSON");
-    let _ = Command::new("tmux")
-        .args(["-L", &socket, "kill-server"])
-        .status();
-
     assert_eq!(
         output["success"], true,
         "blocked resume succeeds: {output:#}; invocation: {invocation:#}"
@@ -420,14 +415,11 @@ async fn compiled_fresh_spawns_return_the_persisted_controller_route() {
     path.push(prior_path);
     let _path_restore = EnvironmentRestore::set("PATH", path.clone());
     let _shell_restore = EnvironmentRestore::set("SHELL", fake_shell.into_os_string());
-    let socket = format!("exo-fresh-route-{}", std::process::id());
+    let server = TmuxTestServer::new();
     let session = format!("exo-fresh-route-{}", std::process::id());
-    let _socket_restore =
-        EnvironmentRestore::set("EXOMONAD_TMUX_SOCKET", std::ffi::OsString::from(&socket));
-    let created = Command::new("tmux")
+    let created = server
+        .command()
         .args([
-            "-L",
-            &socket,
             "new-session",
             "-d",
             "-s",
@@ -441,8 +433,9 @@ async fn compiled_fresh_spawns_return_the_persisted_controller_route() {
         .expect("start isolated tmux session");
     assert!(created.success(), "isolated tmux session starts");
     let path_text = path.to_string_lossy().into_owned();
-    let set_path = Command::new("tmux")
-        .args(["-L", &socket, "set-environment", "-g", "PATH", &path_text])
+    let set_path = server
+        .command()
+        .args(["set-environment", "-g", "PATH", &path_text])
         .status()
         .expect("set isolated tmux PATH");
     assert!(
@@ -546,10 +539,6 @@ async fn compiled_fresh_spawns_return_the_persisted_controller_route() {
     {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    let _ = Command::new("tmux")
-        .args(["-L", &socket, "kill-server"])
-        .status();
-
     let leaf_receipt = &leaf["result"];
     for (receipt, route, owner) in [(leaf_receipt, &leaf_route, "leaf-route-codex")] {
         assert_eq!(receipt["role_route"], *route);
@@ -969,14 +958,11 @@ async fn resume_pr_across_configured_harness(
     shim_path.push(":");
     shim_path.push(prior_path);
     let _path_restore = EnvironmentRestore::set("PATH", shim_path.clone());
-    let socket = format!("exo-configured-resume-{}-{owner_name}", std::process::id());
+    let server = TmuxTestServer::new();
     let session = format!("exo-configured-resume-{}-{owner_name}", std::process::id());
-    let _socket_restore =
-        EnvironmentRestore::set("EXOMONAD_TMUX_SOCKET", std::ffi::OsString::from(&socket));
-    let created = Command::new("tmux")
+    let created = server
+        .command()
         .args([
-            "-L",
-            &socket,
             "new-session",
             "-d",
             "-s",
@@ -990,8 +976,9 @@ async fn resume_pr_across_configured_harness(
         .expect("start isolated tmux session");
     assert!(created.success(), "isolated tmux session starts");
     let path_text = shim_path.to_string_lossy().into_owned();
-    let set_path = Command::new("tmux")
-        .args(["-L", &socket, "set-environment", "-g", "PATH", &path_text])
+    let set_path = server
+        .command()
+        .args(["set-environment", "-g", "PATH", &path_text])
         .status()
         .expect("set isolated tmux PATH");
     assert!(
@@ -1074,9 +1061,6 @@ async fn resume_pr_across_configured_harness(
         .map(|contents| contents.lines().count())
         .unwrap_or_default();
     let events = read_project_events(&project);
-    let _ = Command::new("tmux")
-        .args(["-L", &socket, "kill-server"])
-        .status();
 
     ConfiguredResumePrEvidence {
         output,

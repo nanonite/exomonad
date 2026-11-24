@@ -1401,7 +1401,7 @@ mod tests {
         Topology,
     };
     use crate::services::agent_resolver::AgentResolver;
-    use std::ffi::OsString;
+    use exomonad_test_support::TmuxTestServer;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
 
@@ -1454,19 +1454,14 @@ mod tests {
         session: String,
         window: WindowId,
         pane: PaneId,
-        previous_socket: Option<OsString>,
-        _socket_dir: tempfile::TempDir,
+        _server: TmuxTestServer,
     }
 
     impl IsolatedTmux {
         fn new() -> Self {
-            let socket_dir = super::super::test_tmux::isolated_socket_directory();
-            let socket = super::super::test_tmux::socket_path(socket_dir.path())
-                .to_string_lossy()
-                .into_owned();
+            let server = TmuxTestServer::new();
+            let socket = server.socket().to_owned();
             let session = format!("exo-controller-lifecycle-{}", Uuid::new_v4());
-            let previous_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
-            std::env::set_var("EXOMONAD_TMUX_SOCKET", &socket);
             let output = Self::command(&socket)
                 .args([
                     "new-session",
@@ -1505,8 +1500,7 @@ mod tests {
                 session,
                 window,
                 pane,
-                previous_socket,
-                _socket_dir: socket_dir,
+                _server: server,
             }
         }
 
@@ -1601,17 +1595,6 @@ mod tests {
                     "controller pane {pid} did not install its SIGINT trap"
                 );
                 std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-    }
-
-    impl Drop for IsolatedTmux {
-        fn drop(&mut self) {
-            let _ = Self::command(&self.socket).arg("kill-server").status();
-            if let Some(previous) = self.previous_socket.take() {
-                std::env::set_var("EXOMONAD_TMUX_SOCKET", previous);
-            } else {
-                std::env::remove_var("EXOMONAD_TMUX_SOCKET");
             }
         }
     }

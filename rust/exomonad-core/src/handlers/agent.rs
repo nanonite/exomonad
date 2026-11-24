@@ -6977,7 +6977,7 @@ fn agent_is_alive(info: &AgentInfo) -> bool {
 mod tests {
     use super::*;
     use crate::services::agent_control::InvocationTrigger;
-    use exomonad_test_support::init_fixture_git_repository;
+    use exomonad_test_support::{init_fixture_git_repository, TmuxTestServer};
     use prost::Message;
     use serial_test::serial;
     use std::os::unix::fs::PermissionsExt;
@@ -6994,21 +6994,8 @@ mod tests {
         invocation_id: String,
         prior_invocation_id: String,
         head_sha: String,
-        tmux_socket: String,
-        previous_tmux_socket: Option<std::ffi::OsString>,
-    }
-
-    impl Drop for ResumePrAdoptionFixture {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("tmux")
-                .args(["-L", &self.tmux_socket, "kill-server"])
-                .status();
-            if let Some(socket) = self.previous_tmux_socket.take() {
-                std::env::set_var("EXOMONAD_TMUX_SOCKET", socket);
-            } else {
-                std::env::remove_var("EXOMONAD_TMUX_SOCKET");
-            }
-        }
+        session: String,
+        server: TmuxTestServer,
     }
 
     impl ResumePrAdoptionFixture {
@@ -7101,14 +7088,11 @@ mod tests {
             .mount(&forgejo)
             .await;
 
-        let tmux_socket = format!("exo-pr-resume-{}", std::process::id());
+        let server = TmuxTestServer::new();
         let tmux_session = format!("exo-pr-resume-{}", std::process::id());
-        let previous_tmux_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
-        std::env::set_var("EXOMONAD_TMUX_SOCKET", &tmux_socket);
-        let session = std::process::Command::new("tmux")
+        let session = server
+            .command()
             .args([
-                "-L",
-                &tmux_socket,
                 "new-session",
                 "-d",
                 "-s",
@@ -7120,10 +7104,9 @@ mod tests {
             .status()
             .expect("start isolated tmux server");
         assert!(session.success(), "isolated tmux session must start");
-        let window = std::process::Command::new("tmux")
+        let window = server
+            .command()
             .args([
-                "-L",
-                &tmux_socket,
                 "new-window",
                 "-d",
                 "-t",
@@ -7350,8 +7333,8 @@ mod tests {
             invocation_id: CURRENT.to_string(),
             prior_invocation_id: PRIOR.to_string(),
             head_sha,
-            tmux_socket,
-            previous_tmux_socket,
+            session: tmux_session,
+            server,
         }
     }
 
@@ -7481,13 +7464,13 @@ mod tests {
             1,
             "response-loss retries must retain one logical resume intent"
         );
-        let windows = std::process::Command::new("tmux")
+        let windows = fixture
+            .server
+            .command()
             .args([
-                "-L",
-                &fixture.tmux_socket,
                 "list-windows",
                 "-t",
-                &format!("exo-pr-resume-{}", std::process::id()),
+                &fixture.session,
                 "-F",
                 "#{window_name}",
             ])
@@ -8389,20 +8372,17 @@ mod tests {
 
         let old_path = std::env::var_os("PATH");
         let old_shell = std::env::var_os("SHELL");
-        let old_tmux_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
         std::env::set_var("SHELL", &fake_shell);
         let mut path = std::ffi::OsString::from(&fake_bin);
         path.push(":");
         path.push(old_path.as_deref().unwrap_or_default());
         std::env::set_var("PATH", path);
 
-        let tmux_socket = format!("exo-dispatch-handler-{}", std::process::id());
+        let server = TmuxTestServer::new();
         let session = format!("exo-dispatch-handler-{}", std::process::id());
-        std::env::set_var("EXOMONAD_TMUX_SOCKET", &tmux_socket);
-        let session_status = Command::new("tmux")
+        let session_status = server
+            .command()
             .args([
-                "-L",
-                &tmux_socket,
                 "new-session",
                 "-d",
                 "-s",
@@ -8414,21 +8394,13 @@ mod tests {
                 "sleep 300",
             ])
             .status()
-            .await
             .expect("create test tmux session");
         assert!(session_status.success());
         let path_for_tmux = std::env::var("PATH").expect("test PATH");
-        let tmux_path_status = Command::new("tmux")
-            .args([
-                "-L",
-                &tmux_socket,
-                "set-environment",
-                "-g",
-                "PATH",
-                &path_for_tmux,
-            ])
+        let tmux_path_status = server
+            .command()
+            .args(["set-environment", "-g", "PATH", &path_for_tmux])
             .status()
-            .await
             .expect("set test tmux PATH");
         assert!(tmux_path_status.success());
 
@@ -8519,10 +8491,6 @@ mod tests {
             "agent.spawned must carry the invocation that owns this dispatch"
         );
 
-        let _ = Command::new("tmux")
-            .args(["-L", &tmux_socket, "kill-session", "-t", &session])
-            .status()
-            .await;
         if let Some(old_path) = old_path {
             std::env::set_var("PATH", old_path);
         } else {
@@ -8532,11 +8500,6 @@ mod tests {
             std::env::set_var("SHELL", old_shell);
         } else {
             std::env::remove_var("SHELL");
-        }
-        if let Some(old_tmux_socket) = old_tmux_socket {
-            std::env::set_var("EXOMONAD_TMUX_SOCKET", old_tmux_socket);
-        } else {
-            std::env::remove_var("EXOMONAD_TMUX_SOCKET");
         }
     }
 
@@ -9344,21 +9307,12 @@ mod tests {
         launch_log: PathBuf,
         handler: std::sync::Arc<AgentHandler<crate::services::Services>>,
         context: crate::effects::EffectContext,
-        tmux_socket: String,
-        previous_tmux_socket: Option<std::ffi::OsString>,
+        _server: TmuxTestServer,
         previous_path: std::ffi::OsString,
     }
 
     impl Drop for ConfiguredResumeFixture {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("tmux")
-                .args(["-L", &self.tmux_socket, "kill-server"])
-                .status();
-            if let Some(socket) = self.previous_tmux_socket.take() {
-                std::env::set_var("EXOMONAD_TMUX_SOCKET", socket);
-            } else {
-                std::env::remove_var("EXOMONAD_TMUX_SOCKET");
-            }
             std::env::set_var("PATH", &self.previous_path);
         }
     }
@@ -9641,14 +9595,11 @@ mod tests {
         shim_path.push(":");
         shim_path.push(&previous_path);
         std::env::set_var("PATH", shim_path);
-        let tmux_socket = format!("exo-configured-resume-{}-{owner_name}", std::process::id());
-        let previous_tmux_socket = std::env::var_os("EXOMONAD_TMUX_SOCKET");
-        std::env::set_var("EXOMONAD_TMUX_SOCKET", &tmux_socket);
+        let server = TmuxTestServer::new();
         let session_name = format!("exo-configured-resume-{}-{owner_name}", std::process::id());
-        let session = std::process::Command::new("tmux")
+        let session = server
+            .command()
             .args([
-                "-L",
-                &tmux_socket,
                 "new-session",
                 "-d",
                 "-s",
@@ -9665,15 +9616,9 @@ mod tests {
             .unwrap_or_default()
             .to_string_lossy()
             .into_owned();
-        let set_path = std::process::Command::new("tmux")
-            .args([
-                "-L",
-                &tmux_socket,
-                "set-environment",
-                "-g",
-                "PATH",
-                &path_text,
-            ])
+        let set_path = server
+            .command()
+            .args(["set-environment", "-g", "PATH", &path_text])
             .status()
             .expect("set isolated tmux PATH");
         assert!(
@@ -9763,8 +9708,7 @@ mod tests {
             launch_log,
             handler: std::sync::Arc::new(handler),
             context,
-            tmux_socket,
-            previous_tmux_socket,
+            _server: server,
             previous_path,
         }
     }

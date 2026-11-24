@@ -271,12 +271,26 @@ The `wasm_integration` target is assigned to a one-permit nextest group because
 its tests share WASM runtime state and use `serial_test`; the group makes that
 serialization work across nextest's process-per-test execution model.
 
-Isolated tmux servers in unit tests use `agent_control::test_tmux`, which keeps
-the temporary directory prefix and the `tmux -S` socket file name short. A Unix
-domain socket path is limited to 108 bytes including the NUL terminator, and
-test scratch directories live under `TMPDIR`; a deeply nested `TMPDIR` must not
-decide whether a tmux-backed test can start. The helper panics with the measured
-length instead of letting tmux report `File name too long`.
+Isolated tmux servers in tests use `exomonad_test_support::TmuxTestServer`.
+It owns a temp directory, points `EXOMONAD_TMUX_SOCKET` at an absolute
+`tmux -S <path>` socket inside it, and always runs `kill-server` on that exact
+socket when dropped, including while a test unwinds. Removing the directory
+takes the socket file with it, because tmux leaves the file behind even after a
+clean `kill-server`. A Unix domain socket path is limited to 108 bytes including
+the NUL terminator, and test scratch directories live under `TMPDIR`; the helper
+keeps the temporary directory prefix and socket file name short, and panics with
+the measured length instead of letting tmux report `File name too long`.
+
+Never name a test tmux server with `-L` or a bare `exo-*` socket name: that
+places the socket in the shared `/tmp/tmux-<uid>/` directory, where tmux leaves
+it behind forever. Tests that build their own tmux commands pass
+`TmuxTestServer::command()` (or `-S` with `socket_path()`); tests whose code
+reads `EXOMONAD_TMUX_SOCKET` rely on the guard already pointing it at the
+absolute path. `exomonad-test-support` has a contract test that fails on a new
+`-L` or bare `exo-*` socket name, and `just tmux-socket-leak-check <command>`
+runs any command and fails if it leaves a new `exo-*` entry in
+`/tmp/tmux-<uid>/` (it only reads, and it checks the operator's `default`
+socket metadata is unchanged).
 
 The Teams bridge lock publishes complete metadata through a temporary file and
 an atomic hard-link claim. Lock acquisition reclaims only temporary artifacts

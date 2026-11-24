@@ -18,9 +18,8 @@
 //! skipped when the `tmux` binary is unavailable.
 
 use exomonad_core::services::tmux_ipc::{process_environment_variable, TmuxIpc, WindowId};
-use std::os::unix::fs::MetadataExt;
+use exomonad_test_support::TmuxTestServer;
 use std::process::Command;
-use std::sync::{Mutex, MutexGuard};
 use tempfile::TempDir;
 
 /// The Codex home the tmux server under test captured when it was started.
@@ -29,16 +28,11 @@ const SERVER_CODEX_HOME: &str = "/exomonad-test-foreign-codex-home";
 /// The Codex home the sessions under test are created with.
 const SESSION_CODEX_HOME: &str = "/exomonad-test-run-codex-home";
 
-/// Serialises the tests, because the socket that names a tmux server is process-global.
-static SERVERS: Mutex<()> = Mutex::new(());
-
-fn tmux_socket() -> String {
-    std::env::var("EXOMONAD_TMUX_SOCKET").expect("TestServer::start names the test socket")
-}
-
 fn test_tmux_command() -> Command {
+    let socket =
+        std::env::var("EXOMONAD_TMUX_SOCKET").expect("TestServer::start names the test socket");
     let mut command = Command::new("tmux");
-    command.args(["-L", &tmux_socket()]);
+    command.args(["-S", &socket]);
     command
 }
 
@@ -98,20 +92,12 @@ async fn pane_process_codex_home(window: &str, expected: &str) -> (u32, Option<S
 }
 
 /// A tmux server that captures a foreign `CODEX_HOME` and is killed when it goes out of
-/// scope. It holds the turn for as long as it lives, because `TMUX_TMPDIR` and
-/// `EXOMONAD_TMUX_SOCKET` are both process-global.
-///
-/// The server gets its own `TMUX_TMPDIR` so its socket never lands in the host's shared
-/// tmux directory: tmux exits without unlinking that socket, so a run that used the
-/// host's directory would leave one more dead file there every time.
+/// scope. `TmuxTestServer` owns the socket inside a temp directory and takes the turn
+/// for as long as the server lives, because `EXOMONAD_TMUX_SOCKET` is process-global.
 struct TestServer {
-    // Both fields are held only for their `Drop`: the guard releases the turn, and the
-    // temp dir takes the dead socket with it.
+    // Held only for its `Drop`: the guard kills this exact server and removes its socket.
     #[allow(dead_code)]
-    turn: MutexGuard<'static, ()>,
-    #[allow(dead_code)]
-    tmpdir: TempDir,
-    socket: String,
+    server: TmuxTestServer,
 }
 
 impl TestServer {
@@ -119,25 +105,14 @@ impl TestServer {
         if !tmux_available() {
             return None;
         }
-        let turn = SERVERS.lock().unwrap_or_else(|error| error.into_inner());
-        let tmpdir = tempfile::tempdir().expect("temp dir for the test tmux server");
-        let socket = format!("exo-session-env-{tag}");
-        std::env::set_var("TMUX_TMPDIR", tmpdir.path());
-        std::env::set_var("EXOMONAD_TMUX_SOCKET", &socket);
+        let server = TmuxTestServer::new();
+        let seed_session = format!("seed-{tag}");
 
         // This command starts the server, so the `CODEX_HOME` on it is what the server's
         // global environment holds for the rest of the test.
-        let status = Command::new("tmux")
-            .args([
-                "-L",
-                &socket,
-                "new-session",
-                "-d",
-                "-s",
-                "seed",
-                "-n",
-                "seed",
-            ])
+        let status = server
+            .command()
+            .args(["new-session", "-d", "-s", &seed_session, "-n", "seed"])
             .env("CODEX_HOME", SERVER_CODEX_HOME)
             .status()
             .expect("tmux new-session");
@@ -145,14 +120,10 @@ impl TestServer {
             status.success(),
             "the seed session could not start the test tmux server"
         );
-        let socket_path = tmpdir
-            .path()
-            .join(format!("tmux-{}", tmpdir.path().metadata().unwrap().uid()))
-            .join(&socket);
         assert!(
-            socket_path.exists(),
-            "the test tmux server socket must be inside TMUX_TMPDIR: {}",
-            socket_path.display()
+            server.socket_path().exists(),
+            "the test tmux server socket must be inside its guard directory: {}",
+            server.socket_path().display()
         );
         // `new_session` spawns the server's default shell and these tests read that
         // shell's environment. Pin it to a shell that stays alive on a pane tty whatever
@@ -165,21 +136,7 @@ impl TestServer {
             "the test tmux server must capture a Codex home no session under test asks for"
         );
 
-        Some(Self {
-            turn,
-            tmpdir,
-            socket,
-        })
-    }
-}
-
-impl Drop for TestServer {
-    fn drop(&mut self) {
-        let _ = Command::new("tmux")
-            .args(["-L", &self.socket, "kill-server"])
-            .status();
-        std::env::remove_var("EXOMONAD_TMUX_SOCKET");
-        std::env::remove_var("TMUX_TMPDIR");
+        Some(Self { server })
     }
 }
 

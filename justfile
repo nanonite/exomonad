@@ -281,6 +281,52 @@ test-fast: rust-test
 rust-test-all:
     just rust-test true
 
+# Run a command and fail if it leaves a new exo-* socket in the shared tmux dir.
+# Only entries named `exo-*` are compared; the operator's `default` socket and
+# every other entry are left untouched (their metadata is checked unchanged).
+# Example: just tmux-socket-leak-check cargo test -p exomonad-core --test tmux_liveness
+tmux-socket-leak-check *command:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    socket_dir="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"
+    default_socket="$socket_dir/default"
+    before="$(mktemp)"
+    after="$(mktemp)"
+    trap 'rm -f "$before" "$after"' EXIT
+    snapshot_exo() {
+        if [ -d "$socket_dir" ]; then
+            find "$socket_dir" -maxdepth 1 -mindepth 1 -printf '%f\n' \
+                | grep '^exo-' | sort > "$1" || true
+        fi
+    }
+    default_fingerprint() {
+        if [ -e "$default_socket" ]; then
+            stat -c '%i %f %s %Y %Z' "$default_socket"
+        fi
+    }
+    snapshot_exo "$before"
+    default_before="$(default_fingerprint)"
+    set +e
+    {{command}}
+    status=$?
+    set -e
+    snapshot_exo "$after"
+    default_after="$(default_fingerprint)"
+    leaked="$(comm -13 "$before" "$after")"
+    if [ -n "$leaked" ]; then
+        echo "FAIL: the command left new exo-* tmux sockets in $socket_dir:" >&2
+        printf '%s\n' "$leaked" >&2
+        exit 1
+    fi
+    if [ "$default_before" != "$default_after" ]; then
+        echo "FAIL: the operator's default tmux socket metadata changed:" >&2
+        echo "before: $default_before" >&2
+        echo "after:  $default_after" >&2
+        exit 1
+    fi
+    echo "OK: no new exo-* tmux sockets and the default socket is untouched"
+    exit "$status"
+
 # Run the isolated tmux session-environment integration tests. `inside_nix` selects
 # the Nix development shell; `tmpdir` is applied after shell entry because Nix
 # normalizes TMPDIR while constructing the shell environment.

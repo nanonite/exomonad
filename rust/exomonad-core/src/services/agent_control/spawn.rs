@@ -3532,7 +3532,7 @@ mod tests {
     use crate::domain::PRNumber;
     use exomonad_test_support::{
         assert_fixture_git_root, init_fixture_git_repository, run_fixture_git_command,
-        ScrubGitRepositoryEnv,
+        ScrubGitRepositoryEnv, TmuxTestServer,
     };
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -6177,12 +6177,11 @@ mod tests {
         head_sha: String,
         argv_log: PathBuf,
         launch_log: PathBuf,
-        socket: String,
+        _server: TmuxTestServer,
         session: String,
         forgejo: wiremock::MockServer,
         _path_restore: EnvironmentRestore,
         _shell_restore: EnvironmentRestore,
-        _socket_restore: EnvironmentRestore,
     }
 
     #[cfg(unix)]
@@ -6286,14 +6285,11 @@ mod tests {
             let path_restore = EnvironmentRestore::set("PATH", shim_path.clone());
             let shell_restore =
                 EnvironmentRestore::set("SHELL", std::ffi::OsString::from("/bin/sh"));
-            let socket = format!("exo-reviewer-route-{}", std::process::id());
+            let server = TmuxTestServer::new();
             let session = format!("exo-reviewer-route-{}", std::process::id());
-            let socket_restore =
-                EnvironmentRestore::set("EXOMONAD_TMUX_SOCKET", std::ffi::OsString::from(&socket));
-            let created = std::process::Command::new("tmux")
+            let created = server
+                .command()
                 .args([
-                    "-L",
-                    &socket,
                     "new-session",
                     "-d",
                     "-s",
@@ -6307,8 +6303,9 @@ mod tests {
                 .expect("start isolated tmux session");
             assert!(created.success(), "isolated tmux session starts");
             let path_text = shim_path.to_string_lossy().into_owned();
-            let set_path = std::process::Command::new("tmux")
-                .args(["-L", &socket, "set-environment", "-g", "PATH", &path_text])
+            let set_path = server
+                .command()
+                .args(["set-environment", "-g", "PATH", &path_text])
                 .status()
                 .expect("set isolated tmux PATH");
             assert!(
@@ -6340,12 +6337,11 @@ mod tests {
                 head_sha,
                 argv_log,
                 launch_log,
-                socket,
+                _server: server,
                 session,
                 forgejo,
                 _path_restore: path_restore,
                 _shell_restore: shell_restore,
-                _socket_restore: socket_restore,
             }
         }
 
@@ -6491,15 +6487,6 @@ mod tests {
                         .map(str::to_string)
                 })
                 .expect("reviewer assignment PATCH body")
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for ReviewerRouteFixture {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("tmux")
-                .args(["-L", &self.socket, "kill-server"])
-                .status();
         }
     }
 

@@ -43,3 +43,19 @@ Consequences that decide where a value has to be written:
   value from one that was told about it afterwards.
 - `TmuxIpc::new_session` requires tmux 3.2 or newer on the paths that pass a
   non-empty `environment`; it names the requirement when the tmux build rejects `-e`.
+
+## Test tmux servers own a temp-directory socket
+
+- Every test that starts a tmux server uses
+  `exomonad_test_support::TmuxTestServer`. Do not name a test server with `-L`
+  or a bare `exo-*` name: that writes the socket into the shared
+  `/tmp/tmux-<uid>/` directory, and tmux leaves the file behind even after
+  `kill-server`, so unique per-run names accumulate forever.
+- The guard points `EXOMONAD_TMUX_SOCKET` at an absolute path and exposes that
+  path for `tmux -S <path>`; production code maps a value containing a path
+  separator to `-S`. It kills only that exact server on drop and removes the
+  temp directory, so the socket cannot outlive the test, including on panic.
+- `exomonad-test-support`'s contract test fails on any new `-L` or bare `exo-*`
+  socket name in the Rust tree. `just tmux-socket-leak-check <command>` runs a
+  command and fails if it leaves a new `exo-*` entry in `/tmp/tmux-<uid>/`
+  without touching the operator's `default` socket.

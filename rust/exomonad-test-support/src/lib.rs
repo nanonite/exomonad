@@ -2,6 +2,10 @@
 //!
 //! This unpublished crate is consumed only as a dev-dependency.
 
+pub mod tmux;
+
+pub use tmux::TmuxTestServer;
+
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
