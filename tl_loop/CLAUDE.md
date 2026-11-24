@@ -1065,6 +1065,37 @@ the current route fields; an unresolved/unknown effect, an independent
 rejection, or a missing fresh gate stays held. Old `v1` action arguments are
 never rewritten.
 
+A launch-capable effect is never judged by a client disconnect.
+`resume_blocked_leaf` and the `spawn_*` tools use
+`LAUNCH_CAPABLE_TIMEOUT_SECONDS` (180s), not the 10s interactive default, because
+the host queues the request and then runs a route transition, preflight, launch,
+readiness confirmation, and durable launch rows. The policy lives in
+`tl_loop/client/transport.py` (`LAUNCH_CAPABLE_TOOLS`,
+`TransportClient.effect_timeout`), and `launch_timeout=` tunes it.
+
+If the client still times out, the journal entry stays `unknown` and
+`_reconcile_unknown_launch_actions` (startup, every resume attempt, and every
+idle heartbeat tick, under `launch-reconciliation.lock`) resolves it from the
+immutable ledger by exact `dispatch_intent_id` and ledger floor. Exactly one
+`agent.spawned` row bound to the journaled owner, predecessor successor lineage,
+branch, worktree, dispatch-intent file, and routing ownership is `adopt`: the
+entry becomes `confirmed` and the ordinary adoption path checkpoints the
+invocation without sending a second request. Exactly one `tool.called`
+`resume_blocked_leaf` refusal whose error is in the shared
+`PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS` set and whose recorded arguments reproduce
+the journaled owner/predecessor binding is `reject`; the resolved entry is the
+same envelope `is_proven_prelaunch_role_route_refusal` recognizes, so the
+#1590 retry rules apply. No evidence, a terminal `agent.spawn_failed` row,
+duplicate rows, conflicting launch/refusal rows, or a wrong owner/predecessor/
+invocation/forged intent is `hold`: the entry keeps its status, records a
+`launch_reconciliation` diagnostic naming the intent and last seen evidence, and
+is re-evaluated on later ticks. Absence of evidence never authorizes a relaunch,
+and the bounded window (300s) only changes the diagnostic. Journals and ledger
+segments are only ever written through their own APIs. Contract:
+`docs/launch-capable-effect-contract.md`; the refusal set is defined once in
+`tl_loop/loop/prelaunch_refusal.py` and shared with
+`launch_reconciliation.py`.
+
 A stored `configured_route_authorization` written under an older identity scheme
 is history, not current authority. `_terminal_owner_recovery_proof` separates
 the two: `_historical_terminal_route_authorization_is_genuine` recomputes the

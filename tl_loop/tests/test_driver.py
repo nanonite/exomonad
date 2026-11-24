@@ -11,14 +11,13 @@ import re
 import subprocess
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, ClassVar, cast
-from typing import Protocol
+from typing import Any, ClassVar, Protocol, cast
 
 import pytest
 
@@ -29,23 +28,21 @@ from tl_loop.client.transport import JsonObject, JsonValue, TransportClient
 from tl_loop.events.envelope import EventEnvelope, EventKind, project
 from tl_loop.events.queue import LedgerQueue, QueueError
 from tl_loop.events.reader import LedgerReader, LedgerSnapshot, SequenceStatus
-from tl_loop.fsm.child import ChildKind, ChildRecord
+from tl_loop.fsm.child import ChildKind, ChildRecord, TLOrchestrationEvent
 from tl_loop.fsm.event import ChildCompleted, ChildFailed, PRFiled, PRUpdated
 from tl_loop.fsm.lane import LanePhase, LaneReserved, LaneState
 from tl_loop.fsm.phase import ChildHandle, TLFailed, TLPhase, TLPlanning, TLWaiting
 from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
-from tl_loop.fsm.child import TLOrchestrationEvent
 from tl_loop.fsm.post_merge_events import PostMergeEvent, PostMergeNotApplicable
-from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState, begin_recovery
-from tl_loop.fsm.recovery import transition_recovery
+from tl_loop.fsm.recovery import RecoveryPhase, RecoveryState, begin_recovery, transition_recovery
 from tl_loop.fsm.scope import TLAllMerged as RecursiveTLAllMerged
+from tl_loop.fsm.scope import TLDone as RecursiveTLDone
 from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
 from tl_loop.fsm.scope import TLFinalizing as RecursiveTLFinalizing
-from tl_loop.fsm.scope import TLPRFiled as RecursiveTLPRFiled
-from tl_loop.fsm.scope import TLPlanning as RecursiveTLPlanning
-from tl_loop.fsm.scope import TLRunning as RecursiveTLRunning
-from tl_loop.fsm.scope import TLDone as RecursiveTLDone
 from tl_loop.fsm.scope import TLParked as RecursiveTLParked
+from tl_loop.fsm.scope import TLPlanning as RecursiveTLPlanning
+from tl_loop.fsm.scope import TLPRFiled as RecursiveTLPRFiled
+from tl_loop.fsm.scope import TLRunning as RecursiveTLRunning
 from tl_loop.loop.abandon import abandon_slice
 from tl_loop.loop.blocked_leaf_resume import (
     BlockedLeafOwner,
@@ -53,12 +50,14 @@ from tl_loop.loop.blocked_leaf_resume import (
     blocked_resume_intent_id,
     resolve_dormant_owner_for_slice,
 )
-from tl_loop.loop.heartbeat import HeartbeatConfig, heartbeat_once
-from tl_loop.loop.nested_recovery import verified_nested_recovery_wait
-from tl_loop.loop.work_clock import ActiveWorkClock
 from tl_loop.loop.convergence import ConvergenceInvariantError, ConvergenceTracker
-from tl_loop.loop.pr_number import require_pr_number
-from tl_loop.loop.review import verify_integration
+from tl_loop.loop.prelaunch_refusal import (
+    PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS,
+    ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+    ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS,
+    is_proven_prelaunch_role_route_refusal,
+    is_role_route_configuration_fingerprint,
+)
 from tl_loop.loop.driver import (
     AGGREGATE_PUBLICATION_GATE_PREFIX,
     DISPATCH_ALREADY_CONFIRMED,
@@ -96,7 +95,6 @@ from tl_loop.loop.driver import (
     _integrate_one_candidate,
     _is_aggregate_slice,
     _LeafIssueProvenance,
-    _TerminalOwnerRecoveryProof,
     _merge_result_is_authoritative,
     _migrate_audit_marked_quarantine,
     _new_dispatch_attempt,
@@ -117,18 +115,21 @@ from tl_loop.loop.driver import (
     _run_sub_tl_batch,
     _spawn_invocation_id,
     _supervise_live_sub_tl,
+    _TerminalOwnerRecoveryProof,
     correlate_dispatch_event,
     run_tl_loop,
     tl_run,
 )
 from tl_loop.loop.escalate import blocked_gate_name
+from tl_loop.loop.heartbeat import HeartbeatConfig, heartbeat_once
 from tl_loop.loop.journal import EffectJournal, stable_action_key
-from tl_loop.loop.startup_handoff import HandoffWaitResult, wait_for_root_controller_handoff
+from tl_loop.loop.nested_recovery import verified_nested_recovery_wait
 from tl_loop.loop.observation import WatcherObservation
+from tl_loop.loop.pr_number import require_pr_number
 from tl_loop.loop.reconcile import (
+    REPEATED_ACTION_GATE_PREFIX,
     ExternalIntent,
     Quiescent,
-    REPEATED_ACTION_GATE_PREFIX,
     ReconciliationResult,
     action_key,
     derive_next_action,
@@ -140,8 +141,10 @@ from tl_loop.loop.reconcile import (
     validate_publication_from_watcher,
     watcher_presents_publication,
 )
-from tl_loop.loop.shadow import TLEventDecoder, _update_slices
-from tl_loop.loop.shadow import _phase_from_state
+from tl_loop.loop.review import verify_integration
+from tl_loop.loop.shadow import TLEventDecoder, _phase_from_state, _update_slices
+from tl_loop.loop.startup_handoff import HandoffWaitResult, wait_for_root_controller_handoff
+from tl_loop.loop.work_clock import ActiveWorkClock
 from tl_loop.ordered import (
     ChildRecoverySummary,
     IntegrationContract,
@@ -156,8 +159,6 @@ from tl_loop.select.ledger import apply_continuation_and_charge
 from tl_loop.select.model import ModelCatalog
 from tl_loop.select.policy import HarnessPolicy, validate_policy
 from tl_loop.state.plan_manifest import ManifestNode, PlanManifest, build_plan_manifest
-from tl_loop.state.schema import OrderedStageState
-from tl_loop.state.store import CheckpointConflict
 from tl_loop.state.plan_reconciliation import analyze_plan_reconciliation
 from tl_loop.state.plan_reconciliation_apply import apply_plan_reconciliation
 from tl_loop.state.plan_revision_apply import apply_plan_revision
@@ -194,8 +195,14 @@ from tl_loop.state.schema import (
     Verdict,
 )
 from tl_loop.state.serialization import DurableWriteError
+from tl_loop.state.slice_transition import (
+    PostMergeEventObserved,
+    SliceStatusChanged,
+    slice_transition,
+)
 from tl_loop.state.store import (
     BudgetInput,
+    CheckpointConflict,
     FSMInput,
     IntegrationInput,
     OrderedStagesInput,
@@ -204,11 +211,6 @@ from tl_loop.state.store import (
     SliceInput,
 )
 from tl_loop.state.store import load as load_state
-from tl_loop.state.slice_transition import (
-    PostMergeEventObserved,
-    SliceStatusChanged,
-    slice_transition,
-)
 from tl_loop.tests.checkpoint_fixtures import create
 
 
@@ -21398,6 +21400,7 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
         run_id=run_id,
         root_dir=root_dir,
         project_root=project,
+        ledger_run_id=run_id,
         parent_run_id="root",
         parent_branch="main",
         parent_agent_id="kani",
@@ -21578,6 +21581,41 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
                         encoding="utf-8",
                     )
                     if response_lost:
+                        # The host finished the launch and wrote its durable
+                        # launch row, then the client connection was lost.
+                        segments = project / ".exo" / "ledger" / "segments"
+                        segments.mkdir(parents=True, exist_ok=True)
+                        (segments / "segment-000000000001.jsonl").write_text(
+                            json.dumps(
+                                {
+                                    "schema_version": 1,
+                                    "event_id": "blocked-resume-launch",
+                                    "id": "blocked-resume-launch",
+                                    "event_time": "2026-11-23T14:52:13Z",
+                                    "observed_at": "2026-11-23T14:52:13Z",
+                                    "run_seq": 500,
+                                    "type": "agent.spawned",
+                                    "agent_id": "kani",
+                                    "run_id": run_id,
+                                    "session_id": "session-1",
+                                    "lifecycle_state": "observed",
+                                    "data": {
+                                        "child_agent": owner_name,
+                                        "agent_type": "opencode",
+                                        "spawn_type": "resume_blocked",
+                                        "branch": branch,
+                                        "model": "opencode-go/deepseek-v4.1-flash",
+                                        "effort": "high",
+                                        "topology": "worktree_per_agent",
+                                        "intent_id": expected_intent,
+                                        "invocation_id": "opencode-successor-invocation",
+                                    },
+                                },
+                                sort_keys=True,
+                            )
+                            + "\n",
+                            encoding="utf-8",
+                        )
                         cancel_event.set()
                         raise OSError("simulated response loss after durable host launch")
                 cancel_event.set()
@@ -21698,7 +21736,9 @@ def test_startup_recovery_resumes_approved_blocked_leaf_through_controller(
     assert resumed.dispatch_route_configuration_fingerprint == "sha256:v1:" + "4" * 64
     assert resumed.dispatch_route_manifest_digest == manifest.digest
     assert resumed.dispatch_route_fingerprint == route_arguments["route_fingerprint"]
-    assert len(observed_resume_intents) == (2 if response_lost else 1)
+    # A completed host launch is adopted from its launch row; the controller
+    # never sends the same launch-capable request twice.
+    assert len(observed_resume_intents) == 1
     assert resumed.dispatch_intent_id == observed_resume_intents[0]
     assert resumed.branch == branch
     assert resumed.worktree == str(worktree)
@@ -23756,18 +23796,18 @@ def _prelaunch_configuration_refusal_entry(
         "result": {
             "success": False,
             "result": None,
-            "error": driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+            "error": ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
         },
-        "error": driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+        "error": ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
     }
 
 
 def test_role_route_configuration_fingerprint_accepts_v1_and_v2_without_reinterpretation() -> None:
-    assert driver_module._is_role_route_configuration_fingerprint("sha256:v1:" + "a" * 64)
-    assert driver_module._is_role_route_configuration_fingerprint("sha256:v2:" + "b" * 64)
-    assert not driver_module._is_role_route_configuration_fingerprint("sha256:v3:" + "c" * 64)
-    assert not driver_module._is_role_route_configuration_fingerprint("sha256:v2:short")
-    assert driver_module._is_role_route_configuration_fingerprint(
+    assert is_role_route_configuration_fingerprint("sha256:v1:" + "a" * 64)
+    assert is_role_route_configuration_fingerprint("sha256:v2:" + "b" * 64)
+    assert not is_role_route_configuration_fingerprint("sha256:v3:" + "c" * 64)
+    assert not is_role_route_configuration_fingerprint("sha256:v2:short")
+    assert is_role_route_configuration_fingerprint(
         HISTORICAL_CONFIG_FINGERPRINT_V1
     )
 
@@ -23786,7 +23826,7 @@ def test_prelaunch_refusal_contract_matches_the_compiled_host_definition() -> No
         values["ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED"],
         values["ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS"],
     }
-    assert rust_errors == set(driver_module.PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS)
+    assert rust_errors == set(PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS)
 
 
 def test_shared_prelaunch_refusal_definition_recognizes_both_host_error_codes() -> None:
@@ -23795,8 +23835,8 @@ def test_shared_prelaunch_refusal_definition_recognizes_both_host_error_codes() 
         "route_fingerprint": "sha256:v1:" + "1" * 64,
     }
     for error in (
-        driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
-        driver_module.ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS,
+        ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+        ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS,
     ):
         envelope: dict[str, object] = {
             "success": False,
@@ -23810,32 +23850,32 @@ def test_shared_prelaunch_refusal_definition_recognizes_both_host_error_codes() 
             "result": envelope,
             "error": error,
         }
-        assert driver_module._is_proven_prelaunch_role_route_refusal(entry), error
+        assert is_proven_prelaunch_role_route_refusal(entry), error
         # The same error string is never enough on an unresolved outcome.
-        assert not driver_module._is_proven_prelaunch_role_route_refusal(
+        assert not is_proven_prelaunch_role_route_refusal(
             {**entry, "status": "unknown"}
         )
         # Nor is it proof on a launched or contradictory result envelope.
         launched: dict[str, object] = dict(envelope)
         launched["result"] = {"started": True}
-        assert not driver_module._is_proven_prelaunch_role_route_refusal(
+        assert not is_proven_prelaunch_role_route_refusal(
             {**entry, "result": launched}
         )
         contradictory: dict[str, object] = dict(envelope)
         contradictory["success"] = True
-        assert not driver_module._is_proven_prelaunch_role_route_refusal(
+        assert not is_proven_prelaunch_role_route_refusal(
             {**entry, "result": contradictory}
         )
         # A different operation, missing route identity or unrelated error holds.
-        assert not driver_module._is_proven_prelaunch_role_route_refusal(
+        assert not is_proven_prelaunch_role_route_refusal(
             {**entry, "operation": "spawn_leaf"}
         )
-        assert not driver_module._is_proven_prelaunch_role_route_refusal(
+        assert not is_proven_prelaunch_role_route_refusal(
             {**entry, "arguments": {"route_fingerprint": "sha256:v1:" + "1" * 64}}
         )
         unrelated: dict[str, object] = dict(envelope)
         unrelated["error"] = "Invalid input: unrelated host refusal"
-        assert not driver_module._is_proven_prelaunch_role_route_refusal(
+        assert not is_proven_prelaunch_role_route_refusal(
             {**entry, "error": "Invalid input: unrelated host refusal", "result": unrelated}
         )
 
@@ -23851,10 +23891,10 @@ def test_live_journal_fixture_replays_through_the_shared_classifier() -> None:
     fixture = json.loads(raw)
     entries = {entry["index"]: entry for entry in fixture["entries"]}
     assert entries[22]["status"] == "confirmed"
-    assert entries[30]["error"] == driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED
+    assert entries[30]["error"] == ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED
     assert (
         entries[36]["error"]
-        == driver_module.ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS
+        == ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS
     )
     assert (
         entries[30]["arguments"]["dispatch_intent_id"]
@@ -23864,9 +23904,9 @@ def test_live_journal_fixture_replays_through_the_shared_classifier() -> None:
         entries[30]["arguments"]["route_configuration_fingerprint"]
         != entries[36]["arguments"]["route_configuration_fingerprint"]
     )
-    assert not driver_module._is_proven_prelaunch_role_route_refusal(entries[22])
-    assert driver_module._is_proven_prelaunch_role_route_refusal(entries[30])
-    assert driver_module._is_proven_prelaunch_role_route_refusal(entries[36])
+    assert not is_proven_prelaunch_role_route_refusal(entries[22])
+    assert is_proven_prelaunch_role_route_refusal(entries[30])
+    assert is_proven_prelaunch_role_route_refusal(entries[36])
     diagnostic = driver_module._resume_entry_diagnostic(entries[36], 36)
     assert "entry 36" in diagnostic
     assert "rejected" in diagnostic
@@ -23881,10 +23921,10 @@ def test_prelaunch_configuration_refusal_is_recognized_only_for_the_exact_shape(
         "route_fingerprint": "sha256:v1:" + "1" * 64,
     }
     entry = _prelaunch_configuration_refusal_entry(arguments)
-    assert driver_module._is_proven_prelaunch_role_route_refusal(entry)
+    assert is_proven_prelaunch_role_route_refusal(entry)
 
     unknown = {**entry, "status": "unknown"}
-    assert not driver_module._is_proven_prelaunch_role_route_refusal(unknown)
+    assert not is_proven_prelaunch_role_route_refusal(unknown)
 
     independent = {
         **entry,
@@ -23895,27 +23935,27 @@ def test_prelaunch_configuration_refusal_is_recognized_only_for_the_exact_shape(
         },
         "error": "Invalid input: top-level model conflicts with the accepted role route",
     }
-    assert not driver_module._is_proven_prelaunch_role_route_refusal(independent)
+    assert not is_proven_prelaunch_role_route_refusal(independent)
 
     launched = {
         **entry,
         "result": {
             "success": False,
             "result": {"invocation": {"invocation_id": "launched"}},
-            "error": driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+            "error": ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
         },
     }
-    assert not driver_module._is_proven_prelaunch_role_route_refusal(launched)
+    assert not is_proven_prelaunch_role_route_refusal(launched)
 
     contradictory = {
         **entry,
         "result": {
             "success": True,
             "result": None,
-            "error": driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+            "error": ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
         },
     }
-    assert not driver_module._is_proven_prelaunch_role_route_refusal(contradictory)
+    assert not is_proven_prelaunch_role_route_refusal(contradictory)
 
 
 def test_terminal_owner_retries_prelaunch_configuration_refusal_after_fresh_gate_approval(
@@ -23994,7 +24034,7 @@ def test_terminal_owner_retries_prelaunch_configuration_refusal_after_fresh_gate
     refusal = ToolResult.from_raw(
         {
             "success": False,
-            "error": driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+            "error": ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
         }
     )
     journal.mark_result(old_intent, refusal)
@@ -24216,7 +24256,7 @@ def _seed_approved_prelaunch_configuration_refusal(
         ToolResult.from_raw(
             {
                 "success": False,
-                "error": driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+                "error": ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
             }
         ),
     )
@@ -25391,7 +25431,7 @@ def test_terminal_owner_ledger_proof_refuses_incomplete_dispatch_identity(
     assert reason == "terminal-owner dispatch identity is incomplete"
 
 
-def test_terminal_provider_recovery_adopts_response_lost_successor_once(
+def test_terminal_provider_recovery_adopts_response_lost_successor_from_host_evidence(
     tmp_path: Path,
 ) -> None:
     reference_requirement = _terminal_reference_requirement()
@@ -25478,6 +25518,43 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
         ),
         encoding="utf-8",
     )
+    project_root = config.project_root
+    assert project_root is not None and config.ledger_run_id is not None
+    segments = sorted((Path(project_root) / ".exo" / "ledger" / "segments").glob("*.jsonl"))
+    assert len(segments) == 1
+    events = [
+        json.loads(line) for line in segments[0].read_text(encoding="utf-8").splitlines()
+    ]
+    events.append(
+        {
+            "schema_version": 1,
+            "event_id": "blocked-resume-launch",
+            "id": "blocked-resume-launch",
+            "event_time": "2026-11-23T14:52:13Z",
+            "observed_at": "2026-11-23T14:52:13Z",
+            "run_seq": 10**12,
+            "type": "agent.spawned",
+            "agent_id": "root",
+            "run_id": config.ledger_run_id,
+            "session_id": "session-1",
+            "lifecycle_state": "observed",
+            "data": {
+                "child_agent": owner_name,
+                "agent_type": "codex",
+                "spawn_type": "resume_blocked",
+                "branch": owner.branch,
+                "model": "gpt-6-luna",
+                "effort": "xhigh",
+                "topology": "worktree_per_agent",
+                "intent_id": resume.intent_id,
+                "invocation_id": successor_id,
+            },
+        }
+    )
+    segments[0].write_text(
+        "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+        encoding="utf-8",
+    )
 
     class AdoptionTransport(RecordingTransport):
         resume_calls = 0
@@ -25524,7 +25601,9 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
         journal,
     )
     leaf = result.slices[plan.leaves[0].name]
-    assert transport.resume_calls == 1
+    # The launch row is authoritative: the controller adopts it from evidence
+    # and never sends a second resume request.
+    assert transport.resume_calls == 0
     assert leaf.status is SliceStatus.DISPATCH_UNCONFIRMED
     assert leaf.dispatch_agent_id == owner_name
     assert leaf.dispatch_invocation_id == successor_id
@@ -25541,29 +25620,14 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
     resume_arguments = journal.entries_for("resume_blocked_leaf", plan.leaves[0].name)[0][
         "arguments"
     ]
-    transport_arguments = next(
-        arguments for name, arguments in transport.calls if name == "resume_blocked_leaf"
-    )
-    transport_route = _required_mapping(transport_arguments["role_route"], "role_route")
     journal_arguments = _required_mapping(resume_arguments, "resume_arguments")
-    assert transport_route["harness"] == "codex/gpt-6-luna"
-    assert transport_route["model"] == "gpt-6-luna"
-    assert transport_route["effort"] == "xhigh"
-    assert transport_route["route_fingerprint"] == leaf.dispatch_route_fingerprint
-    for route_key, journal_key in (
-        ("role", "role"),
-        ("harness", "harness"),
-        ("agent_type", "agent_type"),
-        ("model", "model"),
-        ("effort", "effort"),
-        ("configuration_fingerprint", "route_configuration_fingerprint"),
-        ("policy_fingerprint", "route_policy_fingerprint"),
-        ("manifest_digest", "route_manifest_digest"),
-        ("route_fingerprint", "route_fingerprint"),
-        ("dispatch_intent_id", "dispatch_intent_id"),
-    ):
-        assert transport_route[route_key] == journal_arguments[journal_key]
-    assert transport_route["scope_id"] == plan.leaves[0].name
+    assert journal_arguments["harness"] == "codex/gpt-6-luna"
+    assert journal_arguments["model"] == "gpt-6-luna"
+    assert journal_arguments["effort"] == "xhigh"
+    assert journal_arguments["role"] == "worker"
+    assert journal_arguments["agent_type"] == "codex"
+    assert journal_arguments["route_fingerprint"] == leaf.dispatch_route_fingerprint
+    assert journal_arguments["route_configuration_fingerprint"] == "sha256:v1:" + "2" * 64
     assert (
         journal.entries_for("resume_blocked_leaf", plan.leaves[0].name)[0]["status"] == "confirmed"
     )
@@ -25578,7 +25642,7 @@ def test_terminal_provider_recovery_adopts_response_lost_successor_once(
         journal,
     )
     assert repeated.slices[plan.leaves[0].name] == leaf
-    assert transport.resume_calls == 1
+    assert transport.resume_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -33680,7 +33744,7 @@ def _route_switched_config(
 
 def _record_confirmed_legacy_successor(
     plan: WorkPlan,
-    proof: "_TerminalOwnerRecoveryProof",
+    proof: _TerminalOwnerRecoveryProof,
     store: RunStore,
     journal: EffectJournal,
     owner_dir: Path,
@@ -33782,7 +33846,7 @@ def _seed_stored_v1_proof(
     selected_harness: str = "opencode/opencode-go/deepseek-v4.1-flash",
     selected_model: str = DIRECTED_WORKER_MODEL,
     selected_effort: str = "high",
-    refusal_error: str = driver_module.ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
+    refusal_error: str = ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
 ) -> dict[str, Any]:
     """Reproduce the live stored-v1-proof state on the accepted f446/f285 chain."""
     plan, config, store, owner_dir, owner_name, original_id = (
@@ -34215,7 +34279,7 @@ def _seed_live_ambiguity_refusal(
             {
                 "success": False,
                 "result": None,
-                "error": driver_module.ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS,
+                "error": ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS,
             }
         ),
     )
@@ -34339,7 +34403,7 @@ def test_terminal_owner_route_change_holds_when_the_recovery_gate_is_pending(
     seed = _seed_stored_v1_proof(
         tmp_path,
         confirmed_successor=False,
-        refusal_error=driver_module.ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS,
+        refusal_error=ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS,
     )
     store = seed["store"]
     store.set_gate(seed["gate_name"], GateStatus.PENDING)
@@ -34434,7 +34498,7 @@ def test_terminal_owner_resumes_across_supported_route_switches(
     seed = _seed_stored_v1_proof(
         tmp_path,
         confirmed_successor=False,
-        refusal_error=driver_module.ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS,
+        refusal_error=ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS,
         **seed_kwargs,
     )
     plan, store, journal = seed["plan"], seed["store"], seed["journal"]

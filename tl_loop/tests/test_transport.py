@@ -17,6 +17,8 @@ from typing import cast
 from unittest.mock import patch
 
 from tl_loop.client.transport import (
+    LAUNCH_CAPABLE_TIMEOUT_SECONDS,
+    LAUNCH_CAPABLE_TOOLS,
     DecodeError,
     ServerError,
     ServerTimeout,
@@ -214,6 +216,42 @@ class TransportTest(unittest.TestCase):
             self.assertRaises(ServerTimeout),
         ):
             TransportClient(socket_path=path, timeout=0.02).get_json("/slow")
+
+    def test_launch_capable_effects_get_the_host_contract_timeout(self) -> None:
+        """Launch-capable calls budget for queueing plus a launch handler."""
+        client = TransportClient(socket_path=Path("unused.sock"))
+        self.assertGreater(LAUNCH_CAPABLE_TIMEOUT_SECONDS, 60.0)
+        for tool_name in ("resume_blocked_leaf", "spawn_leaf", "spawn_worker"):
+            self.assertIn(tool_name, LAUNCH_CAPABLE_TOOLS)
+            self.assertEqual(client.effect_timeout(tool_name), LAUNCH_CAPABLE_TIMEOUT_SECONDS)
+        self.assertEqual(client.effect_timeout("session_status"), 10.0)
+        bounded = TransportClient(
+            socket_path=Path("unused.sock"), timeout=0.5, launch_timeout=2.0
+        )
+        self.assertEqual(bounded.effect_timeout("resume_blocked_leaf"), 2.0)
+        self.assertEqual(bounded.effect_timeout("session_status"), 0.5)
+
+    def test_slow_launch_tool_outlives_the_default_timeout(self) -> None:
+        """A real UDS response slower than the default still completes a launch."""
+
+        def response(request_line: str, body: bytes) -> ResponseSpec:
+            if b"resume_blocked_leaf" in body or b"session_status" in body:
+                return ResponseSpec(200, b'{"success":true,"result":null,"error":null}', delay=0.2)
+            return ResponseSpec(400, b'{"error":"unexpected request"}')
+
+        with stub_server(response) as socket_path:
+            client = TransportClient(
+                socket_path=socket_path,
+                timeout=0.02,
+                launch_timeout=2.0,
+            )
+            self.assertEqual(
+                client.call_tool("tl", "root", "resume_blocked_leaf", {}),
+                {"success": True, "result": None, "error": None},
+            )
+            with self.assertRaises(ServerTimeout) as caught:
+                client.call_tool("tl", "root", "session_status", {})
+        self.assertIn("0.020s", str(caught.exception))
 
     def test_missing_socket_raises_server_unreachable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

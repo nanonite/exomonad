@@ -725,11 +725,11 @@ def refuse(
     from tl_loop.client.effects import ToolResult
     from tl_loop.loop.driver import (
         EffectIntent,
-        ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
         _blocked_leaf_resume_action_arguments,
         _terminal_owner_recovery_proof,
     )
     from tl_loop.loop.journal import EffectJournal
+    from tl_loop.loop.prelaunch_refusal import ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED
     from tl_loop.state.store import RunStore
 
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))

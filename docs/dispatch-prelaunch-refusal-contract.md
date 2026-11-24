@@ -14,7 +14,10 @@ This contract is implemented once on each side and enforced by a cross-language
 test:
 
 - controller: `PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS` and
-  `_is_proven_prelaunch_role_route_refusal` in `tl_loop/loop/driver.py`
+  `is_proven_prelaunch_role_route_refusal` in
+  `tl_loop/loop/prelaunch_refusal.py`. The driver imports those names and does
+  not keep a copy; `tl_loop/loop/launch_reconciliation.py` uses the same set to
+  reject a timed-out resume from the host's durable `tool.called` row.
 - host: `PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS` and
   `is_prelaunch_role_route_refusal_error` in
   `rust/exomonad-core/src/handlers/dispatch_authorization.rs`

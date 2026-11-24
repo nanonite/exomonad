@@ -182,9 +182,16 @@ from tl_loop.loop.heartbeat import (
     pr_terminal_cause,
 )
 from tl_loop.loop.integration_lineage import GitLineageError, verify_aggregate_lineage
+from tl_loop.loop.launch_reconciliation import reconcile_unknown_blocked_resume
 from tl_loop.loop.nested_recovery import verified_nested_recovery_wait
 from tl_loop.loop.observability import emit_controller_event
 from tl_loop.loop.pr_number import require_pr_number as _require_pr_number
+from tl_loop.loop.prelaunch_refusal import (
+    is_proven_prelaunch_role_route_refusal as _is_proven_prelaunch_role_route_refusal,
+)
+from tl_loop.loop.prelaunch_refusal import (
+    is_role_route_configuration_fingerprint as _is_role_route_configuration_fingerprint,
+)
 from tl_loop.loop.recovery_policy import policy_for_cause
 from tl_loop.loop.reference_verification import observe_reference_project
 from tl_loop.loop.review import (
@@ -283,6 +290,7 @@ from tl_loop.state.legacy_manifest import (
     LegacyManifestReconciliation,
     reconcile_legacy_manifest,
 )
+from tl_loop.state.lock import LockTimeout, RunLock
 from tl_loop.state.plan_manifest import (
     ManifestError,
     ManifestNode,
@@ -4908,6 +4916,13 @@ def _prepare_startup_recovery(
         project_root=config.project_root,
         ledger_run_id=config.ledger_run_id,
     )
+    state, _launch_resolved = _reconcile_unknown_launch_actions(
+        state,
+        store,
+        effects_log,
+        project_root=config.project_root,
+        ledger_run_id=config.ledger_run_id,
+    )
     state = _reconcile_confirmed_repair_actions(
         state, store, effects_log, config, effects
     )
@@ -4963,6 +4978,22 @@ def _activate_startup_work(
         state = _resume_approved_blocked_leaf(plan, state, config, effects, store, effects_log)
     state = _dispatch_children(plan, state, config, effects, effects_log, store)
     state = _run_sub_tls(plan, state, config, source, effects, store, effects_log)
+    return state
+
+
+def _activate_resolved_launch(
+    plan: WorkPlan,
+    state: RunState,
+    config: TLLoopConfig,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Apply an adopted or refused launch after host evidence resolved it."""
+    if _terminal_owner_recovery_candidate(plan, state):
+        return _resume_terminal_owner_failure(plan, state, config, effects, store, effects_log)
+    if config.ordered_recovery or _has_approved_blocked_leaf_resume_gate(plan, state):
+        return _resume_approved_blocked_leaf(plan, state, config, effects, store, effects_log)
     return state
 
 
@@ -9174,73 +9205,6 @@ def _historical_configuration_refusal_retry(
     return approved
 
 
-def _is_role_route_configuration_fingerprint(value: object) -> bool:
-    """Accept a versioned configuration identity.
-
-    `v1` values remain valid historical evidence and decode unchanged. New
-    values use `v2`, the effective-value identity; equality, never the version
-    tag alone, decides whether one is the accepted snapshot.
-    """
-    if not isinstance(value, str):
-        return False
-    for prefix in ("sha256:v1:", "sha256:v2:"):
-        if value.startswith(prefix):
-            return _is_sha256_text(value[len(prefix) :])
-    return False
-
-
-ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED = (
-    "Invalid input: role route configuration is stale or was not accepted by this server"
-)
-ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS = (
-    "Invalid input: role route dispatch authorization is missing or ambiguous"
-)
-
-# Contract: a modern role-route refusal proves the host rejected the request
-# before any launch only when it is one of these exact envelopes. Both sides
-# implement this one set: see
-# docs/dispatch-prelaunch-refusal-contract.md and the matching
-# `PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS` constant in
-# rust/exomonad-core/src/handlers/dispatch_authorization.rs.
-PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS = frozenset(
-    {
-        ROLE_ROUTE_CONFIGURATION_NOT_ACCEPTED,
-        ROLE_ROUTE_DISPATCH_AUTHORIZATION_MISSING_OR_AMBIGUOUS,
-    }
-)
-
-
-def _is_proven_prelaunch_role_route_refusal(entry: Mapping[str, object]) -> bool:
-    """Recognize only a host refusal that proves no effect was launched.
-
-    This is the controller side of the shared prelaunch refusal contract. The
-    historical action already carried a complete versioned route/configuration
-    receipt, so it is not the older missing-route refusal. The result must be
-    the exact rejected envelope: a false success, no result payload, one of the
-    shared prelaunch errors, and the same error at the entry and result level.
-    A matching error string alone is never enough, so successful, launched,
-    unresolved, or contradictory entries stay held for their own outcome.
-    """
-    arguments = entry.get("arguments")
-    result = entry.get("result")
-    error = entry.get("error")
-    return (
-        entry.get("operation") == "resume_blocked_leaf"
-        and entry.get("status") == "rejected"
-        and isinstance(arguments, Mapping)
-        and isinstance(arguments.get("route_configuration_fingerprint"), str)
-        and _is_role_route_configuration_fingerprint(
-            arguments.get("route_configuration_fingerprint")
-        )
-        and isinstance(result, Mapping)
-        and result.get("success") is False
-        and result.get("result") is None
-        and isinstance(error, str)
-        and error in PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS
-        and result.get("error") == error
-    )
-
-
 def _is_legacy_missing_role_route_refusal(entry: Mapping[str, object]) -> bool:
     """Recognize only the historical host refusal that proves no launch occurred."""
     arguments = entry.get("arguments")
@@ -9404,6 +9368,13 @@ def _resume_terminal_owner_failure(
     effects_log: list[EffectIntent],
 ) -> RunState:
     """Reconcile a confirmed launch whose exact host invocation ended in failure."""
+    state, _launch_resolved = _reconcile_unknown_launch_actions(
+        state,
+        store,
+        effects_log,
+        project_root=config.project_root,
+        ledger_run_id=config.ledger_run_id,
+    )
     latest = store.load()
     if latest.revision > state.revision:
         # A concurrent continuation may already have launched the successor.
@@ -9500,6 +9471,13 @@ def _resume_approved_blocked_leaf(
     reprove_terminal: bool = False,
 ) -> RunState:
     """Resume one exactly proved, operator-approved leaf through its owner."""
+    state, _launch_resolved = _reconcile_unknown_launch_actions(
+        state,
+        store,
+        effects_log,
+        project_root=config.project_root,
+        ledger_run_id=config.ledger_run_id,
+    )
     proof, reason = (
         (proof_override, None)
         if proof_override is not None
@@ -9604,6 +9582,21 @@ def _resume_approved_blocked_leaf(
         status = existing.get("status") if existing is not None else None
         if existing is not None and (status == "confirmed" or status == "rejected"):
             result = journal.replay(existing)
+        elif existing is not None and status == "unknown":
+            # A dispatched launch-capable request that timed out must never be
+            # sent again on the strength of its absence alone. Reconciliation
+            # resolves it to confirmed/rejected from exact host evidence. An
+            # ``intended`` entry that never crossed the journal boundary keeps
+            # its historical replay path, where the host is idempotent.
+            return _hold_owner_resume(
+                state,
+                proof,
+                config,
+                effects,
+                store,
+                effects_log,
+                _unresolved_launch_diagnostic(existing, proof.intent_id),
+            )
         else:
             if not _reference_verification_ready(
                 proof.leaf.name,
@@ -9973,6 +9966,27 @@ def _blocked_leaf_resume_action_arguments(
             }
         )
     return arguments
+
+
+def _unresolved_launch_diagnostic(
+    entry: Mapping[str, object], intent_id: str
+) -> str:
+    """Name one held launch request and the evidence reconciliation has seen."""
+    reconciliation = entry.get("launch_reconciliation")
+    if isinstance(reconciliation, Mapping):
+        diagnostic = reconciliation.get("diagnostic")
+        evidence = reconciliation.get("evidence")
+        if isinstance(diagnostic, str) and diagnostic:
+            return diagnostic
+        if isinstance(evidence, list):
+            return (
+                f"blocked-leaf resume intent {intent_id} remains held; "
+                f"last seen evidence: {', '.join(str(item) for item in evidence) or 'none'}"
+            )
+    return (
+        f"blocked-leaf resume intent {intent_id} remains held with status "
+        f"{entry.get('status')!r}; no host evidence has resolved it and it is not relaunched"
+    )
 
 
 def _mark_unlaunched_resume_intent(
@@ -10998,6 +11012,17 @@ def _run_loop(
                 if heartbeat.fired:
                     before_phase = phase
                     state = heartbeat.state
+                    state, launch_resolved = _reconcile_unknown_launch_actions(
+                        state,
+                        store,
+                        effects_log,
+                        project_root=config.project_root,
+                        ledger_run_id=config.ledger_run_id,
+                    )
+                    if launch_resolved:
+                        state = _activate_resolved_launch(
+                            plan, state, config, effects, store, effects_log
+                        )
                     heartbeat_events.extend(heartbeat.events)
                     diagnostics.last_observed_progress_at = state.goals.last_progress_at
                     phase = _phase_from_state(state)
@@ -17374,6 +17399,104 @@ def _action_journal_gate_name(key: str, attempt: int = 0) -> str:
 def _action_journal_compensation_attempt(entry: Mapping[str, object]) -> int:
     attempt = entry.get("compensation_attempt")
     return attempt if isinstance(attempt, int) and attempt >= 0 else 0
+
+
+def _reconcile_unknown_launch_actions(
+    state: RunState,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+    *,
+    project_root: str | Path | None,
+    ledger_run_id: str | None,
+    now: float | None = None,
+) -> tuple[RunState, bool]:
+    """Resolve timed-out launch-capable effects from durable host evidence.
+
+    Runs on startup and on every idle heartbeat tick. A held entry is never
+    relaunched: only an exact-intent, owner/predecessor-bound host launch row
+    adopts it, and only a shared prelaunch refusal row rejects it. The journal
+    is updated exclusively through its own API; this function never hand-edits
+    a journal or ledger file and never dispatches an effect.
+
+    The second result is true when at least one entry moved out of ``unknown``,
+    so the caller can run the ordinary adoption/retry path on the next tick.
+    """
+    if not isinstance(effects_log, EffectJournal) or project_root is None:
+        return state, False
+    lock = RunLock(store.run_dir / "launch-reconciliation.lock", timeout=5.0)
+    try:
+        lock.acquire()
+    except LockTimeout:
+        LOGGER.warning("launch reconciliation lock is held; entries stay held this tick")
+        return state, False
+    observed_at = time.time() if now is None else now
+    try:
+        resolved = _apply_launch_reconciliations(
+            effects_log,
+            project_root,
+            ledger_run_id=ledger_run_id,
+            observed_at=observed_at,
+        )
+    finally:
+        lock.release()
+    return state, resolved
+
+
+def _apply_launch_reconciliations(
+    effects_log: EffectJournal,
+    project_root: str | Path,
+    *,
+    ledger_run_id: str | None,
+    observed_at: float,
+) -> bool:
+    """Apply reconciliation decisions under the caller's run-scoped lock."""
+    resolved = False
+    for entry in effects_log.snapshot():
+        if (
+            entry.get("operation") != "resume_blocked_leaf"
+            or entry.get("status") != "unknown"
+        ):
+            continue
+        key = entry.get("key")
+        if not isinstance(key, str) or not key:
+            continue
+        decision = reconcile_unknown_blocked_resume(
+            project_root,
+            entry,
+            ledger_run_id=ledger_run_id,
+            now=observed_at,
+        )
+        prior = entry.get("launch_reconciliation")
+        evaluations = prior.get("evaluations") if isinstance(prior, Mapping) else None
+        audit = decision.audit(
+            evaluated_at=observed_at,
+            evaluations=(evaluations if type(evaluations) is int else 0) + 1,
+        )
+        if decision.outcome == "adopt":
+            effects_log.resolve_by_key(
+                key,
+                status="confirmed",
+                result=dict(decision.result or {}),
+                error=None,
+                launch_reconciliation=audit,
+            )
+            LOGGER.warning("[TL loop] launch reconciliation %s", decision.diagnostic)
+            resolved = True
+        elif decision.outcome == "reject":
+            effects_log.resolve_by_key(
+                key,
+                status="rejected",
+                result=dict(decision.result or {}),
+                error=decision.error,
+                launch_reconciliation=audit,
+            )
+            LOGGER.warning("[TL loop] launch reconciliation %s", decision.diagnostic)
+            resolved = True
+        else:
+            if prior != audit:
+                effects_log.resolve_by_key(key, launch_reconciliation=audit)
+            LOGGER.warning("[TL loop] launch reconciliation %s", decision.diagnostic)
+    return resolved
 
 
 def _reconcile_action_journal(

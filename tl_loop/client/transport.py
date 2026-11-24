@@ -12,6 +12,19 @@ from typing import Any, TypeAlias, cast
 from urllib.parse import quote
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
+
+#: The host imposes no request deadline: it queues the call and then runs the
+#: handler, which for a blocked-leaf resume launches a process. Observed live
+#: latency was ~24s of queueing plus >60s of handler. A client disconnect never
+#: decides the outcome, so the launch-capable budget covers both phases with
+#: headroom instead of treating a timeout as exceptional.
+LAUNCH_CAPABLE_TIMEOUT_SECONDS = 180.0
+
+#: Effects that mutate durable state and can launch an agent.
+LAUNCH_CAPABLE_TOOLS = frozenset(
+    {"resume_blocked_leaf", "spawn_leaf", "spawn_worker", "spawn_reviewer"}
+)
+
 LOGGER = logging.getLogger(__name__)
 
 JsonPrimitive: TypeAlias = None | bool | int | float | str
@@ -81,13 +94,19 @@ class TransportClient:
         *,
         project_root: str | Path | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        launch_timeout: float = LAUNCH_CAPABLE_TIMEOUT_SECONDS,
         logger: logging.Logger | None = None,
     ) -> None:
-        if timeout <= 0:
-            raise ValueError("timeout must be greater than zero")
+        if timeout <= 0 or launch_timeout <= 0:
+            raise ValueError("timeout and launch_timeout must be greater than zero")
         self.socket_path = resolve_socket_path(socket_path, project_root)
         self.timeout = timeout
+        self.launch_timeout = launch_timeout
         self.logger = logger or LOGGER
+
+    def effect_timeout(self, tool_name: str) -> float:
+        """Return the request budget for one effect (launch-capable or not)."""
+        return self.launch_timeout if tool_name in LAUNCH_CAPABLE_TOOLS else self.timeout
 
     def get_json(self, path: str) -> JsonValue:
         """Issue a GET request and decode its JSON response."""
@@ -114,9 +133,11 @@ class TransportClient:
     ) -> JsonObject:
         """Call one server-side tool without interpreting its effect result."""
         path = f"/agents/{quote(role, safe='')}/{quote(name, safe='')}/tools/call"
-        response = self.post_json(
+        response = self._request(
+            "POST",
             path,
             {"name": tool_name, "arguments": arguments},
+            timeout=self.effect_timeout(tool_name),
         )
         if not isinstance(response, dict):
             raise DecodeError(f"Tool-call response is not an object: {response!r}")
@@ -159,16 +180,27 @@ class TransportClient:
             raise DecodeError(f"Ordered sub-TL provisioning was not confirmed: {response!r}")
         return invocation_id
 
-    def _request(self, method: str, path: str, body: JsonValue | None = None) -> JsonValue:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: JsonValue | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> JsonValue:
+        effective_timeout = self.timeout if timeout is None else timeout
         encoded_body, headers = _encode_request_body(body)
         self.logger.info(
-            "[TL loop transport] request method=%s path=%s socket=%s",
+            "[TL loop transport] request method=%s path=%s socket=%s timeout=%.3fs",
             method,
             path,
             self.socket_path,
+            effective_timeout,
         )
         self._ensure_socket()
-        status, response_body = self._send_request(method, path, encoded_body, headers)
+        status, response_body = self._send_request(
+            method, path, encoded_body, headers, effective_timeout
+        )
 
         self.logger.info(
             "[TL loop transport] response method=%s path=%s status=%d size=%d",
@@ -192,15 +224,16 @@ class TransportClient:
         path: str,
         body: bytes,
         headers: dict[str, str],
+        timeout: float,
     ) -> tuple[int, bytes]:
-        connection = UnixHTTPConnection(self.socket_path, self.timeout)
+        connection = UnixHTTPConnection(self.socket_path, timeout)
         try:
             connection.request(method, path, body=body or None, headers=headers)
             response = connection.getresponse()
             return response.status, response.read()
         except TimeoutError as timeout_error:
             wrapped = ServerTimeout(
-                f"Timed out after {self.timeout:.3f}s waiting for {method} {path}"
+                f"Timed out after {timeout:.3f}s waiting for {method} {path}"
             )
             self.logger.error("[TL loop transport] request timeout: %s", timeout_error)
             raise wrapped from timeout_error

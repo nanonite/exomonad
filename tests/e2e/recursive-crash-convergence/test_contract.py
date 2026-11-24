@@ -281,7 +281,10 @@ def test_the_review_boundary_advances_the_real_base(
     monkeypatch.setattr(
         CrashBoundaryTransport.__mro__[1],
         "_send_request",
-        lambda self, method, path, body, headers: (200, b'{"success": true}'),
+        lambda self, method, path, body, headers, timeout: (
+            200,
+            b'{"success": true}',
+        ),
     )
     transport.call_tool("tl", "parent", "watcher_pr_state", {"pr_number": 1})
     assert advanced == [(tmp_path, 1)]
