@@ -40,6 +40,16 @@ the exact id and `canonical_opencode_builtin`. Every role gets the deny; there
 is no per-role allowlist and no env/flag bypass. PostToolUse, Stop, and
 worker-exit only log `hook.opencode_unknown_tool` (warn) and never deny.
 
+The code-mode `execute` tool maps to `execute` for the same reason. Verified
+against v2.3.2: with `experimental.full_codemode: true`, the inner
+`tools.<name>` calls (captured for `shell` and `write`) fire `execute.before`
+again with their own provider id and `call_id`, so the role guardrails apply
+inside the script and a deny blocks the inner call before it runs. The captured
+sequence is `tests/fixtures/opencode_v2_codemode_hook_events.jsonl`, replayed by
+`captured_codemode_inner_calls_normalize_to_guarded_ids`; the opt-in live probe
+`codemode_inner_calls_are_hooked_individually_when_enabled` fails if that stops
+being true. See `docs/decisions/opencode-hooks.md`.
+
 The v1 `server` export is intentionally absent; v2.3.2 rejects it and v1.14.48
 is not available to verify a dual-shape module. A real-CLI probe runs from
 `tests/opencode_plugin_v2.rs` when `EXOMONAD_OPENCODE_V2_PROBE=1` and skips

@@ -690,7 +690,14 @@ const OPENCODE_CANONICAL_BUILTINS: &[(&str, &str)] = &[
     // Todo tools (the experimental `todowrite` tool when enabled).
     ("todowrite", "todowrite"),
     ("todoread", "todoread"),
-    // Code-mode tool; it executes and its inner calls are hooked separately.
+    // Code-mode `execute`. Verified against OpenCode v2.3.2 (see
+    // `docs/decisions/opencode-hooks.md`): with
+    // `experimental.full_codemode: true` the inner `tools.<name>` calls
+    // (captured for `shell` and `write`) fire `execute.before` again with their
+    // own provider id and `call_id`, so a role deny on those ids applies inside
+    // the script.
+    // `tests/fixtures/opencode_v2_codemode_hook_events.jsonl` is the captured
+    // sequence and `tests/opencode_plugin_v2.rs` re-measures it.
     ("execute", "execute"),
     // Other built-ins with no role-guard equivalent. They keep their own
     // names because no role guardrail matches them.

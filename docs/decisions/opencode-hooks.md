@@ -149,6 +149,56 @@ Because pre/post hooks intercept every MCP tool call, they enable WASM-enforced 
 
 This logic lives in Haskell WASM role handlers, not the TypeScript plugin. The plugin calls the binary; the binary routes to WASM; WASM applies role-specific logic.
 
+## Code-mode `execute` and inner calls (verified)
+
+OpenCode v2.3.2 ships a code-mode `execute` tool. It is in the default tool set
+— a session with a plain `opencode.json` can call it — but the tool catalog
+*inside* the script is empty and every inner call fails with
+`Unknown tool 'shell'. Use search to find available tools.` No built-in tool
+call can be wrapped until code mode is enabled with
+`experimental.full_codemode: true` in `opencode.json` (or
+`OPENCODE_FLAGS=full_codemode`).
+
+With full code mode enabled, inner calls are **hooked individually**: each
+`tools.<name>` call fires `execute.before` again with its own provider id
+(captured for `shell` and `write`), its own arguments, and its own `call_id`,
+and it fires `execute.after` when it completes. A deny thrown by the before hook
+for an inner id blocks that inner call before it runs and surfaces the reason
+inside the script's result; the outer `execute` still completes.
+
+Captured against v2.3.2 with `opencode-go/beam-free` and a probe plugin that
+wrote every hook payload to JSONL. One `execute` script called
+`tools.shell({command: "echo EXO_DENY_ME"})` and
+`tools.write({path: "allowed.txt", content: "allowed write"})` inside
+`Promise.allSettled`; the probe denied the shell call:
+
+| # | event | `tool` | args |
+|---|-------|--------|------|
+| 1 | `execute.before` | `execute` | `{code: "...tools.shell(...); tools.write(...)"}` |
+| 2 | `execute.before` | `shell` | `{command: "echo EXO_DENY_ME"}` |
+| 3 | `execute.before` | `write` | `{path: "allowed.txt", content: "allowed write"}` |
+| 4 | `execute.after` | `write` | completed, file created |
+| 5 | `execute.after` | `execute` | completed, result contains the deny reason |
+
+`shell` has no `after` event because the deny ran first, and the session output
+carried `probe deny: shell blocked by execute.before` as the rejected promise's
+reason. So a role deny on `shell`/`edit`/`patch`/`write` is **not** bypassable by
+wrapping the call in `execute`, and the adapter keeps `execute` → `execute`.
+
+The captured sequence is committed as
+`rust/exomonad-core/tests/fixtures/opencode_v2_codemode_hook_events.jsonl`.
+`tests/opencode_plugin_v2.rs` has two checks:
+
+- `captured_codemode_inner_calls_normalize_to_guarded_ids` (always runs) replays
+  those payloads through `normalize_opencode_hook_payload` and
+  `opencode_unknown_tool_deny`, and fails if an inner id is collapsed onto
+  `execute` or is no longer a known id.
+- `codemode_inner_calls_are_hooked_individually_when_enabled` (opt-in with
+  `EXOMONAD_OPENCODE_V2_PROBE=1`) re-runs the session against the real CLI with
+  the production plugin and fails when inner calls stop reaching
+  `execute.before`, when the deny stops blocking `shell`, or when the allowed
+  `write` stops running. It uses its own `allowed-code-mode.txt` target.
+
 ## Verified Against
 
 OpenCode v2.3.2, with the generated plugin written by the production
