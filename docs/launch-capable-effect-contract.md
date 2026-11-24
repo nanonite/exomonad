@@ -71,6 +71,56 @@ permanent stall. The bounded window (`HOST_EVIDENCE_BOUNDED_WINDOW_SECONDS`,
 300s) only changes the diagnostic text: absence of evidence never authorizes a
 relaunch.
 
+## Third outcome: a held child effect parks, never fails the root
+
+The two evidence outcomes above decide what the *child controller* does with
+its own journal. A child may still be left with one ``unknown`` launch effect
+that the host has no row for after every tick. That hold is correct and stays
+correct: the child must not relaunch on absence of evidence.
+
+The parent controller used to translate that hold into
+``child action journal contains an unreconciled effect`` and then into
+``recursive child failed``, which exited the whole root controller and left no
+supported resolution. That was the defect fixed by #1595. The third outcome is
+now explicit:
+
+* the affected child/slice is **parked** with a durable operator gate, not a
+  controller-fatal failure;
+* sibling children and independent slices keep their own progress;
+* a nested sub-TL parks only its own level, and reports a park upward rather
+  than a failure.
+
+The recursive rule is: **a child's fail-closed hold is reported upward as
+parked-with-gate, never as `recursive child failed`.** Only the child that owns
+the unresolved effect stops.
+
+The parked gate pair is scoped to the child, intent and action
+(`tl-held-launch-effect-<child>-<intent-prefix>-abandon` and `...-retry`).
+The parked diagnostic names the slice, intent, journal index, last host
+evidence seen, and the available operator actions. Both gates are opened
+pending once and an answered gate is never re-armed.
+
+An approved answer is only consumed when the same machine proof still holds:
+
+| Answer | Required proof | Effect |
+| --- | --- | --- |
+| abandon (`...-abandon` approved) | ledger read succeeded with no launch/refusal/failure row for the exact intent; owner invocation is terminal (not live) with no successor; owner, predecessor, branch, worktree and intent all match the journal | append one linked `operator_abandoned` resolution; the slice stays parked until retry is approved; no launch |
+| retry (`...-retry` approved) | the abandon proof above | append `operator_abandoned` and `retry_authorized`, then let the ordinary approved blocked-leaf dispatch path make exactly one fresh launch under the current configuration |
+| reject | - | record the rejection; the slice stays parked and nothing launches |
+
+Resolutions are append-only records (`kind: launch_resolution`) linked to the
+original entry by `resolves_key`. The original `unknown` entry keeps its bytes
+and status, and the journal's `pending_entries()` stops reporting it once the
+resolution exists. Appends are idempotent per original effect and outcome and
+run under the existing `launch-reconciliation.lock`, so repeated
+`init --continue`, restarts and concurrent ticks resolve exactly once.
+
+Every other case stays non-overridable even with an approved gate: a live owner
+invocation, an `agent.spawned` row for the intent, conflicting or duplicate
+evidence, a wrong owner/predecessor/worktree, a forged intent, an unapproved or
+foreign gate, and every non-launch effect. Those keep the distinct fail-closed
+diagnostic and never reach a launch.
+
 ## Shared prelaunch refusal definition
 
 The refusal error set is defined once in
@@ -91,3 +141,6 @@ test in `tl_loop/tests/test_driver.py` fails if the two sets drift. See
 | E. restart while unknown | `test_launch_reconciliation.py::test_restart_while_unknown_adopts_exactly_once` |
 | F. concurrent ticks | `test_launch_reconciliation.py::test_concurrent_reconciliation_ticks_adopt_exactly_once` |
 | G. slow host over the production transport | `tl_loop/tests/test_transport.py::TransportTest::test_slow_launch_tool_outlives_the_default_timeout` |
+| H. held unknown child effect parks, root does not exit | `tl_loop/tests/test_held_launch_effect_resolution.py::test_a_held_unknown_effect_parks_the_child_without_failing_the_root` |
+| I. abandon, retry, reject and the non-overridable negatives | `test_held_launch_effect_resolution.py::test_a_retry_gate_appends_one_abandon_and_one_authorized_retry`, `...::test_abandon_without_retry_stays_parked_and_launches_nothing`, `...::test_a_rejected_retry_gate_keeps_the_slice_parked`, `...::test_negative_owner_proofs_stay_non_overridable`, `...::test_host_evidence_that_is_present_or_conflicting_stays_non_overridable` |
+| J. restart and concurrent ticks resolve once | `...::test_repeated_continue_and_repeated_resolution_are_idempotent`, `...::test_concurrent_ticks_resolve_exactly_once` |

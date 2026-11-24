@@ -20,7 +20,7 @@ from fnmatch import fnmatchcase
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import NamedTuple, NoReturn, Protocol, TypedDict, cast
+from typing import Any, NamedTuple, NoReturn, Protocol, TypedDict, cast
 
 from tl_loop.client.effects import (
     EffectClient,
@@ -183,6 +183,11 @@ from tl_loop.loop.heartbeat import (
 )
 from tl_loop.loop.integration_lineage import GitLineageError, verify_aggregate_lineage
 from tl_loop.loop.launch_reconciliation import reconcile_unknown_blocked_resume
+from tl_loop.loop.launch_resolution import (
+    HeldLaunchClassification,
+    HeldLaunchEffect,
+    classify_held_launch_effect,
+)
 from tl_loop.loop.nested_recovery import verified_nested_recovery_wait
 from tl_loop.loop.observability import emit_controller_event
 from tl_loop.loop.pr_number import require_pr_number as _require_pr_number
@@ -2554,6 +2559,10 @@ class OrderedRecoveryDecision:
     #: checkpoint evidence alone cannot prove; ``PENDING`` and ``REJECTED`` both
     #: leave the run gated, and neither is ever re-armed to pending.
     gate_status: GateStatus | None = None
+    #: set for the third outcome: a child journal holds an unobserved launch
+    #: effect that an operator may abandon or retry. It is never released by the
+    #: generic recovery gate, and an unresolved hold parks only this slice.
+    held_launch_effect: HeldLaunchEffect | None = None
     #: Whether an approved gate, rather than the checkpoint evidence, authorizes
     #: the reopen. An authorized reopen mints a fresh child invocation instead of
     #: reusing the recorded one, because the prior delivery target is gone.
@@ -2566,6 +2575,14 @@ class OrderedRecoveryDecision:
     #: already have landed, so the other failures stay gated however they are
     #: answered.
     operator_overridable: bool = False
+
+
+class HeldLaunchEffectParked(TLLoopError):
+    """A child launch effect is held behind operator gates; do not launch it."""
+
+    def __init__(self, effect: HeldLaunchEffect) -> None:
+        super().__init__(effect.diagnostic)
+        self.effect = effect
 
 
 def _ordered_recovery_gate_name(task_name: str | None) -> str:
@@ -2778,6 +2795,174 @@ def _fresh_ordered_running_projection(
     )
 
 
+def _reverify_held_launch_effect(
+    state: RunState,
+    plan: WorkPlan,
+    config: TLLoopConfig,
+    store: RunStore,
+    effect: HeldLaunchEffect,
+) -> HeldLaunchClassification:
+    """Re-prove the held effect from the journal and host evidence, read only."""
+    task = next((candidate for candidate in plan.sub_tls if candidate.name == effect.child_id), None)
+    parent_branch = state.owner_branch or config.branch
+    branch = (
+        derive_child_branch(parent_branch, _child_controller_name(task))
+        if task is not None
+        else config.branch
+    )
+    child_store = RunStore(effect.child_id, store.run_dir)
+    ledger_run_id = config.ledger_run_id
+    try:
+        ledger_run_id = child_store.load().ledger_run_id or ledger_run_id
+    except (OSError, ValueError):
+        pass
+    return classify_held_launch_effect(
+        effect.child_id,
+        child_store,
+        project_root=config.project_root,
+        ledger_run_id=ledger_run_id,
+        expected_parent_branch=branch,
+    )
+
+
+def _resolve_held_launch_effect(
+    state: RunState,
+    plan: WorkPlan,
+    config: TLLoopConfig,
+    store: RunStore,
+    effect: HeldLaunchEffect,
+    *,
+    retry: bool,
+) -> str | None:
+    """Append the operator resolution once, under the run-scoped lock.
+
+    Returns a fail-closed diagnostic when the machine proof no longer holds, or
+    ``None`` when the resolution is durable (including an idempotent repeat).
+    """
+    lock = RunLock(store.run_dir / "launch-reconciliation.lock", timeout=5.0)
+    try:
+        lock.acquire()
+    except LockTimeout:
+        return (
+            "held launch effect resolution lock is held; the slice stays parked this tick"
+        )
+    try:
+        fresh = _reverify_held_launch_effect(state, plan, config, store, effect)
+        journal = EffectJournal(
+            effect.child_id,
+            RunStore(effect.child_id, store.run_dir).run_dir / "action-journal.json",
+        )
+        if fresh.reason is not None:
+            return fresh.reason
+        if fresh.effect is None:
+            if journal.has_launch_resolution(
+                effect.entry_key, outcomes=frozenset({"retry_authorized"})
+            ):
+                return None
+            return (
+                "held launch effect is no longer present in the child journal; "
+                "re-run recovery instead of consuming the operator answer"
+            )
+        entry = journal.entry_by_key(effect.entry_key)
+        if entry is None:
+            return "held launch effect entry disappeared from the child journal"
+        journal.append_launch_resolution(
+            entry,
+            outcome="operator_abandoned",
+            gate_name=effect.retry_gate if retry else effect.abandon_gate,
+            recorded_at=time.time(),
+            proof=effect.proof(),
+        )
+        if retry:
+            journal.append_launch_resolution(
+                entry,
+                outcome="retry_authorized",
+                gate_name=effect.retry_gate,
+                recorded_at=time.time(),
+                proof=effect.proof(),
+            )
+        return None
+    finally:
+        lock.release()
+
+
+def _held_launch_effect_decision(
+    state: RunState,
+    plan: WorkPlan,
+    config: TLLoopConfig,
+    store: RunStore,
+    proof: OrderedRecoveryDecision,
+) -> OrderedRecoveryDecision:
+    """Apply the recorded abandon/retry answer to one held child launch effect."""
+    effect = proof.held_launch_effect
+    if effect is None:
+        raise TLLoopError("held launch decision has no effect")
+    gates = {gate.name: gate.status for gate in state.gates}
+    abandon_status = gates.get(effect.abandon_gate)
+    retry_status = gates.get(effect.retry_gate)
+    if retry_status is GateStatus.APPROVED:
+        error = _resolve_held_launch_effect(
+            state, plan, config, store, effect, retry=True
+        )
+        if error is not None:
+            return OrderedRecoveryDecision(
+                proof.task_name,
+                effect.retry_gate,
+                error,
+                False,
+                gate_status=retry_status,
+                held_launch_effect=effect,
+            )
+        return OrderedRecoveryDecision(
+            proof.task_name,
+            effect.retry_gate,
+            (
+                f"operator approved retry gate {effect.retry_gate} for child "
+                f"{effect.child_id!r}: the unproven launch is abandoned and exactly one "
+                f"fresh launch is authorized. {effect.diagnostic}"
+            ),
+            True,
+            gate_status=retry_status,
+            held_launch_effect=effect,
+            authorized=True,
+        )
+    if abandon_status is GateStatus.APPROVED:
+        error = _resolve_held_launch_effect(
+            state, plan, config, store, effect, retry=False
+        )
+        if error is not None:
+            return OrderedRecoveryDecision(
+                proof.task_name,
+                effect.abandon_gate,
+                error,
+                False,
+                gate_status=abandon_status,
+                held_launch_effect=effect,
+            )
+        return OrderedRecoveryDecision(
+            proof.task_name,
+            effect.abandon_gate,
+            (
+                f"operator abandoned the unproven launch at gate {effect.abandon_gate}; "
+                f"child {effect.child_id!r} stays parked until retry gate "
+                f"{effect.retry_gate} is approved. {effect.diagnostic}"
+            ),
+            False,
+            gate_status=abandon_status,
+            held_launch_effect=effect,
+        )
+    gate_name = effect.retry_gate if retry_status is not None else effect.abandon_gate
+    gate_status = retry_status if retry_status is not None else abandon_status
+    return OrderedRecoveryDecision(
+        proof.task_name,
+        gate_name,
+        effect.diagnostic,
+        False,
+        gate_status=gate_status,
+        held_launch_effect=effect,
+    )
+
+
 def _ordered_terminal_recovery_decision(
     state: RunState,
     plan: WorkPlan,
@@ -2800,6 +2985,8 @@ def _ordered_terminal_recovery_decision(
     proof = _ordered_recovery_proof(state, plan, config, store)
     if proof is None:
         return None
+    if proof.held_launch_effect is not None:
+        return _held_launch_effect_decision(state, plan, config, store, proof)
     gate_status = next(
         (gate.status for gate in state.gates if gate.name == proof.gate_name),
         None,
@@ -2857,7 +3044,10 @@ def _ordered_recovery_proof(
         task_name
         for task_name in stage.sub_tls
         if state.slices.get(task_name) is not None
-        and state.slices[task_name].status is SliceStatus.FAILED
+        and (
+            state.slices[task_name].status is SliceStatus.FAILED
+            or _held_launch_parked(state.slices.get(task_name))
+        )
     ]
     if len(failed) != 1:
         return OrderedRecoveryDecision(
@@ -2911,6 +3101,7 @@ def _ordered_recovery_proof(
             _ordered_recovery_gate_name(task_name),
             proof.reason,
             False,
+            held_launch_effect=proof.held_launch_effect,
             operator_overridable=proof.operator_overridable,
         )
     return OrderedRecoveryDecision(
@@ -2933,9 +3124,98 @@ def _hold_ordered_recovery_gate(
     re-arming an approved one would discard the authorization this decision
     just consumed. Only an unrecorded name opens one pending gate.
     """
+    state = store.load()
+    if decision.held_launch_effect is not None:
+        state = _park_held_launch_slice(state, store, decision.held_launch_effect)
+        state = _ensure_held_launch_gates(store, state, decision.held_launch_effect)
+        return state
     if decision.gate_status is not None:
-        return store.load()
+        return state
     return store.set_gate(decision.gate_name, GateStatus.PENDING)
+
+
+def _held_launch_parked(slice_state: SliceState | None) -> bool:
+    """Whether a slice is parked only behind its unresolved launch-effect gate."""
+    return (
+        slice_state is not None
+        and slice_state.status is SliceStatus.PARKED
+        and slice_state.park_cause is ParkCause.HUMAN_DECISION_REQUIRED
+        and isinstance(slice_state.park_audit, Mapping)
+        and slice_state.park_audit.get("recovery_action") == "held_launch_effect"
+    )
+
+
+def _held_launch_park_audit(effect: HeldLaunchEffect) -> dict[str, object]:
+    """Render the closed park-audit schema with the launch-effect detail nested."""
+    detail = {
+        "child_id": effect.child_id,
+        "slice_id": effect.slice_id,
+        "intent_id": effect.intent_id,
+        "journal_index": effect.journal_index,
+        "journal_entry_key": effect.entry_key,
+        "owner_agent_name": effect.owner_agent_name,
+        "owner_invocation_status": effect.owner_invocation_status,
+        "last_host_evidence": effect.last_host_evidence,
+        "abandon_gate": effect.abandon_gate,
+        "retry_gate": effect.retry_gate,
+        "available_actions": ["abandon", "retry", "reject"],
+    }
+    return {
+        "recovery_action": "held_launch_effect",
+        "needs_human": True,
+        "gate_name": effect.retry_gate,
+        "reason": effect.diagnostic,
+        "launch_evidence": json.dumps(detail, sort_keys=True),
+    }
+
+
+def _park_held_launch_slice(
+    state: RunState,
+    store: RunStore,
+    effect: HeldLaunchEffect,
+) -> RunState:
+    """Park only the slice whose child journal holds an unobserved launch."""
+    current = state.slices.get(effect.child_id)
+    if current is None:
+        return state
+    audit = _held_launch_park_audit(effect)
+    if (
+        current.status is SliceStatus.PARKED
+        and current.park_cause is ParkCause.HUMAN_DECISION_REQUIRED
+        and current.park_audit == audit
+    ):
+        return state
+    parked = slice_transition(current, SliceStatusChanged(SliceStatus.PARKED))
+    parked = replace(
+        parked,
+        park_cause=ParkCause.HUMAN_DECISION_REQUIRED,
+        park_audit=audit,
+        park_issue_id=current.park_issue_id,
+    )
+    slices = dict(state.slices)
+    slices[effect.child_id] = parked
+    return store.checkpoint(
+        cast(Any, state.recursive_fsm),
+        slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+
+def _ensure_held_launch_gates(
+    store: RunStore,
+    state: RunState,
+    effect: HeldLaunchEffect,
+) -> RunState:
+    """Open both operator actions once; never re-arm an answered gate."""
+    for name in (effect.abandon_gate, effect.retry_gate):
+        if any(gate.name == name for gate in state.gates):
+            continue
+        state = store.set_gate(name, GateStatus.PENDING)
+    return state
 
 
 class _ChildRecoveryProof(NamedTuple):
@@ -2952,6 +3232,9 @@ class _ChildRecoveryProof(NamedTuple):
 
     reason: str | None
     operator_overridable: bool
+    #: Present when the child's only unproven fact is an unresolved launch effect
+    #: that a durable operator gate may abandon or retry with machine proof.
+    held_launch_effect: HeldLaunchEffect | None = None
 
 
 def _ordered_child_recovery_reason(
@@ -3105,8 +3388,24 @@ def _ordered_child_recovery_reason(
         pending = EffectJournal(task.name, journal_path).pending_entries()
     except ActionJournalError as error:
         return _hard_failure(f"child action journal cannot be verified: {error}")
-    if pending and not _pending_blocked_resume_is_proven(pending, blocked_proof):
-        return _hard_failure("child action journal contains an unreconciled effect")
+    if not _pending_blocked_resume_is_proven(pending, blocked_proof):
+        held = classify_held_launch_effect(
+            task.name,
+            child_store,
+            project_root=config.project_root,
+            ledger_run_id=child_state.ledger_run_id or config.ledger_run_id,
+            expected_parent_branch=branch,
+        )
+        if held.effect is not None:
+            return _ChildRecoveryProof(
+                held.effect.diagnostic,
+                False,
+                held_launch_effect=held.effect,
+            )
+        if held.reason is not None:
+            return _hard_failure(held.reason)
+        if pending:
+            return _hard_failure("child action journal contains an unreconciled effect")
     return _ChildRecoveryProof(None, False)
 
 
@@ -3710,6 +4009,7 @@ def _reopen_ordered_scope(
         reopened = replace(
             slice_transition(target, SliceStatusChanged(SliceStatus.SPAWNED)),
             park_cause=None,
+            park_audit=None,
             dispatch_error=None,
         )
         if authorized and _ordered_child_invocation_is_gone(store, target_name):
@@ -4647,7 +4947,17 @@ def _persist_reassessed_ordered_recovery_failure(
         decision = _ordered_terminal_recovery_decision(proof_state, plan, config, store)
         if decision is None or decision.recoverable:
             return latest
+        ensure_gates: tuple[tuple[str, GateStatus], ...] = (
+            (decision.gate_name, GateStatus.PENDING),
+        )
         try:
+            if decision.held_launch_effect is not None:
+                latest = _park_held_launch_slice(latest, store, decision.held_launch_effect)
+                latest = store.load()
+                ensure_gates = (
+                    (decision.held_launch_effect.abandon_gate, GateStatus.PENDING),
+                    (decision.held_launch_effect.retry_gate, GateStatus.PENDING),
+                )
             return _persist_rederived_root_failure(
                 latest,
                 decision.reason,
@@ -4655,7 +4965,7 @@ def _persist_reassessed_ordered_recovery_failure(
                 effects,
                 store,
                 effects_log,
-                ensure_gates=((decision.gate_name, GateStatus.PENDING),),
+                ensure_gates=ensure_gates,
             )
         except CheckpointConflict:
             continue
@@ -6913,11 +7223,22 @@ def _resolve_blocked_leaf_owner(
     if config.project_root is None:
         raise BlockedLeafOwnerError("blocked leaf owner lookup requires the project root")
     child_store = store
+    resume_journal = EffectJournal(
+        state.run_id, child_store.run_dir / "action-journal.json"
+    )
     entries = (
         tuple(resume_entries)
         if resume_entries is not None
-        else EffectJournal(state.run_id, child_store.run_dir / "action-journal.json").entries_for(
-            "resume_blocked_leaf", leaf.name
+        else resume_journal.entries_for("resume_blocked_leaf", leaf.name)
+    )
+    # An operator resolution is a terminal decision about the original effect.
+    # It stays in history but no longer blocks the fresh authorized attempt.
+    resolved_outcomes = frozenset({"operator_abandoned", "retry_authorized"})
+    entries = tuple(
+        entry
+        for entry in entries
+        if not resume_journal.has_launch_resolution(
+            str(entry.get("key") or ""), outcomes=resolved_outcomes
         )
     )
     last_entry_index = resume_entry_offset
@@ -9510,6 +9831,10 @@ def _resume_approved_blocked_leaf(
             initial_entry is not None
             and initial_entry.get("status") in {"intended", "unknown"}
             and isinstance(initial_entry.get("arguments"), Mapping)
+            and not journal.has_launch_resolution(
+                str(initial_entry.get("key") or ""),
+                outcomes=frozenset({"operator_abandoned", "retry_authorized"}),
+            )
         ):
             recorded_arguments = cast(Mapping[str, object], initial_entry["arguments"])
             initial_arguments = recorded_arguments
@@ -17460,6 +17785,13 @@ def _apply_launch_reconciliations(
         key = entry.get("key")
         if not isinstance(key, str) or not key:
             continue
+        if effects_log.has_launch_resolution(
+            key,
+            outcomes=frozenset({"operator_abandoned", "retry_authorized"}),
+        ):
+            # The linked operator resolution is the terminal decision. Evidence
+            # reconciliation never rewrites an entry an operator resolved.
+            continue
         decision = reconcile_unknown_blocked_resume(
             project_root,
             entry,
@@ -22294,7 +22626,11 @@ def _run_sub_tls(
             state = _complete_sub_tl_batch(
                 batch, outcomes, state, config, effects, store, effects_log
             )
-            if any(phase is TLPhase.TLFailed for _, phase, _ in outcomes):
+            if any(
+                phase is TLPhase.TLFailed
+                and not _held_launch_parked(state.slices.get(task.name))
+                for task, phase, _ in outcomes
+            ):
                 return _fail_recursive_parent(
                     state, config, effects, store, effects_log, "recursive child failed"
                 )
@@ -22823,7 +23159,10 @@ def _run_sub_tl_batch(
                 and not controller_shutdown
             ):
                 return task, child_phase, child_state
-        effective_config = _ensure_ordered_parent_ready_for_provision(task, config, store)
+        try:
+            effective_config = _ensure_ordered_parent_ready_for_provision(task, config, store)
+        except HeldLaunchEffectParked:
+            return task, TLPhase.TLFailed, _load_child_checkpoint(task.name, store)
         if retrying_failed_child and effective_config.ordered_recovery_child != task.name:
             effective_config = replace(effective_config, ordered_recovery_child=task.name)
         child_config = _child_config(
@@ -22861,6 +23200,17 @@ def _child_completion_phase(state: RunState) -> TLPhase:
     if recursive_fsm is None:
         return state.fsm.phase
     return _phase_tag(_phase_from_state(state))
+
+
+def _load_child_checkpoint(child_id: str, store: RunStore) -> RunState | None:
+    """Read an existing child checkpoint for a parked outcome, never create one."""
+    child_store = RunStore(child_id, store.run_dir)
+    if not child_store.path.exists():
+        return None
+    try:
+        return child_store.load()
+    except (OSError, ValueError):
+        return None
 
 
 def _run_live_sub_tl_batch(
@@ -22922,11 +23272,20 @@ def _run_live_sub_tl_batch(
                 continue
         runnable.append(task)
     effective_configs: dict[str, TLLoopConfig] = {}
+    held_outcomes: dict[str, tuple[SubTLTask, TLPhase | None, RunState | None]] = {}
     for task in runnable:
         retrying_failed_child = task.name in blocked_leaf_resume_proofs or (
             config.ordered_recovery_child == task.name
         )
-        effective_config = _ensure_ordered_parent_ready_for_provision(task, config, store)
+        try:
+            effective_config = _ensure_ordered_parent_ready_for_provision(task, config, store)
+        except HeldLaunchEffectParked:
+            held_outcomes[task.name] = (
+                task,
+                TLPhase.TLFailed,
+                _load_child_checkpoint(task.name, store),
+            )
+            continue
         if retrying_failed_child and effective_config.ordered_recovery_child != task.name:
             effective_config = replace(effective_config, ordered_recovery_child=task.name)
         effective_configs[task.name] = effective_config
@@ -22947,12 +23306,14 @@ def _run_live_sub_tl_batch(
             ),
         )
         for task in runnable
+        if task.name not in held_outcomes
     ]
     for _, process in processes:
         process.start()
     outcomes_by_name: dict[str, tuple[SubTLTask, TLPhase | None, RunState | None]] = {
         task.name: existing[task.name] for task in tasks if task.name in existing
     }
+    outcomes_by_name.update(held_outcomes)
     for task, process in processes:
         child_store = RunStore(task.name, store.run_dir)
         supervised_state = _supervise_live_sub_tl(
@@ -23344,6 +23705,14 @@ def _failed_ordered_parent_recovery(
         )
     plan = _work_plan_from_manifest(state.plan_manifest)
     decision = _ordered_terminal_recovery_decision(state, plan, config, store)
+    if decision is not None and decision.held_launch_effect is not None:
+        effect = decision.held_launch_effect
+        if not decision.recoverable:
+            parked = _park_held_launch_slice(state, store, effect)
+            _ensure_held_launch_gates(store, parked, effect)
+            raise HeldLaunchEffectParked(effect)
+        if decision.task_name == task.name:
+            return decision
     if decision is None or not decision.recoverable or decision.task_name != task.name:
         reason = decision.reason if decision is not None else "recovery proof is unavailable"
         raise TLLoopError(
@@ -23428,6 +23797,10 @@ def _run_live_sub_tl(
                 outcome="normal_return",
                 expected_revision=final_state.revision,
             )
+    except HeldLaunchEffectParked:
+        # The parent slice is durably parked behind its operator gates. This is
+        # not a child controller failure and must not become one.
+        return
     except Exception as error:
         _persist_child_startup_failure(child_store, str(error))
         _record_child_exit_reason(child_store, str(error), error=error, outcome="exception")
@@ -23881,6 +24254,10 @@ def _complete_sub_tl_batch(
                 # this startup pass. Remove only that stale parent projection.
                 sub_tl_recovery.pop(task.name, None)
                 sub_tl_states[task.name] = IntegrationLifecycle.RUNNING
+            continue
+        if phase is TLPhase.TLFailed and _held_launch_parked(updated_slices.get(task.name)):
+            # A held launch effect parks only this child. Keep its durable park
+            # record and let sibling children keep their own progress.
             continue
         status = SliceStatus.FAILED if phase is TLPhase.TLFailed else SliceStatus.MERGED
         previous_lifecycle = sub_tl_states.get(task.name, IntegrationLifecycle.RUNNING)

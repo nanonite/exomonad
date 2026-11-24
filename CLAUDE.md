@@ -599,7 +599,7 @@ Spawn heterogeneous agent teams as a recursive tree:
 
 - **`spawn_leaf`** — Spawn a leaf agent in own worktree+branch. Files PR when done. Agent type set by server config or explicit `agent_type`. Structured spec fields (steps, verify, boundary, context, read_first). Continuation context is prefixed automatically when available, while the caller's task remains verbatim after a blank-line separator. A preserved deterministic branch is reattached rather than recreated, and an open PR on that branch at the verified head is named in the task so the leaf continues it instead of filing a second one. Reusing a live worktree is proved the same way as attaching one: a branch that no longer contains the head its owner published or resumed from is refused, not continued.
 - **`resume_pr`** — Resume the existing issue-owned PR worktree and invocation after review or CI feedback. Continuation context is prefixed automatically and review feedback is scoped to the exact current PR head SHA. The branch is reattached through the same verified path as a first spawn and is refused unless the recorded publication and recovery-lineage heads still describe it. A resume also refuses when the pull request that owns the branch cannot be read, because a blind leaf files a second PR; a first spawn logs the same outage and proceeds.
-- **`resume_blocked_leaf`** — Resume one externally blocked, no-PR leaf after explicit human gate approval. The host verifies the parked event, exact dormant invocation, branch, and dirty-worktree fingerprint, then reuses the same owner/worktree/harness. The spawn layer independently re-proves the recovery lineage against the durable invocation record and fails closed with `worktree.branch_ownership_conflict` when it has moved on. A confirmed result from the historical pre-launch-event producer nests `success: true` beside `chainlink_issue_id`, `agent`, and `invocation`; it is accepted only when both that boolean and the outer `ToolResult.success` are exactly `true`, and any other value or unknown key is held. A timed-out launch is journalled `unknown` and reconciled from the host ledger by exact `dispatch_intent_id`: one owner/predecessor-bound `agent.spawned` row is adopted without a second request, one shared-set prelaunch `tool.called` refusal is rejected (and may retry under the #1590 rules), and missing, duplicate, conflicting, or unbound evidence stays held and is re-evaluated on later ticks. See `docs/launch-capable-effect-contract.md`; the refusal set `PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS` is defined once in `tl_loop/loop/prelaunch_refusal.py` and imported by the reconciler.
+- **`resume_blocked_leaf`** — Resume one externally blocked, no-PR leaf after explicit human gate approval. The host verifies the parked event, exact dormant invocation, branch, and dirty-worktree fingerprint, then reuses the same owner/worktree/harness. The spawn layer independently re-proves the recovery lineage against the durable invocation record and fails closed with `worktree.branch_ownership_conflict` when it has moved on. A confirmed result from the historical pre-launch-event producer nests `success: true` beside `chainlink_issue_id`, `agent`, and `invocation`; it is accepted only when both that boolean and the outer `ToolResult.success` are exactly `true`, and any other value or unknown key is held. A timed-out launch is journalled `unknown` and reconciled from the host ledger by exact `dispatch_intent_id`: one owner/predecessor-bound `agent.spawned` row is adopted without a second request, one shared-set prelaunch `tool.called` refusal is rejected (and may retry under the #1590 rules), and missing, duplicate, conflicting, or unbound evidence stays held and is re-evaluated on later ticks. A child left with such a held effect no longer fails the root: it parks behind `tl-held-launch-effect-<child>-<intent>-abandon` / `-retry` gates, and only an approved, re-proven answer appends an append-only abandon/retry resolution. See `docs/launch-capable-effect-contract.md`; the refusal set `PRELAUNCH_ROLE_ROUTE_REFUSAL_ERRORS` is defined once in `tl_loop/loop/prelaunch_refusal.py` and imported by the reconciler.
 - **`spawn_worker`** — Spawn an ephemeral worker in a tmux pane. No branch, no PR. Just name + task.
 - **`spawn_codex`** — Spawn a Codex leaf agent in its own worktree+branch. Files PR when done.
 
@@ -1338,12 +1338,33 @@ parent ownership, accepted dispatch intent, an exit diagnostic bound to that
 exact child checkpoint revision, and a retryable exit reason) holds. An
 `approved` answer releases the recovery only when the exit-reason classification
 is the single unproven fact: approving a question about ownership, publication,
-or an unreconciled effect is not evidence for it, so those proofs stay hard and
-the slice is re-decomposed instead. An approved recovery whose child controller
-has exited relaunches that child with a fresh invocation identity, because
-relaunching against the recorded one would deliver to the pane that already
-exited. Branch, worktree, controller identity, PR, head, and publication
-ownership are preserved, so the child is reopened rather than duplicated.
+or an unreconciled non-launch effect is not evidence for it, so those proofs stay
+hard and the slice is re-decomposed instead.
+
+A held `unknown` launch-capable effect is the third outcome. The child's own hold
+is correct and stays fail-closed, but the parent parks only that child/slice
+behind two durable gates, `tl-held-launch-effect-<child>-<intent>-abandon` and
+`...-retry`, instead of exiting the root controller with
+`recursive child failed`. Sibling children and independent slices keep running;
+a nested sub-TL parks only its own level. The recursive rule is that a child's
+fail-closed hold is reported upward as parked-with-gate, never as a controller
+failure. Approving the retry gate consumes the answer only after re-proving that
+the ledger has no launch/refusal/failure row for the exact intent and that the
+journaled owner invocation is terminal with no successor and matching owner,
+predecessor, branch, worktree and intent. It then appends append-only
+`operator_abandoned` + `retry_authorized` records that leave the original
+`unknown` entry untouched, and the ordinary approved blocked-leaf path makes
+exactly one fresh launch. Abandon records only the abandonment and leaves the
+slice parked; reject launches nothing. A live invocation, a launch row for the
+intent, conflicting or duplicate evidence, a wrong owner/predecessor/worktree, a
+forged intent, a foreign or unapproved gate, and every non-launch effect stay
+non-overridable. Contract: `docs/launch-capable-effect-contract.md`.
+
+An approved recovery whose child controller has exited relaunches that child
+with a fresh invocation identity, because relaunching against the recorded one
+would deliver to the pane that already exited. Branch, worktree, controller
+identity, PR, head, and publication ownership are preserved, so the child is
+reopened rather than duplicated.
 
 A dispatch failure is one of those bounded failures, and it is classified by a
 stable machine code rather than by a message. The code is the `code` the runtime

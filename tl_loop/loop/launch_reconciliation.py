@@ -82,6 +82,9 @@ class LaunchReconciliation:
     result: Mapping[str, object] | None = None
     error: str | None = None
     invocation_id: str | None = None
+    #: False only when the durable ledger could not be read. An empty
+    #: ``evidence`` tuple then means "unknown", not "proven absent".
+    evidence_read: bool = True
 
     def audit(self, *, evaluated_at: float, evaluations: int) -> dict[str, object]:
         """Return the durable journal audit record for this evaluation."""
@@ -114,7 +117,12 @@ def reconcile_unknown_blocked_resume(
         arguments = _validated_arguments(entry)
         intent_id = cast(str, arguments["dispatch_intent_id"])
     except LaunchReconciliationError as error:
-        return LaunchReconciliation("hold", "", f"blocked-resume journal entry is unusable: {error}")
+        return LaunchReconciliation(
+            "hold",
+            "",
+            f"blocked-resume journal entry is unusable: {error}",
+            evidence_read=False,
+        )
     try:
         documents = scoped_launch_evidence(
             Path(project_root),
@@ -130,6 +138,7 @@ def reconcile_unknown_blocked_resume(
                 f"blocked-resume intent {intent_id} cannot read durable host evidence "
                 f"({type(error).__name__}); the journal entry stays held"
             ),
+            evidence_read=False,
         )
 
     launches = [

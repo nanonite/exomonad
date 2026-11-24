@@ -1096,6 +1096,33 @@ segments are only ever written through their own APIs. Contract:
 `tl_loop/loop/prelaunch_refusal.py` and shared with
 `launch_reconciliation.py`.
 
+A child that still holds one `unknown` launch effect is not a controller
+failure. `_ordered_child_recovery_reason` calls
+`tl_loop/loop/launch_resolution.py::classify_held_launch_effect`; when the
+ledger was read with no row for the exact intent and the journaled owner,
+predecessor, branch, worktree and intent all bind to one terminal invocation
+with no successor, the parent parks that slice only:
+`SliceStatus.PARKED` with `ParkCause.HUMAN_DECISION_REQUIRED` and the detail in
+`park_audit` (closed schema: `recovery_action: held_launch_effect`,
+`launch_evidence` JSON). Two gates are opened once,
+`tl-held-launch-effect-<child>-<intent-prefix>-abandon` and `...-retry`.
+Sibling children and independent slices keep running; a nested sub-TL parks
+only its own level. The recursive rule is that a child's fail-closed hold is
+reported upward as parked-with-gate, never as `recursive child failed`.
+
+Approving `-retry` re-proves the effect and appends two append-only
+`kind: launch_resolution` records (`operator_abandoned`, then
+`retry_authorized`) linked by `resolves_key`; the original `unknown` entry is
+never edited and `pending_entries()` stops reporting it. The ordinary approved
+blocked-leaf dispatch path then makes exactly one fresh launch. Approving
+`-abandon` records only the abandonment and leaves the slice parked. Reject
+launches nothing. Appends are idempotent per entry/outcome under
+`launch-reconciliation.lock`, so `--continue`, restart and concurrent ticks
+resolve once. Live owners, launch rows for the intent, conflicting or duplicate
+evidence, wrong owner/predecessor/worktree, forged intents, foreign or
+unapproved gates, and all non-launch effects remain non-overridable
+`_hard_failure`s with their own diagnostic.
+
 A stored `configured_route_authorization` written under an older identity scheme
 is history, not current authority. `_terminal_owner_recovery_proof` separates
 the two: `_historical_terminal_route_authorization_is_genuine` recomputes the

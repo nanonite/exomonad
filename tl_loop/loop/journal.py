@@ -51,6 +51,11 @@ MUTATING_OPERATIONS = frozenset(
     }
 )
 RECOVERY_INTENT_STATES = frozenset({"intended", "confirmed", "unknown", "reconciled"})
+#: Append-only operator resolutions for a journaled launch-capable effect. The
+#: original ``unknown`` entry is never edited; these records are linked to it by
+#: ``resolves_key`` so history keeps both the request and the decision.
+LAUNCH_RESOLUTION_KIND = "launch_resolution"
+LAUNCH_RESOLUTION_OUTCOMES = frozenset({"operator_abandoned", "retry_authorized"})
 EffectProbeStatus = Literal[
     "absent",
     "intended",
@@ -148,8 +153,87 @@ class EffectJournal(list[Any]):
         return tuple(
             json.loads(dumps_json(entry))
             for entry in self._read()
-            if entry.get("operation") == operation and entry.get("target") == target
+            if entry.get("kind") != LAUNCH_RESOLUTION_KIND
+            and entry.get("operation") == operation
+            and entry.get("target") == target
         )
+
+    def launch_resolutions(self) -> list[dict[str, object]]:
+        """Return the append-only operator resolutions in journal order."""
+        return [
+            entry
+            for entry in self._read()
+            if isinstance(entry, dict) and entry.get("kind") == LAUNCH_RESOLUTION_KIND
+        ]
+
+    def launch_resolution(
+        self,
+        entry_key: str,
+        *,
+        outcomes: frozenset[str] | None = None,
+    ) -> Mapping[str, object] | None:
+        """Return one linked resolution for a journaled effect, if recorded."""
+        for entry in reversed(self.launch_resolutions()):
+            if entry.get("resolves_key") != entry_key:
+                continue
+            outcome = entry.get("outcome")
+            if outcomes is None or outcome in outcomes:
+                return entry
+        return None
+
+    def has_launch_resolution(
+        self,
+        entry_key: str,
+        *,
+        outcomes: frozenset[str] | None = None,
+    ) -> bool:
+        """Whether the effect already has one of the requested resolutions."""
+        return self.launch_resolution(entry_key, outcomes=outcomes) is not None
+
+    def append_launch_resolution(
+        self,
+        entry: Mapping[str, object],
+        *,
+        outcome: str,
+        gate_name: str,
+        recorded_at: float,
+        proof: Mapping[str, object],
+    ) -> bool:
+        """Append one linked operator resolution without editing the original entry.
+
+        The record key is deterministic per original effect and outcome, so a
+        repeated ``--continue`` or a concurrent tick appends at most once. The
+        original ``unknown`` entry keeps its bytes and status.
+        """
+        if outcome not in LAUNCH_RESOLUTION_OUTCOMES:
+            raise ActionJournalError(f"invalid launch resolution outcome {outcome!r}")
+        entry_key = entry.get("key")
+        if not isinstance(entry_key, str) or not entry_key:
+            raise ActionJournalError("launch effect entry has no stable key")
+        record_key = f"{LAUNCH_RESOLUTION_KIND}:{outcome}:{entry_key}"
+        if any(
+            existing.get("key") == record_key
+            for existing in self._read()
+            if isinstance(existing, dict)
+        ):
+            return False
+        arguments = entry.get("arguments")
+        journal_arguments = arguments if isinstance(arguments, Mapping) else {}
+        self._upsert(
+            {
+                "kind": LAUNCH_RESOLUTION_KIND,
+                "key": record_key,
+                "resolves_key": entry_key,
+                "resolves_intent_id": journal_arguments.get("dispatch_intent_id"),
+                "resolves_operation": entry.get("operation"),
+                "resolves_target": entry.get("target"),
+                "outcome": outcome,
+                "gate_name": gate_name,
+                "recorded_at": recorded_at,
+                "proof": to_jsonable(proof),
+            }
+        )
+        return True
 
     def probe(self, intent: Any) -> EffectProbe:
         """Read one effect outcome without dispatching or guessing."""
@@ -283,11 +367,24 @@ class EffectJournal(list[Any]):
             self._update(intent, status="unknown", error=str(error))
 
     def pending_entries(self) -> list[dict[str, object]]:
-        """Intended/unknown entries that block retry until reconciled."""
+        """Intended/unknown entries that block retry until reconciled.
+
+        An effect with a linked operator resolution is no longer pending: the
+        resolution is the terminal decision, while the original entry keeps its
+        historical status.
+        """
+        resolved_keys = {
+            resolution.get("resolves_key")
+            for resolution in self.launch_resolutions()
+            if resolution.get("outcome") in LAUNCH_RESOLUTION_OUTCOMES
+        }
         return [
             entry
             for entry in self._read()
-            if isinstance(entry, dict) and entry.get("status") in {"intended", "unknown"}
+            if isinstance(entry, dict)
+            and entry.get("kind") != LAUNCH_RESOLUTION_KIND
+            and entry.get("status") in {"intended", "unknown"}
+            and entry.get("key") not in resolved_keys
         ]
 
     def snapshot(self) -> tuple[dict[str, object], ...]:
