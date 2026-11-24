@@ -91,14 +91,33 @@ JSON.
 |---|---|---|
 | `execute.before` | `PreToolUse` | `ToolUse` |
 | `execute.after` | `PostToolUse` | `ToolUse` |
-| `session.execution.succeeded` | `Stop` (or `WorkerExit` when `EXOMONAD_ROLE=worker`) | `Stop` |
-| `session.execution.failed` | `Stop` (or `WorkerExit`) | `Stop` |
-| `session.execution.interrupted` | `Stop` (or `WorkerExit`) | `Stop` |
+| `session.execution.succeeded` | `Stop` | `Stop` |
+| `session.execution.failed` | `Stop` | `Stop` |
+| `session.execution.interrupted` | `Stop` | `Stop` |
+| process end (process `exit` handler) | `WorkerExit` when `EXOMONAD_ROLE=worker`, otherwise `Stop` | `WorkerExit` / `Stop` |
 
 `session.stopped` from the v1 API no longer exists in v2. A one-shot
 `opencode run` emits `session.execution.succeeded` at the end and does not emit
-`session.idle`, so the terminal `session.execution.*` events are the Stop /
-worker-exit trigger.
+`session.idle`.
+
+The terminal `session.execution.*` event marks the end of one **execution**
+(one prompt turn), not the end of the OpenCode process. In `opencode run` those
+coincide, but the interactive companion form `opencode mini` keeps the process
+alive for the next prompt. Sending `WorkerExit` from the terminal event closed
+a worker companion's window after its first turn, so the terminal event always
+reports `Stop`, and the process-end hook owns `WorkerExit`. The exit hook runs
+from the process `exit` handler with `spawnSync`, because the process is
+already tearing down and an async `execFile` would be killed before it
+finished. v2.3.2 runs that handler after the setup disposer on `mini` `/exit`
+and when `run`'s one-shot server is reaped; a plugin reload disposes setup but
+is not a process exit, so the disposer deliberately does not deliver it. The
+once-only guard lives on the process global, so a reload cannot double-deliver
+either. A user quit is delivered exactly once; a SIGKILL or crash emits no
+hook. A non-worker interactive session reports one `Stop` per completed turn
+and no second `Stop` at exit (that would duplicate the `turn_end` record),
+except a quit before any execution completes, which reports one `Stop` at
+process end. A worker session reports `Stop` per completed turn and exactly one
+`WorkerExit` at process end.
 
 ## Plugin Package
 
@@ -123,9 +142,11 @@ but v2.3.2's loader rejects any module whose default export lacks `{ id, setup }
 A dual-shape module was considered, but v1.14.48 is not installed on the
 verification host, so the v1 half could not be exercised. Exporting an
 unverified v1 path would be a silent, untested fallback, so this bridge drops
-v1.14 plugin hooks and states that limitation here rather than claiming
-compatibility. v1.14 users keep the previously released plugin; no v2 code path
-sniffs the CLI version.
+v1.14 plugin hooks. No v2 code path sniffs the CLI version.
+
+**OpenCode 1.14: plugin hooks are not emitted (v2-only plugin); unverified,
+unsupported.** This is the decided status, not a pending question: the v1 half
+cannot be verified here, so the bridge does not claim or attempt it.
 
 ## Spawn Sites
 
@@ -225,6 +246,51 @@ The role-filtering path was then verified end-to-end against the real built
 and a plain `touch` was allowed. The server trace showed `runtime=OpenCode`,
 `tool="shell"`, `exit_code=2`, and the deny reason for the denied calls.
 
+## Interactive `opencode mini` (verified)
+
+`exomonad init` launches a task-less OpenCode companion as
+`opencode mini --standalone --model <provider/model#variant> --agent
+exomonad-<role>`, so the hooks must work in that interactive form, not only in
+`opencode run`. The form was driven non-interactively on v2.3.2 with the free
+`opencode-go/beam-free` model: a private tmux server (`tmux -S <scratch>/t.sock`
+with `TMUX` and `TMUX_PANE` unset), the production
+`write_opencode_plugin_files` package, one prompt that requires shell calls, and
+`/exit`. `mini` requires a TTY stdout; a pipe fails with `opencode mini requires
+a TTY stdout`.
+
+`--standalone` is required for the process-end hook. Without it `mini` connects
+to the shared managed background service, the plugin lives in that service
+rather than in the companion, and `/exit` delivered no hook at all: a captured
+run with the managed service on its own port produced only the per-turn
+`stop`, and `worker-exit` appeared only when the service itself was stopped.
+With a private server the plugin lifecycle belongs to the companion and `/exit`
+delivers exactly one `worker-exit`.
+
+| Check | Result | Evidence |
+|---|---|---|
+| (a) pre-tool-use fires with the normalised tool name and input | **YES** | plugin payload `{"tool_name":"shell","args":{"command":"touch mini-allowed.txt"}}`; the real CLI delivered it to the server as `event=PreToolUse tool="shell"` and the WASM log recorded `input={"command":"touch mini-allowed.txt"}` (that is `tool_input`, not `args`) |
+| (b) post-tool-use fires with the tool response | **YES** | plugin payload `{"tool_name":"shell",...,"output":{"exitCode":0,"output":"(no output)","wallTimeSeconds":0.001}}`; the server received `event=PostToolUse tool="shell"`, and `normalize_opencode_hook_payload` maps `output` to `tool_response` (pinned by `captured_mini_hook_payloads_normalize_to_tool_input_and_response`) |
+| (c) a role deny blocks the tool inside the mini session | **YES** | with the real `exomonad` binary and a real `exomonad serve` (`EXOMONAD_ROLE=dev`, agent `mini-dev`), the shell call `gh --version` was answered by the server with `exit_code=2 response={"continue":false,"stopReason":"BLOCKED: Do not run gh commands from agents. ..."}`; the tool produced no post-tool-use hook and no output, while `touch mini-allowed.txt` was allowed and created its file |
+| (d) stop / worker-exit on normal end and on user quit | **YES** | normal end (one completed turn): `hook stop --runtime opencode` with the `session.execution.succeeded` payload. User quit with `/exit` in a worker session: exactly one `hook worker-exit --runtime opencode` from the process `exit` handler. No hook fires on SIGKILL or a crash |
+
+Before the process-end fix, the terminal event was sent as `worker-exit` for
+`EXOMONAD_ROLE=worker`. Because `mini` keeps running, that closed the
+companion's window after its first turn and nothing was delivered on quit. The
+old-code failure is visible in `old-code-red.log` of the #1589 evidence: the
+hook log showed `pre-tool-use`, `post-tool-use`, `pre-tool-use`,
+`worker-exit` and no `stop` while the session was still alive.
+
+The opt-in `mini_interactive_hooks_when_enabled` test
+(`rust/exomonad-core/tests/opencode_plugin_v2.rs`,
+`EXOMONAD_OPENCODE_V2_PROBE=1`) reproduces the whole run on the free probe
+model. It starts its own `tmux -S` server inside a temporary directory, runs
+`opencode mini` with a prompt that produces one allowed and one denied shell
+call, asserts the pre/post/stop hooks and the deny (the deny is a probe shim
+response, the same technique #1586 used; the real-binary deny above was
+measured separately), then types `/exit` and asserts exactly one `worker-exit`.
+It skips cleanly when `opencode` or `tmux` is unavailable. Re-run it after an
+OpenCode upgrade.
+
 ## OpenCode v2 plugin loader (root cause)
 
 The pre-fix `OPENCODE_PLUGIN_TS` exported only the v1 `server` function. On
@@ -252,9 +318,12 @@ flags), so that path exits 1 with help text. Companion tasks that use
 
 Fixed in #1584. `opencode_companion_launch_form` selects one form per detected
 CLI version: v2.0.22 keeps the top-level `--model`/`--agent` form, and v2.3.2
-uses `opencode mini --model ... --agent exomonad-<role>`. `mini` is the
-supported interactive interface in v2.3.2 and accepts the model (including the
-`#variant` effort suffix) and the generated agent; a PTY launch shows
-`exomonad-worker · Beam Free [high]` in its status line. `init` resolves the
-form before creating a session, and an unknown version is a named error naming
-the known versions instead of a guessed form.
+uses `opencode mini --standalone --model ... --agent exomonad-<role>`. `mini`
+is the supported interactive interface in v2.3.2 and accepts the model
+(including the `#variant` effort suffix), `--standalone`, and the generated
+agent; a PTY launch shows `exomonad-worker · Beam Free [high]` in its status
+line. `init` resolves the form before creating a session, and an unknown
+version is a named error naming the known versions instead of a guessed form.
+This companion form loads the plugin and delivers pre/post tool hooks, role
+denies, per-turn `stop`, and the process-end exit hook; see "Interactive
+`opencode mini` (verified)" above.

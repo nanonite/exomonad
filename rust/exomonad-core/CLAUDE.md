@@ -26,6 +26,20 @@ error from the before hook, argument mutation is `Object.assign` from the
 hook's `updatedInput`. `callHook` parses stdout even when `execFile` reports a
 non-zero exit, because a deny exits 2.
 
+A terminal `session.execution.*` event ends one execution (one prompt turn),
+not the OpenCode process, so it always reports `Stop`. Verified in the
+interactive `opencode mini` companion form: `run` exits right after the event
+while `mini` stays open for the next prompt, and sending `WorkerExit` per turn
+closed a worker companion's window after its first prompt. `worker-exit` (or
+`stop` for non-worker roles) is therefore delivered once from the setup
+process `exit` handler, using `spawnSync` because the process is already
+tearing down. v2.3.2 runs that handler after the disposer on `mini` `/exit` and
+when `run`'s server is reaped, so a user quit is delivered; a plugin reload is
+not a process exit, so the disposer does not deliver it, and the once-only
+guard lives on the process global. A non-worker that
+already completed an execution does not re-send `stop` at exit, because that
+would duplicate its `turn_end` record. A SIGKILL is not observable.
+
 `protocol/hook.rs` owns the single OpenCode adapter,
 `normalize_opencode_hook_payload`. It fills the fields OpenCode omits
 (`hook_event_name`, `tool_input`, `tool_response`, `tool_use_id`,
@@ -51,9 +65,12 @@ sequence is `tests/fixtures/opencode_v2_codemode_hook_events.jsonl`, replayed by
 being true. See `docs/decisions/opencode-hooks.md`.
 
 The v1 `server` export is intentionally absent; v2.3.2 rejects it and v1.14.48
-is not available to verify a dual-shape module. A real-CLI probe runs from
+is not installed, so OpenCode 1.14 plugin hooks are not emitted and are
+unverified/unsupported. A real-CLI probe runs from
 `tests/opencode_plugin_v2.rs` when `EXOMONAD_OPENCODE_V2_PROBE=1` and skips
-otherwise.
+otherwise; `mini_interactive_hooks_when_enabled` drives the interactive
+companion form in a private tmux server. The captured mini payloads are
+`tests/fixtures/opencode_v2_mini_hook_events.jsonl`.
 
 ## Feature Flags
 

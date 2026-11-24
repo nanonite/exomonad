@@ -13,9 +13,19 @@
 //! `codemode_inner_calls_are_hooked_individually_when_enabled` re-measures that
 //! sequence against the real CLI with the production plugin, and fails when
 //! inner `tools.<name>` calls stop reaching `execute.before`.
+//!
+//! `captured_mini_hook_payloads_normalize_to_tool_input_and_response` replays the
+//! pre/post/stop payloads an interactive `opencode mini` v2.3.2 session produced
+//! (captured in `fixtures/opencode_v2_mini_hook_events.jsonl`) through the
+//! production adapter.
+//!
+//! `mini_interactive_hooks_when_enabled` drives a real `opencode mini` session in
+//! a private tmux server and checks hook delivery, a role deny, the per-turn
+//! `stop`, and the process-end `worker-exit` that `/exit` produces.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 const PROBE_ENV: &str = "EXOMONAD_OPENCODE_V2_PROBE";
 const PROBE_MODEL_ENV: &str = "EXOMONAD_OPENCODE_V2_PROBE_MODEL";
@@ -27,9 +37,12 @@ const DEFAULT_PROBE_MODEL: &str = "opencode-go/beam-free";
 /// probe hook denied it, so the recorded sequence is also the evidence that a
 /// deny reaches an inner call.
 const CODEMODE_HOOK_EVENTS: &str = include_str!("fixtures/opencode_v2_codemode_hook_events.jsonl");
+const MINI_HOOK_EVENTS: &str = include_str!("fixtures/opencode_v2_mini_hook_events.jsonl");
 
 const PRE_TOOL_USE_ARGV: &str = "hook pre-tool-use --runtime opencode";
 const POST_TOOL_USE_ARGV: &str = "hook post-tool-use --runtime opencode";
+const STOP_ARGV: &str = "hook stop --runtime opencode";
+const WORKER_EXIT_ARGV: &str = "hook worker-exit --runtime opencode";
 
 fn write_generated_plugin(dir: &Path) {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -233,6 +246,67 @@ fn captured_codemode_inner_calls_normalize_to_guarded_ids() {
         3,
         "each captured call has a distinct call id, so inner calls are hooked individually"
     );
+}
+
+/// The captured interactive `opencode mini` payloads must reach the internal
+/// shape the role hooks read: `args` as `tool_input`, `output` as
+/// `tool_response`, and the event's session id for the terminal stop hook.
+#[test]
+fn captured_mini_hook_payloads_normalize_to_tool_input_and_response() {
+    use exomonad_core::{normalize_opencode_hook_payload, HookEventType};
+
+    let events: Vec<serde_json::Value> = MINI_HOOK_EVENTS
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("fixture line is JSON"))
+        .collect();
+
+    let before = events
+        .iter()
+        .find(|event| event["event"] == "before")
+        .expect("captured pre-tool-use event");
+    let after = events
+        .iter()
+        .find(|event| event["event"] == "after")
+        .expect("captured post-tool-use event");
+    let stop = events
+        .iter()
+        .find(|event| event["event"] == "stop")
+        .expect("captured terminal event");
+
+    let pre = normalize_opencode_hook_payload(
+        HookEventType::PreToolUse,
+        serde_json::json!({
+            "tool_name": before["tool"],
+            "session_id": before["session_id"],
+            "call_id": before["id"],
+            "args": before["input"],
+        }),
+    );
+    assert_eq!(pre["tool_name"], "shell");
+    assert_eq!(pre["tool_input"], before["input"]);
+    assert_eq!(pre["tool_use_id"], before["id"]);
+    assert_eq!(pre["hook_event_name"], "PreToolUse");
+    assert_eq!(pre["session_id"], before["session_id"]);
+
+    let post = normalize_opencode_hook_payload(
+        HookEventType::PostToolUse,
+        serde_json::json!({
+            "tool_name": after["tool"],
+            "session_id": after["session_id"],
+            "call_id": after["id"],
+            "args": after["input"],
+            "output": after["output"],
+        }),
+    );
+    assert_eq!(post["tool_name"], "shell");
+    assert_eq!(post["tool_response"], after["output"]);
+    assert_eq!(post["tool_use_id"], after["id"]);
+    assert_eq!(post["hook_event_name"], "PostToolUse");
+
+    let terminal = normalize_opencode_hook_payload(HookEventType::Stop, stop["payload"].clone());
+    assert_eq!(terminal["hook_event_name"], "Stop");
+    assert_eq!(terminal["session_id"], stop["payload"]["data"]["sessionID"]);
 }
 
 #[test]
@@ -454,5 +528,310 @@ printf '%s\n' '{"continue":true}'
             .contains("probe deny: shell blocked inside execute"),
         "the deny reason must surface to the model; stdout:\n{}",
         String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+fn tmux_available() -> bool {
+    Command::new("tmux")
+        .arg("-V")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn read_or_empty(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+fn wait_until(timeout: Duration, predicate: impl Fn() -> bool) -> bool {
+    let start = Instant::now();
+    loop {
+        if predicate() {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// A tmux server on a private `-S` socket, so the probe never touches the
+/// operator's default server. Dropping it kills only that private server.
+struct PrivateTmux {
+    socket: PathBuf,
+}
+
+impl PrivateTmux {
+    fn new(root: &Path) -> Self {
+        Self {
+            socket: root.join("t.sock"),
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new("tmux")
+            .arg("-S")
+            .arg(&self.socket)
+            .args(args)
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .output()
+            .expect("run tmux")
+    }
+
+    fn session_alive(&self, session: &str) -> bool {
+        self.run(&["has-session", "-t", session]).status.success()
+    }
+
+    fn pane(&self, session: &str) -> String {
+        let output = self.run(&["capture-pane", "-p", "-S", "-500", "-t", session]);
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+}
+
+impl Drop for PrivateTmux {
+    fn drop(&mut self) {
+        let _ = self.run(&["kill-server"]);
+    }
+}
+
+fn launch_mini(root: &Path, bin_dir: &Path, hook_log: &Path, prompt: &str, tmux: &PrivateTmux) {
+    let xdg = root.join("xdg");
+    std::fs::create_dir_all(&xdg).expect("create config home");
+    let launcher = root.join("launch-mini.sh");
+    std::fs::write(
+        &launcher,
+        format!(
+            "#!/usr/bin/env bash\nset -e\nexport PATH={bin}:$PATH\nexport HOOK_LOG={log}\nexport EXOMONAD_ROLE=worker\nexport XDG_CONFIG_HOME={xdg}\nexec opencode mini --standalone --model {model} --agent exomonad-worker --prompt {prompt}\n",
+            bin = bin_dir.display(),
+            log = hook_log.display(),
+            xdg = xdg.display(),
+            model = probe_model(),
+            prompt = shell_single_quote(prompt),
+        ),
+    )
+    .expect("write mini launcher");
+
+    let output = tmux.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "mini",
+        "-x",
+        "140",
+        "-y",
+        "40",
+        "-c",
+        &root.display().to_string(),
+        &format!("bash {}", launcher.display()),
+    ]);
+    assert!(
+        output.status.success(),
+        "failed to start the private tmux session: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Interactive `opencode mini` (the task-less companion form) against the free
+/// probe model. Proves the same plugin path `opencode run` uses also holds for
+/// the interactive session, and that a worker companion is not closed mid-turn:
+/// the terminal execution event is a `stop`, while `worker-exit` is delivered
+/// once when the user quits with `/exit`.
+#[test]
+fn mini_interactive_hooks_when_enabled() {
+    if !probe_enabled() {
+        eprintln!("skipping interactive OpenCode mini probe: set {PROBE_ENV}=1 to enable");
+        return;
+    }
+    let Some(version) = probe_version_or_skip() else {
+        return;
+    };
+    if !tmux_available() {
+        eprintln!("skipping interactive OpenCode mini probe: `tmux` is not available");
+        return;
+    }
+    eprintln!("running interactive OpenCode mini probe against {version}");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    write_generated_plugin(&root);
+
+    std::fs::write(
+        root.join("opencode.json"),
+        r#"{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["./.exo/opencode-plugin"],
+  "permission": "allow",
+  "agent": {
+    "exomonad-worker": {}
+  }
+}
+"#,
+    )
+    .expect("write opencode.json");
+
+    let _ = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&root)
+        .status();
+
+    let hook_log = root.join("hooks.log");
+    let bin_dir = shim_dir(
+        &root,
+        r#"#!/usr/bin/env bash
+input=$(cat)
+{
+  printf 'argv: %s\n' "$*"
+  printf 'stdin: %s\n' "$input"
+} >> "${HOOK_LOG:?HOOK_LOG must be set}"
+if [ "${1:-}" = "hook" ] && [ "${2:-}" = "pre-tool-use" ]; then
+  case "$input" in
+    *'"tool_name":"shell"'*EXO_MINI_DENY_ME*)
+      printf '%s\n' '{"continue":false,"stopReason":"probe deny: EXO_MINI_DENY_ME blocked in mini"}'
+      exit 2
+      ;;
+  esac
+fi
+printf '%s\n' '{"continue":true}'
+"#,
+    );
+
+    let tmux = PrivateTmux::new(&root);
+    launch_mini(
+        &root,
+        &bin_dir,
+        &hook_log,
+        "Run exactly two bash tool calls, one after another: first `touch mini-allowed.txt`; \
+         second `echo EXO_MINI_DENY_ME > mini-denied.txt`. Then reply DONE even if one is blocked.",
+        &tmux,
+    );
+
+    let turn_finished = wait_until(Duration::from_secs(300), || {
+        read_or_empty(&hook_log).contains(&format!("argv: {STOP_ARGV}"))
+    });
+    let log = read_or_empty(&hook_log);
+    let pane = tmux.pane("mini");
+    assert!(
+        turn_finished,
+        "the mini session never finished a prompt turn; hooks:\n{log}\npane:\n{pane}"
+    );
+
+    let calls = hook_calls(&log);
+    let pre: Vec<&HookCall> = calls
+        .iter()
+        .filter(|call| call.argv == PRE_TOOL_USE_ARGV)
+        .collect();
+    let post: Vec<&HookCall> = calls
+        .iter()
+        .filter(|call| call.argv == POST_TOOL_USE_ARGV)
+        .collect();
+
+    let allowed = pre
+        .iter()
+        .find(|call| {
+            call.input["args"]["command"]
+                .as_str()
+                .is_some_and(|command| command.contains("mini-allowed.txt"))
+        })
+        .unwrap_or_else(|| {
+            panic!("mini did not fire pre-tool-use for the allowed shell call; log:\n{log}\npane:\n{pane}")
+        });
+    assert_eq!(
+        allowed.input["tool_name"], "shell",
+        "the hook payload must carry the provider tool id for the adapter; log:\n{log}"
+    );
+    let allowed_id = allowed.input["call_id"].as_str().unwrap_or_default();
+    let allowed_post = post
+        .iter()
+        .find(|call| call.input["call_id"] == allowed_id)
+        .unwrap_or_else(|| {
+            panic!("mini did not fire post-tool-use for the allowed shell call; log:\n{log}\npane:\n{pane}")
+        });
+    assert!(
+        allowed_post.input.get("output").is_some(),
+        "the post-tool-use payload must carry the tool response; log:\n{log}"
+    );
+    assert!(
+        log.contains(&format!("argv: {STOP_ARGV}")),
+        "a completed mini turn must report stop, not a process exit; log:\n{log}"
+    );
+    assert!(
+        !log.contains(&format!("argv: {WORKER_EXIT_ARGV}")),
+        "worker-exit must not fire while the mini session is still alive; log:\n{log}"
+    );
+
+    let denied: Vec<&HookCall> = pre
+        .iter()
+        .copied()
+        .filter(|call| {
+            call.input["args"]["command"]
+                .as_str()
+                .is_some_and(|command| command.contains("EXO_MINI_DENY_ME"))
+        })
+        .collect();
+    assert!(
+        !denied.is_empty(),
+        "the model never attempted the denied command; log:\n{log}\npane:\n{pane}"
+    );
+    let denied_ids: Vec<&str> = denied
+        .iter()
+        .map(|call| call.input["call_id"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        !post
+            .iter()
+            .any(|call| denied_ids.contains(&call.input["call_id"].as_str().unwrap_or_default())),
+        "a denied shell call must never reach post-tool-use; log:\n{log}"
+    );
+    assert!(
+        !root.join("mini-denied.txt").exists(),
+        "the denied shell command must not have run; pane:\n{pane}"
+    );
+    assert!(
+        root.join("mini-allowed.txt").exists(),
+        "the allowed shell command must have run; pane:\n{pane}"
+    );
+
+    assert!(
+        tmux.session_alive("mini"),
+        "mini exited before the user quit"
+    );
+
+    let sent = tmux.run(&["send-keys", "-t", "mini", "-l", "/exit"]);
+    assert!(sent.status.success(), "failed to type /exit into mini");
+    let entered = tmux.run(&["send-keys", "-t", "mini", "Enter"]);
+    assert!(entered.status.success(), "failed to submit /exit");
+
+    let exit_delivered = wait_until(Duration::from_secs(60), || {
+        read_or_empty(&hook_log).contains(&format!("argv: {WORKER_EXIT_ARGV}"))
+    });
+    let log = read_or_empty(&hook_log);
+    assert!(
+        exit_delivered,
+        "quitting mini with /exit must deliver worker-exit for a worker companion; hooks:\n{log}\npane:\n{}",
+        tmux.pane("mini")
+    );
+    assert_eq!(
+        log.matches(&format!("argv: {WORKER_EXIT_ARGV}")).count(),
+        1,
+        "worker-exit must be delivered exactly once from the process-end hook; log:\n{log}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(15), || !tmux.session_alive("mini")),
+        "the mini session must be gone after /exit"
+    );
+
+    for line in log.lines().filter(|line| line.starts_with("argv: ")) {
+        eprintln!("observed {line}");
+    }
+    eprintln!(
+        "mini allowed shell ran: {}; denied shell ran: {}",
+        root.join("mini-allowed.txt").exists(),
+        root.join("mini-denied.txt").exists()
     );
 }

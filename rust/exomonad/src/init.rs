@@ -4612,7 +4612,9 @@ enum OpenCodeCompanionLaunchForm {
     /// The top-level interactive command carries `--model` and `--agent`.
     TopLevelFlags,
     /// The minimal interactive interface carries `--model` and `--agent`
-    /// because the top-level command rejects both.
+    /// because the top-level command rejects both, and runs `--standalone` so
+    /// the plugin's process-end hook belongs to this companion rather than to
+    /// the shared background service.
     MiniSubcommand,
 }
 
@@ -4655,6 +4657,13 @@ fn opencode_model_flag(model: Option<&str>, variant: &str) -> String {
 /// The command is a shell line for a tmux pane: env identity prefix, the
 /// version's interactive form, the worker-effort variant of the configured
 /// model (when one is configured), and the role's generated agent.
+///
+/// The v2.3.2 `mini` form also passes `--standalone`. Without it the plugin
+/// runs inside the shared managed background service: quitting `mini` with
+/// `/exit` delivered no hook, and `worker-exit` surfaced only when the service
+/// itself stopped (verified against v2.3.2). A private server makes the
+/// companion own the plugin lifecycle, so quitting delivers the process-end
+/// hook: exactly one `worker-exit` for a worker role.
 fn opencode_companion_command(
     version: &str,
     env_prefix: &str,
@@ -4669,7 +4678,7 @@ fn opencode_companion_command(
             format!("{env_prefix}opencode{model_flag} --agent {agent}")
         }
         OpenCodeCompanionLaunchForm::MiniSubcommand => {
-            format!("{env_prefix}opencode mini{model_flag} --agent {agent}")
+            format!("{env_prefix}opencode mini --standalone{model_flag} --agent {agent}")
         }
     })
 }
@@ -17424,8 +17433,20 @@ mod tests {
 
         assert_eq!(
             command,
-            "EXOMONAD_AGENT_ID=companion EXOMONAD_ROLE=worker opencode mini \
+            "EXOMONAD_AGENT_ID=companion EXOMONAD_ROLE=worker opencode mini --standalone \
              --model 'opencode-go/deepseek-v4.1-flash#high' --agent exomonad-worker"
+        );
+    }
+
+    #[test]
+    fn opencode_v232_companion_owns_its_plugin_lifecycle() {
+        let command = opencode_companion_command("v2.3.2", "", None, "high", "worker")
+            .expect("v2.3.2 has a known interactive companion form");
+
+        assert!(
+            command.contains("opencode mini --standalone"),
+            "the managed background service keeps the plugin alive after `/exit`, so the \
+             companion must run its own server: {command}"
         );
     }
 
@@ -17452,7 +17473,10 @@ mod tests {
         let command =
             opencode_companion_command("v2.3.2", "", None, "high", "worker").expect("known form");
 
-        assert_eq!(command, "opencode mini --agent exomonad-worker");
+        assert_eq!(
+            command,
+            "opencode mini --standalone --agent exomonad-worker"
+        );
     }
 
     #[test]

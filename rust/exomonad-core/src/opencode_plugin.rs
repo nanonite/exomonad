@@ -17,6 +17,20 @@
 //!
 //! No external npm install is required. Bun resolves `.ts` files natively.
 //!
+//! ## Interactive `opencode mini`
+//!
+//! The task-less companion form `opencode mini --standalone --model ...
+//! --agent ...` loads this plugin and fires `execute.before`, `execute.after`,
+//! and the terminal `session.execution.*` event exactly like `opencode run`.
+//! The terminal event ends one prompt turn, not the process, so it reports
+//! `stop` for every role; `worker-exit` is delivered from the process `exit`
+//! handler when the server process actually ends (`mini` `/exit` included). A
+//! non-worker that already completed an execution does not re-send `stop` at
+//! exit, because that would duplicate its `turn_end` record. A plugin reload
+//! disposes setup but is not a process exit, so it does not deliver the exit
+//! hook. `--standalone` keeps that lifecycle private to the companion instead
+//! of the shared background service.
+//!
 //! ## Plugin API version
 //!
 //! The generated module targets the OpenCode v2 plugin API: the default export
@@ -28,8 +42,9 @@
 //! OpenCode v1.14 exposed a different API (`export const server` returning a
 //! hooks object). That API is not emitted any more: the v2 loader rejects a
 //! module without a default `{ id, setup }` definition, and v1.14.48 is not
-//! available to verify a dual-shape module. v1.14 plugin hooks are therefore
-//! dropped; see `docs/decisions/opencode-hooks.md`.
+//! installed to verify a dual-shape module. OpenCode 1.14 plugin hooks are
+//! therefore not emitted: unverified and unsupported. See
+//! `docs/decisions/opencode-hooks.md`.
 //!
 //! ## Response shape from WASM (Claude format, used for OpenCode)
 //!
@@ -70,7 +85,7 @@
 //!   → OpenCode catches the throw, blocks that tool call
 //!   → OpenCode continues running normally
 //! ```
-pub const OPENCODE_PLUGIN_TS: &str = r#"import { execFile } from "node:child_process";
+pub const OPENCODE_PLUGIN_TS: &str = r#"import { execFile, spawnSync } from "node:child_process";
 
 type HookResponse = {
   continue?: boolean;
@@ -144,6 +159,49 @@ function applyPreToolUse(
   }
 }
 
+// A terminal `session.execution.*` event ends one execution (one prompt turn),
+// not the OpenCode process: `opencode run` exits right after it, while
+// `opencode mini` stays interactive for the next prompt. WorkerExit therefore
+// cannot be sent from that event -- doing so closed an interactive worker
+// companion's window after its first turn. The process-end hook below owns
+// WorkerExit, and the terminal event only ever reports Stop.
+let lastExecutionEvent: unknown = null;
+
+// Kept on the process global so a hot plugin reload (which creates a new module
+// instance and a new exit listener) still delivers the exit hook only once.
+type LifecycleState = { exitHookDelivered: boolean };
+const globalScope = globalThis as { __exomonadLifecycle?: LifecycleState };
+const lifecycle = (globalScope.__exomonadLifecycle ??= {
+  exitHookDelivered: false,
+});
+
+// The process is already tearing down, so an async `execFile` would be killed
+// before it finished; `spawnSync` completes inside the process exit handler.
+// v2.3.2 runs that handler on `mini` `/exit` and when `run`'s one-shot server
+// is reaped (verified), but not when the plugin is merely reloaded mid-session.
+// A SIGKILL cannot be seen.
+function deliverExitHook(): void {
+  if (lifecycle.exitHookDelivered) return;
+  lifecycle.exitHookDelivered = true;
+  const isWorker = process.env.EXOMONAD_ROLE === "worker";
+  // A completed execution already reported Stop for itself. Re-sending Stop at
+  // exit would duplicate the turn_end record, so a non-worker only reports here
+  // when no execution ever completed. A worker's process end is a new fact and
+  // is always reported, once.
+  if (!isWorker && lastExecutionEvent !== null) return;
+  const payload =
+    lastExecutionEvent ?? { type: "session.execution.interrupted", data: {} };
+  spawnSync(
+    "exomonad",
+    ["hook", isWorker ? "worker-exit" : "stop", "--runtime", "opencode"],
+    {
+      input: JSON.stringify(payload),
+      timeout: 10000,
+      maxBuffer: 8 * 1024 * 1024,
+    },
+  );
+}
+
 async function setup(ctx: any) {
   await ctx.tool.hook("execute.before", async (input: any) => {
     const response = await callHook("pre-tool-use", {
@@ -169,9 +227,10 @@ async function setup(ctx: any) {
     });
   });
 
-  // v2 dropped the v1 "session.stopped" event. A one-shot `opencode run`
-  // emits the terminal session.execution.* event instead (verified against
-  // v2.3.2), so these are the Stop / worker-exit trigger.
+  // v2 dropped the v1 "session.stopped" event. The terminal
+  // session.execution.* event reports one completed execution, so it is a
+  // Stop for every role (verified against v2.3.2 in both `opencode run` and
+  // the interactive `opencode mini`).
   const stop = new AbortController();
   void (async () => {
     try {
@@ -183,16 +242,18 @@ async function setup(ctx: any) {
         ],
         signal: stop.signal,
       })) {
-        const hook =
-          process.env.EXOMONAD_ROLE === "worker" ? "worker-exit" : "stop";
-        await callHook(hook, event);
+        lastExecutionEvent = event;
+        await callHook("stop", event);
       }
     } catch {
       // Subscription cancelled or host event stream failed; nothing to do.
     }
   })();
 
-  return () => stop.abort();
+  process.once("exit", deliverExitHook);
+  return () => {
+    stop.abort();
+  };
 }
 
 export default { id: "exomonad", setup };
@@ -250,8 +311,36 @@ mod tests {
     }
 
     #[test]
-    fn opencode_worker_stop_routes_to_worker_exit_hook() {
+    fn opencode_terminal_execution_event_reports_stop_for_every_role() {
+        assert!(OPENCODE_PLUGIN_TS.contains("lastExecutionEvent = event;"));
+        assert!(OPENCODE_PLUGIN_TS.contains("await callHook(\"stop\", event);"));
+        assert!(
+            !OPENCODE_PLUGIN_TS.contains("callHook(hook, event)"),
+            "a completed turn must never be reported as a process exit"
+        );
+    }
+
+    #[test]
+    fn opencode_worker_exit_is_delivered_when_the_process_ends() {
         assert!(OPENCODE_PLUGIN_TS.contains("EXOMONAD_ROLE === \"worker\""));
-        assert!(OPENCODE_PLUGIN_TS.contains("? \"worker-exit\" : \"stop\""));
+        assert!(OPENCODE_PLUGIN_TS.contains("isWorker ? \"worker-exit\" : \"stop\""));
+        assert!(
+            OPENCODE_PLUGIN_TS.contains("if (!isWorker && lastExecutionEvent !== null) return;")
+        );
+        assert!(OPENCODE_PLUGIN_TS.contains("spawnSync("));
+        assert!(OPENCODE_PLUGIN_TS.contains("process.once(\"exit\", deliverExitHook)"));
+        assert!(
+            OPENCODE_PLUGIN_TS.contains("__exomonadLifecycle"),
+            "a plugin reload must not double-deliver the exit hook"
+        );
+        assert!(
+            !OPENCODE_PLUGIN_TS.contains("deliverExitHook();\n  };"),
+            "a plugin reload disposes setup but is not a process exit, so the disposer must \
+             not deliver the exit hook"
+        );
+        assert!(
+            OPENCODE_PLUGIN_TS.contains("export default { id: \"exomonad\", setup };"),
+            "the exit hook stays inside the v2 setup definition"
+        );
     }
 }

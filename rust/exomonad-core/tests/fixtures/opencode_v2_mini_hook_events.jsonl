@@ -1,0 +1,3 @@
+{"event": "before", "tool": "shell", "id": "call-ae6f1aa2-f7b6-46c3-aca3-028ec3221289", "input": {"command": "echo EXO_MINI_PROBE"}, "session_id": "ses_df415dbe6ffeGrPYrUlqv0aDw2"}
+{"event": "after", "tool": "shell", "id": "call-ae6f1aa2-f7b6-46c3-aca3-028ec3221289", "input": {"command": "echo EXO_MINI_PROBE"}, "status": "completed", "output": {"exitCode": 0, "output": "EXO_MINI_PROBE\n", "wallTimeSeconds": 0}, "session_id": "ses_df415dbe6ffeGrPYrUlqv0aDw2"}
+{"event": "stop", "payload": {"id": "evt_20bea2f090010pSn1xGcWZvA6l", "created": 1795496226569, "type": "session.execution.succeeded", "durable": {"aggregateID": "ses_df415dbe6ffeGrPYrUlqv0aDw2", "seq": 25, "version": 1}, "data": {"sessionID": "ses_df415dbe6ffeGrPYrUlqv0aDw2"}}}

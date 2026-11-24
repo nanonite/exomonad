@@ -246,8 +246,12 @@ task-less (interactive) companion form is version-specific and selected by
 `opencode_companion_launch_form`: `v2.0.22` keeps
 `opencode [--model M] --agent exomonad-<role>` because its top-level command
 accepts both flags, while `v2.3.2` uses
-`opencode mini [--model M] --agent exomonad-<role>` because its top-level
-command rejects them and `mini` is the supported interactive interface. `init`
+`opencode mini --standalone [--model M] --agent exomonad-<role>` because its
+top-level command rejects them and `mini` is the supported interactive
+interface. `--standalone` gives the companion its own OpenCode server: the
+plugin's process-end `worker-exit`/`stop` hook fires when the user quits, while
+the shared managed background service outlives the TUI and delivers nothing on
+`/exit`. `init`
 detects the version once, before creating a session, and an unknown version is a
 named error rather than a guessed form. The TypeScript plugin loader requires
 a default `{ id, setup }` definition instead of the old `server` export; the
