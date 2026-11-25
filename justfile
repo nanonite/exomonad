@@ -685,6 +685,9 @@ check-e2e-blocked-resume-host:
     grep -q '"skip-held-stage": case_skip_held_stage' tests/e2e/blocked-resume-host/run.py
     grep -q 'skip-held-stage' tests/e2e/blocked-resume-host/e2e-test.md
     grep -q 'skip-held-stage' docs/guides/e2e-acceptance.md
+    grep -q '^## Operator walkthrough: a parked or skipped stage' docs/guides/tl-gates-and-failures.md
+    grep -q 'There is no in-manifest rebind' docs/guides/tl-gates-and-failures.md
+    grep -q 'tl-gates-and-failures.md#operator-walkthrough-a-parked-or-skipped-stage' docs/guides/programming-the-tl.md
 
 e2e-pre-pr-recovery-fsm:
     nix develop --command cargo build -p exomonad

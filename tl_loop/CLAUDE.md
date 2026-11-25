@@ -1162,11 +1162,16 @@ path observes `closed` and records `already_closed` without a second close.
 A skip is not a merge, so the post-merge issue-close path never runs for a
 `SKIPPED` stage: its linked Chainlink issue stays open for a fresh plan, a
 following stage's own issue proceeds and closes independently, and an unlinked
-stage is unaffected. The compiled replay is
-`just e2e-blocked-resume-host skip-held-stage`.
+stage is unaffected. The controller has no command that closes or reopens that
+issue; the operator handles it in Chainlink and plans the repair in a new
+`plan.json`, which may bind the still-open issue as verified by #1599. The
+operator walkthrough is `docs/guides/tl-gates-and-failures.md`. The compiled
+replay is `just e2e-blocked-resume-host skip-held-stage`.
 `plan revise` supports superseding such a stage with a new future node; the old
 declaration keeps its identity, branch and dependency history and only the new
-node is added (`spec.superseded_nodes`).
+node is added (`spec.superseded_nodes`). This is a same-run substitute, not an
+in-manifest rebind: the replacement cannot claim the skipped stage's
+`chainlink_issue_id`.
 
 A stored `configured_route_authorization` written under an older identity scheme
 is history, not current authority. `_terminal_owner_recovery_proof` separates

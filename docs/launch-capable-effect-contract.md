@@ -121,7 +121,7 @@ An approved answer is only consumed when the same machine proof still holds:
 | abandon (`...-abandon` approved) | ledger read succeeded with no launch/refusal/failure row for the exact intent; owner invocation is terminal (not live) with no successor; owner, predecessor, branch, worktree and intent all match the journal | append one linked `operator_abandoned` resolution; the slice stays parked until retry is approved; no launch |
 | retry (`...-retry` approved) | the abandon proof above | append `operator_abandoned` and `retry_authorized`, then let the ordinary approved blocked-leaf dispatch path make exactly one fresh launch under the current configuration |
 | abandon-and-skip (`...-skip` approved, optionally after `...-abandon`) | the abandon proof above, a recorded operator reason, and a dependency policy that does not widen the plan's declared `skip_dependents` | append `operator_skipped` (plus `operator_abandoned` when abandon was also approved); mark the stage `SKIPPED`; reopen the scope at the next eligible stage; apply the policy to every dependent |
-| reject (any gate) | - | record the rejection; the slice stays parked and nothing launches |
+| reject (`...-abandon` or `...-retry`) | - | record the rejection on that gate; the slice stays parked and nothing launches. A `...-skip` gate accepts only `--approve`. |
 
 The skip answer is the only release for a stage whose record is unrecoverable
 but whose launch is still unproven. Its proofs are exactly the abandon proofs:
@@ -182,8 +182,14 @@ The operator release path is explicit, never automatic:
 5. If the child's own record is unrecoverable, `...-skip` is the supported
    answer instead: it records the reason, marks the stage `SKIPPED`, and moves
    the plan on. The original journal entry, ledger rows, proofs and plan
-   snapshot digest are unchanged; `plan revise` then supersedes the old stage
-   with a new future node rather than deleting or rewriting it.
+   snapshot digest are unchanged. A skip is not a merge, so the controller
+   never closes the skipped stage's Chainlink issue; the operator handles that
+   issue (close with no PR, or split it into sub-issues) and plans the repair
+   under the remaining issue in a new `plan.json`. See
+   [`docs/guides/tl-gates-and-failures.md`](guides/tl-gates-and-failures.md#after-a-skip-the-post-skip-workflow)
+   for the operator walkthrough. `plan revise` can add a same-run substitute
+   node for the skipped stage, but it cannot rebind or take over the skipped
+   stage's issue, identity, branch, worktree, or history.
 
 The compiled-host acceptance for this hold is
 `tests/e2e/blocked-resume-host/run.py terminal-failure-hold`

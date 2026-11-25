@@ -29,8 +29,9 @@ hard and the slice is re-decomposed instead.
 
 A held `unknown` launch-capable effect is the third outcome. The child's own hold
 is correct and stays fail-closed, but the parent parks only that child/slice
-behind three durable gates, `tl-held-launch-effect-<child>-<intent>-abandon`,
-`...-retry` and `...-skip`, instead of exiting the root controller with
+behind three durable gates,
+`tl-held-launch-effect-<child>-<intent-prefix>-abandon`, `...-retry` and
+`...-skip`, instead of exiting the root controller with
 `recursive child failed`. Sibling children and independent slices keep running;
 a nested sub-TL parks only its own level. The recursive rule is that a child's
 fail-closed hold is reported upward as parked-with-gate, never as a controller
@@ -46,65 +47,201 @@ intent, conflicting or duplicate evidence, a wrong owner/predecessor/worktree, a
 forged intent, a foreign or unapproved gate, and every non-launch effect stay
 non-overridable. Contract: `docs/launch-capable-effect-contract.md`.
 
-A stage whose record is genuinely unrecoverable can be **skipped** instead. The
-skip gate takes the same machine proofs as abandon and additionally requires a
-recorded operator reason and an explicit dependency policy:
+## Operator walkthrough: a parked or skipped stage
+
+This is the single operator procedure for a stage whose child journal holds one
+`unknown` launch-capable effect. The machine proofs are defined in
+[`docs/launch-capable-effect-contract.md`](../launch-capable-effect-contract.md);
+this section is what the operator sees, decides, and does next.
+
+### Recognising a parked stage
+
+The controller does not fail the run. It parks only that stage and logs
+`human gate pending`. Read the durable status:
 
 ```bash
-python3 ~/.exo/tl_loop.pyz gate --project-root . --run-id root \
-  --name tl-held-launch-effect-<child>-<intent>-skip --approve \
-  --reason "the child record is unrecoverable; re-plan it in a fresh context" \
-  --dependency-policy block
-# require-named also takes one or more --dependent <stage>
+python3 -m tl_loop status --project-root . --run-id root
 ```
 
-Approving it appends one append-only `operator_skipped` record linked to the
-original journal entry (the entry, ledger rows, proofs and plan snapshot stay
-byte-identical) and marks the stage `SKIPPED`. Approving abandon first and then
-skip records both decisions — that is `abandon-and-skip`. The scope then reopens
-at the next eligible stage. Every dependent is evaluated under the effective
-policy, which is the stricter of the plan's declared `skip_dependents` and the
-answer: `proceed` runs them although the prerequisite produced nothing, `block`
-holds all of them, and `require-named` runs only the dependents the operator
-named while every unnamed dependent holds. A skip never runs a dependent
-silently, never relaunches the skipped stage, and is decided exactly once across
-restarts and concurrent ticks.
+The status document shows:
 
-The skip is not a merge and grants no post-merge work. The controller never runs
-the post-merge issue-close path for a `SKIPPED` stage, so the skipped stage's
-linked Chainlink issue (if any) stays open and remains available for a fresh
-plan. A following stage's own linked issue proceeds and closes independently
-when that stage merges, and an unlinked stage is unaffected. The compiled
-acceptance is the `skip-held-stage` case in
+| Field | Value at a held-launch park |
+| --- | --- |
+| `slices.<stage>.status` | `parked` |
+| `slices.<stage>.park_cause` | `human_decision_required` |
+| `park_causes` | maps that stage to `human_decision_required` |
+| `gates` | three `pending` names scoped to the child and intent: `tl-held-launch-effect-<child>-<intent-prefix>-abandon`, `...-retry`, `...-skip` |
+| `next_transition` | `answer_gate:<first pending gate>` |
+| `current_order` | the parked stage's order |
+
+`<intent-prefix>` is the first 12 alphanumeric characters of the child's
+`dispatch_intent_id` suffix. `status` lists only each gate's name and
+`pending`/`approved`/`rejected` status; the durable run state keeps the fuller
+diagnostic: `park_audit.recovery_action = held_launch_effect`,
+`park_audit.reason` (the intent, journal index, owner, and last host evidence),
+and `park_audit.launch_evidence`, which carries the exact intent and the three
+gate names. `park_audit.available_actions` is `park`, `abandon-and-skip`,
+`retry`. A sibling stage and a nested sub-TL are not parked by this one.
+
+### Deciding a parked stage
+
+The three gates are independent durable records; answering one does not answer
+another, except that abandon-and-skip answers the abandon gate and then the skip
+gate. The commands below use the source-checkout form; the installed archive is
+`python3 ~/.exo/tl_loop.pyz`, with the same subcommands and flags.
+
+| Decision | Exact CLI | Slice | Journal | Dependents and next stage |
+| --- | --- | --- | --- | --- |
+| Park | `gate --name <gate> --reject` on `...-abandon` or `...-retry` | stays `PARKED` | nothing appended | unchanged; same order held |
+| Retry | `gate --name ...-retry --approve` | reopens as `SPAWNED` | `operator_abandoned` + `retry_authorized` appended, linked to the original entry | not evaluated; the same stage launches exactly once more |
+| Abandon | `gate --name ...-abandon --approve` | stays `PARKED` | one `operator_abandoned` appended | unchanged; same order held |
+| Abandon-and-skip | `gate --name ...-skip --approve --reason <reason> --dependency-policy <policy> [--dependent <stage> ...]` | `SKIPPED`, `park_cause` cleared, no PR or post-merge | `operator_skipped` appended (plus `operator_abandoned` when abandon was approved first) | scope reopens at the next eligible stage; every dependent follows the policy below |
+
+Park (rejecting either the abandon or the retry gate):
+
+```bash
+python3 -m tl_loop gate --project-root . --run-id root \
+  --name tl-held-launch-effect-<child>-<intent-prefix>-retry --reject
+```
+
+Retry:
+
+```bash
+python3 -m tl_loop gate --project-root . --run-id root \
+  --name tl-held-launch-effect-<child>-<intent-prefix>-retry --approve
+```
+
+Abandon:
+
+```bash
+python3 -m tl_loop gate --project-root . --run-id root \
+  --name tl-held-launch-effect-<child>-<intent-prefix>-abandon --approve
+```
+
+Abandon-and-skip (a prior abandon is optional; skip alone is enough):
+
+```bash
+python3 -m tl_loop gate --project-root . --run-id root \
+  --name tl-held-launch-effect-<child>-<intent-prefix>-skip --approve \
+  --reason "the child record is unrecoverable; re-plan it in a fresh context" \
+  --dependency-policy block
+# require-named adds one or more:
+#   --dependent <stage>
+```
+
+A gate stored by a direct child scope is answered with `--parent-run-id <root>`
+and `--run-id <child>` instead of the top-level run id.
+
+The CLI enforces the decision shape: a `-skip` gate accepts only `--approve`,
+`--reason` must be non-empty, `--dependency-policy` is required and is one of
+`proceed`, `block`, `require-named`, and `--dependent` is repeatable and only
+valid with `require-named`. `--reason`, `--dependency-policy`, and `--dependent`
+are refused on every non-skip gate. The rejection of an abandon or retry gate
+is recorded on that gate; no journal resolution is appended.
+
+A skip answer is consumed only while the abandon proofs still hold: the ledger
+read succeeded with no launch, refusal, or failure row for the exact intent; the
+owner invocation is terminal with no successor; and the owner, predecessor,
+branch, worktree, and intent all match the journal. A live owner, a launch row,
+duplicate or conflicting evidence, a forged intent, or a foreign or unapproved
+gate stays held and consumes nothing. Approving retry and skip together is
+conflicting evidence and also consumes nothing. An answer that widens the plan's
+declared policy, records no policy, names no dependent under `require-named`, or
+names a node that is not a dependent is refused and consumes nothing. A skip,
+abandon, or retry is appended exactly once across restarts and concurrent ticks;
+the original journal entry, ledger rows, proofs, and plan snapshot digest stay
+byte-identical.
+
+### Dependency policies
+
+The stage's declared `skip_dependents` is the floor. Absence means `block`, and
+an answer may only tighten it: `proceed` < `require-named` < `block`. The
+effective policy is the stricter of the declaration and the answer.
+
+| Policy | Dependents | Verified end state (plan A -> B -> C, sibling D in A's stage) |
+| --- | --- | --- |
+| `proceed` | every dependent runs although the prerequisite produced nothing | B, C, and D `merged`; the run reaches `TLDone` |
+| `block` | every dependent is held | B and C `blocked` with `blocked_by` naming the skipped stage and a `park_audit` carrying the skip gate and policy reason; D `merged`; the run stays held in `TLRunning` at that stage, not terminal |
+| `require-named` | only named dependents run; every unnamed dependent is held | naming B: B and D `merged`; C `blocked` with the "unnamed in the skip decision" reason and `blocked_by` naming the skipped stage; the run advances to C's stage and stays held in `TLRunning` |
+
+A held dependent is never dispatched, merged, or released silently. The ordered
+stage path does not dispatch a `BLOCKED` child, so a later tick cannot override
+the held verdict. `tl_loop/tests/test_skip_policy_end_to_end.py` proves these
+end states through the production `run_tl_loop` path;
+`tl_loop/tests/test_parked_stage_skip.py` proves the decision, diagnostics, and
+refusals above.
+
+### After a skip: the post-skip workflow
+
+For the skipped stage the run's plan is considered finished. The stage is terminal
+`SKIPPED`; the controller never relaunches it and never runs its post-merge
+path. The rest of the run follows the dependency policy: under `proceed` it can
+reach `TLDone`; under `block` or `require-named` it holds in `TLRunning` at the
+first withheld stage.
+
+1. **The controller leaves the issue alone.** A skip is not a merge, so no
+   post-merge recovery runs for it and the skipped stage's linked Chainlink
+   issue stays open. A following stage's own linked issue closes independently
+   when that stage merges, and an unlinked stage is unaffected. Proved by
+   `test_k_a_skip_does_not_close_the_skipped_stages_linked_issue`,
+   `test_k_a_skipped_stage_never_runs_the_post_merge_issue_close_path`,
+   `test_k_the_next_stages_linked_issue_closes_independently`, and
+   `test_k_the_live_controller_does_not_close_the_skipped_issue` in
+   `tl_loop/tests/test_parked_stage_skip.py`.
+
+2. **Handle the issue in Chainlink, by hand.** The controller has no command
+   that closes, reopens, or rewrites a skipped stage's issue. Either close the
+   issue with no PR (the skipped work produces none), or split the work into
+   smaller sub-issues and close the original. This is an operator action in
+   Chainlink, outside the controller.
+
+3. **Plan the repair in a new `plan.json`.** Put the repair slices under
+   whichever issue remains. A new run (new run id and new `plan.json`) may bind
+   the still-open issue the older run's skipped stage referenced and a freshly
+   created sub-issue. Issue admission has no cross-run issue-state check; the
+   new run's slices carry both bindings, dispatch is admitted, and the ordinary
+   post-merge close path closes the older issue under the new run. The older
+   run's state, journal, and checkpoint bytes stay unchanged. Admission also
+   accepts an issue the operator already closed; the close path observes
+   `closed` and records `already_closed` without issuing a second close. Proved
+   by `test_a_new_plan_binds_the_skipped_issue_and_a_fresh_sub_issue`,
+   `test_a_plan_binding_an_already_closed_issue_is_adopted`, and
+   `test_plan_validation_binds_the_same_issue_in_a_new_manifest` in
+   `tl_loop/tests/test_skip_policy_end_to_end.py`.
+
+There is no in-manifest rebind. Within one manifest an issue id is bound to one
+node, so a replacement node cannot claim the skipped node's
+`chainlink_issue_id`; `test_g_reusing_the_replaced_issue_binding_is_refused` in
+`tl_loop/tests/test_plan_revision_supersession.py` refuses exactly that. No
+command or plan field transfers the skipped stage's issue, identity, branch,
+worktree, or history to a replacement. If the repair needs that issue, it goes
+in a new plan as above.
+
+#### What `plan revise` supersession is and is not for
+
+`exomonad plan revise` can add a new future node that declares
+`"supersedes": "<old stage>"`. The old declaration stays byte-for-byte; the
+manifest records `superseded_nodes: {old -> new}`, the dry run reports the
+replacement and the `rebound_dependents`, and apply writes that report into the
+audit entry. The replaced node must already be decided (a `PENDING` or `READY`
+node is refused by `superseded_node_still_pending`), and a skip is such a
+decision. The replacement gets its own name, branch, and worktree and cannot
+reuse the replaced node's identity.
+
+It is for a same-run substitute slice when the run is still active and the
+skipped stage's issue does not need to move. It is not a rebind: it cannot take
+the skipped stage's `chainlink_issue_id`, cannot delete or rewrite the old
+declaration, and does not touch Chainlink. It is also not the post-skip issue
+workflow: closing or splitting the issue and binding the repair under it is the
+new-plan path above. See
+[`programming-the-tl.md`](programming-the-tl.md#superseding-a-dispatched-node)
+for the plan-authoring mechanics and
+`tl_loop/tests/test_plan_revision_supersession.py` for the proved behaviour.
+
+The compiled acceptance for the skip path is the `skip-held-stage` case in
 `tests/e2e/blocked-resume-host/`, which also proves that a real
 `exomonad init --continue` restart adds no launch, no owner window, and no
 second skip record.
-
-#### Verified end states after a skip
-
-`tl_loop/tests/test_skip_policy_end_to_end.py` drives the same fixture through
-the production `run_tl_loop` path. Plan A -> B -> C with a sibling D in A's
-stage (so D does not depend on A):
-
-- `proceed`: B, C and D all run to completion, and the run reaches `TLDone`.
-  A skip under `proceed` withholds no dependent.
-- `block`: B and C stay `BLOCKED` with `blocked_by` naming the skipped stage
-  and a `park_audit` carrying the skip gate and the policy reason; D still
-  completes. The run stays held in `TLRunning` at that stage and is not
-  terminal. A held dependent is never dispatched or merged by the ordered
-  stage path.
-- `require-named` naming B: B and D complete, C stays `BLOCKED` with the
-  "unnamed in the skip decision" reason, and the run advances to C's stage and
-  stays held in `TLRunning`. No unnamed dependent runs silently.
-
-A fresh run (new run id and new `plan.json`) may bind both the still-open issue
-the older run's skipped stage referenced and a freshly created sub-issue: plan
-admission has no cross-run issue-state check, the new run's slices carry both
-bindings, their dispatch is admitted, and the ordinary post-merge close path
-closes the older issue under the new run while the older run's state, journal
-and checkpoint bytes stay unchanged. Admission also accepts an issue the
-operator already closed; the close path then observes `closed` and records
-`already_closed` without issuing a second close.
 
 An approved recovery whose child controller has exited relaunches that child
 with a fresh invocation identity, because relaunching against the recorded one
@@ -150,5 +287,5 @@ budget is
 operator-configurable (see Configuration). Elapsed time and silence are never
 evidence of failure, and abandoned durable guidance is re-queued with its
 `batch_id` recorded rather than dropped. See
-[tl_loop/CLAUDE.md](tl_loop/CLAUDE.md) for the full table and the rest of the
-knobs.
+[`tl_loop/CLAUDE.md`](../../tl_loop/CLAUDE.md) for the full table and the rest
+of the knobs.

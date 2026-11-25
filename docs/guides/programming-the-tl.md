@@ -247,9 +247,9 @@ fails closed and requires a separately verified reconciliation path.
 #### Superseding a dispatched node
 
 A stage whose own record is unrecoverable is not repaired by editing or deleting
-it. Skip it with the held-launch gate first (see
-[`tl-gates-and-failures.md`](tl-gates-and-failures.md)), then declare a new
-future node that stands in for it:
+it. After the operator has decided it with the held-launch skip gate (the single
+walkthrough is [`tl-gates-and-failures.md`](tl-gates-and-failures.md)), a
+nonterminal run may declare a new future node that stands in for it:
 
 ```json
 {
@@ -269,28 +269,23 @@ manifest records `superseded_nodes: {old -> new}`. The dry run reports each
 ordered stage, plus any leaf whose `depends_on` names the replaced node). Apply
 writes that report into the audit entry. Removing or rewriting a dispatched node
 is still refused, and a replacement may not reuse the replaced node's name,
-branch or worktree. The replaced node's `chainlink_issue_id` is immutable, so a
+branch or worktree. The replaced node's `chainlink_issue_id` is immutable, so the
 replacement cannot claim the same issue in the same manifest: declare it `null`
-and bind the fresh repair slice in a new plan when the repair is planned.
+(or a fresh issue) and bind the repair under the skipped issue in a new plan
+when that issue is needed. Supersession is a same-run substitute. It is not an
+in-manifest rebind and it does not touch Chainlink.
 
 #### Skipping a parked stage and its dependents
 
-The held-launch gates answer three ways. `park` (reject) changes nothing;
-`abandon-and-skip` records the abandonment and the skip; `retry` records the
-abandonment and authorizes exactly one fresh launch of the same stage.
-
-| Action | Slice | Journal | Next stage |
-| --- | --- | --- | --- |
-| park (`--reject` on any gate) | stays `PARKED` | nothing appended | held |
-| abandon (`...-abandon --approve`) | stays `PARKED` | one `operator_abandoned` record | held |
-| abandon-and-skip (`...-skip --approve --reason ... --dependency-policy ...`) | `SKIPPED`, `park_cause` cleared | `operator_skipped` (and `operator_abandoned` when abandon was also approved) | the scope reopens at the next eligible stage; dependents follow the policy |
-| retry (`...-retry --approve`) | reopened as `SPAWNED` | `operator_abandoned` + `retry_authorized` | the same stage launches once more |
-
-The stage's `skip_dependents` declaration (or its absence, which means `block`)
-sets the policy floor; the skip answer may only tighten it. `proceed` runs every
-dependent even though the prerequisite produced no output, `block` holds all of
-them, and `require-named` runs only the dependents named with `--dependent`
-while every unnamed dependent holds with a diagnostic. Nothing runs silently.
+The recognition, decision table, dependency-policy end states, and the post-skip
+Chainlink and new-plan workflow are documented once in
+[`tl-gates-and-failures.md`](tl-gates-and-failures.md#operator-walkthrough-a-parked-or-skipped-stage).
+In short: `--reject` on the abandon or retry gate parks, `...-abandon --approve`
+records the abandonment and leaves the stage parked, `...-retry --approve`
+authorizes exactly one fresh launch, and `...-skip --approve --reason ...
+--dependency-policy ...` marks the stage `SKIPPED` and applies the policy to its
+dependents. A skip never closes the stage's Chainlink issue; the operator handles
+that issue and plans the repair in a new `plan.json`.
 
 `--continue` remains a strict resume and never accepts an edited plan by itself.
 `--recreate` remains the path for replacing a run, not applying a revision.
