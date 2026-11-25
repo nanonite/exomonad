@@ -823,16 +823,6 @@ def test_recorded_live_shape_replays_through_production_python(tmp_path: Path) -
     assert decision.held_launch_effect.journal_index == 0
 
 
-def test_compiled_host_path_is_an_explicit_skip_when_unavailable(tmp_path: Path) -> None:
-    binary = Path(__file__).resolve().parents[2] / "target" / "debug" / "exomonad"
-    if shutil.which("tmux") is None or not binary.is_file():
-        pytest.skip(
-            "compiled host/tmux launch path is unavailable here; the Python "
-            "controller path is covered, the compiled launch path is NOT CLAIMED"
-        )
-    pytest.skip("compiled host launch coverage is provided by the e2e harness, not this unit file")
-
-
 def test_an_unreadable_ledger_never_becomes_no_host_evidence(tmp_path: Path) -> None:
     """An unread ledger is unknown evidence, never "no launch happened"."""
     fixture = _failed_ordered_run(tmp_path)

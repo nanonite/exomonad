@@ -27,10 +27,10 @@ from tl_loop.state.schema import SliceStatus
 from tl_loop.state.store import RunStore
 from tl_loop.tests.checkpoint_fixtures import create
 
-FIRST = "substitution-model-architecture-stage"
-BROKEN = "substitution-model-kani-stage"
-DEPENDENT = "substitution-model-positive-stage"
-REPAIR = "substitution-model-kani-stage-repair"
+FIRST = "first-stage"
+BROKEN = "held-stage"
+DEPENDENT = "next-stage"
+REPAIR = "held-stage-repair"
 
 
 def _leaf(name: str, issue_id: int | None) -> dict[str, object]:
@@ -46,14 +46,14 @@ def _document(
     broken: str = BROKEN,
 ) -> dict[str, object]:
     sub_tls: list[dict[str, object]] = [
-        {"name": FIRST, "order": 1, "plan": {"leaves": [_leaf("architecture", None)]}},
+        {"name": FIRST, "order": 1, "plan": {"leaves": [_leaf("first-leaf", None)]}},
         {
             "name": broken,
             "order": 2,
             "chainlink_issue_id": broken_issue,
-            "plan": {"leaves": [_leaf("kani", None)]},
+            "plan": {"leaves": [_leaf("held-leaf", None)]},
         },
-        {"name": DEPENDENT, "order": 3, "plan": {"leaves": [_leaf("positive", None)]}},
+        {"name": DEPENDENT, "order": 3, "plan": {"leaves": [_leaf("next-leaf", None)]}},
     ]
     if repair:
         sub_tls.append(
@@ -62,7 +62,7 @@ def _document(
                 "order": 4,
                 "supersedes": broken,
                 "chainlink_issue_id": repair_issue,
-                "plan": {"leaves": [_leaf("kani-repair", None)]},
+                "plan": {"leaves": [_leaf("held-leaf-repair", None)]},
             }
         )
     return {"run_id": "root", "plan": {"sub_tls": sub_tls}}
@@ -108,7 +108,7 @@ def _mark_broken_stage_skipped(store: RunStore) -> None:
             "recovery_action": "held_launch_effect_skip",
             "needs_human": False,
             "gate_name": f"tl-held-launch-effect-{BROKEN}-abc123abc123-skip",
-            "reason": "the kani-stage record is unrecoverable",
+            "reason": "the held-stage record is unrecoverable",
         },
     )
     store.checkpoint(
@@ -171,7 +171,7 @@ def test_g_apply_adds_the_future_node_and_writes_the_audit(tmp_path: Path) -> No
     assert before_manifest is not None
     _write_candidate(state_root, _document(repair=True))
 
-    result = apply_plan_revision(tmp_path, "Replace the unrecoverable kani stage")
+    result = apply_plan_revision(tmp_path, "Replace the unrecoverable held stage")
 
     assert result.applied
     assert result.audit_record is not None
@@ -297,7 +297,7 @@ def test_g_supersession_is_never_rewritten_by_a_later_revision(
 ) -> None:
     state_root, store = _project(tmp_path, _document())
     _write_candidate(state_root, _document(repair=True))
-    apply_plan_revision(tmp_path, "Replace the unrecoverable kani stage")
+    apply_plan_revision(tmp_path, "Replace the unrecoverable held stage")
     manifest = store.load().plan_manifest
     assert manifest is not None and manifest.superseded_nodes
 
@@ -338,6 +338,6 @@ def test_g_apply_refuses_an_unprovable_supersession(tmp_path: Path) -> None:
     before = (state_root / "plan.snapshot").read_bytes()
 
     with pytest.raises(PlanRevisionError, match="superseded_node_still_pending"):
-        apply_plan_revision(tmp_path, "Replace the unrecoverable kani stage")
+        apply_plan_revision(tmp_path, "Replace the unrecoverable held stage")
 
     assert (state_root / "plan.snapshot").read_bytes() == before

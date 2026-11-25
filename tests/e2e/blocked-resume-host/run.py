@@ -44,6 +44,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -61,26 +62,54 @@ from e2e_harness import tmuxio
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.transport import TransportClient, TransportError
 from tl_loop.fsm.phase import ChildHandle, TLWaiting
+from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
 from tl_loop.loop.driver import (
     EffectIntent,
+    LeafTask,
+    SubTLTask,
     TLLoopConfig,
     WorkPlan,
+    _bind_initial_slices,
+    _child_controller_name,
+    _ensure_canonical_scope,
+    _hold_ordered_recovery_gate,
+    _initial_slices,
     _manifest_for_plan,
+    _ordered_terminal_recovery_decision,
     _reconcile_unknown_launch_actions,
+    _release_canonical_scope,
+    _reopen_after_ordered_recovery,
+    _sub_tl_worktree,
+    _supervise_live_sub_tl,
+    derive_child_branch,
+    normalize_work_plan,
 )
 from tl_loop.loop.journal import EffectJournal
+from tl_loop.ordered import IntegrationLifecycle
 from tl_loop.state.schema import (
+    IntegrationRuntimeState,
+    OrderedStageState,
     RepositoryIdentity,
     RunState,
+    SkipDependencyPolicy,
     SliceState,
     SliceStatus,
 )
 from tl_loop.state.store import RunStore, _encode_slice, create
 
-SLICE_ID = "issue-814-substitution-model-kani"
-OWNER_HINT = "issue-814-substitution-model-kani"
+SLICE_ID = "held-launch-owner"
+OWNER_HINT = "held-launch-owner"
 ISSUE_ID = 814
 RUN_ID = "root"
+#: Generic names for the compiled skip case: a stage whose child journal holds
+#: one unknown blocked-resume effect, followed by the next ordered stage.
+SKIP_STAGE = "held-stage"
+SKIP_NEXT = "next-stage"
+SKIP_PARENT_BRANCH = "main"
+SKIP_STAGE_ISSUE = 704
+SKIP_LEAF_ISSUE = 701
+SKIP_NEXT_ISSUE = 702
+SKIP_REASON = "the held-stage record is unrecoverable; re-plan it in a fresh context"
 # The old interactive transport default.  The host is held well past it so the
 # controller's timeout is real, not an injected exception.
 OLD_CLIENT_TIMEOUT_SECONDS = 10.0
@@ -114,6 +143,28 @@ def wait_until(predicate: Any, description: str, timeout: float = 90.0) -> Any:
     raise HarnessError(
         f"timed out after {timeout:.0f}s waiting for {description}; last={last!r}"
     )
+
+
+def owner_for(repo: Path, slug: str = OWNER_HINT) -> Path:
+    """Resolve the exact owner directory by its durable slug."""
+    agents = repo / ".exo/agents"
+
+    def find() -> Path | None:
+        if not agents.is_dir():
+            return None
+        for candidate in agents.iterdir():
+            path = candidate / "identity.json"
+            if not path.is_file():
+                continue
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, Mapping) and record.get("slug") == slug:
+                return candidate
+        return None
+
+    return wait_until(find, f"owner {slug!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +243,7 @@ def create_blocked_owner(
     )
     if not spawned.success:
         raise HarnessError(f"real leaf spawn failed: {spawned.raw!r}")
-    owner_dir = gate.owner_for(repo)
+    owner_dir = owner_for(repo)
     worktree = gate.worktree_for(repo, owner_dir)
     (owner_dir / "active_issue").write_text(str(ISSUE_ID), encoding="utf-8")
     initial = gate.invocation(owner_dir)
@@ -235,6 +286,469 @@ def create_blocked_owner(
     return owner_dir, worktree, initial, identity, branch, fingerprint
 
 
+# ---------------------------------------------------------------------------
+# Ordered skip fixture (generic held stage, no project-specific names)
+
+
+class _ExitedProcess:
+    """Stand-in for a child controller that exited before authoritative resolution."""
+
+    exitcode = 1
+
+    def is_alive(self) -> bool:
+        return False
+
+    def join(self, timeout: float | None = None) -> None:
+        del timeout
+
+    def terminate(self) -> None:
+        return None
+
+
+def _force_issue_id(repo: Path, current: int, target: int) -> int:
+    import sqlite3
+
+    with sqlite3.connect(repo / ".chainlink/issues.db") as database:
+        database.execute("UPDATE issues SET id = ? WHERE id = ?", (target, current))
+        database.execute(
+            "UPDATE sqlite_sequence SET seq = ? WHERE name = 'issues'",
+            (max(current, target),),
+        )
+    return target
+
+
+def create_issue_with_id(
+    repo: Path, effects: EffectClient, *, title: str, target: int
+) -> int:
+    created = effects.chainlink_issue_create(
+        title=title,
+        description="Disposable compiled skip fixture; the run removes it.",
+        labels=("bug",),
+        priority="high",
+    )
+    if not created.success:
+        raise HarnessError(f"real Chainlink issue creation failed: {created.raw!r}")
+    return _force_issue_id(repo, gate.issue_number(created), target)
+
+
+def seed_skip_root(repo: Path, *, branch: str, worktree: Path) -> None:
+    """Record the root identity the compiled host resolves before the checkout.
+
+    The spawned leaf inherits this birth branch as its parent branch, which is
+    how the child stage's declared branch and the owner's durable identity agree
+    without rewriting either record later.
+    """
+    root_dir = repo / ".exo/agents/root"
+    root_dir.mkdir(parents=True, exist_ok=True)
+    (root_dir / "identity.json").write_text(
+        json.dumps(
+            {
+                "agent_name": "root",
+                "slug": "root",
+                "agent_type": "codex",
+                "birth_branch": branch,
+                "parent_branch": branch,
+                "working_dir": str(worktree),
+                "display_name": "root",
+                "topology": "worktree_per_agent",
+                "ledger_owned": True,
+                "slice_id": "root",
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (root_dir / ".birth_branch").write_text(branch + "\n", encoding="utf-8")
+
+
+def prepare_skip_repository(
+    root: Path,
+) -> tuple[Path, Path, subprocess.Popen[str], str, Path, str]:
+    """Prepare the disposable repository and the stage branch the child owns."""
+    repo, _remote, mock, forgejo = prepare_repository(root)
+    stage_branch = f"{SKIP_PARENT_BRANCH}.{SKIP_STAGE}"
+    stage_worktree = repo / ".exo/worktrees" / SKIP_STAGE
+    stage_worktree.parent.mkdir(parents=True, exist_ok=True)
+    real.git(
+        repo,
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        stage_branch,
+        str(stage_worktree),
+        SKIP_PARENT_BRANCH,
+    )
+    seed_skip_root(repo, branch=stage_branch, worktree=stage_worktree)
+    return repo, _remote, mock, forgejo, stage_worktree, stage_branch
+
+
+def spawn_skip_owner(
+    repo: Path, effects: EffectClient, *, issue_id: int
+) -> tuple[Path, Path, dict[str, Any], dict[str, Any], str]:
+    """Spawn and then make terminal the one owner the held request names."""
+    spawned = effects.spawn_leaf(
+        name=OWNER_HINT,
+        task=f"Work on Chainlink issue #{issue_id}; this owner will be held.",
+        agent_type="codex",
+        model="gpt-6-luna",
+    )
+    if not spawned.success:
+        raise HarnessError(f"real leaf spawn failed: {spawned.raw!r}")
+    owner_dir = owner_for(repo)
+    worktree = gate.worktree_for(repo, owner_dir)
+    (owner_dir / "active_issue").write_text(str(issue_id), encoding="utf-8")
+    fingerprint = gate.worktree_fingerprint(worktree)
+    gate.kill_owner_target(owner_dir)
+    wait_until(
+        lambda: gate.invocation(owner_dir).get("status") in {"exited", "failed", "killed"},
+        "the held owner invocation to become terminal",
+    )
+    parked = effects.emit_controller_event(
+        event_type="tl.slice_parked",
+        payload={
+            "slice_id": OWNER_HINT,
+            "park_cause": "base_ci_unstable",
+            "attempts": 1,
+            "reason": "base CI failed independently of the leaf",
+        },
+    )
+    blocked = effects.emit_controller_event(
+        event_type="agent.task_blocked",
+        payload={
+            "outcome": "blocked",
+            "slice_id": OWNER_HINT,
+            "cause": "base_ci_unstable",
+            "scope_attribution": "base",
+            "needs_human": True,
+            "retryable": True,
+            "recovery_action": "stabilize base CI, then resume the parked owner",
+            "declared_difficulty": "standard",
+            "matched_difficulty_rule": "standard_slice",
+            "attempt": 1,
+        },
+    )
+    if not parked.success or not blocked.success:
+        raise HarnessError(
+            f"real blocked events failed: {parked.raw!r} {blocked.raw!r}"
+        )
+    return (
+        owner_dir,
+        worktree,
+        gate.invocation(owner_dir),
+        gate.identity(owner_dir),
+        fingerprint,
+    )
+
+
+def _write_plan_snapshot(
+    repo: Path, plan_document: Mapping[str, object], run_id: str
+) -> None:
+    import hashlib
+
+    state_root = repo / ".exo/tl-loop"
+    state_root.mkdir(parents=True, exist_ok=True)
+    document = {
+        "run_id": run_id,
+        "budgets": {"tokens": 120000, "wall_seconds": 1800},
+        "plan": plan_document,
+    }
+    payload = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
+    (state_root / "plan.json").write_bytes(payload)
+    (state_root / "plan.snapshot").write_bytes(payload)
+    (state_root / "plan.snapshot.sha256").write_text(
+        hashlib.sha256(payload).hexdigest() + "\n", encoding="ascii"
+    )
+
+
+def build_skip_ordered_state(
+    repo: Path,
+    *,
+    owner_dir: Path,
+    worktree: Path,
+    initial: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    request: Mapping[str, Any],
+    route: Mapping[str, str],
+) -> tuple[
+    WorkPlan,
+    TLLoopConfig,
+    RunStore,
+    RunStore,
+    EffectJournal,
+    EffectIntent,
+    dict[str, Any],
+]:
+    """Build the ordered parent/child fixture through production helpers.
+
+    Stage one is the failed child whose own action journal holds the held
+    request; stage two is the following ordered stage. Both are generic.
+    """
+    state_root = repo / ".exo/tl-loop"
+    stage_plan = WorkPlan(
+        leaves=(LeafTask(OWNER_HINT, "implement the held stage", chainlink_issue_id=SKIP_LEAF_ISSUE),)
+    )
+    stages = (
+        SubTLTask(
+            SKIP_STAGE,
+            stage_plan,
+            order=1,
+            skip_dependents=SkipDependencyPolicy.PROCEED,
+            chainlink_issue_id=SKIP_STAGE_ISSUE,
+        ),
+        SubTLTask(
+            SKIP_NEXT,
+            WorkPlan(),
+            order=2,
+            skip_dependents=SkipDependencyPolicy.PROCEED,
+            chainlink_issue_id=SKIP_NEXT_ISSUE,
+        ),
+    )
+    plan = normalize_work_plan(WorkPlan(sub_tls=stages))
+    config = TLLoopConfig(
+        root_dir=state_root,
+        project_root=repo,
+        branch=SKIP_PARENT_BRANCH,
+        ledger_run_id=real.server_run_id(repo),
+        session_mode="continue",
+        repository_identity=RepositoryIdentity("https://forgejo-e2e/owner/repo.git"),
+    )
+    manifest = _manifest_for_plan(plan, RUN_ID, config)
+    plan_document = {
+        "workers": [],
+        "leaves": [],
+        "sub_tls": [
+            {
+                "name": SKIP_STAGE,
+                "order": 1,
+                "chainlink_issue_id": SKIP_STAGE_ISSUE,
+                "skip_dependents": SkipDependencyPolicy.PROCEED.value,
+                "plan": {
+                    "workers": [],
+                    "leaves": [
+                        {
+                            "name": OWNER_HINT,
+                            "task": "implement the held stage",
+                            "chainlink_issue_id": SKIP_LEAF_ISSUE,
+                        }
+                    ],
+                    "sub_tls": [],
+                },
+            },
+            {
+                "name": SKIP_NEXT,
+                "order": 2,
+                "chainlink_issue_id": SKIP_NEXT_ISSUE,
+                "skip_dependents": SkipDependencyPolicy.PROCEED.value,
+                "plan": {"workers": [], "leaves": [], "sub_tls": []},
+            },
+        ],
+    }
+    _write_plan_snapshot(repo, plan_document, RUN_ID)
+    parent_slices = _bind_initial_slices(
+        _initial_slices(plan, config, state_root, RUN_ID),
+        manifest,
+    )
+    create(
+        RUN_ID,
+        {
+            "plan_manifest": manifest.to_document(),
+            "slices": parent_slices,
+            "repository_identity": config.repository_identity.to_document(),
+        },
+        root_dir=state_root,
+    )
+    parent_store = RunStore(RUN_ID, state_root)
+    parent_state = parent_store.load()
+    child_branch = derive_child_branch(
+        SKIP_PARENT_BRANCH, _child_controller_name(stages[0])
+    )
+    child_worktree = _sub_tl_worktree(config, state_root, RUN_ID, stages[0])
+    parked = replace(
+        parent_state.slices[SKIP_STAGE],
+        status=SliceStatus.FAILED,
+        branch=child_branch,
+        worktree=str(child_worktree),
+        dispatch_intent_id="sub-tl-dispatch",
+        dispatch_agent_id=_child_controller_name(stages[0]),
+        dispatch_authoritative_event_seq=11,
+        dispatch_last_boundary="sub_tl_started",
+    )
+    slices: dict[str, SliceState | Mapping[str, object]] = {SKIP_STAGE: parked}
+    for task in stages[1:]:
+        slices[task.name] = replace(
+            parent_state.slices[task.name],
+            branch=derive_child_branch(SKIP_PARENT_BRANCH, _child_controller_name(task)),
+            worktree=str(_sub_tl_worktree(config, state_root, RUN_ID, task)),
+        )
+    integration = {SKIP_STAGE: IntegrationLifecycle.FAILED, SKIP_NEXT: IntegrationLifecycle.RUNNING}
+    parent_store.checkpoint(
+        RecursiveTLFailed("recursive child failed", scope_path=(RUN_ID,)),
+        slices,
+        parent_state.budgets,
+        0,
+        current_order=1,
+        ordered_stages=(
+            OrderedStageState(1, (SKIP_STAGE,)),
+            OrderedStageState(2, (SKIP_NEXT,)),
+        ),
+        integration=IntegrationRuntimeState(sub_tl_states=integration),
+    )
+    child_manifest = manifest.child_manifests[
+        next(node.node_id for node in manifest.nodes if node.name == SKIP_STAGE)
+    ]
+    child_config = replace(
+        config,
+        root_dir=parent_store.run_dir,
+        run_id=SKIP_STAGE,
+        branch=child_branch,
+        worktree=str(child_worktree),
+        parent_branch=SKIP_PARENT_BRANCH,
+        parent_run_id=RUN_ID,
+        depth=1,
+    )
+    child_slices = _bind_initial_slices(
+        _initial_slices(stage_plan, child_config, parent_store.run_dir, SKIP_STAGE),
+        child_manifest,
+    )
+    create(
+        SKIP_STAGE,
+        {
+            "plan_manifest": child_manifest.to_document(),
+            "slices": child_slices,
+            "owner_branch": child_branch,
+            "owner_worktree": str(child_worktree),
+            "parent_branch": SKIP_PARENT_BRANCH,
+            "parent_run_id": RUN_ID,
+            "session_mode": "continue",
+            "repository_identity": config.repository_identity.to_document(),
+        },
+        root_dir=parent_store.run_dir,
+    )
+    child_store = RunStore(SKIP_STAGE, parent_store.run_dir)
+    child_state = _ensure_canonical_scope(child_store.load(), child_manifest, child_store)
+    child_state = _release_canonical_scope(child_state, child_store)
+    del child_state
+    _supervise_live_sub_tl(_ExitedProcess(), child_store, config)
+    journal = EffectJournal(SKIP_STAGE, child_store.run_dir / "action-journal.json")
+    arguments = dict(request)
+    arguments.update(
+        {
+            "owner_agent_name": owner_dir.name,
+            "prior_generation": initial.get("generation", 0),
+            "expected_worktree": str(worktree),
+            "expected_worktree_recorded": str(identity["working_dir"]),
+            "dispatch_intent_id": route["dispatch_intent_id"],
+            "dispatch_attempt": 1,
+            "dispatch_started_at": time.time(),
+            "dispatch_generation": 1,
+            "dispatch_ledger_floor": gate._highest_sequence(repo),
+            "controller_epoch": "e2e-skip-held-stage",
+            "route_reconciliation_source": "proven_preexecution_retry",
+        }
+    )
+    intent = EffectIntent("resume_blocked_leaf", OWNER_HINT, arguments, True)
+    journal.append(intent)
+    entry = journal.entries_for("resume_blocked_leaf", OWNER_HINT)[0]
+    return plan, config, parent_store, child_store, journal, intent, entry
+
+
+def ledger_bytes(repo: Path) -> tuple[tuple[str, bytes], ...]:
+    segments = repo / ".exo/ledger/segments"
+    return tuple(
+        (path.name, path.read_bytes())
+        for path in sorted(segments.glob("segment-*.jsonl"))
+    )
+
+
+def issue_status(repo: Path, issue_id: int) -> str | None:
+    import sqlite3
+
+    database = sqlite3.connect(
+        f"file:{repo / '.chainlink/issues.db'}?mode=ro", uri=True
+    )
+    try:
+        row = database.execute(
+            "SELECT status FROM issues WHERE id = ?", (issue_id,)
+        ).fetchone()
+    finally:
+        database.close()
+    return None if row is None else str(row[0])
+
+
+def build_controller_home(root: Path) -> Path:
+    """Install this working tree's TL controller archive under a run-scoped HOME.
+
+    `exomonad init --continue` resolves the controller archive from
+    `$HOME/.exo/tl_loop.pyz`. A run that exercises a newly accepted plan field
+    must not silently use an operator's older installed archive, so this makes
+    the exact source under test the one the compiled init loads.
+    """
+    home = root / "controller-home"
+    staging = home / ".exo"
+    staging.mkdir(parents=True, exist_ok=True)
+    archive = staging / "tl_loop.pyz"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts/build_tl_loop_archive.py"),
+            "--source",
+            str(PROJECT_ROOT / "tl_loop"),
+            "--output",
+            str(archive),
+        ],
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise HarnessError(
+            f"building the TL controller archive failed ({result.returncode}):\n"
+            f"{result.stdout[-2000:]}\n{result.stderr[-2000:]}"
+        )
+    return home
+
+
+def answer_skip_gate(
+    root: Path, repo: Path, environment: Mapping[str, str], gate_name: str
+) -> None:
+    """Answer the real -skip gate through the shipped CLI."""
+    env = tmuxio.child_env(root, dict(environment))
+    env["NO_COLOR"] = "1"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tl_loop",
+            "gate",
+            "--project-root",
+            str(repo),
+            "--run-id",
+            RUN_ID,
+            "--name",
+            gate_name,
+            "--approve",
+            "--reason",
+            SKIP_REASON,
+            "--dependency-policy",
+            "proceed",
+        ],
+        cwd=str(PROJECT_ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise HarnessError(
+            f"real tl_loop gate CLI rejected the skip answer ({result.returncode}):\n"
+            f"{result.stdout[-2000:]}\n{result.stderr[-2000:]}"
+        )
+
+
 def resume_arguments(
     repo: Path,
     client: TransportClient,
@@ -244,6 +758,8 @@ def resume_arguments(
     identity: Mapping[str, Any],
     branch: str,
     fingerprint: str,
+    *,
+    issue_id: int = ISSUE_ID,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     route = gate.configured_resume_route(
         client,
@@ -254,12 +770,12 @@ def resume_arguments(
         branch=branch,
         worktree=worktree,
         worktree_fingerprint=fingerprint,
-        issue_id=ISSUE_ID,
+        issue_id=issue_id,
     )
     gate.seed_resume_dispatch_declaration(repo, route)
     request = gate.resume_arguments(
         {
-            "chainlink_issue_id": ISSUE_ID,
+            "chainlink_issue_id": issue_id,
             "expected_invocation_id": initial["invocation_id"],
             "expected_branch": branch,
             "expected_worktree_fingerprint": fingerprint,
@@ -430,6 +946,12 @@ def intent_launches(repo: Path, intent: str) -> list[Mapping[str, Any]]:
         and isinstance(row.get("data"), Mapping)
         and row["data"].get("intent_id") == intent
     ]
+
+
+def agent_spawned_count(repo: Path) -> int:
+    return sum(
+        1 for row in real.server_ledger_events(repo) if row.get("type") == "agent.spawned"
+    )
 
 
 def intent_failures(repo: Path, intent: str) -> list[Mapping[str, Any]]:
@@ -1029,6 +1551,278 @@ def _case_sigkill_boundary(
         teardown(root, repo, mock)
 
 
+def case_skip_held_stage(root: Path) -> dict[str, Any]:
+    """Compiled held entry, real -skip gate, and a restart that adds nothing."""
+    repo, _remote, mock, forgejo, _stage_worktree, _stage_branch = prepare_skip_repository(
+        root
+    )
+    server: subprocess.Popen[str] | None = None
+    try:
+        server, client = start_server(root, repo, forgejo)
+        environment = server_environment(server)
+        install_reviewer_route(repo)
+        stop_server_process(server)
+        server = None
+        server, client = start_attached_server(
+            root, repo, environment, label="configured-server"
+        )
+        effects = EffectClient(client, role="tl", name="root")
+        create_issue_with_id(
+            repo, effects, title="Held stage", target=SKIP_STAGE_ISSUE
+        )
+        create_issue_with_id(
+            repo, effects, title="Next stage", target=SKIP_NEXT_ISSUE
+        )
+        leaf_issue = create_issue_with_id(
+            repo, effects, title="Held stage leaf", target=SKIP_LEAF_ISSUE
+        )
+        owner_dir, worktree, initial, identity, fingerprint = spawn_skip_owner(
+            repo, effects, issue_id=leaf_issue
+        )
+        request, route = resume_arguments(
+            repo,
+            client,
+            owner_dir,
+            worktree,
+            initial,
+            identity,
+            str(identity["birth_branch"]),
+            fingerprint,
+            issue_id=leaf_issue,
+        )
+        intent = route["dispatch_intent_id"]
+        plan, config, parent_store, child_store, journal, effect, entry = (
+            build_skip_ordered_state(
+                repo,
+                owner_dir=owner_dir,
+                worktree=worktree,
+                initial=initial,
+                identity=identity,
+                request=request,
+                route=route,
+            )
+        )
+        stop_server_process(server)
+        server = None
+        marker_dir = root / "interrupt"
+        server, client = start_attached_server(
+            root,
+            repo,
+            environment,
+            extra={
+                "EXOMONAD_E2E_INTERRUPT_AT": "blocked_resume_before_launch",
+                "EXOMONAD_E2E_INTERRUPT_SCOPE": intent,
+                "EXOMONAD_E2E_INTERRUPT_DIR": str(marker_dir),
+                "EXOMONAD_E2E_INTERRUPT_ACTION": "pause",
+            },
+            label="skip-boundary-server",
+        )
+        request_error: list[Exception] = []
+
+        def send() -> None:
+            try:
+                TransportClient(project_root=repo, timeout=5, launch_timeout=300).call_tool(
+                    "tl", "root", "resume_blocked_leaf", request
+                )
+            except (TransportError, OSError, EOFError) as error:
+                # The host is about to be SIGKILLed at the boundary; a transport
+                # failure is the expected observation, not a harness error.
+                request_error.append(error)
+
+        sender = threading.Thread(target=send, daemon=True)
+        sender.start()
+        wait_until(
+            (marker_dir / "blocked_resume_before_launch.json").is_file,
+            "the compiled host to reach blocked_resume_before_launch",
+            timeout=60,
+        )
+        if intent_launches(repo, intent):
+            raise HarnessError("the boundary launch completed before the host was killed")
+        sigkill(server)
+        server = None
+        sender.join(timeout=15)
+        journal.mark_unknown(
+            effect,
+            request_error[0]
+            if request_error
+            else ConnectionError("compiled host was SIGKILLed before launch"),
+        )
+
+        decision = _ordered_terminal_recovery_decision(
+            parent_store.load(), plan, config, parent_store
+        )
+        if decision is None or decision.held_launch_effect is None:
+            raise HarnessError(f"the held stage was not classified as held: {decision!r}")
+        effect = decision.held_launch_effect
+        _hold_ordered_recovery_gate(parent_store, decision)
+        journal_path = child_store.run_dir / "action-journal.json"
+        child_run_path = child_store.run_dir / "run.json"
+        snapshot_path = repo / ".exo/tl-loop/plan.snapshot"
+        journal_before = journal_path.read_text(encoding="utf-8")
+        ledger_before = ledger_bytes(repo)
+        child_run_before = child_run_path.read_bytes()
+        snapshot_before = snapshot_path.read_bytes()
+
+        answer_skip_gate(root, repo, environment, effect.skip_gate)
+        decision = _ordered_terminal_recovery_decision(
+            parent_store.load(), plan, config, parent_store
+        )
+        if decision is None or not decision.skipped:
+            raise HarnessError(f"the approved skip was not consumed: {decision!r}")
+        state = _reopen_after_ordered_recovery(
+            parent_store.load(), plan, parent_store, decision
+        )
+
+        skipped = state.slices[SKIP_STAGE]
+        if skipped.status is not SliceStatus.SKIPPED:
+            raise HarnessError(f"the skipped stage is not SKIPPED: {skipped!r}")
+        if skipped.chainlink_issue_id != SKIP_STAGE_ISSUE:
+            raise HarnessError(
+                f"the skipped stage lost its linked issue: {skipped.chainlink_issue_id!r}"
+            )
+        if state.current_order != 2:
+            raise HarnessError(f"the scope did not advance: current_order={state.current_order}")
+        if state.slices[SKIP_NEXT].status in {SliceStatus.BLOCKED, SliceStatus.SKIPPED}:
+            raise HarnessError(
+                f"the next stage did not proceed: {state.slices[SKIP_NEXT]!r}"
+            )
+        journal_after = journal_path.read_text(encoding="utf-8")
+        before_rows = json.loads(journal_before)
+        after_rows = json.loads(journal_after)
+        if after_rows[: len(before_rows)] != before_rows:
+            raise HarnessError("the original journal entry bytes changed")
+        if len(after_rows) != len(before_rows) + 1:
+            raise HarnessError(
+                f"the skip appended {len(after_rows) - len(before_rows)} journal records"
+            )
+        resolutions = [
+            record
+            for record in after_rows
+            if isinstance(record, Mapping) and record.get("kind") == "launch_resolution"
+        ]
+        if [record.get("outcome") for record in resolutions] != ["operator_skipped"]:
+            raise HarnessError(f"expected one operator_skipped record: {resolutions!r}")
+        record = resolutions[0]
+        if record.get("resolves_key") != entry.get("key"):
+            raise HarnessError(
+                f"the skip record is not linked to the original entry: {record!r}"
+            )
+        decision_record = record.get("decision")
+        if not isinstance(decision_record, Mapping):
+            raise HarnessError(f"the skip record has no decision: {record!r}")
+        if decision_record.get("reason") != SKIP_REASON:
+            raise HarnessError(f"the skip reason was not recorded: {decision_record!r}")
+        if decision_record.get("dependency_policy") != "proceed":
+            raise HarnessError(
+                f"the skip dependency policy was not recorded: {decision_record!r}"
+            )
+        if ledger_bytes(repo) != ledger_before:
+            raise HarnessError("the skip appended host ledger rows")
+        if child_run_path.read_bytes() != child_run_before:
+            raise HarnessError("the skip rewrote the child checkpoint")
+        if snapshot_path.read_bytes() != snapshot_before:
+            raise HarnessError("the skip rewrote the accepted plan snapshot")
+        if intent_launches(repo, intent):
+            raise HarnessError("the skip relaunched the held stage")
+        if owner_windows(repo, owner_dir, identity):
+            raise HarnessError("the skip created an owner window")
+        if issue_status(repo, SKIP_STAGE_ISSUE) != "open":
+            raise HarnessError("the skip closed the skipped stage's linked issue")
+        if issue_status(repo, SKIP_NEXT_ISSUE) != "open":
+            raise HarnessError("the skip closed the next stage's linked issue")
+        spawned_before_restart = agent_spawned_count(repo)
+
+        # A compiled restart must not turn the held host journal back into a
+        # launch. The dirty worktree makes the host's own re-drive refuse before
+        # any window exists; the controller journal and the skip stay unchanged.
+        smart_codex(root)
+        (worktree / "dirty-at-skip-recovery.txt").write_text(
+            "the owner worktree is deliberately dirty after the skip\n",
+            encoding="utf-8",
+        )
+        restart_journal = journal_path.read_text(encoding="utf-8")
+        restart_failures = len(intent_failures(repo, intent))
+        init_runs: list[dict[str, Any]] = []
+        controller_home = build_controller_home(root)
+        # The old session is disposable before a controller target exists; a
+        # real init --continue starts the replacement server and controller.
+        tmuxio.tmux(real.tmux_socket(repo), "kill-server", check=False)
+        for index, label in enumerate(("skip-init-1", "skip-init-2")):
+            process, log = run_init_continue(
+                root,
+                repo,
+                environment,
+                label=label,
+                extra={"HOME": str(controller_home)},
+            )
+            init_succeeded_or_detached(process, log)
+            wait_until(
+                lambda: host_journal_phase(owner_dir) in {"failed", "launched"} or None,
+                "the restarted host to finish its pending blocked-resume journal",
+                timeout=120,
+            )
+            if host_journal_phase(owner_dir) == "launched":
+                raise HarnessError("the restart launched the skipped stage")
+            if intent_launches(repo, intent):
+                raise HarnessError("the restart relaunched the skipped stage")
+            if agent_spawned_count(repo) != spawned_before_restart:
+                raise HarnessError("the restart added an agent.spawned row")
+            if owner_windows(repo, owner_dir, identity):
+                raise HarnessError("the restart created an owner window")
+            if journal_path.read_text(encoding="utf-8") != restart_journal:
+                raise HarnessError("the restart appended a controller journal record")
+            failures = len(intent_failures(repo, intent))
+            if index == 0:
+                # The first compiled restart re-drives the stale host journal and
+                # records exactly one terminal refusal; a refusal is not a launch.
+                if failures != restart_failures + 1:
+                    raise HarnessError(
+                        f"the first restart did not record exactly one refusal "
+                        f"({restart_failures} -> {failures})"
+                    )
+            elif failures != restart_failures:
+                raise HarnessError(
+                    f"the repeat restart added a host row ({restart_failures} -> {failures})"
+                )
+            restart_failures = failures
+            init_runs.append(
+                {
+                    "label": label,
+                    "host_journal_phase": host_journal_phase(owner_dir),
+                    "launch_count": len(intent_launches(repo, intent)),
+                    "failure_count": failures,
+                }
+            )
+        after_restart = parent_store.load()
+        if after_restart.slices[SKIP_STAGE].status is not SliceStatus.SKIPPED:
+            raise HarnessError("a restart un-skipped the stage")
+        if issue_status(repo, SKIP_STAGE_ISSUE) != "open":
+            raise HarnessError("a restart closed the skipped stage's linked issue")
+        if issue_status(repo, SKIP_NEXT_ISSUE) != "open":
+            raise HarnessError("a restart closed the next stage's linked issue")
+
+        return {
+            "case": "skip-held-stage",
+            "skip_gate": effect.skip_gate,
+            "journal_records_before": len(before_rows),
+            "journal_records_after": len(after_rows),
+            "operator_skipped_outcomes": [record.get("outcome") for record in resolutions],
+            "skipped_status": skipped.status.value,
+            "next_stage_status": after_restart.slices[SKIP_NEXT].status.value,
+            "current_order": after_restart.current_order,
+            "launch_count": len(intent_launches(repo, intent)),
+            "agent_spawned_total": agent_spawned_count(repo),
+            "owner_windows": owner_windows(repo, owner_dir, identity),
+            "skipped_issue_status": issue_status(repo, SKIP_STAGE_ISSUE),
+            "next_issue_status": issue_status(repo, SKIP_NEXT_ISSUE),
+            "init_runs": init_runs,
+        }
+    finally:
+        if server is not None:
+            sigkill(server)
+        teardown(root, repo, mock)
+
+
 def case_terminal_failure_hold(root: Path) -> dict[str, Any]:
     """A restarted host that records only a terminal failure leaves a hold."""
     repo, _remote, mock, forgejo = prepare_repository(root)
@@ -1143,6 +1937,7 @@ CASES = {
     "init-continue-before-window": case_init_continue_before_window,
     "sigkill-after-window": case_sigkill_after_window,
     "terminal-failure-hold": case_terminal_failure_hold,
+    "skip-held-stage": case_skip_held_stage,
 }
 
 

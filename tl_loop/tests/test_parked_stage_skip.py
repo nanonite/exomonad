@@ -1,12 +1,12 @@
 """Operator skip for a stage parked behind an unresolved launch effect.
 
-The fixture is the redacted live shape (beast-workspace, 2026-11-24): one
-ordered stage is parked behind ``tl-held-launch-effect-...`` because its child
-controller journaled ``resume_blocked_leaf`` as ``unknown`` and the host never
-recorded a launch. Rejecting that gate parks forever, abandoning it records the
-decision but keeps the slice parked, and retrying the same failed launch is not
-what the operator wants. A skip records the decision durably, marks the stage
-SKIPPED, and evaluates its dependents under an explicit dependency policy.
+The generic fixture is a redacted held-launch shape: one ordered stage is
+parked behind ``tl-held-launch-effect-...`` because its child controller
+journaled ``resume_blocked_leaf`` as ``unknown`` and the host never recorded a
+launch. Rejecting that gate parks forever, abandoning it records the decision
+but keeps the slice parked, and retrying the same failed launch is not what the
+operator wants. A skip records the decision durably, marks the stage SKIPPED,
+and evaluates its dependents under an explicit dependency policy.
 """
 
 from __future__ import annotations
@@ -16,13 +16,14 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple, cast
 
 import pytest
 
 from tl_loop.client.effects import EffectClient
 from tl_loop.client.readonly import ReadOnlyEffectClient
 from tl_loop.client.transport import TransportClient
+from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.scope import TLFailed as RecursiveTLFailed
 from tl_loop.fsm.scope import TLRunning
 from tl_loop.loop import driver
@@ -33,6 +34,7 @@ from tl_loop.loop.driver import (
     SubTLTask,
     TLLoopConfig,
     WorkPlan,
+    _advance_post_merge_boundary,
     _bind_initial_slices,
     _ensure_canonical_scope,
     _hold_ordered_recovery_gate,
@@ -63,6 +65,7 @@ from tl_loop.state.schema import (
 )
 from tl_loop.state.store import RunStore
 from tl_loop.tests.checkpoint_fixtures import create
+from tl_loop.tests.test_chainlink_issue_binding import IssueCloseTransport
 from tl_loop.tests.test_driver import SyntheticQueue
 from tl_loop.tests.test_held_launch_effect_resolution import (
     LEAF,
@@ -73,17 +76,23 @@ from tl_loop.tests.test_held_launch_effect_resolution import (
     _write_ledger,
 )
 
-STAGE = "substitution-model-kani-stage"
-NEXT = "substitution-model-positive-stage"
-SIBLING = "substitution-model-audit-stage"
+STAGE = "held-stage"
+NEXT = "next-stage"
+SIBLING = "sibling-stage"
 OWNER = f"{LEAF}-opencode"
-#: The branch the parked stage owns; its leaf owner branches from it, exactly as
-#: the live kani-stage child did.
+#: The branch the parked stage owns; its leaf owner branches from it.
 PARENT_BRANCH = f"main.{STAGE}"
 CHILD_BRANCH = PARENT_BRANCH
 LEAF_BRANCH = f"{CHILD_BRANCH}.{OWNER}"
 GENERIC_GATE = "tl-ordered-child-recovery-" + STAGE
-SKIP_REASON = "the kani-stage record is unrecoverable; re-plan it in a fresh context"
+ISSUE_ID = 701
+#: Issues bound to the stages in the Chainlink-semantics cases. The held
+#: stage's own issue must stay open for a fresh plan; the next stage's issue
+#: closes independently once that stage merges.
+STAGE_ISSUE = 704
+NEXT_ISSUE = 702
+SIBLING_ISSUE = 703
+SKIP_REASON = "the held stage record is unrecoverable; re-plan it in a fresh context"
 
 
 class _Fixture(NamedTuple):
@@ -108,7 +117,7 @@ def _seed_owner(
     _git("init", "-q", "-b", LEAF_BRANCH, str(worktree))
     owner_dir = project / ".exo" / "agents" / OWNER
     owner_dir.mkdir(parents=True)
-    (owner_dir / "active_issue").write_text("814\n", encoding="utf-8")
+    (owner_dir / "active_issue").write_text("701\n", encoding="utf-8")
     identity = {
         "agent_name": OWNER,
         "slug": LEAF,
@@ -162,7 +171,7 @@ def _derive_intent(project: Path, worktree: Path) -> str:
     owner, _successor = resolve_owner_for_resume_retry(
         project,
         slice_id=LEAF,
-        issue_id=814,
+        issue_id=ISSUE_ID,
         expected_parent_branch=PARENT_BRANCH,
         expected_agent_name=OWNER,
         prior_invocation_id="opencode-prior-invocation",
@@ -178,11 +187,11 @@ def _derive_intent(project: Path, worktree: Path) -> str:
 
 def _journal_arguments(worktree: Path, intent: str) -> dict[str, object]:
     return {
-        "chainlink_issue_id": 814,
+        "chainlink_issue_id": ISSUE_ID,
         "expected_invocation_id": "opencode-prior-invocation",
         "expected_branch": LEAF_BRANCH,
         "expected_worktree_fingerprint": _owner_fingerprint(worktree),
-        "task": "Recover the substitution-model Kani stage for issue 814",
+        "task": "Recover the held stage for the fixture issue",
         "human_approved": True,
         "owner_agent_name": OWNER,
         "prior_generation": 1,
@@ -239,6 +248,7 @@ def _stage(
     *,
     policy: SkipDependencyPolicy,
     empty: bool = False,
+    issue_id: int | None = None,
 ) -> SubTLTask:
     child_plan = WorkPlan() if empty else WorkPlan(leaves=(LeafTask(LEAF, "implement it"),))
     return SubTLTask(
@@ -246,6 +256,7 @@ def _stage(
         child_plan,
         order=order,
         skip_dependents=policy,
+        chainlink_issue_id=issue_id,
     )
 
 
@@ -254,6 +265,7 @@ def _run(
     *,
     policy: SkipDependencyPolicy = SkipDependencyPolicy.PROCEED,
     sibling: bool = False,
+    linked_issues: bool = False,
 ) -> _Fixture:
     """Build two ordered stages through the production fixture helpers."""
     project = tmp_path
@@ -263,10 +275,32 @@ def _run(
     intent = _derive_intent(project, worktree)
     _write_ledger(project)
 
-    stage = _stage(STAGE, 1, policy=policy)
-    tasks = [stage, _stage(NEXT, 2, policy=policy, empty=True)]
+    stage = _stage(
+        STAGE,
+        1,
+        policy=policy,
+        issue_id=STAGE_ISSUE if linked_issues else None,
+    )
+    tasks = [
+        stage,
+        _stage(
+            NEXT,
+            2,
+            policy=policy,
+            empty=True,
+            issue_id=NEXT_ISSUE if linked_issues else None,
+        ),
+    ]
     if sibling:
-        tasks.append(_stage(SIBLING, 3, policy=policy, empty=True))
+        tasks.append(
+            _stage(
+                SIBLING,
+                3,
+                policy=policy,
+                empty=True,
+                issue_id=SIBLING_ISSUE if linked_issues else None,
+            )
+        )
     plan = normalize_work_plan(WorkPlan(sub_tls=tuple(tasks)))
     config = TLLoopConfig(
         root_dir=state_root,
@@ -923,10 +957,10 @@ def test_h_skipping_a_nested_stage_leaves_siblings_and_outer_stages_alone(
     assert state.current_order == 2
 
 
-def test_i_recorded_live_shape_replays_through_production_classification(
+def test_i_recorded_held_shape_replays_through_production_classification(
     tmp_path: Path,
 ) -> None:
-    """The redacted kani-stage journal and gate state drive the skip decision."""
+    """The recorded held-stage journal and gate state drive the skip decision."""
     fixture = _run(tmp_path)
     stored = _journal_state(fixture)[0]
     assert stored["operation"] == "resume_blocked_leaf"
@@ -954,21 +988,6 @@ def test_i_recorded_live_shape_replays_through_production_classification(
     assert state.slices[STAGE].status is SliceStatus.SKIPPED
 
 
-def test_i_compiled_host_path_is_an_explicit_skip_when_unavailable() -> None:
-    import shutil
-
-    binary = Path(__file__).resolve().parents[2] / "target" / "debug" / "exomonad"
-    if shutil.which("tmux") is None or not binary.is_file():
-        pytest.skip(
-            "compiled host/tmux is unavailable here; the Python controller path is "
-            "covered and the compiled launch path is NOT CLAIMED"
-        )
-    pytest.skip(
-        "compiled skip coverage is provided by tests/e2e/blocked-resume-host, "
-        "not this unit file"
-    )
-
-
 def test_j_skip_never_edits_the_snapshot_digest_or_the_child_checkpoint(
     tmp_path: Path,
 ) -> None:
@@ -986,6 +1005,229 @@ def test_j_skip_never_edits_the_snapshot_digest_or_the_child_checkpoint(
     assert (
         fixture.project / ".exo" / "tl-loop" / "plan.snapshot.sha256"
     ).read_bytes() == digest_bytes
+
+
+# ---------------------------------------------------------------------------
+# Chainlink issue semantics around a skipped stage
+
+_POST_MERGE_EVIDENCE = {
+    "repository": "https://forge.example.com/org/repo.git",
+    "parent_branch": "main",
+    "head_sha": "head-next",
+    "merge_journal_id": "merge-next",
+    "lane_epoch": "1",
+    "parent_commit_sha": "parent-next",
+}
+
+
+def _with_post_merge(
+    store: RunStore,
+    state: RunState,
+    slice_id: str,
+    *,
+    status: SliceStatus,
+    issue_id: int | None,
+    pr_number: int | None,
+    phase: PostMergePhase,
+) -> RunState:
+    """Persist one slice carrying a post-merge boundary for a boundary test."""
+    current = state.slices[slice_id]
+    evidence = {
+        **_POST_MERGE_EVIDENCE,
+        "child_id": slice_id,
+        **({"pr_number": str(pr_number)} if pr_number is not None else {}),
+    }
+    updated = replace(
+        current,
+        status=status,
+        chainlink_issue_id=issue_id,
+        pr_number=pr_number,
+        base_ref="main",
+        post_merge=PostMergeState(phase, evidence),
+    )
+    return store.checkpoint(
+        cast(Any, state.recursive_fsm),
+        {**state.slices, slice_id: updated},
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+
+def _advance_issue_close_twice(
+    fixture: _Fixture,
+    state: RunState,
+    *,
+    slice_id: str,
+    pr_number: int,
+    issue_id: int,
+) -> tuple[RunState, IssueCloseTransport]:
+    transport = IssueCloseTransport(issue_id)
+    effects = EffectClient(transport)
+    pending = _advance_post_merge_boundary(
+        state,
+        slice_id,
+        pr_number,
+        fixture.config,
+        effects,
+        [],
+        fixture.parent_store,
+    )
+    confirmed = _advance_post_merge_boundary(
+        pending,
+        slice_id,
+        pr_number,
+        fixture.config,
+        effects,
+        [],
+        fixture.parent_store,
+    )
+    return confirmed, transport
+
+
+def test_k_a_skip_does_not_close_the_skipped_stages_linked_issue(
+    tmp_path: Path,
+) -> None:
+    fixture = _run(tmp_path, linked_issues=True)
+    _answer_skip(fixture, policy=SkipDependencyPolicy.PROCEED)
+
+    state = _skipped(fixture)[1]
+
+    assert state.slices[STAGE].status is SliceStatus.SKIPPED
+    assert state.slices[STAGE].chainlink_issue_id == STAGE_ISSUE
+    assert state.slices[STAGE].post_merge is None
+    transport = IssueCloseTransport(STAGE_ISSUE)
+    effects = EffectClient(transport)
+    _advance_post_merge_boundary(
+        state,
+        STAGE,
+        0,
+        fixture.config,
+        effects,
+        [],
+        fixture.parent_store,
+    )
+    assert transport.calls == []
+    assert fixture.parent_store.load().slices[STAGE].status is SliceStatus.SKIPPED
+
+
+def test_k_a_skipped_stage_never_runs_the_post_merge_issue_close_path(
+    tmp_path: Path,
+) -> None:
+    """A skipped stage carries no post-merge boundary and derives no recovery."""
+    from tl_loop.loop.reconcile import Quiescent, _derive_slice_action
+
+    fixture = _run(tmp_path, linked_issues=True)
+    _answer_skip(fixture, policy=SkipDependencyPolicy.PROCEED)
+    state = _skipped(fixture)[1]
+
+    current = state.slices[STAGE]
+    assert current.status is SliceStatus.SKIPPED
+    assert current.post_merge is None
+    assert isinstance(_derive_slice_action(current), Quiescent)
+    transport = IssueCloseTransport(STAGE_ISSUE)
+    effects = EffectClient(transport)
+    unchanged = _advance_post_merge_boundary(
+        state,
+        STAGE,
+        0,
+        fixture.config,
+        effects,
+        [],
+        fixture.parent_store,
+    )
+    assert unchanged.slices[STAGE] == current
+    assert transport.calls == []
+    assert not fixture.parent_store.load().slices[STAGE].post_merge
+
+
+def test_k_the_next_stages_linked_issue_closes_independently(
+    tmp_path: Path,
+) -> None:
+    fixture = _run(tmp_path, linked_issues=True)
+    _answer_skip(fixture, policy=SkipDependencyPolicy.PROCEED)
+    state = _skipped(fixture)[1]
+    state = _with_post_merge(
+        fixture.parent_store,
+        state,
+        NEXT,
+        status=SliceStatus.MERGED,
+        issue_id=NEXT_ISSUE,
+        pr_number=77,
+        phase=PostMergePhase.PARENT_BRANCH_SYNCED,
+    )
+
+    confirmed, transport = _advance_issue_close_twice(
+        fixture, state, slice_id=NEXT, pr_number=77, issue_id=NEXT_ISSUE
+    )
+
+    receipt = confirmed.slices[NEXT].post_merge
+    assert receipt is not None
+    assert receipt.phase is PostMergePhase.ISSUE_CLOSE_CONFIRMED
+    close_calls = [
+        arguments for name, arguments in transport.calls if name == "chainlink_issue_close"
+    ]
+    assert [arguments["issue_id"] for arguments in close_calls] == [NEXT_ISSUE]
+    assert confirmed.slices[STAGE].chainlink_issue_id == STAGE_ISSUE
+    assert confirmed.slices[STAGE].status is SliceStatus.SKIPPED
+
+
+def test_k_the_live_controller_does_not_close_the_skipped_issue(
+    tmp_path: Path,
+) -> None:
+    """The shipped loop path never issues a close for the skipped stage."""
+    fixture = _run(tmp_path, linked_issues=True)
+    _answer_skip(fixture, policy=SkipDependencyPolicy.PROCEED)
+
+    run_tl_loop(
+        "parent",
+        fixture.plan,
+        SyntheticQueue([]),
+        ReadOnlyEffectClient(
+            EffectClient(TransportClient(socket_path=tmp_path / "unused.sock"))
+        ),
+        config=replace(
+            fixture.config,
+            active=False,
+            session_mode="continue",
+            keep_alive_on_waiting=False,
+        ),
+        root_dir=fixture.parent_store.root_dir,
+        budgets=BudgetLedger(0, 0),
+    )
+
+    state = fixture.parent_store.load()
+    assert state.slices[STAGE].status is SliceStatus.SKIPPED
+    assert state.slices[STAGE].chainlink_issue_id == STAGE_ISSUE
+    assert _outcomes(fixture) == ["operator_skipped"]
+    assert state.current_order == 2
+
+
+def test_k_an_unlinked_stage_is_unaffected_by_another_stages_skip(
+    tmp_path: Path,
+) -> None:
+    fixture = _run(tmp_path, sibling=True)
+    _answer_skip(fixture, policy=SkipDependencyPolicy.PROCEED)
+
+    state = _skipped(fixture)[1]
+
+    assert state.slices[STAGE].chainlink_issue_id is None
+    assert state.slices[SIBLING].chainlink_issue_id is None
+    assert state.slices[SIBLING].status is SliceStatus.PENDING
+    transport = IssueCloseTransport(0)
+    effects = EffectClient(transport)
+    _advance_post_merge_boundary(
+        state,
+        STAGE,
+        0,
+        fixture.config,
+        effects,
+        [],
+        fixture.parent_store,
+    )
+    assert transport.calls == []
 
 
 def _set_invocation(fixture: _Fixture, **updates: object) -> None:

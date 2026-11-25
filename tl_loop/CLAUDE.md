@@ -1144,6 +1144,11 @@ unnamed dependent becomes `BLOCKED` with `blocked_by` and a diagnostic. An
 answer that widens the declaration, records no policy, names no dependent under
 `require-named`, or names a non-dependent is refused and consumes nothing; two
 approvals that would both act are conflicting evidence and also consume nothing.
+A skip is not a merge, so the post-merge issue-close path never runs for a
+`SKIPPED` stage: its linked Chainlink issue stays open for a fresh plan, a
+following stage's own issue proceeds and closes independently, and an unlinked
+stage is unaffected. The compiled replay is
+`just e2e-blocked-resume-host skip-held-stage`.
 `plan revise` supports superseding such a stage with a new future node; the old
 declaration keeps its identity, branch and dependency history and only the new
 node is added (`spec.superseded_nodes`).

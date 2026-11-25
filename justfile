@@ -682,6 +682,9 @@ check-e2e-blocked-resume-host:
     {{py}} -m py_compile tests/e2e/blocked-resume-host/run.py
     test -s tests/e2e/blocked-resume-host/e2e-test.md
     test -s tests/e2e/blocked-resume-host/testrunner.md
+    grep -q '"skip-held-stage": case_skip_held_stage' tests/e2e/blocked-resume-host/run.py
+    grep -q 'skip-held-stage' tests/e2e/blocked-resume-host/e2e-test.md
+    grep -q 'skip-held-stage' docs/guides/e2e-acceptance.md
 
 e2e-pre-pr-recovery-fsm:
     nix develop --command cargo build -p exomonad

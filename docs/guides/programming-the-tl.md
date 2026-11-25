@@ -253,9 +253,9 @@ future node that stands in for it:
 
 ```json
 {
-  "name": "substitution-model-kani-stage-repair",
+  "name": "held-stage-repair",
   "order": 4,
-  "supersedes": "substitution-model-kani-stage",
+  "supersedes": "held-stage",
   "chainlink_issue_id": null,
   "plan": { "leaves": [] }
 }
@@ -1519,7 +1519,7 @@ python3 ~/.exo/tl_loop.pyz status --project-root . --run-id root
 python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name <gate> --approve
 python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id root --name <gate> --reject
 # A gate stored by a direct child scope can be answered explicitly as well.
-python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id kani --parent-run-id root \
+python3 ~/.exo/tl_loop.pyz gate   --project-root . --run-id held-stage --parent-run-id root \
   --name <child-gate> --approve
 ```
 

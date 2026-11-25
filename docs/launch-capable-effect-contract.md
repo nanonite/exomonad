@@ -133,6 +133,13 @@ records no policy is refused and consumes nothing. Two approvals on the same
 effect that would both act (retry together with abandon or skip) are conflicting
 evidence and also consume nothing.
 
+A skipped stage is not merged, so no post-merge recovery runs for it. The
+controller never executes the post-merge issue-close path for a `SKIPPED` stage:
+the skipped stage's linked Chainlink issue stays open for a fresh plan, a later
+stage's own linked issue proceeds and closes independently, and an unlinked stage
+is unaffected. The compiled replay is `skip-held-stage` in
+`tests/e2e/blocked-resume-host/`.
+
 Resolutions are append-only records (`kind: launch_resolution`) linked to the
 original entry by `resolves_key`. The original `unknown` entry keeps its bytes
 and status, and the journal's `pending_entries()` stops reporting it once the
@@ -206,3 +213,4 @@ test in `tl_loop/tests/test_driver.py` fails if the two sets drift. See
 | I. abandon, retry, reject and the non-overridable negatives | `test_held_launch_effect_resolution.py::test_a_retry_gate_appends_one_abandon_and_one_authorized_retry`, `...::test_abandon_without_retry_stays_parked_and_launches_nothing`, `...::test_a_rejected_retry_gate_keeps_the_slice_parked`, `...::test_negative_owner_proofs_stay_non_overridable`, `...::test_host_evidence_that_is_present_or_conflicting_stays_non_overridable` |
 | J. restart and concurrent ticks resolve once | `...::test_repeated_continue_and_repeated_resolution_are_idempotent`, `...::test_concurrent_ticks_resolve_exactly_once` |
 | K. compiled host, real tmux, slow host over 10s, SIGKILL at both spawn boundaries, real `init --continue`, long-running tick, terminal-failure hold | `just e2e-blocked-resume-host` (`tests/e2e/blocked-resume-host/`: `slow-adoption`, `init-continue-before-window`, `sigkill-after-window`, `terminal-failure-hold`) |
+| L. compiled skip: generic held stage, real `-skip` gate with reason and dependency policy, next stage released, linked issue stays open, repeated `init --continue` adds nothing | `just e2e-blocked-resume-host skip-held-stage`, `tl_loop/tests/test_parked_stage_skip.py::test_k_*` |

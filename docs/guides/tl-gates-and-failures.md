@@ -70,6 +70,16 @@ named while every unnamed dependent holds. A skip never runs a dependent
 silently, never relaunches the skipped stage, and is decided exactly once across
 restarts and concurrent ticks.
 
+The skip is not a merge and grants no post-merge work. The controller never runs
+the post-merge issue-close path for a `SKIPPED` stage, so the skipped stage's
+linked Chainlink issue (if any) stays open and remains available for a fresh
+plan. A following stage's own linked issue proceeds and closes independently
+when that stage merges, and an unlinked stage is unaffected. The compiled
+acceptance is the `skip-held-stage` case in
+`tests/e2e/blocked-resume-host/`, which also proves that a real
+`exomonad init --continue` restart adds no launch, no owner window, and no
+second skip record.
+
 An approved recovery whose child controller has exited relaunches that child
 with a fresh invocation identity, because relaunching against the recorded one
 would deliver to the pane that already exited. Branch, worktree, controller

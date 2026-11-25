@@ -28,6 +28,18 @@ launch reconciler. It prints one PASS line per case:
   diagnostic naming the intent and the failure; nothing is relaunched. The
   operator release path is documented in
   `docs/launch-capable-effect-contract.md`.
+- `skip-held-stage` — a generic ordered stage whose child journal holds one
+  `unknown` `resume_blocked_leaf` effect is followed by a second ordered stage.
+  The compiled host is killed at `blocked_resume_before_launch`, the production
+  classification parks the stage, and the real `tl_loop gate` CLI approves the
+  `-skip` gate with a reason and the `proceed` dependency policy. The run
+  asserts exactly one linked `operator_skipped` record, `SKIPPED` stage state,
+  the next stage released, no launch row, no owner window, and unchanged
+  original journal/ledger/child-checkpoint/snapshot bytes. The skipped stage's
+  linked Chainlink issue stays open; a repeated real `exomonad init --continue`
+  records at most the one terminal host refusal and adds nothing else. The
+  run-scoped `HOME` carries the working tree's TL controller archive, so a
+  newly accepted plan field is never validated by an operator's older install.
 
 A missing binary, WASM, or tmux is an explicit SKIP with its reason. The run
 owns its temporary repository, mock forge, Chainlink database, tmux server and

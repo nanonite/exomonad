@@ -45,7 +45,7 @@ historical byte, and add no duplicate after repeat init or a server-only
 restart. It prints `LITERAL-1..5` then `LITERAL-ALL PASS`. The digest excludes
 the assignment coordinates (ledger sequence, dispatch intent id, terminal
 invocation digest, worktree fingerprint), so those alone are rebound to the
-disposable ledger and worktree; the retained values name the read-only Beast
+disposable ledger and worktree; the retained values name a read-only operator
 filesystem. Set `E2E_STORED_PROOF_RETAINED` to point at another backup copy.
 
 `just e2e-dispatch-collision` runs the same Phase 0 build, fresh explicit WASM,
@@ -93,9 +93,18 @@ ledger by `dispatch_intent_id`; SIGKILLs the host before the worker window
 exists and after the window/routing record exists but before `agent.spawned`;
 drives the before-window recovery with a real `exomonad init --continue`; keeps
 a long-running reconciliation tick that holds on absent evidence and adopts on
-a later tick; and proves a host that records only a terminal `agent.spawn_failed`
-is held rather than relaunched. A missing binary, WASM, or tmux is an explicit
-SKIP with its reason.
+a later tick; proves a host that records only a terminal `agent.spawn_failed`
+is held rather than relaunched; and replays a generic held ordered stage through
+the skip path. That last case produces the held `unknown` entry with the
+compiled host, answers the real `-skip` gate through the shipped `tl_loop gate`
+CLI with a reason and dependency policy, and asserts one linked
+`operator_skipped` record, a `SKIPPED` stage, a released next stage, no launch
+row, no owner window, byte-identical original journal/ledger/checkpoint/
+snapshot content apart from the appended record, and a repeated
+`exomonad init --continue` that adds nothing. The skipped stage's linked
+Chainlink issue is left open for a fresh plan. The case is
+`skip-held-stage`. A missing binary, WASM, or tmux
+is an explicit SKIP with its reason.
 
 `just e2e-tl-loop-active` is intentionally non-interactive: it uses a bounded
 Python controller, a bare scratch remote, deterministic effect/review stubs,
