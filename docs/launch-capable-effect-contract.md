@@ -63,6 +63,20 @@ carry the same `run_id` as the authoritative ledger run.
 | more than one launch row, more than one refusal row, or both a launch and a refusal | - | `hold`; conflicting evidence never resolves |
 | launch row for a different owner, predecessor, invocation, branch, or intent | - | `hold`; a forged or stale intent is never adopted |
 
+### Transient init fences defer, never terminalize
+
+A host journal re-drive can run while `init --continue` is still reconciling
+its control plane. Two exact refusals are transient: `controller startup
+handoff is incomplete; run init --continue to reconcile before dispatch`, and
+`workspace control-plane shutdown is pending; run init --continue to reconcile
+before dispatch`. When a blocked-resume replay meets either one, the journal
+stays `pending`, no terminal `agent.spawn_failed` row is written, and the next
+recovery tick retries after init commits the handoff. The preconditions are
+also checked before the replay reads the owner or renders runtime config, so a
+deferral cannot change the owner worktree fingerprint its next attempt
+verifies. Every other launch error remains terminal; the deferral never
+authorizes a second launch.
+
 Holding records `launch_reconciliation` on the journal entry (outcome, intent,
 diagnostic, evidence labels, evaluation count, timestamp) through
 `EffectJournal.resolve_by_key`. Journals and ledger segments are never
@@ -121,6 +135,37 @@ evidence, a wrong owner/predecessor/worktree, a forged intent, an unapproved or
 foreign gate, and every non-launch effect. Those keep the distinct fail-closed
 diagnostic and never reach a launch.
 
+## Deliberate hold: a terminal failure row is not a launch proof
+
+A restarted host that re-drives a pending `blocked_resume_journal.json` and
+fails before any launch records exactly one terminal `agent.spawn_failed` row
+for the intent and no `agent.spawned` row. The controller must keep that
+journal entry `unknown`: the failure row proves the host did not launch, but it
+does not prove the owner is free of a successor, and absence of a launch row
+never authorizes a relaunch. The reconciliation diagnostic names the terminal
+failure and the intent.
+
+The operator release path is explicit, never automatic:
+
+1. Read the owner's durable records (`.exo/agents/<owner>/invocation.json`,
+   `routing.json`, and `blocked_resume_journal.json`) and the ledger
+   `agent.spawn_failed` row. Confirm no live successor exists.
+2. Repair the cause named by the failure row (for example a dirty worktree
+   preflight refusal, an unavailable PR context, or a stale role route).
+3. Re-run the approved blocked-leaf resume through the ordinary controller
+   path with a fresh, currently accepted route and gate. That is one new
+   authorized dispatch; the held journal entry is never rewritten into a
+   launch, and the reconciler never issues the request itself.
+4. If the host recorded no launch proof and no successor, the #1595
+   `tl-held-launch-effect-<child>-<intent-prefix>-abandon` and `...-retry`
+   gates are the supported in-controller answer: `abandon` leaves the slice
+   parked with a linked resolution, and `retry` appends the abandonment and
+   then lets the ordinary approved path make exactly one fresh launch.
+
+The compiled-host acceptance for this hold is
+`tests/e2e/blocked-resume-host/run.py terminal-failure-hold`
+(`just e2e-blocked-resume-host terminal-failure-hold`).
+
 ## Shared prelaunch refusal definition
 
 The refusal error set is defined once in
@@ -144,3 +189,4 @@ test in `tl_loop/tests/test_driver.py` fails if the two sets drift. See
 | H. held unknown child effect parks, root does not exit | `tl_loop/tests/test_held_launch_effect_resolution.py::test_a_held_unknown_effect_parks_the_child_without_failing_the_root` |
 | I. abandon, retry, reject and the non-overridable negatives | `test_held_launch_effect_resolution.py::test_a_retry_gate_appends_one_abandon_and_one_authorized_retry`, `...::test_abandon_without_retry_stays_parked_and_launches_nothing`, `...::test_a_rejected_retry_gate_keeps_the_slice_parked`, `...::test_negative_owner_proofs_stay_non_overridable`, `...::test_host_evidence_that_is_present_or_conflicting_stays_non_overridable` |
 | J. restart and concurrent ticks resolve once | `...::test_repeated_continue_and_repeated_resolution_are_idempotent`, `...::test_concurrent_ticks_resolve_exactly_once` |
+| K. compiled host, real tmux, slow host over 10s, SIGKILL at both spawn boundaries, real `init --continue`, long-running tick, terminal-failure hold | `just e2e-blocked-resume-host` (`tests/e2e/blocked-resume-host/`: `slow-adoption`, `init-continue-before-window`, `sigkill-after-window`, `terminal-failure-hold`) |

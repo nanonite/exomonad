@@ -25,6 +25,7 @@ pub use controller_lifecycle::{
     capture_controller_ownership, capture_controller_pane_target,
     clear_pending_controller_ownership, controller_ownership_is_live,
     controller_ownership_is_live_for_startup, controller_pane_target_is_live,
+    dispatch_precondition_is_transient, dispatch_preconditions_ready,
     pending_startup_target_if_current, persist_controller_ownership,
     persist_pending_controller_ownership, read_controller_ownership,
     read_controller_target_for_routing, reconcile_controller_binding,

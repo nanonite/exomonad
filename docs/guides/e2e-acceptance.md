@@ -85,6 +85,18 @@ brings up its own disposable Forgejo, and prints one PASS/FAIL line per T-item.
 It owns everything it creates and fails if anything outlives the run — see
 § Real-server integration tests below.
 
+`just e2e-blocked-resume-host` runs `tests/e2e/blocked-resume-host/` against the
+compiled `exomonad serve`, a run-scoped tmux server and the production
+controller journal/reconciler. It holds a real host handler past the old 10s
+client deadline and proves the controller adopts exactly one launch from the
+ledger by `dispatch_intent_id`; SIGKILLs the host before the worker window
+exists and after the window/routing record exists but before `agent.spawned`;
+drives the before-window recovery with a real `exomonad init --continue`; keeps
+a long-running reconciliation tick that holds on absent evidence and adopts on
+a later tick; and proves a host that records only a terminal `agent.spawn_failed`
+is held rather than relaunched. A missing binary, WASM, or tmux is an explicit
+SKIP with its reason.
+
 `just e2e-tl-loop-active` is intentionally non-interactive: it uses a bounded
 Python controller, a bare scratch remote, deterministic effect/review stubs,
 and the exact default TL-window command without creating an ExoMonad session.

@@ -32,6 +32,23 @@ const WORKSPACE_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 const WORKSPACE_SHUTDOWN_POLL: Duration = Duration::from_millis(50);
 const ORDERED_CONTROLLER_REGISTRATION_DECISION: &str =
     "register an ordered sub-TL controller invocation";
+/// The exact transient refusals a dispatch sees while `init --continue` is
+/// still reconciling the control plane. A blocked-resume journal re-drive that
+/// hits one of these must stay pending and retry after init commits; treating
+/// it as a terminal launch failure would strand a resume the same init is
+/// about to release.
+pub const CONTROLLER_STARTUP_HANDOFF_INCOMPLETE: &str =
+    "controller startup handoff is incomplete; run init --continue to reconcile before dispatch";
+pub const WORKSPACE_SHUTDOWN_PENDING: &str =
+    "workspace control-plane shutdown is pending; run init --continue to reconcile before dispatch";
+
+/// Whether a dispatch refusal is the transient control-plane reconciliation
+/// precondition rather than a durable launch failure. Matched by the exact
+/// messages this module emits, so a new refusal is never retried by accident.
+pub fn dispatch_precondition_is_transient(message: &str) -> bool {
+    message.contains(CONTROLLER_STARTUP_HANDOFF_INCOMPLETE)
+        || message.contains(WORKSPACE_SHUTDOWN_PENDING)
+}
 
 /// Exact root controller pane ownership captured by `init` after startup.
 /// Numeric tmux IDs are accepted only with the server, process, run and epoch
@@ -852,19 +869,30 @@ where
         decision: &str,
     ) -> Result<crate::services::worktree_lifecycle::LifecycleGuard> {
         let guard = self.acquire_worktree_lifecycle(decision).await?;
-        let path = workspace_shutdown_path(self.project_dir());
-        if path.exists()
-            && !completed_shutdown_allows_controller_registration(&path, decision).await?
-        {
-            anyhow::bail!("workspace control-plane shutdown is pending; run init --continue to reconcile before dispatch");
-        }
-        if controller_startup_handoff_pending(self.project_dir()).await?
-            && decision != ORDERED_CONTROLLER_REGISTRATION_DECISION
-        {
-            anyhow::bail!("controller startup handoff is incomplete; run init --continue to reconcile before dispatch");
-        }
+        ensure_dispatch_preconditions(self.project_dir(), decision).await?;
         Ok(guard)
     }
+}
+
+/// Read-only check for the transient control-plane preconditions that fence
+/// ordinary dispatch while `init --continue` reconciles. Callers that need to
+/// avoid a pre-launch side effect (the blocked-resume replay) use this before
+/// rendering runtime config or touching the owner worktree.
+pub async fn dispatch_preconditions_ready(project_dir: &Path) -> Result<()> {
+    ensure_dispatch_preconditions(project_dir, "blocked resume readiness").await
+}
+
+async fn ensure_dispatch_preconditions(project_dir: &Path, decision: &str) -> Result<()> {
+    let path = workspace_shutdown_path(project_dir);
+    if path.exists() && !completed_shutdown_allows_controller_registration(&path, decision).await? {
+        anyhow::bail!("{WORKSPACE_SHUTDOWN_PENDING}");
+    }
+    if controller_startup_handoff_pending(project_dir).await?
+        && decision != ORDERED_CONTROLLER_REGISTRATION_DECISION
+    {
+        anyhow::bail!("{CONTROLLER_STARTUP_HANDOFF_INCOMPLETE}");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1404,6 +1432,26 @@ mod tests {
     use exomonad_test_support::TmuxTestServer;
     use std::process::{Command, Stdio};
     use std::sync::Arc;
+
+    #[test]
+    fn transient_control_plane_preconditions_are_classified_exactly() {
+        assert!(dispatch_precondition_is_transient(
+            CONTROLLER_STARTUP_HANDOFF_INCOMPLETE
+        ));
+        assert!(dispatch_precondition_is_transient(
+            WORKSPACE_SHUTDOWN_PENDING
+        ));
+        assert!(dispatch_precondition_is_transient(&format!(
+            "[agent_error] {}",
+            CONTROLLER_STARTUP_HANDOFF_INCOMPLETE
+        )));
+        assert!(!dispatch_precondition_is_transient(
+            "worktree check failed: uncommitted or untracked files are present"
+        ));
+        assert!(!dispatch_precondition_is_transient(
+            "blocked owner invocation is still live; refusing duplicate resume"
+        ));
+    }
 
     /// A predecessor controller epoch must never authorize the current
     /// controller's run, pane, or process identity.

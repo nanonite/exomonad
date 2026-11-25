@@ -4049,6 +4049,14 @@ impl<
         ctx: &crate::effects::EffectContext,
     ) -> EffectResult<SpawnLeafSubtreeResponse> {
         validate_blocked_resume_request(req)?;
+        // Check the transient init fences before reading the owner or rendering
+        // runtime config. A replay that lands while init is still reconciling
+        // must not dirty the owner worktree before it is deferred; otherwise
+        // the next tick would refuse its own config side effect as a changed
+        // worktree fingerprint.
+        crate::services::agent_control::dispatch_preconditions_ready(self.ctx.project_dir())
+            .await
+            .map_err(|error| EffectError::custom("agent_error", error.to_string()))?;
         let _resume_guard = resume_reconciliation_lock().lock().await;
         ensure_chainlink_issue_open(self.ctx.project_dir(), req.blocked_issue_id)
             .await
@@ -4438,6 +4446,11 @@ impl<
                 "blocked resume target was not live at readiness confirmation",
             ));
         }
+        // Inert unless a compiled acceptance opts in. The successor window and
+        // its routing record exist here, but the launch row has not been
+        // written yet, so a kill at this exact boundary proves that a restart
+        // re-drives the pending journal without creating a duplicate owner.
+        crate::e2e_interrupt::interrupt_at("blocked_resume_window_before_launch_row", &intent_id);
         let mut agent_info = leaf_subtree_result_to_proto(owner.slug.as_str(), &result)?;
         agent_info.alive = true;
         agent_info.is_alive = true;
@@ -4503,6 +4516,35 @@ impl<
                     );
                 }
                 Ok(response)
+            }
+            Err(error)
+                if crate::services::agent_control::dispatch_precondition_is_transient(
+                    &error.to_string(),
+                ) =>
+            {
+                // init --continue is still reconciling the control plane. A
+                // dispatch made by the durable journal re-drive is refused
+                // until that handoff commits; this is a transient startup
+                // ordering, not a launch failure. Leave the journal pending so
+                // the next recovery tick re-drives it after init releases the
+                // fence. No terminal row is written and nothing is relaunched
+                // by this decision.
+                journal.updated_at = unix_now_secs();
+                if let Err(write_error) = write_blocked_resume_journal(owner_dir, &journal).await {
+                    warn!(
+                        intent_id = %intent_id,
+                        owner = %owner.agent_name,
+                        %write_error,
+                        "blocked resume deferral journal could not be refreshed; it stays pending for the next tick"
+                    );
+                }
+                info!(
+                    intent_id = %intent_id,
+                    owner = %owner.agent_name,
+                    %error,
+                    "blocked resume deferred until init reconciles the controller startup handoff"
+                );
+                Err(error)
             }
             Err(error) => {
                 journal.phase = BLOCKED_RESUME_PHASE_FAILED.to_string();
@@ -4747,6 +4789,30 @@ impl<
                             "recovered blocked resume launched but its journal could not be completed"
                         );
                     }
+                }
+                Err(error)
+                    if crate::services::agent_control::dispatch_precondition_is_transient(
+                        &error.to_string(),
+                    ) =>
+                {
+                    // The durable journal is still valid; init is reconciling
+                    // its startup handoff. Keep it pending so a later tick can
+                    // re-drive it after the fence releases.
+                    journal.updated_at = unix_now_secs();
+                    if let Err(write_error) =
+                        write_blocked_resume_journal(&owner_dir, &journal).await
+                    {
+                        warn!(
+                            intent_id = %journal.intent_id,
+                            %write_error,
+                            "recovered blocked resume deferral journal could not be refreshed; it stays pending"
+                        );
+                    }
+                    info!(
+                        intent_id = %journal.intent_id,
+                        %error,
+                        "recovered blocked resume deferred until init reconciles the controller startup handoff"
+                    );
                 }
                 Err(error) => {
                     journal.phase = BLOCKED_RESUME_PHASE_FAILED.to_string();
@@ -10055,6 +10121,119 @@ mod tests {
             .await
             .expect("recovered journal remains readable");
         assert_eq!(completed.phase, BLOCKED_RESUME_PHASE_LAUNCHED);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn blocked_resume_recovery_defers_a_controller_startup_handoff_refusal() {
+        let (fixture, request, intent) = blocked_resume_fixture().await;
+        let identity: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(fixture.owner_dir.join("identity.json")).expect("read fixture identity"),
+        )
+        .expect("identity is JSON");
+        let journal = BlockedResumeJournal {
+            schema_version: BLOCKED_RESUME_JOURNAL_SCHEMA,
+            intent_id: intent.clone(),
+            transition_id: configured_route_transition_id(
+                &intent,
+                ServiceAgentType::OpenCode,
+                Some("deepseek-v4.1-flash"),
+                Some("high"),
+            ),
+            owner_agent: identity["agent_name"]
+                .as_str()
+                .expect("identity agent name")
+                .to_string(),
+            caller_agent: fixture.context.agent_name.to_string(),
+            birth_branch: fixture.context.birth_branch.to_string(),
+            working_dir: fixture.context.working_dir.display().to_string(),
+            phase: BLOCKED_RESUME_PHASE_PENDING.to_string(),
+            owner_pid: 0,
+            updated_at: 0,
+            request: BlockedResumeJournalRequest::from_request(&request),
+        };
+        write_blocked_resume_journal(&fixture.owner_dir, &journal)
+            .await
+            .expect("write the crashed server's journal");
+        // init --continue persists this fence before it reconciles the
+        // controller. A re-drive that lands inside that window must not
+        // terminalize the resume.
+        let fence = fixture
+            .project
+            .join(crate::services::agent_control::CONTROLLER_STARTUP_INTENT_RELATIVE_PATH);
+        std::fs::create_dir_all(fence.parent().expect("fence parent")).expect("create fence dir");
+        std::fs::write(
+            &fence,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "controller_epoch": "epoch-startup",
+                "previous_controller_epoch": null,
+                "tmux_session": "workspace",
+                "tmux_server_pid": 1,
+                "tmux_server_start_ticks": 1,
+                "continue_mode": false,
+                "root_run_id": null,
+                "target": null,
+                "phase": "requested"
+            }))
+            .expect("serialize fence"),
+        )
+        .expect("write startup fence");
+
+        let deferred = fixture
+            .handler
+            .reconcile_blocked_resume_journals()
+            .await
+            .expect("the recovery tick defers instead of failing");
+        assert_eq!(deferred, 1, "the pending journal is still evaluated");
+        let pending = read_blocked_resume_journal(&fixture.owner_dir)
+            .await
+            .expect("the deferred journal remains readable");
+        assert_eq!(
+            pending.phase, BLOCKED_RESUME_PHASE_PENDING,
+            "a startup-handoff refusal must leave the journal pending"
+        );
+        assert_eq!(
+            blocked_resume_rows(&fixture.project, "agent.spawn_failed", &intent),
+            0,
+            "a transient startup refusal must not write a terminal row"
+        );
+        assert_eq!(
+            blocked_resume_rows(&fixture.project, "agent.spawned", &intent),
+            0,
+            "a transient startup refusal must not launch"
+        );
+
+        std::fs::remove_file(&fence).expect("remove the startup fence");
+        let recovered = fixture
+            .handler
+            .reconcile_blocked_resume_journals()
+            .await
+            .expect("the tick after startup handoff launches");
+        assert_eq!(recovered, 1, "the pending journal is recovered");
+        let after_handoff = read_blocked_resume_journal(&fixture.owner_dir)
+            .await
+            .expect("journal after handoff");
+        let failures: Vec<_> = ledger_rows(&fixture.project)
+            .into_iter()
+            .filter(|row| {
+                row["event_type"] == "agent.spawn_failed"
+                    && row["data"]["intent_id"].as_str() == Some(intent.as_str())
+            })
+            .collect();
+        assert_eq!(
+            blocked_resume_rows(&fixture.project, "agent.spawned", &intent),
+            1,
+            "the deferred resume launches exactly once after the handoff: phase={:?} failures={failures:?}",
+            after_handoff.phase
+        );
+        assert_eq!(
+            read_blocked_resume_journal(&fixture.owner_dir)
+                .await
+                .expect("recovered journal")
+                .phase,
+            BLOCKED_RESUME_PHASE_LAUNCHED
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

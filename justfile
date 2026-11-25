@@ -666,6 +666,23 @@ check-e2e-task-blocked-human-gate:
     bash -n tests/e2e/task-blocked-human-gate/run.sh
     {{py}} -m py_compile tests/e2e/task-blocked-human-gate/run.py
 
+# A real `exomonad serve`, a run-scoped tmux server, and the production
+# controller journal/reconciler. Covers the >10s slow host adoption, SIGKILL
+# before/after the worker window, real `exomonad init --continue` recovery, a
+# held terminal-failure row, and a long-running reconciliation tick that holds
+# then adopts. A missing binary, WASM, or tmux is an explicit SKIP.
+# Run the compiled-host blocked-resume acceptance.
+e2e-blocked-resume-host *cases:
+    nix develop --command cargo build -p exomonad
+    just wasm devswarm
+    ./tests/e2e/blocked-resume-host/run.sh {{cases}}
+
+check-e2e-blocked-resume-host:
+    bash -n tests/e2e/blocked-resume-host/run.sh
+    {{py}} -m py_compile tests/e2e/blocked-resume-host/run.py
+    test -s tests/e2e/blocked-resume-host/e2e-test.md
+    test -s tests/e2e/blocked-resume-host/testrunner.md
+
 e2e-pre-pr-recovery-fsm:
     nix develop --command cargo build -p exomonad
     just wasm devswarm
