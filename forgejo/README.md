@@ -66,8 +66,7 @@ A real-server E2E test brings up its **own** Forgejo from the shared template at
 running instance: it declares no `container_name` and no fixed host port, so
 each run gets its own container, its own project-scoped volume, and an ephemeral
 port that the harness discovers with `docker compose port`. See
-`just e2e-recreated-leaf-recovery` and CLAUDE.md § "Real-server integration
-tests" for the full pattern.
+`just e2e-recreated-leaf-recovery` and docs/guides/real-server-tests.md for the full pattern.
 
 The practical difference from this stack:
 
