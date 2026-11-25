@@ -80,6 +80,32 @@ acceptance is the `skip-held-stage` case in
 `exomonad init --continue` restart adds no launch, no owner window, and no
 second skip record.
 
+#### Verified end states after a skip
+
+`tl_loop/tests/test_skip_policy_end_to_end.py` drives the same fixture through
+the production `run_tl_loop` path. Plan A -> B -> C with a sibling D in A's
+stage (so D does not depend on A):
+
+- `proceed`: B, C and D all run to completion, and the run reaches `TLDone`.
+  A skip under `proceed` withholds no dependent.
+- `block`: B and C stay `BLOCKED` with `blocked_by` naming the skipped stage
+  and a `park_audit` carrying the skip gate and the policy reason; D still
+  completes. The run stays held in `TLRunning` at that stage and is not
+  terminal. A held dependent is never dispatched or merged by the ordered
+  stage path.
+- `require-named` naming B: B and D complete, C stays `BLOCKED` with the
+  "unnamed in the skip decision" reason, and the run advances to C's stage and
+  stays held in `TLRunning`. No unnamed dependent runs silently.
+
+A fresh run (new run id and new `plan.json`) may bind both the still-open issue
+the older run's skipped stage referenced and a freshly created sub-issue: plan
+admission has no cross-run issue-state check, the new run's slices carry both
+bindings, their dispatch is admitted, and the ordinary post-merge close path
+closes the older issue under the new run while the older run's state, journal
+and checkpoint bytes stay unchanged. Admission also accepts an issue the
+operator already closed; the close path then observes `closed` and records
+`already_closed` without issuing a second close.
+
 An approved recovery whose child controller has exited relaunches that child
 with a fresh invocation identity, because relaunching against the recorded one
 would deliver to the pane that already exited. Branch, worktree, controller

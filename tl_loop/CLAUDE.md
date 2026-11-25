@@ -1144,6 +1144,21 @@ unnamed dependent becomes `BLOCKED` with `blocked_by` and a diagnostic. An
 answer that widens the declaration, records no policy, names no dependent under
 `require-named`, or names a non-dependent is refused and consumes nothing; two
 approvals that would both act are conflicting evidence and also consume nothing.
+
+Verified end states through `run_tl_loop` (`test_skip_policy_end_to_end.py`,
+plan A -> B -> C plus a sibling D in A's stage): `proceed` completes B, C and D
+and reaches `TLDone`; `block` holds B and C `BLOCKED` (the skip gate name and policy
+reason in `park_audit`) while D completes, and the run stays held in
+`TLRunning` at that stage rather than turning terminal; `require-named` naming B
+completes B and D, holds C with the unnamed diagnostic, and advances to C's
+stage while staying `TLRunning`. The ordered stage path does not dispatch a
+`BLOCKED` child, matching leaf dispatch, so a persisted block/require-named
+answer cannot be overridden by the next tick. A fresh run may bind the
+still-open issue the older run's skipped stage referenced and a fresh sub-issue:
+admission has no cross-run issue-state check, dispatch and the ordinary
+post-merge close path work for the new run, and the older run's files are
+unchanged. An already-closed bound issue is accepted at admission; the close
+path observes `closed` and records `already_closed` without a second close.
 A skip is not a merge, so the post-merge issue-close path never runs for a
 `SKIPPED` stage: its linked Chainlink issue stays open for a fresh plan, a
 following stage's own issue proceeds and closes independently, and an unlinked

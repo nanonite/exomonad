@@ -22999,6 +22999,11 @@ def _run_sub_tls(
             for task, current in zip(stage_tasks, stage_states)
             if current is not None
             and current.status is not SliceStatus.MERGED
+            # A BLOCKED child is a held decision, not work to launch. Leaf
+            # dispatch already refuses every non-PENDING slice; the ordered
+            # stage path must hold it too, or a skip policy's block/require-named
+            # answer would be overridden by the same tick that recorded it.
+            and current.status is not SliceStatus.BLOCKED
             and current.status not in {SliceStatus.IN_REVIEW, SliceStatus.REPAIRING}
             and not (
                 current.status is SliceStatus.PARKED

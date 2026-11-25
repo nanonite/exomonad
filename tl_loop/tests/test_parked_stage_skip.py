@@ -51,7 +51,7 @@ from tl_loop.loop.driver import (
 )
 from tl_loop.loop.journal import EffectJournal
 from tl_loop.loop.launch_resolution import HeldLaunchEffect, classify_held_launch_effect
-from tl_loop.ordered import IntegrationLifecycle
+from tl_loop.ordered import IntegrationContract, IntegrationLifecycle
 from tl_loop.state.schema import (
     BudgetLedger,
     GateStatus,
@@ -249,6 +249,7 @@ def _stage(
     policy: SkipDependencyPolicy,
     empty: bool = False,
     issue_id: int | None = None,
+    integration: IntegrationContract | None = None,
 ) -> SubTLTask:
     child_plan = WorkPlan() if empty else WorkPlan(leaves=(LeafTask(LEAF, "implement it"),))
     return SubTLTask(
@@ -257,6 +258,7 @@ def _stage(
         order=order,
         skip_dependents=policy,
         chainlink_issue_id=issue_id,
+        integration=integration or IntegrationContract(),
     )
 
 
@@ -266,8 +268,20 @@ def _run(
     policy: SkipDependencyPolicy = SkipDependencyPolicy.PROCEED,
     sibling: bool = False,
     linked_issues: bool = False,
+    chain: Sequence[str] = (NEXT,),
+    parallel_sibling: bool = False,
+    optional_chain: bool = False,
 ) -> _Fixture:
-    """Build two ordered stages through the production fixture helpers."""
+    """Build ordered stages through the production fixture helpers.
+
+    ``chain`` names the ordered stages after the parked one; ``sibling`` appends
+    a further ordered stage, while ``parallel_sibling`` places the sibling in
+    stage one beside the parked stage so it does not depend on it. Empty stage
+    children with ``optional_chain`` declare no aggregate PR, which lets the
+    production loop complete them without a harness.
+    """
+    if sibling and parallel_sibling:
+        raise ValueError("sibling and parallel_sibling both declare the sibling once")
     project = tmp_path
     state_root = tmp_path / "state"
     (project / ".exo").mkdir(parents=True, exist_ok=True)
@@ -281,24 +295,43 @@ def _run(
         policy=policy,
         issue_id=STAGE_ISSUE if linked_issues else None,
     )
-    tasks = [
-        stage,
-        _stage(
-            NEXT,
-            2,
-            policy=policy,
-            empty=True,
-            issue_id=NEXT_ISSUE if linked_issues else None,
-        ),
-    ]
+    optional = (
+        IntegrationContract(aggregate_pr_required=False) if optional_chain else None
+    )
+    chain_issues = () if not linked_issues else (NEXT_ISSUE,)
+    tasks = [stage]
+    for index, name in enumerate(chain):
+        tasks.append(
+            _stage(
+                name,
+                2 + index,
+                policy=policy,
+                empty=True,
+                issue_id=chain_issues[index] if index < len(chain_issues) else None,
+                integration=optional,
+            )
+        )
+    sibling_order = len(chain) + 2
     if sibling:
         tasks.append(
             _stage(
                 SIBLING,
-                3,
+                sibling_order,
                 policy=policy,
                 empty=True,
                 issue_id=SIBLING_ISSUE if linked_issues else None,
+                integration=optional,
+            )
+        )
+    if parallel_sibling:
+        tasks.append(
+            _stage(
+                SIBLING,
+                1,
+                policy=policy,
+                empty=True,
+                issue_id=SIBLING_ISSUE if linked_issues else None,
+                integration=optional,
             )
         )
     plan = normalize_work_plan(WorkPlan(sub_tls=tuple(tasks)))
@@ -340,10 +373,17 @@ def _run(
         dispatch_last_boundary="sub_tl_started",
     )
     slices: dict[str, SliceState | Mapping[str, object]] = {STAGE: parked}
-    stages = [OrderedStageState(1, (STAGE,)), OrderedStageState(2, (NEXT,))]
-    states = {STAGE: IntegrationLifecycle.FAILED, NEXT: IntegrationLifecycle.RUNNING}
+    first_stage = (STAGE, SIBLING) if parallel_sibling else (STAGE,)
+    stages = [OrderedStageState(1, first_stage)]
+    stages.extend(
+        OrderedStageState(2 + index, (name,)) for index, name in enumerate(chain)
+    )
+    states = {STAGE: IntegrationLifecycle.FAILED}
+    states.update({name: IntegrationLifecycle.RUNNING for name in chain})
     if sibling:
-        stages.append(OrderedStageState(3, (SIBLING,)))
+        stages.append(OrderedStageState(sibling_order, (SIBLING,)))
+        states[SIBLING] = IntegrationLifecycle.RUNNING
+    if parallel_sibling:
         states[SIBLING] = IntegrationLifecycle.RUNNING
     for task in tasks[1:]:
         slices[task.name] = replace(
@@ -1045,8 +1085,10 @@ def _with_post_merge(
         base_ref="main",
         post_merge=PostMergeState(phase, evidence),
     )
+    # A fresh (non-recursive) run carries its lifecycle in the legacy phase.
+    fsm = state.recursive_fsm if state.recursive_fsm is not None else state.fsm
     return store.checkpoint(
-        cast(Any, state.recursive_fsm),
+        cast(Any, fsm),
         {**state.slices, slice_id: updated},
         state.budgets,
         state.events.last_consumed_offset,
