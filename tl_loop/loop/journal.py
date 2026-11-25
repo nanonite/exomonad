@@ -55,7 +55,11 @@ RECOVERY_INTENT_STATES = frozenset({"intended", "confirmed", "unknown", "reconci
 #: original ``unknown`` entry is never edited; these records are linked to it by
 #: ``resolves_key`` so history keeps both the request and the decision.
 LAUNCH_RESOLUTION_KIND = "launch_resolution"
-LAUNCH_RESOLUTION_OUTCOMES = frozenset({"operator_abandoned", "retry_authorized"})
+LAUNCH_RESOLUTION_OUTCOMES = frozenset(
+    {"operator_abandoned", "retry_authorized", "operator_skipped"}
+)
+#: Outcomes that terminally decide the effect: nothing further may launch it.
+TERMINAL_LAUNCH_RESOLUTION_OUTCOMES = frozenset({"retry_authorized", "operator_skipped"})
 EffectProbeStatus = Literal[
     "absent",
     "intended",
@@ -70,6 +74,11 @@ EffectProbeStatus = Literal[
 
 class ActionJournalError(RuntimeError):
     """Raised when the durable idempotency record cannot be trusted."""
+
+
+def launch_resolution_key(entry_key: str, outcome: str) -> str:
+    """Return the deterministic identity of one linked operator resolution."""
+    return f"{LAUNCH_RESOLUTION_KIND}:{outcome}:{entry_key}"
 
 
 @dataclass(frozen=True)
@@ -198,6 +207,7 @@ class EffectJournal(list[Any]):
         gate_name: str,
         recorded_at: float,
         proof: Mapping[str, object],
+        decision: Mapping[str, object] | None = None,
     ) -> bool:
         """Append one linked operator resolution without editing the original entry.
 
@@ -210,7 +220,7 @@ class EffectJournal(list[Any]):
         entry_key = entry.get("key")
         if not isinstance(entry_key, str) or not entry_key:
             raise ActionJournalError("launch effect entry has no stable key")
-        record_key = f"{LAUNCH_RESOLUTION_KIND}:{outcome}:{entry_key}"
+        record_key = launch_resolution_key(entry_key, outcome)
         if any(
             existing.get("key") == record_key
             for existing in self._read()
@@ -219,20 +229,21 @@ class EffectJournal(list[Any]):
             return False
         arguments = entry.get("arguments")
         journal_arguments = arguments if isinstance(arguments, Mapping) else {}
-        self._upsert(
-            {
-                "kind": LAUNCH_RESOLUTION_KIND,
-                "key": record_key,
-                "resolves_key": entry_key,
-                "resolves_intent_id": journal_arguments.get("dispatch_intent_id"),
-                "resolves_operation": entry.get("operation"),
-                "resolves_target": entry.get("target"),
-                "outcome": outcome,
-                "gate_name": gate_name,
-                "recorded_at": recorded_at,
-                "proof": to_jsonable(proof),
-            }
-        )
+        record: dict[str, object] = {
+            "kind": LAUNCH_RESOLUTION_KIND,
+            "key": record_key,
+            "resolves_key": entry_key,
+            "resolves_intent_id": journal_arguments.get("dispatch_intent_id"),
+            "resolves_operation": entry.get("operation"),
+            "resolves_target": entry.get("target"),
+            "outcome": outcome,
+            "gate_name": gate_name,
+            "recorded_at": recorded_at,
+            "proof": to_jsonable(proof),
+        }
+        if decision is not None:
+            record["decision"] = to_jsonable(decision)
+        self._upsert(record)
         return True
 
     def probe(self, intent: Any) -> EffectProbe:

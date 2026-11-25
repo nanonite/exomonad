@@ -1521,7 +1521,13 @@ def _parallel_impact(state: RunState, slice_id: str) -> str:
     if any(status in {SliceStatus.READY, SliceStatus.PENDING} for status in sibling_statuses):
         return "sibling_progress"
     if any(
-        status not in {SliceStatus.MERGED, SliceStatus.FAILED, SliceStatus.PARKED}
+        status
+        not in {
+            SliceStatus.MERGED,
+            SliceStatus.FAILED,
+            SliceStatus.PARKED,
+            SliceStatus.SKIPPED,
+        }
         for status in sibling_statuses
     ):
         return "sibling_wait"

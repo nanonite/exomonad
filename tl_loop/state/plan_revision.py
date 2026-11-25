@@ -12,6 +12,7 @@ from .plan_manifest import PlanManifest
 from .plan_revision_diff import (
     collect_changed_scope_summaries,
     collect_node_changes,
+    collect_supersessions,
     unique_blockers,
 )
 from .plan_revision_manifest import (
@@ -178,6 +179,7 @@ def _build_analysis(
         scopes=collect_changed_scope_summaries(previous, candidate),
         changes=collect_node_changes(previous, candidate),
         blockers=unique_blockers(blockers),
+        supersessions=collect_supersessions(previous, candidate),
         candidate_plan_bytes=plan_bytes,
         previous_manifest=previous,
         candidate_manifest=candidate,

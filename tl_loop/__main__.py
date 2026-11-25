@@ -70,7 +70,7 @@ from tl_loop.state.plan_revision_apply import apply_plan_revision
 from tl_loop.state.plan_revision_files import controller_lifecycle_lock_path
 from tl_loop.state.plan_revision_transaction import recover_plan_revision
 from tl_loop.state.read_model import project_read_model
-from tl_loop.state.schema import GateStatus, RunState
+from tl_loop.state.schema import GateStatus, RunState, SkipDependencyPolicy
 from tl_loop.state.store import CorruptCheckpoint, RunStore
 
 LOGGER = logging.getLogger("tl_loop")
@@ -269,6 +269,21 @@ def _parser() -> argparse.ArgumentParser:
     decision = gate.add_mutually_exclusive_group(required=True)
     decision.add_argument("--approve", action="store_true")
     decision.add_argument("--reject", action="store_true")
+    gate.add_argument(
+        "--reason",
+        help="required operator reason for a skip decision, recorded durably",
+    )
+    gate.add_argument(
+        "--dependency-policy",
+        choices=[policy.value for policy in SkipDependencyPolicy],
+        help="how the skipped stage's dependents are treated",
+    )
+    gate.add_argument(
+        "--dependent",
+        action="append",
+        default=[],
+        help="dependent named by a require-named skip decision (repeatable)",
+    )
     gate.add_argument(
         "--source",
         choices=("cli", "control"),
@@ -1020,8 +1035,33 @@ def _set_gate(args: argparse.Namespace) -> None:
         state_root = RunStore(parent_run_id, root).run_dir
     store = RunStore(args.run_id, state_root)
     status = GateStatus.APPROVED.value if args.approve else GateStatus.REJECTED.value
+    reason = getattr(args, "reason", None)
+    policy = getattr(args, "dependency_policy", None)
+    dependents = tuple(getattr(args, "dependent", ()) or ())
+    if args.name.endswith("-skip"):
+        if status != GateStatus.APPROVED.value:
+            raise LauncherError("a skip gate can only be answered with --approve")
+        if not reason or not str(reason).strip():
+            raise LauncherError("a skip decision requires a non-empty --reason")
+        if policy is None:
+            raise LauncherError(
+                "a skip decision requires --dependency-policy "
+                "(proceed, block or require-named)"
+            )
+    elif reason is not None or policy is not None or dependents:
+        raise LauncherError(
+            "--reason, --dependency-policy and --dependent are only valid for a skip gate"
+        )
     try:
-        store.answer_gate(args.name, GateStatus(status))
+        store.answer_gate(
+            args.name,
+            GateStatus(status),
+            reason=reason,
+            dependency_policy=(
+                SkipDependencyPolicy(policy) if policy is not None else None
+            ),
+            named_dependents=dependents,
+        )
     except ValueError as error:
         raise LauncherError(str(error)) from error
     effects = EffectClient(

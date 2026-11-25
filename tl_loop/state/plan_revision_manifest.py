@@ -59,6 +59,7 @@ def rebuild_manifest(
             node_id: cast(str, child.digest) for node_id, child in children.items()
         },
         child_manifests=children,
+        superseded_nodes=source.superseded_nodes,
         schema_version=source.schema_version,
         plan_compatibility_version=source.plan_compatibility_version,
         manifest_revision=revision,

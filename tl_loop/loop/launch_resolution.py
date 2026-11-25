@@ -83,6 +83,10 @@ class HeldLaunchEffect:
         return _gate_name(self, "retry")
 
     @property
+    def skip_gate(self) -> str:
+        return _gate_name(self, "skip")
+
+    @property
     def abandoned(self) -> bool:
         """Whether an earlier approval already abandoned the unproven launch."""
         return self.journal_status == "operator_abandoned"
@@ -279,9 +283,11 @@ def _diagnostic(
         f"child {child_id!r} slice {slice_id!r} has an unresolved launch effect: "
         f"intent {intent_id} at journal index {journal_index}, owner {owner_agent_name!r}, "
         f"last host evidence {last_evidence}; {state}. "
-        "Available operator actions: approve the abandon gate to record that no launch "
-        "happened, approve the retry gate to record that decision and launch exactly once "
-        "under the current configuration, or reject to keep the slice parked."
+        "Available operator actions: reject to keep the slice parked, approve the retry "
+        "gate to record that decision and launch exactly once under the current "
+        "configuration, approve the abandon gate to record only that no launch happened, "
+        "or record a skip decision for the skip gate to mark this stage skipped and "
+        "evaluate its dependents under the declared dependency policy."
     )
 
 
@@ -372,7 +378,7 @@ def classify_held_launch_effect(
         if resolution.get("resolves_key") == last_entry.get("key")
     ]
     outcomes = {cast(str, resolution.get("outcome")) for resolution in linked}
-    if outcomes & {"retry_authorized"}:
+    if outcomes & {"retry_authorized", "operator_skipped"}:
         return HeldLaunchClassification()
     if "operator_abandoned" not in outcomes:
         return HeldLaunchClassification()

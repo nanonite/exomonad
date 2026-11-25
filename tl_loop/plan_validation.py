@@ -14,7 +14,15 @@ _PLAN_KEYS = frozenset({"run_id", "budgets", "plan", "workers", "leaves", "sub_t
 _PROPOSAL_KEYS = frozenset({"plan", "workers", "leaves", "sub_tls", "clarification"})
 _TASK_KEYS = {
     "workers": frozenset(
-        {"name", "task", "agent_type", "task_timeout_seconds", "chainlink_issue_id"}
+        {
+            "name",
+            "task",
+            "agent_type",
+            "task_timeout_seconds",
+            "chainlink_issue_id",
+            "skip_dependents",
+            "supersedes",
+        }
     ),
     "leaves": frozenset(
         {
@@ -30,6 +38,8 @@ _TASK_KEYS = {
             "depends_on",
             "task_timeout_seconds",
             "chainlink_issue_id",
+            "skip_dependents",
+            "supersedes",
         }
     ),
     # A sub-TL is a nested controller process, not a model session, so it has
@@ -50,6 +60,8 @@ _TASK_KEYS = {
             "integration",
             "task_timeout_seconds",
             "chainlink_issue_id",
+            "skip_dependents",
+            "supersedes",
         }
     ),
 }

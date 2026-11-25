@@ -82,6 +82,33 @@ class SliceStatus(str, Enum):
     FAILED = "failed"
     PARKED = "parked"
     BLOCKED = "blocked"
+    #: An operator-approved skip of a parked stage. The stage's original
+    #: record is append-only history and is never rewritten; this status only
+    #: says the controller must not launch it again and must evaluate its
+    #: dependents under the declared dependency policy.
+    SKIPPED = "skipped"
+
+
+class SkipDependencyPolicy(str, Enum):
+    """How a skipped stage's dependents are treated.
+
+    ``PROCEED`` lets a dependent run although the prerequisite produced no
+    output; ``BLOCK`` holds every dependent; ``REQUIRE_NAMED`` runs only the
+    dependents the operator named in the skip decision. Strictness increases
+    in that order, so a skip answer may only tighten the plan's declaration.
+    """
+
+    PROCEED = "proceed"
+    BLOCK = "block"
+    REQUIRE_NAMED = "require-named"
+
+    @property
+    def strictness(self) -> int:
+        return {
+            SkipDependencyPolicy.PROCEED: 0,
+            SkipDependencyPolicy.REQUIRE_NAMED: 1,
+            SkipDependencyPolicy.BLOCK: 2,
+        }[self]
 
 
 class WaitReason(str, Enum):
@@ -467,6 +494,7 @@ TERMINAL_SLICE_STATUSES = frozenset(
         SliceStatus.DISPATCH_FAILED.value,
         SliceStatus.PARKED.value,
         SliceStatus.BLOCKED.value,
+        SliceStatus.SKIPPED.value,
     }
 )
 RUN_KEYS = frozenset(
@@ -863,7 +891,7 @@ CHARGE_KEYS = frozenset(
         "launched_invocation_id",
     }
 )
-GATE_KEYS = frozenset({"name", "status"})
+GATE_KEYS = frozenset({"name", "status", "reason", "dependency_policy", "named_dependents"})
 EVENT_KEYS = frozenset({"last_consumed_offset"})
 GOAL_KEYS = frozenset(
     {
@@ -1015,10 +1043,18 @@ class BudgetLedger:
 
 @dataclass(frozen=True)
 class GateState:
-    """One named human-approval result."""
+    """One named human-approval result.
+
+    A gate answer is a decision, and a skip answer must also carry the
+    operator's reason, the dependency policy they chose, and the dependents
+    they named. Those fields are absent on every other gate.
+    """
 
     name: str
     status: GateStatus
+    reason: str | None = None
+    dependency_policy: SkipDependencyPolicy | None = None
+    named_dependents: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2634,6 +2670,10 @@ def _gates(value: object, errors: list[tuple[str, str]]) -> None:
             continue
         _non_empty_string(gate, "name", path, errors)
         _enum_value(gate, "status", path, GateStatus, errors)
+        _nullable_string(gate, "reason", path, errors)
+        _nullable_enum_value(gate, "dependency_policy", path, SkipDependencyPolicy, errors)
+        if "named_dependents" in gate:
+            _string_list(gate, "named_dependents", path, errors, allow_empty=True)
         name = gate.get("name")
         if isinstance(name, str):
             if name in names:

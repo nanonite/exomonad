@@ -23,7 +23,9 @@ _LIVE_STATUSES = frozenset({SliceStatus.SPAWNED, SliceStatus.IN_REVIEW, SliceSta
 #: merge, so no dependent it names can ever satisfy its precondition.
 #: ``dispatch_failed`` is deliberately absent: a refused spawn holds an
 #: operator gate the operator may still answer, exactly like ``parked``.
-_FAILED_STATUSES = frozenset({SliceStatus.FAILED, SliceStatus.BLOCKED})
+_FAILED_STATUSES = frozenset(
+    {SliceStatus.FAILED, SliceStatus.BLOCKED, SliceStatus.SKIPPED}
+)
 
 
 class ScheduleError(RuntimeError):

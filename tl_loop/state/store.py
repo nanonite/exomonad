@@ -125,6 +125,7 @@ from .schema import (
     RunState,
     SchemaError,
     SessionMode,
+    SkipDependencyPolicy,
     SliceMap,
     SliceState,
     SliceStatus,
@@ -1416,12 +1417,44 @@ class RunStore:
         apply(self.run_dir, mutate)
         return self.load()
 
-    def answer_gate(self, name: str, status: GateStatus) -> RunState:
-        """Answer an existing named gate without creating a new one."""
+    def answer_gate(
+        self,
+        name: str,
+        status: GateStatus,
+        *,
+        reason: str | None = None,
+        dependency_policy: SkipDependencyPolicy | None = None,
+        named_dependents: Sequence[str] = (),
+    ) -> RunState:
+        """Answer an existing named gate without creating a new one.
+
+        A skip answer must also record the operator's reason and the dependency
+        policy they chose. Those fields are written only when supplied, so every
+        other gate answer keeps its two-field shape.
+        """
         if not isinstance(name, str) or not name:
             raise ValueError("gate name must be a non-empty string")
         if not isinstance(status, GateStatus):
             raise TypeError("status must be a GateStatus")
+        if reason is not None:
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError("gate reason must be a non-empty string")
+            reason = reason.strip()
+        if dependency_policy is not None and not isinstance(
+            dependency_policy, SkipDependencyPolicy
+        ):
+            raise TypeError("dependency_policy must be a SkipDependencyPolicy")
+        dependents = tuple(named_dependents)
+        if any(not isinstance(item, str) or not item.strip() for item in dependents):
+            raise ValueError("named_dependents must be non-empty strings")
+        dependents = tuple(item.strip() for item in dependents)
+        optional: dict[str, object] = {}
+        if reason is not None:
+            optional["reason"] = reason
+        if dependency_policy is not None:
+            optional["dependency_policy"] = dependency_policy.value
+        if dependents:
+            optional["named_dependents"] = list(dependents)
 
         def mutate(document: dict[str, object]) -> dict[str, object]:
             gates = document.get("gates")
@@ -1429,13 +1462,16 @@ class RunStore:
                 raise CorruptCheckpoint("run state gates are not an array")
             for gate in gates:
                 if isinstance(gate, dict) and gate.get("name") == name:
-                    if gate.get("status") == status.value:
+                    if gate.get("status") == status.value and all(
+                        gate.get(key) == value for key, value in optional.items()
+                    ):
                         # Idempotent re-answer: leave the convergence epoch
                         # unchanged so a duplicate approval cannot grant the
                         # same action another fresh tracker key (and thus a
                         # second retry without a new pending occurrence).
                         return document
                     gate["status"] = status.value
+                    gate.update(optional)
                     # A status change is a durable semantic transition, so
                     # advance the convergence epoch exactly like an internal
                     # transition does. Without this, a live controller's
@@ -3776,7 +3812,21 @@ def _decode_deadline_ledger(value: object) -> DeadlineLedger | None:
 
 
 def _decode_gate(value: dict[str, object]) -> GateState:
-    return GateState(name=cast(str, value["name"]), status=GateStatus(cast(str, value["status"])))
+    policy = value.get("dependency_policy")
+    dependents = value.get("named_dependents")
+    return GateState(
+        name=cast(str, value["name"]),
+        status=GateStatus(cast(str, value["status"])),
+        reason=cast(str | None, value.get("reason")),
+        dependency_policy=(
+            SkipDependencyPolicy(policy) if isinstance(policy, str) else None
+        ),
+        named_dependents=(
+            tuple(cast(str, item) for item in dependents)
+            if isinstance(dependents, list)
+            else ()
+        ),
+    )
 
 
 def _assert_consistent(path: Path, state: RunState) -> None:

@@ -1104,11 +1104,12 @@ predecessor, branch, worktree and intent all bind to one terminal invocation
 with no successor, the parent parks that slice only:
 `SliceStatus.PARKED` with `ParkCause.HUMAN_DECISION_REQUIRED` and the detail in
 `park_audit` (closed schema: `recovery_action: held_launch_effect`,
-`launch_evidence` JSON). Two gates are opened once,
-`tl-held-launch-effect-<child>-<intent-prefix>-abandon` and `...-retry`.
-Sibling children and independent slices keep running; a nested sub-TL parks
-only its own level. The recursive rule is that a child's fail-closed hold is
-reported upward as parked-with-gate, never as `recursive child failed`.
+`launch_evidence` JSON). Three gates are opened once,
+`tl-held-launch-effect-<child>-<intent-prefix>-abandon`, `...-retry` and
+`...-skip`. Sibling children and independent slices keep running; a nested
+sub-TL parks only its own level. The recursive rule is that a child's
+fail-closed hold is reported upward as parked-with-gate, never as
+`recursive child failed`.
 
 Approving `-retry` re-proves the effect and appends two append-only
 `kind: launch_resolution` records (`operator_abandoned`, then
@@ -1122,6 +1123,30 @@ resolve once. Live owners, launch rows for the intent, conflicting or duplicate
 evidence, wrong owner/predecessor/worktree, forged intents, foreign or
 unapproved gates, and all non-launch effects remain non-overridable
 `_hard_failure`s with their own diagnostic.
+
+Approving `-skip` is the only release for a stage whose own record is
+unrecoverable. It takes the abandon proofs plus a recorded operator reason and a
+dependency policy, appends one linked `operator_skipped` resolution carrying
+that reason and policy, and marks the stage `SliceStatus.SKIPPED` through
+`slice_transition(SliceSkipped)`; the original journal entry, ledger rows,
+proofs and plan snapshot digest stay byte-identical. Approving abandon and then
+skip records both (`operator_abandoned` + `operator_skipped`), which is the
+documented `abandon-and-skip`. `_reopen_after_ordered_recovery` then reopens the
+scope from that checkpoint, so the skipped stage lands in
+`completed_children` with `PostMergeState(NOT_REQUIRED, {operator_skip: true,
+aggregate_pr_required: false})` and `current_order` advances to the next stage.
+`_skip_dependents` names every node that depends on the skipped one (all later
+ordered stages plus any leaf edge), and `_effective_skip_dependency_policy`
+takes the stricter of the accepted manifest's `skip_dependents` declaration
+(absent means `block`) and the gate answer: `proceed` runs every dependent,
+`block` holds all of them, `require-named` runs only the named ones while every
+unnamed dependent becomes `BLOCKED` with `blocked_by` and a diagnostic. An
+answer that widens the declaration, records no policy, names no dependent under
+`require-named`, or names a non-dependent is refused and consumes nothing; two
+approvals that would both act are conflicting evidence and also consume nothing.
+`plan revise` supports superseding such a stage with a new future node; the old
+declaration keeps its identity, branch and dependency history and only the new
+node is added (`spec.superseded_nodes`).
 
 A stored `configured_route_authorization` written under an older identity scheme
 is history, not current authority. `_terminal_owner_recovery_proof` separates

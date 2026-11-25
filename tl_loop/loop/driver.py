@@ -340,6 +340,7 @@ from tl_loop.state.schema import (
     ReviewValidationDisposition,
     ReviewValidationObservation,
     RunState,
+    SkipDependencyPolicy,
     SliceState,
     SliceStatus,
     Verdict,
@@ -363,6 +364,7 @@ from tl_loop.state.slice_transition import (
     ReviewValidated,
     ReviewValidationFailed,
     ReviewVerdictObserved,
+    SliceSkipped,
     SliceStatusChanged,
     StaleReviewerActionHealed,
     StallClassificationObserved,
@@ -399,7 +401,14 @@ from .dispatch_classification import (
     classify_dispatch_failure,
     dispatch_retry_delay,
 )
-from .journal import MUTATING_OPERATIONS, ActionJournalError, EffectJournal, stable_action_key
+from .journal import (
+    MUTATING_OPERATIONS,
+    TERMINAL_LAUNCH_RESOLUTION_OUTCOMES,
+    ActionJournalError,
+    EffectJournal,
+    launch_resolution_key,
+    stable_action_key,
+)
 from .observation import PublicationRecord, WatcherObservation
 from .reconcile import (
     REPEATED_ACTION_GATE_PREFIX,
@@ -717,6 +726,12 @@ def _scope_declared_completion_matches(state: RunState) -> bool:
 
 def _scope_node_completion_matches(node: ManifestNode, current: SliceState) -> bool:
     """Check a declaration's completion contract against its current slice receipt."""
+    if current.status is SliceStatus.SKIPPED:
+        # An operator-approved skip is the stage's receipt. Its original record
+        # stays append-only history, and no PR or post-merge work will exist.
+        return isinstance(current.park_audit, Mapping) and (
+            current.park_audit.get("recovery_action") == "held_launch_effect_skip"
+        )
     if not _ordered_slice_complete(current):
         return False
     receipt = current.post_merge
@@ -778,7 +793,15 @@ def _scope_has_pending_post_merge(state: RunState) -> bool:
 
 
 def _ordered_child_complete(task: SubTLTask, current: SliceState) -> bool:
-    """Require aggregate post-merge recovery before releasing a child barrier."""
+    """Require aggregate post-merge recovery before releasing a child barrier.
+
+    A skipped stage is complete in the only sense the barrier asks about: this
+    slice will never produce another PR or launch again. It is not merged, and
+    nothing downstream may read it as if its output existed — dependents are
+    governed by the declared skip dependency policy instead.
+    """
+    if current.status is SliceStatus.SKIPPED:
+        return True
     if not task.integration.aggregate_pr_required:
         if current.status is not SliceStatus.MERGED:
             return False
@@ -1248,6 +1271,13 @@ class WorkerTask:
     task_timeout_declared: bool = False
     chainlink_issue_id: int | None = None
     reference_verification_requirements: tuple[ReferenceVerificationRequirement, ...] = ()
+    #: How this node's dependents are treated if an operator skips it. Absent
+    #: means `block`: no dependent may silently run without the prerequisite's
+    #: output.
+    skip_dependents: SkipDependencyPolicy | None = None
+    #: Name of a same-scope node this declaration replaces. The replaced node
+    #: keeps its identity, branch and history; only a new future node is added.
+    supersedes: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.name, "worker name")
@@ -1256,6 +1286,8 @@ class WorkerTask:
         _validate_task_timeout(self.task_timeout_seconds, "worker task_timeout_seconds")
         _validate_chainlink_issue_id(self.chainlink_issue_id, "worker chainlink_issue_id")
         _validate_reference_requirements(self.reference_verification_requirements)
+        _validate_skip_dependents(self.skip_dependents, "worker skip_dependents")
+        _optional_text(self.supersedes, "worker supersedes")
 
 
 @dataclass(frozen=True)
@@ -1278,6 +1310,13 @@ class LeafTask:
     task_timeout_declared: bool = False
     chainlink_issue_id: int | None = None
     reference_verification_requirements: tuple[ReferenceVerificationRequirement, ...] = ()
+    #: How this node's dependents are treated if an operator skips it. Absent
+    #: means `block`: no dependent may silently run without the prerequisite's
+    #: output.
+    skip_dependents: SkipDependencyPolicy | None = None
+    #: Name of a same-scope node this declaration replaces. The replaced node
+    #: keeps its identity, branch and history; only a new future node is added.
+    supersedes: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.name, "leaf name")
@@ -1287,6 +1326,8 @@ class LeafTask:
         _validate_task_timeout(self.task_timeout_seconds, "leaf task_timeout_seconds")
         _validate_chainlink_issue_id(self.chainlink_issue_id, "leaf chainlink_issue_id")
         _validate_reference_requirements(self.reference_verification_requirements)
+        _validate_skip_dependents(self.skip_dependents, "leaf skip_dependents")
+        _optional_text(self.supersedes, "leaf supersedes")
         for field_name, values in (
             ("boundary", self.boundary),
             ("read_first", self.read_first),
@@ -1323,6 +1364,9 @@ class WorkPlan:
             other_names=set(names) - leaf_names,
         )
         _validate_chainlink_issue_bindings(self)
+        _validate_supersessions(
+            self.workers, self.leaves, self.sub_tls, set(names)
+        )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object], *, path: str = "plan") -> WorkPlan:
@@ -1365,6 +1409,13 @@ class SubTLTask:
     task_timeout_declared: bool = False
     chainlink_issue_id: int | None = None
     reference_verification_requirements: tuple[ReferenceVerificationRequirement, ...] = ()
+    #: How this node's dependents are treated if an operator skips it. Absent
+    #: means `block`: no dependent may silently run without the prerequisite's
+    #: output.
+    skip_dependents: SkipDependencyPolicy | None = None
+    #: Name of a same-scope node this declaration replaces. The replaced node
+    #: keeps its identity, branch and history; only a new future node is added.
+    supersedes: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.name, "sub-TL name")
@@ -1386,6 +1437,8 @@ class SubTLTask:
         _validate_task_timeout(self.task_timeout_seconds, "sub-TL task_timeout_seconds")
         _validate_chainlink_issue_id(self.chainlink_issue_id, "sub-TL chainlink_issue_id")
         _validate_reference_requirements(self.reference_verification_requirements)
+        _validate_skip_dependents(self.skip_dependents, "sub-TL skip_dependents")
+        _optional_text(self.supersedes, "sub-TL supersedes")
 
 
 @dataclass(frozen=True)
@@ -1814,12 +1867,11 @@ def run_tl_loop(
                             (),
                         )
                     try:
-                        existing_state = _reopen_ordered_scope(
+                        existing_state = _reopen_after_ordered_recovery(
                             existing_state,
                             recovery_plan,
                             store,
-                            decision.task_name,
-                            authorized=decision.authorized,
+                            decision,
                         )
                     except OrderedCompletionEvidenceError as error:
                         return _terminal_ordered_completion_hold_result(
@@ -2265,6 +2317,7 @@ def _recover_durable_write_failure(
                     SliceStatus.FAILED,
                     SliceStatus.PARKED,
                     SliceStatus.BLOCKED,
+                    SliceStatus.SKIPPED,
                 }
             ),
             None,
@@ -2319,6 +2372,7 @@ def _recover_tool_unavailable(
                     SliceStatus.FAILED,
                     SliceStatus.PARKED,
                     SliceStatus.BLOCKED,
+                    SliceStatus.SKIPPED,
                 }
             ),
             None,
@@ -2418,12 +2472,17 @@ def _canonical_child_record(
     }
     integration = getattr(node, "integration_contract", {})
     aggregate_required = integration.get("aggregate_pr_required", True)
-    if (
-        kind is ChildKind.SUB_TL
-        and aggregate_required is False
-        and _runtime_field(slice_value, "status") is SliceStatus.MERGED
+    status = _runtime_field(slice_value, "status")
+    if kind is ChildKind.SUB_TL and (
+        (aggregate_required is False and status is SliceStatus.MERGED)
+        # A skipped stage never publishes, so its aggregate PR is not merely
+        # unneeded: it can never exist. The record says so rather than claiming a
+        # completion it does not have.
+        or status is SliceStatus.SKIPPED
     ):
         evidence["aggregate_pr_required"] = "false"
+        if status is SliceStatus.SKIPPED:
+            evidence["operator_skip"] = "true"
     return ChildRecord(
         child_id=node.name,
         kind=kind,
@@ -2567,6 +2626,10 @@ class OrderedRecoveryDecision:
     #: the reopen. An authorized reopen mints a fresh child invocation instead of
     #: reusing the recorded one, because the prior delivery target is gone.
     authorized: bool = False
+    #: Whether an approved skip already marked this stage SKIPPED and evaluated
+    #: its dependents. The caller then reopens the whole scope from the persisted
+    #: checkpoint instead of reopening one child.
+    skipped: bool = False
     #: Whether an approved gate may release *this* failure. True only when the
     #: sole unproven fact is how the child's exit reason is classified, because
     #: every ownership, publication, and effect-reconciliation proof already
@@ -2832,13 +2895,17 @@ def _resolve_held_launch_effect(
     store: RunStore,
     effect: HeldLaunchEffect,
     *,
-    retry: bool,
+    action: str,
+    decision: Mapping[str, object] | None = None,
 ) -> str | None:
     """Append the operator resolution once, under the run-scoped lock.
 
-    Returns a fail-closed diagnostic when the machine proof no longer holds, or
-    ``None`` when the resolution is durable (including an idempotent repeat).
+    ``action`` is ``abandon``, ``retry``, or ``skip``. Returns a fail-closed
+    diagnostic when the machine proof no longer holds, or ``None`` when the
+    resolution is durable (including an idempotent repeat).
     """
+    if action not in {"abandon", "retry", "skip"}:
+        raise TLLoopError(f"unknown held launch effect action {action!r}")
     lock = RunLock(store.run_dir / "launch-reconciliation.lock", timeout=5.0)
     try:
         lock.acquire()
@@ -2856,7 +2923,7 @@ def _resolve_held_launch_effect(
             return fresh.reason
         if fresh.effect is None:
             if journal.has_launch_resolution(
-                effect.entry_key, outcomes=frozenset({"retry_authorized"})
+                effect.entry_key, outcomes=TERMINAL_LAUNCH_RESOLUTION_OUTCOMES
             ):
                 return None
             return (
@@ -2866,6 +2933,17 @@ def _resolve_held_launch_effect(
         entry = journal.entry_by_key(effect.entry_key)
         if entry is None:
             return "held launch effect entry disappeared from the child journal"
+        if action == "skip":
+            journal.append_launch_resolution(
+                entry,
+                outcome="operator_skipped",
+                gate_name=effect.skip_gate,
+                recorded_at=time.time(),
+                proof=effect.proof(),
+                decision=decision,
+            )
+            return None
+        retry = action == "retry"
         journal.append_launch_resolution(
             entry,
             outcome="operator_abandoned",
@@ -2893,16 +2971,54 @@ def _held_launch_effect_decision(
     store: RunStore,
     proof: OrderedRecoveryDecision,
 ) -> OrderedRecoveryDecision:
-    """Apply the recorded abandon/retry answer to one held child launch effect."""
+    """Apply the recorded park/abandon-and-skip/retry answer to one held effect."""
     effect = proof.held_launch_effect
     if effect is None:
         raise TLLoopError("held launch decision has no effect")
-    gates = {gate.name: gate.status for gate in state.gates}
-    abandon_status = gates.get(effect.abandon_gate)
-    retry_status = gates.get(effect.retry_gate)
-    if retry_status is GateStatus.APPROVED:
+    gates = {gate.name: gate for gate in state.gates}
+    abandon = gates.get(effect.abandon_gate)
+    retry = gates.get(effect.retry_gate)
+    skip = gates.get(effect.skip_gate)
+    retry_approved = retry is not None and retry.status is GateStatus.APPROVED
+    abandon_approved = abandon is not None and abandon.status is GateStatus.APPROVED
+    skip_approved = skip is not None and skip.status is GateStatus.APPROVED
+    approved_names = sorted(
+        gate.name
+        for gate in (abandon, retry, skip)
+        if gate is not None and gate.status is GateStatus.APPROVED
+    )
+    if retry_approved and len(approved_names) > 1:
+        # Retry launches the stage; abandon and skip decide not to. Approving
+        # retry together with either is conflicting evidence, so no action is
+        # consumed. Abandon plus skip is the documented abandon-and-skip.
+        return OrderedRecoveryDecision(
+            proof.task_name,
+            effect.retry_gate,
+            "conflicting operator answers for one held launch effect: "
+            + ", ".join(approved_names)
+            + f". {effect.diagnostic}",
+            False,
+            gate_status=GateStatus.APPROVED,
+            held_launch_effect=effect,
+        )
+    if skip is not None and skip_approved:
+        if abandon is not None and abandon_approved:
+            abandoned_error = _resolve_held_launch_effect(
+                state, plan, config, store, effect, action="abandon"
+            )
+            if abandoned_error is not None:
+                return OrderedRecoveryDecision(
+                    proof.task_name,
+                    effect.abandon_gate,
+                    abandoned_error,
+                    False,
+                    gate_status=abandon.status,
+                    held_launch_effect=effect,
+                )
+        return _skip_held_launch_effect(state, plan, config, store, proof, effect, skip)
+    if retry is not None and retry_approved:
         error = _resolve_held_launch_effect(
-            state, plan, config, store, effect, retry=True
+            state, plan, config, store, effect, action="retry"
         )
         if error is not None:
             return OrderedRecoveryDecision(
@@ -2910,7 +3026,7 @@ def _held_launch_effect_decision(
                 effect.retry_gate,
                 error,
                 False,
-                gate_status=retry_status,
+                gate_status=retry.status,
                 held_launch_effect=effect,
             )
         return OrderedRecoveryDecision(
@@ -2922,13 +3038,13 @@ def _held_launch_effect_decision(
                 f"fresh launch is authorized. {effect.diagnostic}"
             ),
             True,
-            gate_status=retry_status,
+            gate_status=retry.status,
             held_launch_effect=effect,
             authorized=True,
         )
-    if abandon_status is GateStatus.APPROVED:
+    if abandon is not None and abandon_approved:
         error = _resolve_held_launch_effect(
-            state, plan, config, store, effect, retry=False
+            state, plan, config, store, effect, action="abandon"
         )
         if error is not None:
             return OrderedRecoveryDecision(
@@ -2936,7 +3052,7 @@ def _held_launch_effect_decision(
                 effect.abandon_gate,
                 error,
                 False,
-                gate_status=abandon_status,
+                gate_status=abandon.status,
                 held_launch_effect=effect,
             )
         return OrderedRecoveryDecision(
@@ -2948,18 +3064,317 @@ def _held_launch_effect_decision(
                 f"{effect.retry_gate} is approved. {effect.diagnostic}"
             ),
             False,
-            gate_status=abandon_status,
+            gate_status=abandon.status,
             held_launch_effect=effect,
         )
-    gate_name = effect.retry_gate if retry_status is not None else effect.abandon_gate
-    gate_status = retry_status if retry_status is not None else abandon_status
+    answered = next(
+        (
+            gate
+            for gate in (skip, abandon, retry)
+            if gate is not None and gate.status is not GateStatus.PENDING
+        ),
+        None,
+    )
+    gate = answered or retry or abandon or skip
     return OrderedRecoveryDecision(
         proof.task_name,
-        gate_name,
+        gate.name if gate is not None else effect.abandon_gate,
         effect.diagnostic,
         False,
-        gate_status=gate_status,
+        gate_status=gate.status if gate is not None else None,
         held_launch_effect=effect,
+    )
+
+
+def _skip_held_launch_effect(
+    state: RunState,
+    plan: WorkPlan,
+    config: TLLoopConfig,
+    store: RunStore,
+    proof: OrderedRecoveryDecision,
+    effect: HeldLaunchEffect,
+    gate: GateState,
+) -> OrderedRecoveryDecision:
+    """Apply an approved skip: append the decision, mark the stage, apply policy.
+
+    The machine proofs are the abandon proofs, re-proved under the run-scoped
+    lock. The original journal entry, ledger, proofs and plan snapshot are never
+    rewritten; the appended ``operator_skipped`` record is linked to the entry
+    and carries the operator's reason and the declared dependency policy.
+    """
+    reason = gate.reason or ""
+    try:
+        current = state.slices.get(effect.child_id)
+        if current is None or not _held_launch_parked(current):
+            raise TLLoopError(
+                f"stage {effect.child_id!r} is not parked behind this held launch effect; "
+                "re-run recovery instead of consuming the skip decision"
+            )
+        policy = _effective_skip_dependency_policy(state, effect, gate)
+        dependents = _skip_dependents(plan, effect.child_id)
+        named = _validated_named_dependents(gate, policy, dependents)
+    except TLLoopError as error:
+        return OrderedRecoveryDecision(
+            proof.task_name,
+            effect.skip_gate,
+            f"{error}. {effect.diagnostic}",
+            False,
+            gate_status=gate.status,
+            held_launch_effect=effect,
+        )
+    decision = {
+        "reason": reason,
+        "dependency_policy": policy.value,
+        "named_dependents": sorted(named),
+        "dependents": sorted(dependents),
+        "plan_snapshot_sha256": _held_launch_plan_snapshot_sha256(config),
+    }
+    error_reason = _resolve_held_launch_effect(
+        state,
+        plan,
+        config,
+        store,
+        effect,
+        action="skip",
+        decision=decision,
+    )
+    if error_reason is not None:
+        return OrderedRecoveryDecision(
+            proof.task_name,
+            effect.skip_gate,
+            error_reason,
+            False,
+            gate_status=gate.status,
+            held_launch_effect=effect,
+        )
+    skipped_state = _skip_held_launch_slice(
+        state,
+        store,
+        effect,
+        gate,
+        policy=policy,
+        dependents=dependents,
+        named=named,
+        reason=reason,
+    )
+    held = _skip_dependent_hold(
+        skipped_state, effect.child_id, dependents, policy, named
+    )
+    return OrderedRecoveryDecision(
+        None,
+        effect.skip_gate,
+        (
+            f"operator skipped child {effect.child_id!r} at gate {effect.skip_gate} with "
+            f"dependency policy {policy.value!r}: the stage is SKIPPED, its dependents "
+            f"{sorted(dependents) or '[]'} were evaluated, and the scope continues from the "
+            f"next eligible stage. "
+            + (
+                f"Held dependents: {sorted(held)}. "
+                if held
+                else ""
+            )
+            + effect.diagnostic
+        ),
+        True,
+        gate_status=gate.status,
+        held_launch_effect=effect,
+        skipped=True,
+    )
+
+
+def _effective_skip_dependency_policy(
+    state: RunState,
+    effect: HeldLaunchEffect,
+    gate: GateState,
+) -> SkipDependencyPolicy:
+    """Require the answer to be at least as strict as the plan declaration."""
+    declared = _declared_skip_dependency_policy(state, effect.child_id)
+    answer = gate.dependency_policy
+    if answer is None:
+        raise TLLoopError(
+            f"skip gate {gate.name} records no dependency policy; declare "
+            "proceed, block or require-named when answering it"
+        )
+    if answer.strictness < declared.strictness:
+        raise TLLoopError(
+            f"skip answer {answer.value!r} widens the declared dependency policy "
+            f"{declared.value!r} for stage {effect.child_id!r}"
+        )
+    return answer
+
+
+def _declared_skip_dependency_policy(
+    state: RunState, stage_id: str
+) -> SkipDependencyPolicy:
+    """Read the accepted plan's declared policy for one stage, defaulting to block."""
+    manifest = state.plan_manifest
+    node = None if manifest is None else next(
+        (item for item in manifest.nodes if item.name == stage_id), None
+    )
+    raw = None if node is None else node.declaration.get("skip_dependents")
+    if raw is None:
+        return SkipDependencyPolicy.BLOCK
+    try:
+        return SkipDependencyPolicy(cast(str, raw))
+    except ValueError as error:
+        raise TLLoopError(
+            f"stage {stage_id!r} declares an unknown skip dependency policy {raw!r}"
+        ) from error
+
+
+def _skip_dependents(plan: WorkPlan, skipped_id: str) -> tuple[str, ...]:
+    """Every same-scope node that depends on the skipped one, in plan order."""
+    stage = next(
+        (item for item in plan.ordered_stages if skipped_id in item.sub_tls), None
+    )
+    ordered = (
+        ()
+        if stage is None
+        else tuple(
+            name
+            for later in plan.ordered_stages
+            if later.order > stage.order
+            for name in later.sub_tls
+        )
+    )
+    leaves = tuple(
+        task.name for task in plan.leaves if skipped_id in task.depends_on
+    )
+    return (*ordered, *leaves)
+
+
+def _validated_named_dependents(
+    gate: GateState,
+    policy: SkipDependencyPolicy,
+    dependents: Sequence[str],
+) -> tuple[str, ...]:
+    """Require names exactly when the effective policy needs them."""
+    named = tuple(gate.named_dependents)
+    if policy is SkipDependencyPolicy.REQUIRE_NAMED and not named:
+        raise TLLoopError(
+            f"skip gate {gate.name} uses policy {policy.value!r} and names no dependent"
+        )
+    if policy is not SkipDependencyPolicy.REQUIRE_NAMED and named:
+        raise TLLoopError(
+            f"skip gate {gate.name} names dependents under policy {policy.value!r}, "
+            "which does not use them"
+        )
+    unknown = sorted(set(named) - set(dependents))
+    if unknown:
+        raise TLLoopError(
+            f"skip gate {gate.name} names nodes that do not depend on the skipped stage: "
+            + ", ".join(unknown)
+        )
+    return named
+
+
+def _held_launch_plan_snapshot_sha256(config: TLLoopConfig) -> str | None:
+    """Read the accepted plan snapshot digest the skip decision is linked to."""
+    if config.project_root is None:
+        return None
+    digest_path = Path(config.project_root) / ".exo" / "tl-loop" / "plan.snapshot.sha256"
+    try:
+        return digest_path.read_text(encoding="ascii").strip() or None
+    except (OSError, UnicodeError):
+        return None
+
+
+def _skip_held_launch_slice(
+    state: RunState,
+    store: RunStore,
+    effect: HeldLaunchEffect,
+    gate: GateState,
+    *,
+    policy: SkipDependencyPolicy,
+    dependents: Sequence[str],
+    named: Sequence[str],
+    reason: str,
+) -> RunState:
+    """Mark the stage SKIPPED and hold every dependent the policy withholds."""
+    current = state.slices.get(effect.child_id)
+    if current is None:
+        raise TLLoopError(
+            f"skipped stage {effect.child_id!r} has no persisted slice"
+        )
+    slices = dict(state.slices)
+    slices[effect.child_id] = slice_transition(
+        current,
+        SliceSkipped(
+            gate_name=gate.name,
+            reason=reason,
+            decision_key=launch_resolution_key(effect.entry_key, "operator_skipped"),
+        ),
+    )
+    for name in dependents:
+        dependent = slices.get(name)
+        if dependent is None:
+            continue
+        withheld = _skip_withholds_dependent(dependent, policy, named)
+        if withheld is None:
+            continue
+        slices[name] = replace(
+            slice_transition(
+                dependent, SliceStatusChanged(SliceStatus.BLOCKED)
+            ),
+            blocked_by=effect.child_id,
+            suspended_dependency=None,
+            park_audit={
+                "recovery_action": "held_launch_effect_skip_dependent",
+                "needs_human": False,
+                "gate_name": gate.name,
+                "reason": withheld,
+            },
+        )
+    return store.checkpoint(
+        cast(Any, state.recursive_fsm),
+        slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=state.current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+    )
+
+
+def _skip_withholds_dependent(
+    dependent: SliceState,
+    policy: SkipDependencyPolicy,
+    named: Sequence[str],
+) -> str | None:
+    """Return the hold diagnostic for one dependent, or None when it may run."""
+    if dependent.status not in {SliceStatus.PENDING, SliceStatus.READY}:
+        return None
+    if policy is SkipDependencyPolicy.PROCEED:
+        return None
+    if policy is SkipDependencyPolicy.REQUIRE_NAMED and dependent.id in named:
+        return None
+    if policy is SkipDependencyPolicy.REQUIRE_NAMED:
+        return (
+            "this dependent is unnamed in the skip decision and its prerequisite "
+            "produced no output, so it is held"
+        )
+    return (
+        "the declared dependency policy blocks dependents of a skipped stage "
+        "whose prerequisite output does not exist"
+    )
+
+
+def _skip_dependent_hold(
+    state: RunState,
+    skipped_id: str,
+    dependents: Sequence[str],
+    policy: SkipDependencyPolicy,
+    named: Sequence[str],
+) -> tuple[str, ...]:
+    """Report which dependents the applied skip actually held."""
+    return tuple(
+        name
+        for name in dependents
+        if (slice_state := state.slices.get(name)) is not None
+        and slice_state.status is SliceStatus.BLOCKED
+        and slice_state.blocked_by == skipped_id
+        and policy in {SkipDependencyPolicy.BLOCK, SkipDependencyPolicy.REQUIRE_NAMED}
+        and name not in named
     )
 
 
@@ -3158,7 +3573,8 @@ def _held_launch_park_audit(effect: HeldLaunchEffect) -> dict[str, object]:
         "last_host_evidence": effect.last_host_evidence,
         "abandon_gate": effect.abandon_gate,
         "retry_gate": effect.retry_gate,
-        "available_actions": ["abandon", "retry", "reject"],
+        "skip_gate": effect.skip_gate,
+        "available_actions": ["park", "abandon-and-skip", "retry"],
     }
     return {
         "recovery_action": "held_launch_effect",
@@ -3210,8 +3626,8 @@ def _ensure_held_launch_gates(
     state: RunState,
     effect: HeldLaunchEffect,
 ) -> RunState:
-    """Open both operator actions once; never re-arm an answered gate."""
-    for name in (effect.abandon_gate, effect.retry_gate):
+    """Open every operator action once; never re-arm an answered gate."""
+    for name in (effect.abandon_gate, effect.retry_gate, effect.skip_gate):
         if any(gate.name == name for gate in state.gates):
             continue
         state = store.set_gate(name, GateStatus.PENDING)
@@ -3914,6 +4330,28 @@ def _ordered_child_recovery_state(
     )
 
 
+def _reopen_after_ordered_recovery(
+    state: RunState,
+    plan: WorkPlan,
+    store: RunStore,
+    decision: OrderedRecoveryDecision,
+) -> RunState:
+    """Reopen the scope a consumed operator decision just released.
+
+    A skip already persisted the skipped stage and its dependents, so the reopen
+    must start from that checkpoint rather than the caller's pre-decision view.
+    Every other recovery reopens the one proven child from the state it holds.
+    """
+    base = store.load() if decision.skipped else state
+    return _reopen_ordered_scope(
+        base,
+        plan,
+        store,
+        decision.task_name,
+        authorized=decision.authorized,
+    )
+
+
 def _reopen_ordered_scope(
     state: RunState,
     plan: WorkPlan,
@@ -4140,6 +4578,28 @@ def _ordered_sub_tl_completion_state(
     if declared_required is not task.integration.aggregate_pr_required:
         raise OrderedCompletionEvidenceError(
             task.name, "aggregate requirement conflicts with its manifest"
+        )
+    if current.status is SliceStatus.SKIPPED:
+        audit = current.park_audit
+        if not isinstance(audit, Mapping) or audit.get("recovery_action") != (
+            "held_launch_effect_skip"
+        ):
+            raise OrderedCompletionEvidenceError(
+                task.name, "skipped declaration has no operator skip receipt"
+            )
+        if current.pr_number is not None or current.post_merge is not None:
+            raise OrderedCompletionEvidenceError(
+                task.name, "skipped declaration carries merge evidence"
+            )
+        return PostMergeState(
+            PostMergePhase.NOT_REQUIRED,
+            {
+                "child_id": task.name,
+                "aggregate_pr_required": "false",
+                "operator_skip": "true",
+                "skip_gate": str(audit.get("gate_name") or "unknown"),
+                "operator_skip_reason": str(audit.get("reason") or "unknown"),
+            },
         )
     receipt = current.post_merge
     if receipt is None and not declared_required and current.pr_number is None:
@@ -4794,7 +5254,13 @@ def _reconcile_continued_root_failure(
     failed = [
         name
         for name in stage.sub_tls
-        if state.slices.get(name) is not None and state.slices[name].status is SliceStatus.FAILED
+        if state.slices.get(name) is not None
+        and (
+            state.slices[name].status is SliceStatus.FAILED
+            # A held-launch park is the one non-FAILED child an operator answer
+            # releases; it is the same set `_ordered_recovery_proof` classifies.
+            or _held_launch_parked(state.slices[name])
+        )
     ]
     if not failed:
         if any(
@@ -4834,12 +5300,11 @@ def _reconcile_continued_root_failure(
             effects_log,
         )
     try:
-        return _reopen_ordered_scope(
+        return _reopen_after_ordered_recovery(
             state,
             plan,
             store,
-            decision.task_name,
-            authorized=decision.authorized,
+            decision,
         )
     except OrderedCompletionEvidenceError as error:
         held, hold_active, _held_error = _hold_reassessed_ordered_completion_evidence(
@@ -4957,6 +5422,7 @@ def _persist_reassessed_ordered_recovery_failure(
                 ensure_gates = (
                     (decision.held_launch_effect.abandon_gate, GateStatus.PENDING),
                     (decision.held_launch_effect.retry_gate, GateStatus.PENDING),
+                    (decision.held_launch_effect.skip_gate, GateStatus.PENDING),
                 )
             return _persist_rederived_root_failure(
                 latest,
@@ -12119,6 +12585,7 @@ def _park_repeated_action(
         SliceStatus.FAILED,
         SliceStatus.PARKED,
         SliceStatus.BLOCKED,
+        SliceStatus.SKIPPED,
     }:
         gate_name = f"{REPEATED_ACTION_GATE_PREFIX}{error.key}"
         existing = next((gate for gate in state.gates if gate.name == gate_name), None)
@@ -12306,6 +12773,7 @@ def _park_review_rounds_exhausted(
                 SliceStatus.FAILED,
                 SliceStatus.PARKED,
                 SliceStatus.BLOCKED,
+                SliceStatus.SKIPPED,
             }
         ),
         None,
@@ -33406,6 +33874,7 @@ def _classify_task_blocked_disposition(
         SliceStatus.REPAIRING,
         SliceStatus.BLOCKED,
         SliceStatus.PARKED,
+        SliceStatus.SKIPPED,
         SliceStatus.DISPATCH_UNCONFIRMED,
         SliceStatus.DISPATCH_RETRY_SCHEDULED,
     }:
@@ -34160,7 +34629,13 @@ def _recovery_parallel_impact(state: RunState, slice_id: str) -> str:
     if any(status in {SliceStatus.READY, SliceStatus.PENDING} for status in siblings):
         return "sibling_progress"
     if any(
-        status not in {SliceStatus.MERGED, SliceStatus.FAILED, SliceStatus.PARKED}
+        status
+        not in {
+            SliceStatus.MERGED,
+            SliceStatus.FAILED,
+            SliceStatus.PARKED,
+            SliceStatus.SKIPPED,
+        }
         for status in siblings
     ):
         return "sibling_wait"
@@ -34807,6 +35282,7 @@ def _manifest_plan(plan: WorkPlan) -> Mapping[str, object]:
                 else {}
             ),
             **_reference_requirements_document(task.reference_verification_requirements),
+            **_skip_and_supersedes_document(task.skip_dependents, task.supersedes),
         }
         for task in plan.workers
     ]
@@ -34832,6 +35308,7 @@ def _manifest_plan(plan: WorkPlan) -> Mapping[str, object]:
                 else {}
             ),
             **_reference_requirements_document(task.reference_verification_requirements),
+            **_skip_and_supersedes_document(task.skip_dependents, task.supersedes),
         }
         for task in plan.leaves
     ]
@@ -34860,6 +35337,7 @@ def _manifest_plan(plan: WorkPlan) -> Mapping[str, object]:
                     else {}
                 ),
                 **_reference_requirements_document(task.reference_verification_requirements),
+                **_skip_and_supersedes_document(task.skip_dependents, task.supersedes),
             }
         )
     return {"workers": workers, "leaves": leaves, "sub_tls": sub_tls}
@@ -35190,6 +35668,7 @@ def _all_expected_terminal(state: RunState, expected: set[str]) -> bool:
         SliceStatus.FAILED,
         SliceStatus.PARKED,
         SliceStatus.BLOCKED,
+        SliceStatus.SKIPPED,
     }
     return bool(expected) and all(
         state.slices.get(slice_id) is not None and state.slices[slice_id].status in terminal
@@ -35403,6 +35882,8 @@ def _sub_tl(value: object, *, path: str = "plan.sub_tls[0]") -> SubTLTask:
         "task_timeout_seconds",
         "chainlink_issue_id",
         "reference_verification_requirements",
+        "skip_dependents",
+        "supersedes",
     }
     unknown = sorted(set(value) - allowed)
     if unknown:
@@ -35436,6 +35917,8 @@ def _sub_tl(value: object, *, path: str = "plan.sub_tls[0]") -> SubTLTask:
         reference_verification_requirements=_reference_verification_requirements(
             value.get("reference_verification_requirements"), "sub-TL"
         ),
+        skip_dependents=_parse_skip_dependents(value.get("skip_dependents"), "sub-TL"),
+        supersedes=_optional_string(value, "supersedes", "sub-TL"),
     )
 
 
@@ -35451,6 +35934,77 @@ def _optional_chainlink_issue_id(value: object, path: str) -> int | None:
     if type(value) is not int or value <= 0:
         raise ChainlinkIssueBindingError(f"{path} must be a positive integer or null")
     return value
+
+
+def _validate_skip_dependents(
+    value: SkipDependencyPolicy | None, label: str
+) -> None:
+    if value is not None and not isinstance(value, SkipDependencyPolicy):
+        raise TypeError(f"{label} must be a SkipDependencyPolicy or null")
+
+
+def _validate_supersessions(
+    workers: Sequence[WorkerTask],
+    leaves: Sequence[LeafTask],
+    sub_tls: Sequence[SubTLTask],
+    names: set[str],
+) -> None:
+    """Prove each supersession names one distinct, un-superseded sibling."""
+    replaced: dict[str, str] = {}
+    all_tasks: tuple[WorkerTask | LeafTask | SubTLTask, ...] = (
+        *workers,
+        *leaves,
+        *sub_tls,
+    )
+    by_name = {task.name: task for task in all_tasks}
+    for task in all_tasks:
+        target = task.supersedes
+        if target is None:
+            continue
+        if target == task.name:
+            raise ValueError(f"{task.name!r} cannot supersede itself")
+        if target not in names:
+            raise ValueError(f"{task.name!r} supersedes unknown sibling {target!r}")
+        if target in replaced:
+            raise ValueError(
+                f"sibling {target!r} is superseded by both {replaced[target]!r} "
+                f"and {task.name!r}"
+            )
+        replaced[target] = task.name
+        if by_name[target].supersedes is not None:
+            raise ValueError(
+                f"sibling {target!r} is itself a supersession and cannot be superseded"
+            )
+
+
+def _parse_skip_dependents(
+    value: object, kind: str
+) -> SkipDependencyPolicy | None:
+    """Parse one declared dependent policy, rejecting an unknown value."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{kind}.skip_dependents must be a string or null")
+    try:
+        return SkipDependencyPolicy(value)
+    except ValueError as error:
+        allowed = ", ".join(policy.value for policy in SkipDependencyPolicy)
+        raise ValueError(
+            f"{kind}.skip_dependents must be one of {allowed}"
+        ) from error
+
+
+def _skip_and_supersedes_document(
+    skip_dependents: SkipDependencyPolicy | None,
+    supersedes: str | None,
+) -> dict[str, object]:
+    """Render the two operator-facing declaration fields when they are set."""
+    document: dict[str, object] = {}
+    if skip_dependents is not None:
+        document["skip_dependents"] = skip_dependents.value
+    if supersedes is not None:
+        document["supersedes"] = supersedes
+    return document
 
 
 def _validate_reference_requirements(value: object) -> None:
@@ -35631,6 +36185,8 @@ def _worker(value: object) -> WorkerTask:
             "task_timeout_seconds",
             "chainlink_issue_id",
             "reference_verification_requirements",
+            "skip_dependents",
+            "supersedes",
         },
         "worker",
     )
@@ -35648,6 +36204,8 @@ def _worker(value: object) -> WorkerTask:
         reference_verification_requirements=_reference_verification_requirements(
             value.get("reference_verification_requirements"), "worker"
         ),
+        skip_dependents=_parse_skip_dependents(value.get("skip_dependents"), "worker"),
+        supersedes=_optional_string(value, "supersedes", "worker"),
     )
 
 
@@ -35676,6 +36234,8 @@ def _leaf(value: object, *, path: str = "plan.leaves[0]") -> LeafTask:
             "task_timeout_seconds",
             "chainlink_issue_id",
             "reference_verification_requirements",
+            "skip_dependents",
+            "supersedes",
         },
         "leaf",
     )
@@ -35700,6 +36260,8 @@ def _leaf(value: object, *, path: str = "plan.leaves[0]") -> LeafTask:
         reference_verification_requirements=_reference_verification_requirements(
             value.get("reference_verification_requirements"), "leaf"
         ),
+        skip_dependents=_parse_skip_dependents(value.get("skip_dependents"), "leaf"),
+        supersedes=_optional_string(value, "supersedes", "leaf"),
     )
 
 

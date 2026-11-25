@@ -29,8 +29,8 @@ hard and the slice is re-decomposed instead.
 
 A held `unknown` launch-capable effect is the third outcome. The child's own hold
 is correct and stays fail-closed, but the parent parks only that child/slice
-behind two durable gates, `tl-held-launch-effect-<child>-<intent>-abandon` and
-`...-retry`, instead of exiting the root controller with
+behind three durable gates, `tl-held-launch-effect-<child>-<intent>-abandon`,
+`...-retry` and `...-skip`, instead of exiting the root controller with
 `recursive child failed`. Sibling children and independent slices keep running;
 a nested sub-TL parks only its own level. The recursive rule is that a child's
 fail-closed hold is reported upward as parked-with-gate, never as a controller
@@ -45,6 +45,30 @@ slice parked; reject launches nothing. A live invocation, a launch row for the
 intent, conflicting or duplicate evidence, a wrong owner/predecessor/worktree, a
 forged intent, a foreign or unapproved gate, and every non-launch effect stay
 non-overridable. Contract: `docs/launch-capable-effect-contract.md`.
+
+A stage whose record is genuinely unrecoverable can be **skipped** instead. The
+skip gate takes the same machine proofs as abandon and additionally requires a
+recorded operator reason and an explicit dependency policy:
+
+```bash
+python3 ~/.exo/tl_loop.pyz gate --project-root . --run-id root \
+  --name tl-held-launch-effect-<child>-<intent>-skip --approve \
+  --reason "the child record is unrecoverable; re-plan it in a fresh context" \
+  --dependency-policy block
+# require-named also takes one or more --dependent <stage>
+```
+
+Approving it appends one append-only `operator_skipped` record linked to the
+original journal entry (the entry, ledger rows, proofs and plan snapshot stay
+byte-identical) and marks the stage `SKIPPED`. Approving abandon first and then
+skip records both decisions — that is `abandon-and-skip`. The scope then reopens
+at the next eligible stage. Every dependent is evaluated under the effective
+policy, which is the stricter of the plan's declared `skip_dependents` and the
+answer: `proceed` runs them although the prerequisite produced nothing, `block`
+holds all of them, and `require-named` runs only the dependents the operator
+named while every unnamed dependent holds. A skip never runs a dependent
+silently, never relaunches the skipped stage, and is decided exactly once across
+restarts and concurrent ticks.
 
 An approved recovery whose child controller has exited relaunches that child
 with a fresh invocation identity, because relaunching against the recorded one

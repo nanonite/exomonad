@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from .plan_manifest import ManifestNode, PlanManifest
-from .plan_revision_types import PlanRevisionBlocker, PlanRevisionNodeChange, PlanRevisionScope
+from .plan_revision_types import (
+    PlanRevisionBlocker,
+    PlanRevisionNodeChange,
+    PlanRevisionScope,
+    PlanRevisionSupersession,
+)
 
 
 def collect_node_changes(
@@ -194,3 +199,84 @@ def unique_blockers(blockers: list[PlanRevisionBlocker]) -> tuple[PlanRevisionBl
 
 def _change_sort_key(change: PlanRevisionNodeChange) -> tuple[str, str, str, tuple[str, ...]]:
     return (change.scope_id, change.node_id, change.action, change.fields)
+
+
+def collect_supersessions(
+    previous: PlanManifest,
+    candidate: PlanManifest,
+) -> tuple[PlanRevisionSupersession, ...]:
+    """Report every new supersession and the dependents it rebinds."""
+    collected = _local_supersessions(previous, candidate)
+    for node_id, old_child in previous.child_manifests.items():
+        new_child = candidate.child_manifests.get(node_id)
+        if new_child is not None:
+            collected.extend(collect_supersessions(old_child, new_child))
+    for node_id, new_child in candidate.child_manifests.items():
+        if node_id not in previous.child_manifests:
+            collected.extend(
+                _local_supersessions(None, new_child)
+            )
+    return tuple(sorted(collected, key=lambda item: (item.scope_id, item.superseded_name)))
+
+
+def _local_supersessions(
+    previous: PlanManifest | None,
+    candidate: PlanManifest,
+) -> list[PlanRevisionSupersession]:
+    already = {} if previous is None else dict(previous.superseded_nodes)
+    by_id = {node.node_id: node for node in candidate.nodes}
+    result: list[PlanRevisionSupersession] = []
+    for old_id, new_id in candidate.superseded_nodes.items():
+        if already.get(old_id) == new_id:
+            continue
+        old_node = by_id[old_id]
+        new_node = by_id[new_id]
+        result.append(
+            PlanRevisionSupersession(
+                candidate.scope_id,
+                old_id,
+                old_node.name,
+                new_id,
+                new_node.name,
+                rebound_dependent_names(candidate, old_node, exclude=new_id),
+            )
+        )
+    return result
+
+
+def rebound_dependent_names(
+    manifest: PlanManifest,
+    superseded: ManifestNode,
+    *,
+    exclude: str | None = None,
+) -> tuple[str, ...]:
+    """Name every same-scope node that now depends on the replacement.
+
+    Ordered stages depend on one another implicitly, so every node declared in a
+    later stage is a dependent of the superseded stage. A leaf that names the
+    superseded node in ``depends_on`` is a dependent too. The superseded node
+    itself is never a dependent of its replacement.
+    """
+    stage = next(
+        (
+            order
+            for order, node_ids in manifest.ordered_stages
+            if superseded.node_id in node_ids
+        ),
+        None,
+    )
+    names: list[str] = []
+    if stage is not None:
+        names.extend(
+            manifest.node(node_id).name
+            for order, node_ids in manifest.ordered_stages
+            if order > stage
+            for node_id in node_ids
+            if node_id != exclude
+        )
+    names.extend(
+        node.name
+        for node in manifest.nodes
+        if superseded.name in node.depends_on and node.node_id != exclude
+    )
+    return tuple(sorted(set(names)))

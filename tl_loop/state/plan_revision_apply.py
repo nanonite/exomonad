@@ -350,6 +350,9 @@ def _audit_record(
         "candidate_plan_sha256": analysis.candidate_plan_sha256,
         "scopes": [scope.to_document() for scope in analysis.scopes],
         "changed_node_ids": [change.to_document() for change in analysis.changes],
+        "supersessions": [
+            supersession.to_document() for supersession in analysis.supersessions
+        ],
     }
 
 

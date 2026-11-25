@@ -73,6 +73,28 @@ class PlanRevisionScope:
 
 
 @dataclass(frozen=True)
+class PlanRevisionSupersession:
+    """One dispatched node replaced by a new future declaration."""
+
+    scope_id: str
+    superseded_node_id: str
+    superseded_name: str
+    replacement_node_id: str
+    replacement_name: str
+    rebound_dependents: tuple[str, ...]
+
+    def to_document(self) -> dict[str, object]:
+        return {
+            "scope_id": self.scope_id,
+            "superseded_node_id": self.superseded_node_id,
+            "superseded_name": self.superseded_name,
+            "replacement_node_id": self.replacement_node_id,
+            "replacement_name": self.replacement_name,
+            "rebound_dependents": list(self.rebound_dependents),
+        }
+
+
+@dataclass(frozen=True)
 class PlanRevisionAnalysis:
     """Immutable dry-run result and candidate manifests for the apply phase."""
 
@@ -84,6 +106,7 @@ class PlanRevisionAnalysis:
     candidate_plan_bytes: bytes = field(repr=False, compare=False)
     previous_manifest: PlanManifest = field(repr=False, compare=False)
     candidate_manifest: PlanManifest = field(repr=False)
+    supersessions: tuple[PlanRevisionSupersession, ...] = ()
 
     @property
     def can_apply(self) -> bool:
@@ -99,6 +122,9 @@ class PlanRevisionAnalysis:
             "scopes": [scope.to_document() for scope in self.scopes],
             "changes": [change.to_document() for change in self.changes],
             "blockers": [blocker.to_document() for blocker in self.blockers],
+            "supersessions": [
+                supersession.to_document() for supersession in self.supersessions
+            ],
         }
 
 

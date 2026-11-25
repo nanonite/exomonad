@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Literal
 
@@ -13,6 +14,7 @@ from tl_loop.state.schema import (
     ActionPhase,
     ActionState,
     DurableReviewEvidence,
+    ParkCause,
     ReviewValidationDisposition,
     ReviewValidationObservation,
     SliceState,
@@ -189,9 +191,24 @@ class StaleReviewerActionHealed(SliceEvent):
     head_sha: str
 
 
+@dataclass(frozen=True)
+class SliceSkipped(SliceEvent):
+    """An operator approved skipping one parked stage.
+
+    Only a slice parked behind the held-launch-effect operator gate may be
+    skipped, because that gate carries the machine proofs and the durable
+    append-only resolution record this event is bound to. The skipped status is
+    terminal: the controller never launches this slice again and evaluates its
+    dependents under the declared dependency policy.
+    """
+
+    gate_name: str
+    reason: str
+    decision_key: str
+
+
 class IllegalSliceTransition(Exception):
     """Raised when an event has no legal transition for the current slice."""
-
     def __init__(self, state: SliceState, event: SliceEvent) -> None:
         self.state = state
         self.event = event
@@ -276,6 +293,20 @@ def slice_transition(state: SliceState, event: SliceEvent) -> SliceState:
             review_validation_failure_reason=None
             if event.status == "failure"
             else state.review_validation_failure_reason,
+        )
+    if isinstance(event, SliceSkipped):
+        _validate_slice_skip(state, event)
+        return replace(
+            state,
+            status=SliceStatus.SKIPPED,
+            park_cause=None,
+            park_audit={
+                "recovery_action": "held_launch_effect_skip",
+                "needs_human": False,
+                "gate_name": event.gate_name,
+                "reason": event.reason,
+                "action_key": event.decision_key,
+            },
         )
     if isinstance(event, HeadEvidenceObserved):
         ci_state = dict(state.ci_state)
@@ -423,6 +454,21 @@ def slice_transition(state: SliceState, event: SliceEvent) -> SliceState:
             action=None,
         )
     raise IllegalSliceTransition(state, event)
+
+
+def _validate_slice_skip(state: SliceState, event: SliceSkipped) -> None:
+    """Allow a skip only for the held-launch operator park it was proven for."""
+    audit = state.park_audit
+    if (
+        state.status is not SliceStatus.PARKED
+        or state.park_cause is not ParkCause.HUMAN_DECISION_REQUIRED
+        or not isinstance(audit, Mapping)
+        or audit.get("recovery_action") != "held_launch_effect"
+        or not event.gate_name.strip()
+        or not event.reason.strip()
+        or not event.decision_key.strip()
+    ):
+        raise IllegalSliceTransition(state, event)
 
 
 def _validate_review_event(state: SliceState, event: ReviewVerdictObserved) -> None:

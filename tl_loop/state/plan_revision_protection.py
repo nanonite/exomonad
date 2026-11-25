@@ -24,6 +24,39 @@ def collect_blockers(
     blockers = _collect_node_blockers(previous, candidate, protected)
     _collect_child_scope_blockers(previous, candidate, scopes, blockers)
     _collect_runtime_rebase_blockers(previous, candidate, scopes, blockers)
+    blockers.extend(_collect_supersession_blockers(previous, candidate, current))
+    return blockers
+
+
+def _collect_supersession_blockers(
+    previous: PlanManifest,
+    candidate: PlanManifest,
+    current: ScopeState | None,
+) -> list[PlanRevisionBlocker]:
+    """A superseded node must be decided, not still waiting to be dispatched."""
+    if current is None:
+        return []
+    blockers: list[PlanRevisionBlocker] = []
+    by_id = {node.node_id: node for node in candidate.nodes}
+    for old_id, new_id in candidate.superseded_nodes.items():
+        if previous.superseded_nodes.get(old_id) == new_id:
+            continue
+        old_name = by_id[old_id].name
+        new_name = by_id[new_id].name
+        record = current.state.slices.get(old_name)
+        if record is not None and record.status in {
+            SliceStatus.PENDING,
+            SliceStatus.READY,
+        }:
+            blockers.append(
+                PlanRevisionBlocker(
+                    "superseded_node_still_pending",
+                    f"node {old_name!r} is still waiting to run; record the skip "
+                    f"decision before superseding it with {new_name!r}",
+                    candidate.scope_id,
+                    old_id,
+                )
+            )
     return blockers
 
 

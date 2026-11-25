@@ -108,10 +108,10 @@ The recursive rule is: **a child's fail-closed hold is reported upward as
 parked-with-gate, never as `recursive child failed`.** Only the child that owns
 the unresolved effect stops.
 
-The parked gate pair is scoped to the child, intent and action
-(`tl-held-launch-effect-<child>-<intent-prefix>-abandon` and `...-retry`).
-The parked diagnostic names the slice, intent, journal index, last host
-evidence seen, and the available operator actions. Both gates are opened
+The parked gate set is scoped to the child, intent and action
+(`tl-held-launch-effect-<child>-<intent-prefix>-abandon`, `...-retry` and
+`...-skip`). The parked diagnostic names the slice, intent, journal index, last
+host evidence seen, and the available operator actions. Every gate is opened
 pending once and an answered gate is never re-armed.
 
 An approved answer is only consumed when the same machine proof still holds:
@@ -120,7 +120,18 @@ An approved answer is only consumed when the same machine proof still holds:
 | --- | --- | --- |
 | abandon (`...-abandon` approved) | ledger read succeeded with no launch/refusal/failure row for the exact intent; owner invocation is terminal (not live) with no successor; owner, predecessor, branch, worktree and intent all match the journal | append one linked `operator_abandoned` resolution; the slice stays parked until retry is approved; no launch |
 | retry (`...-retry` approved) | the abandon proof above | append `operator_abandoned` and `retry_authorized`, then let the ordinary approved blocked-leaf dispatch path make exactly one fresh launch under the current configuration |
-| reject | - | record the rejection; the slice stays parked and nothing launches |
+| abandon-and-skip (`...-skip` approved, optionally after `...-abandon`) | the abandon proof above, a recorded operator reason, and a dependency policy that does not widen the plan's declared `skip_dependents` | append `operator_skipped` (plus `operator_abandoned` when abandon was also approved); mark the stage `SKIPPED`; reopen the scope at the next eligible stage; apply the policy to every dependent |
+| reject (any gate) | - | record the rejection; the slice stays parked and nothing launches |
+
+The skip answer is the only release for a stage whose record is unrecoverable
+but whose launch is still unproven. Its proofs are exactly the abandon proofs:
+the ledger read succeeded with no row for the intent, the owner invocation is
+terminal with no successor, and owner, predecessor, branch, worktree and intent
+all match the journal. A skip answer that widens the plan's declared policy, names
+no dependent under `require-named`, names a node that is not a dependent, or
+records no policy is refused and consumes nothing. Two approvals on the same
+effect that would both act (retry together with abandon or skip) are conflicting
+evidence and also consume nothing.
 
 Resolutions are append-only records (`kind: launch_resolution`) linked to the
 original entry by `resolves_key`. The original `unknown` entry keeps its bytes
@@ -161,6 +172,11 @@ The operator release path is explicit, never automatic:
    gates are the supported in-controller answer: `abandon` leaves the slice
    parked with a linked resolution, and `retry` appends the abandonment and
    then lets the ordinary approved path make exactly one fresh launch.
+5. If the child's own record is unrecoverable, `...-skip` is the supported
+   answer instead: it records the reason, marks the stage `SKIPPED`, and moves
+   the plan on. The original journal entry, ledger rows, proofs and plan
+   snapshot digest are unchanged; `plan revise` then supersedes the old stage
+   with a new future node rather than deleting or rewriting it.
 
 The compiled-host acceptance for this hold is
 `tests/e2e/blocked-resume-host/run.py terminal-failure-hold`

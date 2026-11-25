@@ -959,6 +959,7 @@ def _derive_slice_action(
             SliceStatus.FAILED,
             SliceStatus.PARKED,
             SliceStatus.BLOCKED,
+            SliceStatus.SKIPPED,
         }
     ):
         return InternalTransition("parked", "review_rounds_exhausted")
@@ -1032,6 +1033,7 @@ def _derive_slice_action(
         SliceStatus.FAILED,
         SliceStatus.PARKED,
         SliceStatus.BLOCKED,
+        SliceStatus.SKIPPED,
     }:
         return Quiescent(f"closed_{state.status.value}")
     if state.review_validation_required:

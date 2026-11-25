@@ -39,6 +39,7 @@ MANIFEST_KEYS = frozenset(
         "ordered_stages",
         "child_manifest_digests",
         "child_manifests",
+        "superseded_nodes",
         "digest",
     }
 )
@@ -253,6 +254,11 @@ class PlanManifest:
     ordered_stages: tuple[tuple[int, tuple[str, ...]], ...] = ()
     child_manifest_digests: Mapping[str, str] = field(default_factory=dict)
     child_manifests: Mapping[str, PlanManifest] = field(default_factory=dict)
+    #: Superseded node ID -> replacement node ID. A dispatched node is never
+    #: removed or rewritten to replace it; the operator instead adds a new future
+    #: node and this map records which old declaration it stands in for. The old
+    #: node keeps its identity, branch and dependency history byte-for-byte.
+    superseded_nodes: Mapping[str, str] = field(default_factory=dict)
     schema_version: int = MANIFEST_SCHEMA_VERSION
     plan_compatibility_version: int = PLAN_COMPATIBILITY_VERSION
     manifest_revision: int = 1
@@ -325,7 +331,9 @@ class PlanManifest:
             if persisted_child is not None and persisted_child.digest != expected:
                 raise ManifestError("child manifest digest does not match its persisted document")
         _validate_unique_chainlink_bindings(nodes, children)
+        superseded = _validate_supersessions(nodes, self.superseded_nodes)
         object.__setattr__(self, "nodes", nodes)
+        object.__setattr__(self, "superseded_nodes", MappingProxyType(superseded))
         object.__setattr__(self, "source_order", ids)
         object.__setattr__(self, "ordered_stages", stages)
         object.__setattr__(self, "child_manifest_digests", MappingProxyType(child_digests))
@@ -354,6 +362,10 @@ class PlanManifest:
                 node_id: child.to_document() for node_id, child in self.child_manifests.items()
             },
         }
+        # Omitted when empty so a scope with no supersession keeps the exact
+        # payload (and digest) it had before this field existed.
+        if self.superseded_nodes:
+            payload["superseded_nodes"] = dict(self.superseded_nodes)
         if self.plan_compatibility_version > MINIMUM_SUPPORTED_PLAN_COMPATIBILITY_VERSION:
             payload["plan_compatibility_version"] = self.plan_compatibility_version
         return payload
@@ -395,6 +407,9 @@ class PlanManifest:
         source_order = value.get("source_order")
         if not isinstance(source_order, list):
             raise ManifestError("manifest source_order must be an array")
+        raw_superseded = value.get("superseded_nodes", {})
+        if not isinstance(raw_superseded, Mapping):
+            raise ManifestError("manifest superseded_nodes must be an object")
         raw_children = value.get("child_manifests", {})
         if not isinstance(raw_children, Mapping):
             raise ManifestError("manifest child_manifests must be an object")
@@ -418,6 +433,12 @@ class PlanManifest:
                 for key, value in raw_digests.items()
             },
             child_manifests=children,
+            superseded_nodes={
+                _require_text(key, "superseded node"): _require_text(
+                    target, "superseding node"
+                )
+                for key, target in raw_superseded.items()
+            },
             schema_version=_required_int(value, "schema_version"),
             plan_compatibility_version=_plan_compatibility_version(value),
             manifest_revision=_required_int(value, "manifest_revision"),
@@ -452,6 +473,7 @@ def build_plan_manifest(
     nodes: list[ManifestNode] = []
     child_digests: dict[str, str] = {}
     child_manifests: dict[str, PlanManifest] = {}
+    supersedes_by_name: dict[str, str] = {}
     source_index = 0
     for kind, key in (("worker", "workers"), ("leaf", "leaves"), ("sub_tl", "sub_tls")):
         entries = plan.get(key, [])
@@ -470,6 +492,11 @@ def build_plan_manifest(
             if not isinstance(boundary, Sequence) or isinstance(boundary, (str, bytes)):
                 raise ManifestError(f"manifest boundary for {name!r} must be an array")
             depends_on = _declared_depends_on(raw, kind=kind, name=name)
+            supersedes = raw.get("supersedes")
+            if supersedes is not None:
+                supersedes_by_name[name] = _require_text(
+                    supersedes, f"{kind} {name!r} supersedes"
+                )
             branch = str(raw.get("branch") or f"{owned_branch}.{name}")
             worktree = raw.get("worktree")
             child_digest: str | None = None
@@ -519,6 +546,7 @@ def build_plan_manifest(
                 child_manifests[node_id] = child
             source_index += 1
     ordered = _ordered_from_nodes(nodes)
+    superseded = _resolve_supersessions(nodes, supersedes_by_name)
     return PlanManifest(
         scope_id=scope_id,
         parent_scope_id=parent_scope_id,
@@ -530,6 +558,7 @@ def build_plan_manifest(
         ordered_stages=ordered,
         child_manifest_digests=child_digests,
         child_manifests=child_manifests,
+        superseded_nodes=superseded,
         manifest_revision=manifest_revision,
         plan_compatibility_version=plan_compatibility_version,
     )
@@ -642,6 +671,55 @@ def validate_manifest_revision(
         new = candidate_nodes.get(node_id)
         if new is not None and old.identity() != new.identity() and node_id in protected_node_ids:
             raise ManifestError(f"manifest revision mutates protected node {node_id!r}")
+    _validate_supersession_revision(previous, candidate, previous_nodes, candidate_nodes)
+
+
+def _validate_supersession_revision(
+    previous: PlanManifest,
+    candidate: PlanManifest,
+    previous_nodes: Mapping[str, ManifestNode],
+    candidate_nodes: Mapping[str, ManifestNode],
+) -> None:
+    """Allow a replaced node to gain a new future node, never to be rewritten.
+
+    Superseding is additive: the old declaration keeps its identity, branch and
+    dependency history, and the replacement is a declaration this manifest has
+    never carried. Dropping or repointing a recorded supersession is refused,
+    because that would let a revision silently resurrect a stage an operator
+    already replaced.
+    """
+    for old_id, new_id in previous.superseded_nodes.items():
+        if candidate.superseded_nodes.get(old_id) != new_id:
+            raise ManifestError(
+                f"manifest revision cannot drop or change the supersession of {old_id!r}"
+            )
+    for old_id, new_id in candidate.superseded_nodes.items():
+        if old_id in previous.superseded_nodes:
+            continue
+        old_previous = previous_nodes.get(old_id)
+        old = candidate_nodes.get(old_id)
+        if old is None or old_previous is None or old.identity() != old_previous.identity():
+            raise ManifestError(
+                f"manifest revision cannot supersede and rewrite node {old_id!r}"
+            )
+        if new_id in previous_nodes:
+            raise ManifestError(
+                f"manifest supersession of {old_id!r} must introduce a new node, "
+                f"not reuse existing node {new_id!r}"
+            )
+        new = candidate_nodes[new_id]
+        if new.kind != old.kind:
+            raise ManifestError(
+                f"manifest supersession of {old_id!r} must replace a node of the same kind"
+            )
+        if (
+            new.chainlink_issue_id is not None
+            and new.chainlink_issue_id == old.chainlink_issue_id
+        ):
+            raise ManifestError(
+                f"superseding node {new_id!r} cannot reuse the replaced node's "
+                "chainlink_issue_id; declare it null and bind the fresh slice in a new plan"
+            )
 
 
 def _validate_dependency_edges(nodes: Sequence[ManifestNode]) -> None:
@@ -749,7 +827,11 @@ def _integration_contract(value: object) -> Mapping[str, object]:
 def _node_declaration(value: Mapping[str, object], kind: str) -> Mapping[str, object]:
     """Retain task metadata needed to reconstruct the exact child declaration."""
     fields = {
-        "worker": ("task_timeout_seconds", "reference_verification_requirements"),
+        "worker": (
+            "task_timeout_seconds",
+            "reference_verification_requirements",
+            "skip_dependents",
+        ),
         "leaf": (
             "context",
             "read_first",
@@ -758,16 +840,77 @@ def _node_declaration(value: Mapping[str, object], kind: str) -> Mapping[str, ob
             "done_criteria",
             "task_timeout_seconds",
             "reference_verification_requirements",
+            "skip_dependents",
         ),
         "sub_tl": (
             "order_explicit",
             "task_timeout_seconds",
             "reference_verification_requirements",
+            "skip_dependents",
         ),
         "legacy": (),
     }[kind]
     declaration = {name: value[name] for name in fields if name in value}
     return _json_mapping(declaration, "manifest node declaration")
+
+
+def _resolve_supersessions(
+    nodes: Sequence[ManifestNode],
+    supersedes_by_name: Mapping[str, str],
+) -> dict[str, str]:
+    """Resolve each declared ``supersedes`` name to the replaced node ID."""
+    if not supersedes_by_name:
+        return {}
+    by_name = {node.name: node for node in nodes}
+    resolved: dict[str, str] = {}
+    for name, target in supersedes_by_name.items():
+        replacement = by_name.get(name)
+        replaced = by_name.get(target)
+        if replacement is None or replaced is None:
+            raise ManifestError(
+                f"supersedes for {name!r} names an unknown sibling {target!r}"
+            )
+        if replacement.kind != replaced.kind:
+            raise ManifestError(
+                f"{name!r} supersedes {target!r} of a different kind"
+            )
+        resolved[replaced.node_id] = replacement.node_id
+    return resolved
+
+
+def _validate_supersessions(
+    nodes: Sequence[ManifestNode],
+    declared: Mapping[str, str],
+) -> dict[str, str]:
+    """Prove every supersession pair is a real, distinct declaration pair."""
+    if not isinstance(declared, Mapping):
+        raise ManifestError("manifest superseded_nodes must be an object")
+    by_id = {node.node_id: node for node in nodes}
+    result: dict[str, str] = {}
+    for old_id, new_id in declared.items():
+        old = by_id.get(_require_text(old_id, "superseded node"))
+        new = by_id.get(_require_text(new_id, "superseding node"))
+        if old is None or new is None:
+            raise ManifestError("manifest supersession names an unknown node")
+        if old.node_id == new.node_id:
+            raise ManifestError("manifest supersession cannot name itself")
+        if old.kind != new.kind:
+            raise ManifestError(
+                "manifest supersession must replace a node of the same kind"
+            )
+        if old.name == new.name or old.owned_branch == new.owned_branch:
+            raise ManifestError(
+                "manifest supersession must declare a distinct name and branch"
+            )
+        if (
+            old.worktree is not None
+            and old.worktree == new.worktree
+        ):
+            raise ManifestError(
+                "manifest supersession must not reuse the replaced worktree"
+            )
+        result[old.node_id] = new.node_id
+    return result
 
 
 def _validate_unique_chainlink_bindings(

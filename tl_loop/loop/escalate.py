@@ -37,6 +37,7 @@ _TERMINAL_STATUSES = frozenset(
         SliceStatus.FAILED.value,
         SliceStatus.PARKED.value,
         SliceStatus.BLOCKED.value,
+        SliceStatus.SKIPPED.value,
     }
 )
 _AUDIT_FIELDS = frozenset(
