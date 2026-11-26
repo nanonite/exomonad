@@ -7,7 +7,13 @@ from collections.abc import Mapping
 from tl_loop.fsm.child import ChildRecord
 from tl_loop.fsm.scope import TLPlanning, TLRunning
 
-from .plan_manifest import ManifestError, ManifestNode, PlanManifest, validate_manifest_revision
+from .plan_manifest import (
+    ManifestError,
+    ManifestNode,
+    PlanManifest,
+    source_index_shift_allowed,
+    validate_manifest_revision,
+)
 from .plan_revision_diff import changed_node_fields
 from .plan_revision_types import PlanRevisionBlocker, ScopeState
 from .schema import RunState, SliceState, SliceStatus
@@ -67,6 +73,7 @@ def _collect_node_blockers(
 ) -> list[PlanRevisionBlocker]:
     old_nodes = {node.node_id: node for node in previous.nodes}
     new_nodes = {node.node_id: node for node in candidate.nodes}
+    allow_source_shift = source_index_shift_allowed(previous, candidate)
     blockers = []
     for node_id in sorted(set(old_nodes) | set(new_nodes)):
         blocker = _node_change_blocker(
@@ -75,6 +82,7 @@ def _collect_node_blockers(
             old_nodes.get(node_id),
             new_nodes.get(node_id),
             protected,
+            allow_source_shift=allow_source_shift,
         )
         if blocker is not None:
             blockers.append(blocker)
@@ -87,6 +95,8 @@ def _node_change_blocker(
     old: ManifestNode | None,
     new: ManifestNode | None,
     protected: frozenset[str],
+    *,
+    allow_source_shift: bool,
 ) -> PlanRevisionBlocker | None:
     if old is not None and new is None:
         return PlanRevisionBlocker(
@@ -95,7 +105,9 @@ def _node_change_blocker(
     if old is None or new is None:
         return None
     if node_id in protected:
-        blocker = _protected_mutation_blocker(scope_id, node_id, old, new)
+        blocker = _protected_mutation_blocker(
+            scope_id, node_id, old, new, allow_source_shift=allow_source_shift
+        )
         if blocker is not None:
             return blocker
     if old.kind != new.kind:
@@ -113,8 +125,12 @@ def _protected_mutation_blocker(
     node_id: str,
     old: ManifestNode,
     new: ManifestNode,
+    *,
+    allow_source_shift: bool,
 ) -> PlanRevisionBlocker | None:
     fields = changed_node_fields(old, new)
+    if allow_source_shift and fields == ("source_index",):
+        return None
     if not fields:
         return None
     return PlanRevisionBlocker(
@@ -233,8 +249,18 @@ def _collect_past_work_blockers(
     blockers: list[PlanRevisionBlocker],
 ) -> None:
     completed = set(phase.completed_children)
+    previous_nodes = {node.node_id: node for node in previous.nodes}
+    candidate_nodes = {node.node_id: node for node in candidate.nodes}
+    same_order_replacements = {
+        replacement_id
+        for old_id, replacement_id in candidate.superseded_nodes.items()
+        if old_id not in previous.superseded_nodes
+        and old_id in previous_nodes
+        and replacement_id in candidate_nodes
+        and previous_nodes[old_id].order == candidate_nodes[replacement_id].order
+    }
     for node in candidate.nodes:
-        if node.name in completed:
+        if node.name in completed or node.node_id in same_order_replacements:
             continue
         blocker = _past_work_blocker(previous.scope_id, node, phase.current_order)
         if blocker is not None:

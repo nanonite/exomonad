@@ -266,14 +266,39 @@ dispatch history byte-for-byte; only a new declaration is added and the
 manifest records `superseded_nodes: {old -> new}`. The dry run reports each
 `supersessions` entry with the replaced and replacement names and the
 `rebound_dependents` that now depend on the replacement (every node in a later
-ordered stage, plus any leaf whose `depends_on` names the replaced node). Apply
-writes that report into the audit entry. Removing or rewriting a dispatched node
-is still refused, and a replacement may not reuse the replaced node's name,
-branch or worktree. The replaced node's `chainlink_issue_id` is immutable, so the
-replacement cannot claim the same issue in the same manifest: declare it `null`
-(or a fresh issue) and bind the repair under the skipped issue in a new plan
-when that issue is needed. Supersession is a same-run substitute. It is not an
-in-manifest rebind and it does not touch Chainlink.
+ordered stage, plus any leaf whose `depends_on` names the replaced node). It also
+reports `blocked_dependents`: the subset currently held `BLOCKED` on the
+replaced node (a skipped stage under `block` or an unnamed `require-named`
+dependent). Apply moves each of those dependents' `blocked_by` from the skipped
+node to the replacement through the slice transition, records the old and new
+prerequisite in that dependent's `park_audit`, and writes the report into the
+revision audit entry. A dependent already running or blocked on some other stage
+is not touched.
+
+The replacement is ordered like any other future node, with two rules:
+
+- It may share the **same order and owned paths as the node it supersedes**: the
+  superseded declaration is already `SKIPPED`, so the two never run together.
+  That exemption is only for the exact declared `supersedes` pair; overlapping
+  paths with any other same-order peer are still refused.
+- A replacement placed later than a stage whose dependents are held does not
+  wait behind them. The ordered scope treats a stage as non-gating when every
+  unfinished child is held on an unmerged replacement, advances past it, and
+  dispatches the replacement. Once the replacement is `MERGED` (and, when it
+  requires an aggregate PR, its post-merge recovery is `COMPLETE`), the held
+  dependents are released to `PENDING` and the barrier moves back to their
+  stage, so B and C run in their declared order. If the replacement fails or is
+  itself skipped, they stay `BLOCKED` and the scope remains held instead of
+  claiming `TLDone`. A replacement placed behind `current_order` without the
+  same-order supersession proof is refused by `runtime_rebase_past_work`.
+
+Removing or rewriting a dispatched node is still refused, and a replacement may
+not reuse the replaced node's name, branch or worktree. The replaced node's
+`chainlink_issue_id` is immutable, so the replacement cannot claim the same
+issue in the same manifest: declare it `null` (or a fresh issue) and bind the
+repair under the skipped issue in a new plan when that issue is needed.
+Supersession is a same-run substitute. It rebinds the *prerequisite* of held
+dependents, not their issue binding, and it does not touch Chainlink.
 
 #### Skipping a parked stage and its dependents
 

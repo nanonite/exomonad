@@ -82,6 +82,10 @@ class PlanRevisionSupersession:
     replacement_node_id: str
     replacement_name: str
     rebound_dependents: tuple[str, ...]
+    #: The subset of ``rebound_dependents`` currently held ``BLOCKED`` on the
+    #: superseded node. Apply moves these to the replacement; the others were
+    #: never held by the skip and keep whatever state they already had.
+    blocked_dependents: tuple[str, ...] = ()
 
     def to_document(self) -> dict[str, object]:
         return {
@@ -91,6 +95,7 @@ class PlanRevisionSupersession:
             "replacement_node_id": self.replacement_node_id,
             "replacement_name": self.replacement_name,
             "rebound_dependents": list(self.rebound_dependents),
+            "blocked_dependents": list(self.blocked_dependents),
         }
 
 

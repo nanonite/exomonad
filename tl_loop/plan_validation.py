@@ -246,7 +246,7 @@ def _normalize_work_plan_mapping(value: Mapping[str, object], path: str) -> dict
 
 
 def _validate_sibling_ownership(value: Mapping[str, object], path: str) -> None:
-    owned: list[tuple[str, str]] = []
+    owned: list[tuple[str, str, str | None, str]] = []
     for kind in ("workers", "leaves", "sub_tls"):
         entries = value.get(kind, ())
         if not isinstance(entries, list):
@@ -257,6 +257,8 @@ def _validate_sibling_ownership(value: Mapping[str, object], path: str) -> None:
             name = entry.get("name", f"{kind}[{index}]")
             if not isinstance(name, str):
                 continue
+            supersedes = entry.get("supersedes")
+            declared = supersedes if isinstance(supersedes, str) else None
             boundaries = entry.get("boundary") if kind == "leaves" else None
             paths = (
                 boundaries if isinstance(boundaries, list) and boundaries else [f"tl-loop/{name}"]
@@ -264,13 +266,20 @@ def _validate_sibling_ownership(value: Mapping[str, object], path: str) -> None:
             for candidate in paths:
                 if not isinstance(candidate, str) or not candidate:
                     continue
-                for other_name, other_path in owned:
-                    if _patterns_overlap(candidate, other_path):
-                        raise PlanValidationError(
-                            f"{path}.{kind}[{index}] path {candidate!r} overlaps "
-                            f"{other_name!r} path {other_path!r}"
-                        )
-                owned.append((name, candidate))
+                for other_name, other_path, other_supersedes, other_kind in owned:
+                    if not _patterns_overlap(candidate, other_path):
+                        continue
+                    # A replacement never runs beside the node it replaces: the
+                    # superseded declaration is already SKIPPED. Only that exact
+                    # declared pair may share ownership; every other overlap,
+                    # including a same-order unrelated sibling, stays refused.
+                    if other_kind == kind and (declared == other_name or other_supersedes == name):
+                        continue
+                    raise PlanValidationError(
+                        f"{path}.{kind}[{index}] path {candidate!r} overlaps "
+                        f"{other_name!r} path {other_path!r}"
+                    )
+                owned.append((name, candidate, declared, kind))
 
 
 def _validate_run_id(value: object) -> None:

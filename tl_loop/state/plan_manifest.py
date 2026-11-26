@@ -656,6 +656,7 @@ def validate_manifest_revision(
             "manifest revisions are additive-only; cannot remove nodes: "
             + ", ".join(repr(node_id) for node_id in removed)
         )
+    source_shift = source_index_shift_allowed(previous, candidate)
     for node_id in protected_node_ids:
         old = previous_nodes.get(node_id)
         new = candidate_nodes.get(node_id)
@@ -665,13 +666,57 @@ def validate_manifest_revision(
             raise ManifestError(
                 f"manifest revision changes chainlink_issue_id for protected node {node_id!r}"
             )
-        if old.identity() != new.identity():
+        if not _same_identity(old, new, allow_source_shift=source_shift):
             raise ManifestError(f"manifest revision mutates protected node {node_id!r}")
     for node_id, old in previous_nodes.items():
         new = candidate_nodes.get(node_id)
-        if new is not None and old.identity() != new.identity() and node_id in protected_node_ids:
+        if (
+            new is not None
+            and node_id in protected_node_ids
+            and not _same_identity(old, new, allow_source_shift=source_shift)
+        ):
             raise ManifestError(f"manifest revision mutates protected node {node_id!r}")
     _validate_supersession_revision(previous, candidate, previous_nodes, candidate_nodes)
+
+
+def _same_identity(
+    old: ManifestNode,
+    new: ManifestNode,
+    *,
+    allow_source_shift: bool,
+) -> bool:
+    if old.identity() == new.identity():
+        return True
+    if not allow_source_shift:
+        return False
+    return replace(old, source_index=new.source_index).identity() == new.identity()
+
+
+def source_index_shift_allowed(
+    previous: PlanManifest,
+    candidate: PlanManifest,
+) -> bool:
+    """Allow only index shifts caused by inserted supersession replacements.
+
+    A replacement declared at an earlier same-order position moves every later
+    node's positional index. That is a shift, not a rewrite: removing the newly
+    inserted replacement declarations from the candidate sequence must restore
+    the previous node sequence exactly. Any other reorder still fails closed.
+    """
+    inserted = {
+        replacement_id
+        for old_id, replacement_id in candidate.superseded_nodes.items()
+        if old_id not in previous.superseded_nodes
+    }
+    old_sequence = [
+        node.node_id for node in sorted(previous.nodes, key=lambda item: item.source_index)
+    ]
+    new_sequence = [
+        node.node_id
+        for node in sorted(candidate.nodes, key=lambda item: item.source_index)
+        if node.node_id not in inserted
+    ]
+    return old_sequence == new_sequence
 
 
 def _validate_supersession_revision(

@@ -302,6 +302,7 @@ from tl_loop.state.plan_manifest import (
     PlanManifest,
     build_plan_manifest,
 )
+from tl_loop.state.plan_revision_diff import rebound_dependent_names
 from tl_loop.state.plan_revision_manifest import retain_scope_revisions
 from tl_loop.state.reference_verification import (
     ReferenceVerificationError,
@@ -364,6 +365,7 @@ from tl_loop.state.slice_transition import (
     ReviewValidated,
     ReviewValidationFailed,
     ReviewVerdictObserved,
+    SliceDependencyReleased,
     SliceSkipped,
     SliceStatusChanged,
     StaleReviewerActionHealed,
@@ -22862,7 +22864,220 @@ def _reopen_shutdown_sub_tl_dispatches(
     return store.load()
 
 
+MAX_REBOUND_RELEASE_PASSES = 2
+
+_TERMINAL_REPLACEMENT_STATUSES = frozenset(
+    {
+        SliceStatus.MERGED,
+        SliceStatus.FAILED,
+        SliceStatus.DISPATCH_FAILED,
+        SliceStatus.PARKED,
+        SliceStatus.BLOCKED,
+        SliceStatus.SKIPPED,
+    }
+)
+
+
+def _declared_replacements(
+    manifest: PlanManifest,
+) -> dict[str, tuple[ManifestNode, ManifestNode]]:
+    """Map each replacement name to its (superseded, replacement) declaration."""
+    by_id = {node.node_id: node for node in manifest.nodes}
+    replacements: dict[str, tuple[ManifestNode, ManifestNode]] = {}
+    for old_id, replacement_id in manifest.superseded_nodes.items():
+        superseded = by_id.get(old_id)
+        replacement = by_id.get(replacement_id)
+        if superseded is not None and replacement is not None:
+            replacements[replacement.name] = (superseded, replacement)
+    return replacements
+
+
+def _replacement_satisfied(
+    replacement: ManifestNode,
+    current: SliceState | None,
+    task: SubTLTask | None,
+) -> bool:
+    """A replacement releases dependents only after it actually merged."""
+    if current is None or current.status is not SliceStatus.MERGED:
+        return False
+    if task is not None:
+        return _ordered_child_complete(task, current)
+    if current.pr_number is None:
+        return current.post_merge is not None and current.post_merge.phase in {
+            PostMergePhase.NOT_REQUIRED,
+            PostMergePhase.COMPLETE,
+        }
+    return current.post_merge is not None and (
+        current.post_merge.phase is PostMergePhase.COMPLETE
+    )
+
+
+def _release_rebound_dependents(
+    plan: WorkPlan,
+    state: RunState,
+    store: RunStore,
+) -> RunState:
+    """Release dependents held by a replacement that has now merged."""
+    manifest = state.plan_manifest
+    if manifest is None or not manifest.superseded_nodes:
+        return state
+    tasks_by_name = {task.name: task for task in plan.sub_tls}
+    satisfied: dict[str, tuple[ManifestNode, ManifestNode]] = {}
+    for replacement_name, declarations in _declared_replacements(manifest).items():
+        superseded, replacement = declarations
+        if _replacement_satisfied(
+            replacement,
+            state.slices.get(replacement_name),
+            tasks_by_name.get(replacement_name),
+        ):
+            satisfied[replacement_name] = declarations
+    if not satisfied:
+        return state
+    slices = dict(state.slices)
+    released: list[str] = []
+    for name, current in state.slices.items():
+        if current.status is not SliceStatus.BLOCKED or current.blocked_by is None:
+            continue
+        matched = satisfied.get(current.blocked_by)
+        if matched is None:
+            continue
+        superseded, replacement = matched
+        if name not in rebound_dependent_names(
+            manifest, superseded, exclude=replacement.node_id
+        ):
+            continue
+        slices[name] = slice_transition(
+            current,
+            SliceDependencyReleased(
+                current.blocked_by,
+                "the superseding replacement merged and produced its output",
+            ),
+        )
+        released.append(name)
+    if not released:
+        return state
+    orders = [
+        order
+        for order, node_ids in manifest.ordered_stages
+        if any(manifest.node(node_id).name in released for node_id in node_ids)
+    ]
+    current_order = state.current_order or 1
+    if orders:
+        current_order = min(current_order, *orders)
+    return store.checkpoint(
+        cast(Any, state.recursive_fsm),
+        slices,
+        state.budgets,
+        state.events.last_consumed_offset,
+        current_order=current_order,
+        ordered_stages=state.ordered_stages,
+        integration=state.integration,
+        expected_revision=state.revision,
+    )
+
+
+def _stage_held_by_pending_supersession(
+    tasks: Sequence[SubTLTask],
+    state: RunState,
+) -> bool:
+    """Return whether every unfinished child waits on an unmerged replacement."""
+    manifest = state.plan_manifest
+    if manifest is None or not manifest.superseded_nodes:
+        return False
+    replacements = _declared_replacements(manifest)
+    unfinished = [
+        task
+        for task in tasks
+        if not _ordered_child_complete(task, state.slices[task.name])
+    ]
+    if not unfinished:
+        return False
+    for task in unfinished:
+        current = state.slices[task.name]
+        if current.status is not SliceStatus.BLOCKED or current.blocked_by is None:
+            return False
+        declared = replacements.get(current.blocked_by)
+        if declared is None:
+            return False
+        _superseded, replacement = declared
+        replacement_slice = state.slices.get(replacement.name)
+        if replacement_slice is None:
+            return False
+        if replacement_slice.status in _TERMINAL_REPLACEMENT_STATUSES:
+            return False
+    return True
+
+
+def _scope_holds_unsatisfied_rebound_dependents(
+    plan: WorkPlan,
+    state: RunState,
+) -> bool:
+    """Hold a scope whose dependents still wait on a terminal replacement."""
+    manifest = state.plan_manifest
+    if manifest is None or not manifest.superseded_nodes:
+        return False
+    tasks_by_name = {task.name: task for task in plan.sub_tls}
+    replacements = _declared_replacements(manifest)
+    for name, current in state.slices.items():
+        if current.status is not SliceStatus.BLOCKED or current.blocked_by is None:
+            continue
+        declared = replacements.get(current.blocked_by)
+        if declared is None:
+            continue
+        superseded, replacement = declared
+        if name not in rebound_dependent_names(
+            manifest, superseded, exclude=replacement.node_id
+        ):
+            continue
+        if not _replacement_satisfied(
+            replacement,
+            state.slices.get(replacement.name),
+            tasks_by_name.get(replacement.name),
+        ):
+            return True
+    return False
+
+
 def _run_sub_tls(
+    plan: WorkPlan,
+    state: RunState,
+    config: TLLoopConfig,
+    source: EventQueue,
+    effects: EffectClient | ReadOnlyEffectClient,
+    store: RunStore,
+    effects_log: list[EffectIntent],
+) -> RunState:
+    """Run ordered children, including one pass after a replacement releases work.
+
+    Releasing rebound dependents moves the barrier back to their stage. The same
+    call then has to dispatch them, so the ordered pass runs again exactly once
+    after that release is observed.
+    """
+    for _pass in range(MAX_REBOUND_RELEASE_PASSES):
+        before = store.load()
+        result = _run_sub_tls_once(
+            plan, state, config, source, effects, store, effects_log
+        )
+        after = store.load()
+        if not _rebound_release_advanced(before, after):
+            return result
+        state = after
+    return store.load()
+
+
+def _rebound_release_advanced(before: RunState, after: RunState) -> bool:
+    """Detect the single barrier rewind a satisfied replacement performs."""
+    if (after.current_order or 0) < (before.current_order or 0):
+        return True
+    return any(
+        (prior := before.slices.get(name)) is not None
+        and prior.status is SliceStatus.BLOCKED
+        and current.status is SliceStatus.PENDING
+        for name, current in after.slices.items()
+    )
+
+
+def _run_sub_tls_once(
     plan: WorkPlan,
     state: RunState,
     config: TLLoopConfig,
@@ -22877,6 +23092,7 @@ def _run_sub_tls(
     for task in plan.sub_tls:
         _adopt_live_child_controller_invocation(config, task)
     state = store.load()
+    state = _release_rebound_dependents(plan, state, store)
     state = _reopen_shutdown_sub_tl_dispatches(plan, state, config, store)
     state, completion_hold = _reconcile_optional_sub_tl_completion(
         plan, config, effects, store, effects_log
@@ -22994,6 +23210,16 @@ def _run_sub_tls(
                 state, config, effects, store, effects_log, "recursive child is not recoverable"
             )
         was_stage_complete = _ordered_stage_complete(stage_tasks, state.slices)
+        if not was_stage_complete and _stage_held_by_pending_supersession(
+            stage_tasks, state
+        ):
+            # Every unfinished child here waits on a replacement that has not
+            # merged yet. The stage cannot make progress, and it must not hold
+            # the replacement behind it; advance to the next stage.
+            state, current_order = _advance_ordered_stage(
+                stage.order, state, current_order, plan, store
+            )
+            continue
         pending = tuple(
             task
             for task, current in zip(stage_tasks, stage_states)
@@ -23130,6 +23356,11 @@ def _run_sub_tls(
         state, current_order = _advance_ordered_stage(
             stage.order, state, current_order, plan, store
         )
+    state = _release_rebound_dependents(plan, store.load(), store)
+    if _scope_holds_unsatisfied_rebound_dependents(plan, state):
+        # A replacement that failed, was skipped, or is parked cannot release
+        # its dependents. Hold the scope instead of claiming the run is done.
+        return state
     if plan.sub_tls and not plan.workers and not plan.leaves:
         current_stage_ids = next(
             (stage.sub_tls for stage in plan.ordered_stages if stage.order == state.current_order),
@@ -36150,17 +36381,23 @@ def normalize_work_plan(plan: WorkPlan, *, path: str = "plan") -> WorkPlan:
 
 
 def _validate_concurrent_ownership(tasks: Sequence[SubTLTask], path: str, order: int) -> None:
-    owned: list[tuple[str, str]] = []
+    owned: list[tuple[str, str, str | None]] = []
     for task in tasks:
         for owned_path in _sub_tl_owned_paths(task):
-            for other_name, other_path in owned:
-                if _patterns_overlap(owned_path, other_path):
-                    raise ValueError(
-                        f"{path} order {order} ownership overlaps between "
-                        f"{task.name!r} path {owned_path!r} and "
-                        f"{other_name!r} path {other_path!r}"
-                    )
-            owned.append((task.name, owned_path))
+            for other_name, other_path, other_supersedes in owned:
+                if not _patterns_overlap(owned_path, other_path):
+                    continue
+                # The superseded declaration is already SKIPPED, so it can never
+                # run beside this replacement. Only that exact declared pair may
+                # share ownership; unrelated same-order work still must not.
+                if task.supersedes == other_name or other_supersedes == task.name:
+                    continue
+                raise ValueError(
+                    f"{path} order {order} ownership overlaps between "
+                    f"{task.name!r} path {owned_path!r} and "
+                    f"{other_name!r} path {other_path!r}"
+                )
+            owned.append((task.name, owned_path, task.supersedes))
 
 
 def _sub_tl_owned_paths(task: SubTLTask) -> tuple[str, ...]:

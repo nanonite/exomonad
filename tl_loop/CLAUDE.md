@@ -1169,8 +1169,20 @@ operator walkthrough is `docs/guides/tl-gates-and-failures.md`. The compiled
 replay is `just e2e-blocked-resume-host skip-held-stage`.
 `plan revise` supports superseding such a stage with a new future node; the old
 declaration keeps its identity, branch and dependency history and only the new
-node is added (`spec.superseded_nodes`). This is a same-run substitute, not an
-in-manifest rebind: the replacement cannot claim the skipped stage's
+node is added (`spec.superseded_nodes`). Apply rebinds every dependent the dry
+run reports as `blocked_dependents` through `SliceRebound`, moving `blocked_by`
+from the skipped stage to the replacement and auditing both prerequisites. The
+ordered dispatcher treats a stage as non-gating when all its unfinished children
+are `BLOCKED` on an unmerged replacement, so it advances to and dispatches the
+replacement even at a later order. `_release_rebound_dependents` runs
+`SliceDependencyReleased` only after that replacement is `MERGED` (and its
+post-merge recovery is `COMPLETE` when required), then rewinds `current_order` to
+the dependents' stage; a failed or skipped replacement leaves them `BLOCKED` and
+the scope held. A fresh replacement may share the superseded node's order and
+paths (they never run together), but unrelated same-order overlap is still
+refused, and a replacement behind `current_order` without that same-order proof
+is refused. This is a same-run substitute for the prerequisite, not an
+in-manifest issue rebind: the replacement cannot claim the skipped stage's
 `chainlink_issue_id`.
 
 A stored `configured_route_authorization` written under an older identity scheme

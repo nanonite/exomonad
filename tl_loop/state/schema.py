@@ -791,6 +791,10 @@ PARK_AUDIT_KEYS = frozenset(
         "role",
         "estimated_tokens",
         "launch_evidence",
+        # A skip dependent rebound by a plan revision keeps the old and new
+        # prerequisite identities beside the operator's skip decision.
+        "superseded_blocker",
+        "replacement_blocker",
     }
 )
 RECOVERY_KEYS = frozenset(

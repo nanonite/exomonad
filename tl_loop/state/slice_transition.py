@@ -192,6 +192,28 @@ class StaleReviewerActionHealed(SliceEvent):
 
 
 @dataclass(frozen=True)
+class SliceRebound(SliceEvent):
+    """A held dependent now waits on its prerequisite's declaration replacement.
+
+    Plan revision declares a new node that supersedes the skipped prerequisite.
+    The dependent keeps its ``BLOCKED`` decision but its ``blocked_by`` moves to
+    the replacement, so it runs only after the replacement's output exists.
+    """
+
+    superseded_id: str
+    replacement_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class SliceDependencyReleased(SliceEvent):
+    """A replacement merged, so a dependent rebound to it may be dispatched."""
+
+    replacement_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class SliceSkipped(SliceEvent):
     """An operator approved skipping one parked stage.
 
@@ -209,6 +231,7 @@ class SliceSkipped(SliceEvent):
 
 class IllegalSliceTransition(Exception):
     """Raised when an event has no legal transition for the current slice."""
+
     def __init__(self, state: SliceState, event: SliceEvent) -> None:
         self.state = state
         self.event = event
@@ -293,6 +316,32 @@ def slice_transition(state: SliceState, event: SliceEvent) -> SliceState:
             review_validation_failure_reason=None
             if event.status == "failure"
             else state.review_validation_failure_reason,
+        )
+    if isinstance(event, SliceRebound):
+        _validate_slice_rebind(state, event)
+        audit = dict(state.park_audit or {})
+        audit.update(
+            {
+                "recovery_action": "superseded_dependency_rebound",
+                "needs_human": False,
+                "superseded_blocker": event.superseded_id,
+                "replacement_blocker": event.replacement_id,
+                "reason": event.reason,
+            }
+        )
+        return replace(
+            state,
+            status=SliceStatus.BLOCKED,
+            blocked_by=event.replacement_id,
+            park_audit=audit,
+        )
+    if isinstance(event, SliceDependencyReleased):
+        _validate_slice_release(state, event)
+        return replace(
+            state,
+            status=SliceStatus.PENDING,
+            blocked_by=None,
+            park_audit=None,
         )
     if isinstance(event, SliceSkipped):
         _validate_slice_skip(state, event)
@@ -454,6 +503,30 @@ def slice_transition(state: SliceState, event: SliceEvent) -> SliceState:
             action=None,
         )
     raise IllegalSliceTransition(state, event)
+
+
+def _validate_slice_rebind(state: SliceState, event: SliceRebound) -> None:
+    """Rebind only a held dependent of the exact skipped prerequisite."""
+    if (
+        state.status is not SliceStatus.BLOCKED
+        or state.blocked_by != event.superseded_id
+        or not event.superseded_id.strip()
+        or not event.replacement_id.strip()
+        or event.replacement_id == event.superseded_id
+        or not event.reason.strip()
+    ):
+        raise IllegalSliceTransition(state, event)
+
+
+def _validate_slice_release(state: SliceState, event: SliceDependencyReleased) -> None:
+    """Release only a dependent still held by the exact merged replacement."""
+    if (
+        state.status is not SliceStatus.BLOCKED
+        or state.blocked_by != event.replacement_id
+        or not event.replacement_id.strip()
+        or not event.reason.strip()
+    ):
+        raise IllegalSliceTransition(state, event)
 
 
 def _validate_slice_skip(state: SliceState, event: SliceSkipped) -> None:

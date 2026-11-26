@@ -13,12 +13,20 @@ from tl_loop.fsm.post_merge import PostMergePhase, PostMergeState
 from tl_loop.fsm.scope import TLPlanning, TLRunning
 
 from .plan_manifest import ManifestNode, PlanManifest
-from .plan_revision_diff import changed_node_fields
+from .plan_revision_diff import changed_node_fields, rebound_dependent_names
 from .plan_revision_state import read_checkpoint
 from .plan_revision_types import PlanRevisionError
 from .schema import IntegrationRuntimeState, SliceStatus, validate
 from .serialization import dumps as dumps_json
-from .store import _assert_consistent, _decode, _encode_fsm, _encode_integration
+from .slice_transition import SliceRebound, slice_transition
+from .store import (
+    _assert_consistent,
+    _decode,
+    _decode_slice,
+    _encode_fsm,
+    _encode_integration,
+    _encode_slice,
+)
 
 
 def revise_scope_checkpoint(
@@ -64,6 +72,9 @@ def _apply_scope_revision(
     document["slices"] = slices
     document["plan_manifest"] = candidate.to_document()
     document["fsm"] = _encode_fsm(revised_phase)
+    if isinstance(revised_phase, TLRunning):
+        # A same-order replacement can move the barrier back to its stage.
+        document["current_order"] = revised_phase.current_order
     _revise_ordered_state(document, candidate)
     document["revision"] = _next_run_revision(document, path)
 
@@ -76,7 +87,7 @@ def _validate_and_encode(document: dict[str, object], path: Path) -> bytes:
     except Exception as error:
         raise PlanRevisionError(
             "runtime_rebase_invalid",
-            f"revised RunStore {path} failed validation or consistency checks",
+            f"revised RunStore {path} failed validation or consistency checks: {error}",
         ) from error
     return (dumps_json(document, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
@@ -99,7 +110,45 @@ def _revise_slices(
             record["manifest_revision"] = manifest.manifest_revision
         record["manifest_node_id"] = node.node_id
         revised[node.name] = record
+    _rebind_blocked_dependents(revised, previous, manifest)
     return revised
+
+
+def _rebind_blocked_dependents(
+    slices: dict[str, object],
+    previous: PlanManifest,
+    candidate: PlanManifest,
+) -> None:
+    """Point dependents held by a newly superseded node at its replacement."""
+    recorded = set(previous.superseded_nodes.items())
+    nodes = {node.node_id: node for node in candidate.nodes}
+    for old_id, replacement_id in candidate.superseded_nodes.items():
+        if (old_id, replacement_id) in recorded:
+            continue
+        old_node = nodes.get(old_id)
+        replacement = nodes.get(replacement_id)
+        if old_node is None or replacement is None:
+            continue
+        for name in rebound_dependent_names(candidate, old_node, exclude=replacement_id):
+            record = slices.get(name)
+            if not isinstance(record, dict):
+                continue
+            if record.get("status") != SliceStatus.BLOCKED.value:
+                continue
+            if record.get("blocked_by") not in {
+                old_node.name,
+                old_node.node_id,
+            }:
+                continue
+            rebound = slice_transition(
+                _decode_slice(record),
+                SliceRebound(
+                    old_node.name,
+                    replacement.name,
+                    "plan revision superseded the held prerequisite",
+                ),
+            )
+            slices[name] = _encode_slice(name, rebound)
 
 
 def _update_changed_declaration_fields(
@@ -232,7 +281,7 @@ def _make_running_phase(
         phase, previous, candidate, completed, records
     )
     return TLRunning(
-        current_order=phase.current_order,
+        current_order=_rebased_current_order(phase, previous, candidate),
         pending_by_order=pending_by_order,
         scope_path=phase.scope_path,
         plan_digest=cast(str, candidate.digest),
@@ -294,7 +343,14 @@ def _ensure_scope_order_preserved(
 ) -> None:
     old_nodes = {node.node_id: node for node in previous.nodes}
     new_nodes = {node.node_id: node for node in candidate.nodes}
-    _ensure_not_reopening_past_work(phase, old_nodes, new_nodes, completed, path)
+    _ensure_not_reopening_past_work(
+        phase,
+        old_nodes,
+        new_nodes,
+        completed,
+        path,
+        allowed_past=_same_order_replacement_ids(previous, candidate),
+    )
 
 
 def _running_records(
@@ -368,12 +424,50 @@ def _ordered_pending(
     return pending_by_order
 
 
+def _same_order_replacement_ids(
+    previous: PlanManifest,
+    candidate: PlanManifest,
+) -> set[str]:
+    """Name fresh replacements that stand in at the superseded node's order."""
+    previous_nodes = {node.node_id: node for node in previous.nodes}
+    new_nodes = {node.node_id: node for node in candidate.nodes}
+    allowed: set[str] = set()
+    for old_id, replacement_id in candidate.superseded_nodes.items():
+        if old_id in previous.superseded_nodes:
+            continue
+        old = previous_nodes.get(old_id)
+        replacement = new_nodes.get(replacement_id)
+        if old is not None and replacement is not None and old.order == replacement.order:
+            allowed.add(replacement_id)
+    return allowed
+
+
+def _rebased_current_order(
+    phase: TLRunning,
+    previous: PlanManifest,
+    candidate: PlanManifest,
+) -> int:
+    """Move the barrier back to a fresh same-order replacement's stage."""
+    current = phase.current_order
+    if current <= 0:
+        return current
+    new_nodes = {node.node_id: node for node in candidate.nodes}
+    replacement_orders: list[int] = []
+    for node_id in _same_order_replacement_ids(previous, candidate):
+        order = new_nodes[node_id].order
+        if order is not None and order < current:
+            replacement_orders.append(order)
+    return min([current, *replacement_orders])
+
+
 def _ensure_not_reopening_past_work(
     phase: TLRunning,
     old_nodes: dict[str, ManifestNode],
     new_nodes: dict[str, ManifestNode],
     completed: dict[str, ChildRecord],
     path: Path,
+    *,
+    allowed_past: set[str],
 ) -> None:
     if phase.current_order == 0:
         return
@@ -384,6 +478,7 @@ def _ensure_not_reopening_past_work(
             old_nodes.get(node_id),
             completed,
             path,
+            allowed_past=node_id in allowed_past,
         )
         if blocker is not None:
             raise blocker
@@ -395,8 +490,12 @@ def _past_order_blocker(
     previous: ManifestNode | None,
     completed: dict[str, ChildRecord],
     path: Path,
+    *,
+    allowed_past: bool = False,
 ) -> PlanRevisionError | None:
     if current_order == 0 or node.kind in {"worker", "leaf"} or node.name in completed:
+        return None
+    if allowed_past:
         return None
     previous_order = previous.order if previous is not None else None
     if node.order is None or node.order < current_order:

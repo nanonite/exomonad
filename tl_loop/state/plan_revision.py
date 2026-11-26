@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 
 from tl_loop.fsm.phase import TLPhase
@@ -34,9 +35,10 @@ from .plan_revision_types import (
     DecodedPlan,
     PlanRevisionAnalysis,
     PlanRevisionError,
+    PlanRevisionSupersession,
     ScopeState,
 )
-from .schema import RunState
+from .schema import RunState, SliceStatus
 
 
 def analyze_plan_revision(
@@ -164,6 +166,29 @@ def _candidate_manifest(
     return increment_changed_revisions(proposed, previous, changed_ids)
 
 
+def _with_blocked_dependents(
+    supersessions: tuple[PlanRevisionSupersession, ...],
+    current_scopes: Mapping[str, ScopeState],
+) -> tuple[PlanRevisionSupersession, ...]:
+    """Report which named dependents are actually held by the skipped node."""
+    enriched: list[PlanRevisionSupersession] = []
+    for supersession in supersessions:
+        scope = current_scopes.get(supersession.scope_id)
+        if scope is None:
+            enriched.append(supersession)
+            continue
+        blocked = tuple(
+            name
+            for name in supersession.rebound_dependents
+            if (current := scope.state.slices.get(name)) is not None
+            and current.status is SliceStatus.BLOCKED
+            and current.blocked_by
+            in {supersession.superseded_name, supersession.superseded_node_id}
+        )
+        enriched.append(replace(supersession, blocked_dependents=blocked))
+    return tuple(enriched)
+
+
 def _build_analysis(
     snapshot_digest: str,
     plan_bytes: bytes,
@@ -179,7 +204,9 @@ def _build_analysis(
         scopes=collect_changed_scope_summaries(previous, candidate),
         changes=collect_node_changes(previous, candidate),
         blockers=unique_blockers(blockers),
-        supersessions=collect_supersessions(previous, candidate),
+        supersessions=_with_blocked_dependents(
+            collect_supersessions(previous, candidate), current_scopes
+        ),
         candidate_plan_bytes=plan_bytes,
         previous_manifest=previous,
         candidate_manifest=candidate,

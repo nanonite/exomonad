@@ -177,7 +177,8 @@ For the skipped stage the run's plan is considered finished. The stage is termin
 `SKIPPED`; the controller never relaunches it and never runs its post-merge
 path. The rest of the run follows the dependency policy: under `proceed` it can
 reach `TLDone`; under `block` or `require-named` it holds in `TLRunning` at the
-first withheld stage.
+first withheld stage. That hold is what the same-run `plan revise` supersession
+below can release without rewriting the skip decision.
 
 1. **The controller leaves the issue alone.** A skip is not a merge, so no
    post-merge recovery runs for it and the skipped stage's linked Chainlink
@@ -221,22 +222,39 @@ in a new plan as above.
 
 `exomonad plan revise` can add a new future node that declares
 `"supersedes": "<old stage>"`. The old declaration stays byte-for-byte; the
-manifest records `superseded_nodes: {old -> new}`, the dry run reports the
-replacement and the `rebound_dependents`, and apply writes that report into the
-audit entry. The replaced node must already be decided (a `PENDING` or `READY`
-node is refused by `superseded_node_still_pending`), and a skip is such a
-decision. The replacement gets its own name, branch, and worktree and cannot
-reuse the replaced node's identity.
+manifest records `superseded_nodes: {old -> new}`. The dry run reports the
+replacement, every `rebound_dependents`, and the subset that is actually held
+`BLOCKED` on the old stage as `blocked_dependents`. Apply moves those held
+dependents' `blocked_by` to the replacement and audits the old and new
+prerequisite, so they wait on the repair rather than on the skipped node. The
+replaced node must already be decided (a `PENDING` or `READY` node is refused by
+`superseded_node_still_pending`), and a skip is such a decision.
+
+Ordering follows the skipped stage's dependents instead of blocking the repair:
+
+- The replacement may sit at the superseded node's own order and reuse its owned
+  paths; they never run together because the old node is `SKIPPED`. Any other
+  same-order overlap remains refused.
+- When the replacement is later than the held stage, the controller advances
+  past a stage that only waits on the unmerged replacement and dispatches it.
+- When the replacement merges, the rebound dependents are released to `PENDING`
+  and the barrier moves back to their stage, so they run in declared order. If
+  the replacement fails or is skipped, they stay `BLOCKED` and the scope stays
+  held rather than reaching `TLDone`.
+- A replacement placed behind `current_order` without the same-order
+  supersession proof is refused.
 
 It is for a same-run substitute slice when the run is still active and the
-skipped stage's issue does not need to move. It is not a rebind: it cannot take
-the skipped stage's `chainlink_issue_id`, cannot delete or rewrite the old
+skipped stage's issue does not need to move. It is not an issue rebind: it cannot
+take the skipped stage's `chainlink_issue_id`, cannot delete or rewrite the old
 declaration, and does not touch Chainlink. It is also not the post-skip issue
 workflow: closing or splitting the issue and binding the repair under it is the
 new-plan path above. See
 [`programming-the-tl.md`](programming-the-tl.md#superseding-a-dispatched-node)
-for the plan-authoring mechanics and
-`tl_loop/tests/test_plan_revision_supersession.py` for the proved behaviour.
+for the plan-authoring mechanics,
+`tl_loop/tests/test_plan_revision_supersession.py` for the option and refusal
+rules, and `tl_loop/tests/test_plan_revision_supersession_blocked.py` for the
+held-dependent rebind, dispatch, release, and failure end states.
 
 The compiled acceptance for the skip path is the `skip-held-stage` case in
 `tests/e2e/blocked-resume-host/`, which also proves that a real
